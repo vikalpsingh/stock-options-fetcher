@@ -1,35 +1,74 @@
-import requests
-from bs4 import BeautifulSoup
-from utils.fetch_options import *
+from nsepython import *
+import pandas as pd
+from datetime import datetime
 
+# Define the symbol
+symbol = "PFC"
 
-def get_call_options(symbol):
-    url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    session = requests.Session()
-    session.headers.update(headers)
-    session.get("https://www.nseindia.com")
-    response = session.get(url)
-    data = response.json()
-    calls = [item['CE'] for item in data['records']['data'] if 'CE' in item]
-    return [
-        f"Strike: {call['strikePrice']}, Premium: {call['lastPrice']}"
-        for call in calls[:3]
-    ]
+# Fetch the option chain data
+try:
+    option_chain_data = nse_optionchain_scrapper(symbol)
+except Exception as e:
+    print(f"Error fetching option chain: {e}")
+    exit()
 
-def main():
-    stock_symbol = input("Enter the stock symbol: ")
-    call_options = get_call_options(stock_symbol)
-    
-    if call_options:
-        print(f"Call options for {stock_symbol}:")
-        for option in call_options:
-            print(option)
-    else:
-        print(f"No call options found for {stock_symbol}.")
+# Extract expiry dates and select the nearest or specific expiry
+expiry_list = option_chain_data['records']['expiryDates']
+# Optionally, specify a particular expiry (e.g., "28-Aug-2025")
+target_expiry = "28-Aug-2025"  # Adjust based on your needs
+if target_expiry in expiry_list:
+    latest_expiry = target_expiry
+else:
+    latest_expiry = expiry_list[0]  # Fallback to nearest expiry
+    print(f"Target expiry {target_expiry} not found. Using nearest expiry: {latest_expiry}")
 
-if __name__ == "__main__":
-    main()
+# Filter data for the selected expiry
+data = [row for row in option_chain_data['filtered']['data'] if row['expiryDate'] == latest_expiry]
+spot_price = option_chain_data['records']['underlyingValue']
+
+# Create a DataFrame
+option_chain_df = pd.DataFrame(data)
+
+# Select relevant columns
+columns = [
+    'strikePrice', 
+    'callOption.lastPrice', 'callOption.openInterest', 'callOption.impliedVolatility',
+    'putOption.lastPrice', 'putOption.openInterest', 'putOption.impliedVolatility'
+]
+
+# Flatten nested JSON data
+option_chain_df['callOption.lastPrice'] = option_chain_df['CE'].apply(lambda x: x.get('lastPrice', 0))
+option_chain_df['callOption.openInterest'] = option_chain_df['CE'].apply(lambda x: x.get('openInterest', 0))
+option_chain_df['callOption.impliedVolatility'] = option_chain_df['CE'].apply(lambda x: x.get('impliedVolatility', 0))
+option_chain_df['putOption.lastPrice'] = option_chain_df['PE'].apply(lambda x: x.get('lastPrice', 0))
+option_chain_df['putOption.openInterest'] = option_chain_df['PE'].apply(lambda x: x.get('openInterest', 0))
+option_chain_df['putOption.impliedVolatility'] = option_chain_df['PE'].apply(lambda x: x.get('impliedVolatility', 0))
+
+# Filter relevant columns
+option_chain_df = option_chain_df[columns]
+
+# Rename columns for clarity
+option_chain_df.columns = [
+    'Strike Price', 
+    'Call Last Price', 'Call OI', 'Call IV',
+    'Put Last Price', 'Put OI', 'Put IV'
+]
+
+# Filter for ~10% OTM call (₹450 strike)
+otm_strike = 450
+filtered_df = option_chain_df[option_chain_df['Strike Price'] == otm_strike]
+
+# Display results
+print(f"PFC Option Chain for Expiry: {latest_expiry}")
+print(f"Spot Price: ₹{spot_price}")
+print("\nOption Chain Data for Strike ₹450:")
+print(filtered_df)
+
+# Calculate premium per lot for ₹450 CE
+if not filtered_df.empty:
+    call_premium = filtered_df['Call Last Price'].iloc[0]
+    lot_size = 1300  # As per your provided data
+    premium_per_lot = call_premium * lot_size
+    print(f"\nEstimated Premium per Lot for ₹450 CE: ₹{premium_per_lot:.2f}")
+else:
+    print(f"No data found for strike ₹450 in expiry {latest_expiry}")
