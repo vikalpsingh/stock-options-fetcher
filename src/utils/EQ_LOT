@@ -1,0 +1,84 @@
+from nsepython import nse_fno, nsefetch
+import time
+
+# Optional known fallbacks in case NSE hides it temporarily
+KNOWN_LOTS = {
+    "PFC": 2700,
+    "RELIANCE": 250,     # example
+    "HDFCBANK": 550,     # example
+    "BANKNIFTY": 15,     # example (check current)
+    "NIFTY": 50,         # example (check current)
+}
+
+def _pick_lot_from_json(obj):
+    """
+    Check common locations for market lot.
+    """
+    if not isinstance(obj, dict):
+        return None
+    # direct
+    if isinstance(obj.get("marketLot"), (int, float)) and obj["marketLot"] > 0:
+        return int(obj["marketLot"])
+    # records.marketLot
+    rec = obj.get("records") or {}
+    if isinstance(rec.get("marketLot"), (int, float)) and rec["marketLot"] > 0:
+        return int(rec["marketLot"])
+    # info.marketLot (quote-derivative)
+    info = obj.get("info") or {}
+    if isinstance(info.get("marketLot"), (int, float)) and info["marketLot"] > 0:
+        return int(info["marketLot"])
+    return None
+
+def get_lot_size(symbol: str, default: int | None = None, retries: int = 2, sleep_sec: float = 1.0) -> int:
+    """
+    Robust lot-size fetch:
+      1) nse_fno(symbol)
+      2) nsefetch(quote-derivative)
+      3) KNOWN_LOTS / default
+    Raises if still not found.
+    """
+    sym = symbol.upper()
+
+    # 1) Try nse_fno with light retries (handles many cases)
+    last_err = None
+    for _ in range(max(1, retries)):
+        try:
+            d = nse_fno(sym)
+            lot = _pick_lot_from_json(d)
+            if lot:
+                return lot
+        except Exception as e:
+            last_err = e
+        time.sleep(sleep_sec)
+
+    # 2) Fallback: quote-derivative (often contains `info.marketLot`)
+    for _ in range(max(1, retries)):
+        try:
+            qd = nsefetch(f"https://www.nseindia.com/api/quote-derivative?symbol={sym}")
+            lot = _pick_lot_from_json(qd)
+            if lot:
+                return lot
+        except Exception as e:
+            last_err = e
+        time.sleep(sleep_sec)
+
+    # 3) Known map / user default
+    if sym in KNOWN_LOTS:
+        return KNOWN_LOTS[sym]
+    if default:
+        return int(default)
+
+    # If you get here, it’s a session/symbol problem
+    raise RuntimeError(f"Could not determine lot size for {sym}. Last error: {last_err}")
+
+
+
+print(get_lot_size("PFC"))          # should return 2700 (live) or from KNOWN_LOTS
+print(get_lot_size("RELIANCE"))     # example
+print(get_lot_size("BANKNIFTY"))    # example for index
+# If still None earlier, force a default:
+print(get_lot_size("PFC", default=2700))
+
+
+
+

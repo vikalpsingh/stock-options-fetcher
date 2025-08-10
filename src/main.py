@@ -1,14 +1,15 @@
 from nsepython import *
+from nsepython import nse_fno
 import pandas as pd
 from datetime import datetime
 import math
 
 # Configuration: Define symbols, lot sizes, and OTM percentage
 config = {
-    "TATACONSUM": {"lot_size": 550, "otm_percentage": 0.10},  # Tata Consumer
+    #"TATACONSUM": {"lot_size": 550, "otm_percentage": 0.10},  # Tata Consumer
     "PFC": {"lot_size": 1300, "otm_percentage": 0.10},        # Power Finance Corporation
-    "ETERNAL": {"lot_size": 2425, "otm_percentage": 0.10},     # Zomato (Eternal Ltd.)
-    "RVNL": {"lot_size": 1375, "otm_percentage": 0.10}        # Rail Vikas Nigam Limited
+    #"ETERNAL": {"lot_size": 2425, "otm_percentage": 0.10},     # Zomato (Eternal Ltd.)
+    #"RVNL": {"lot_size": 1375, "otm_percentage": 0.10}        # Rail Vikas Nigam Limited
 }
 
 # Target expiry date
@@ -17,9 +18,23 @@ target_expiry = "28-Aug-2025"
 def fetch_option_chain(symbol, lot_size, otm_percentage):
     try:
         # Fetch option chain data
+        otm_percentage =0.08 # 8% OTM
+
+        print(f"Fetching option chain for {symbol} with lot size {lot_size} and OTM percentage {otm_percentage * 100}%")
+        # Fetch current price
+        data = nse_eq(symbol)
+
+        fno_data = nse_fno(symbol)
+        print(f"FNO data for {symbol}:", fno_data)
+        lot_size_l = fno_data['marketLot']
+        print(f"Lot size for {symbol} options:", lot_size_l)
+      
+        print(f"Current price of {symbol}:", data['priceInfo']['lastPrice'])
+
         option_chain_data = nse_optionchain_scrapper(symbol)
         expiry_list = option_chain_data['records']['expiryDates']
         spot_price = option_chain_data['records']['underlyingValue']
+
 
         # Select expiry
         expiry = target_expiry if target_expiry in expiry_list else expiry_list[0]
