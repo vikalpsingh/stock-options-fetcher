@@ -1,0 +1,6 @@
+ & C:/Users/vikal/AppData/Local/Programs/Python/Python313/python.exe c:/Coding/NSE/stock-options-fetcher/src/otm_premiums.py --file input.csv --out output.csv
+
+
+ & C:/Users/vikal/AppData/Local/Programs/Python/Python313/python.exe c:/Coding/NSE/stock-options-fetcher/src/otm_premiums.py --file C:\Coding\NSE\stock-options-fetcher\input.csv --out C:\Coding\NSE\stock-options-fetcher\premiums.csv
+ 
+
