@@ -1,0 +1,36 @@
+from nsepython import equity_history
+import pandas as pd
+from datetime import datetime, timedelta
+
+def get_monthly_pct_change(symbol, months=16):
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=30*months)
+    start_str = start_date.strftime("%d-%m-%Y")
+    end_str = end_date.strftime("%d-%m-%Y")
+
+    data = equity_history(symbol, "EQ", start_str, end_str)
+    if data is None or data.empty:
+        print(f"No data for {symbol}")
+        return None
+
+    data['YearMonth'] = pd.to_datetime(data['CH_TIMESTAMP']).dt.to_period('M')
+    monthly_prices = data.groupby('YearMonth').agg({'CH_CLOSING_PRICE': 'last'}).reset_index()
+
+    monthly_prices['pct_change'] = monthly_prices['CH_CLOSING_PRICE'].pct_change() * 100
+    monthly_prices = monthly_prices.dropna(subset=['pct_change']).reset_index(drop=True)
+
+    return monthly_prices[['YearMonth', 'pct_change']]
+
+# Get last 15 months % change for PFC and TATACONSUM
+pfc_changes = get_monthly_pct_change("PFC", 16)
+tataconsum_changes = get_monthly_pct_change("TATACONSUM", 16)
+
+# Merge data for display and save to CSV
+if pfc_changes is not None and tataconsum_changes is not None:
+    merged = pd.merge(pfc_changes, tataconsum_changes, on="YearMonth", how="outer", suffixes=("_PFC", "_TATACONSUM"))
+    merged = merged.tail(15)  # Show last 15 months
+    print(merged.to_string(index=False))
+    merged.to_csv("out.csv", index=False)
+    print("Saved to out.csv")
+else:
+    print("Could not retrieve data for one or both symbols.")

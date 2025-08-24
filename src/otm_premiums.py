@@ -226,5 +226,16 @@ def main():
     df.to_csv(args.out, index=False)
     print(f"Saved: {args.out} ({len(df)} rows)")
 
+    # Call sort_by_premium.py to sort the output CSV
+    try:
+        import subprocess
+        subprocess.run(
+            ["python", os.path.join(os.path.dirname(__file__), "sort_by_premium.py"), args.out],
+            check=True
+        )
+        print(f"Sorted output saved as 'sorted_output.csv'")
+    except Exception as e:
+        print(f"Sorting failed: {e}")
+
 if __name__ == "__main__":
     main()
