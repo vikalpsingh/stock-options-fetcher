@@ -20,6 +20,7 @@ To run this project, you need to install the following dependencies:
 
 - `requests`
 - `beautifulsoup4`
+- `yfinance`
 
 You can install the required packages using pip:
 
@@ -38,6 +39,16 @@ python src/main.py
 ```
 
 4. Follow the prompts to enter a stock symbol and view the call option data.
+
+### Fetch Daily News
+
+To fetch the latest news and sector information for a set of stocks, run:
+
+```
+python src/fetch_news.py
+```
+
+This script prints the most recent headlines for stocks such as Bajaj Finance, Tata Consumer, PGEL, Titan, Eternal, United Spirits, Havells, Info Edge, PFC, CAMS, CDSL, Cyient, and Mazagon Dock.
 
 ## Contributing
 
