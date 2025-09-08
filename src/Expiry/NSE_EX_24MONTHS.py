@@ -5,7 +5,19 @@ from datetime import datetime, timedelta
 import os
 
 # -------- PARAMETERS --------
-symbols = ["PFC", "TATACONSUM", "ETERNAL", "RVNL"]
+symbols = [ "PGEL",
+ "ETERNAL",
+ "BAJFINANCE",
+ "UNITDSPR",
+ "PFC",
+ "MAZDOCK",
+ "TATACONSUM",
+ "TITAN",
+ "NTPC",
+ "NAUKRI",
+ "HAVELLS",
+ "CYIENT"
+]
 series = "EQ"
 alpha = 0.85             # Decay factor for exponential weights
 months_back = 24

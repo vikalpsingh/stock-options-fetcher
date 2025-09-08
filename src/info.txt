@@ -3,4 +3,17 @@
 
  & C:/Users/vikal/AppData/Local/Programs/Python/Python313/python.exe c:/Coding/NSE/stock-options-fetcher/src/otm_premiums.py --file C:\Coding\NSE\stock-options-fetcher\input.csv --out C:\Coding\NSE\stock-options-fetcher\premiums.csv
  
+FOCUS on one 
+
+
+Write the requrements ---
+
+Now add last 1 week, 1 month and 2 month movement of teh stock price
+
+ & C:/Users/vikal/AppData/Local/Programs/Python/Python313/python.exe c:/Coding/NSE/stock-options-fetcher/src/myshares/fetch_pfc_option_chain.py
+
+ & C:/Users/vikal/AppData/Local/Programs/Python/Python313/python.exe c:/Coding/NSE/stock-options-fetcher/src/otm_premiums.py --file C:\Coding\NSE\stock-options-fetcher\input2.cs 
+
+
+
 

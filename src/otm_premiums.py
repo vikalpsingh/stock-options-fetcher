@@ -1,7 +1,3 @@
-# otm_premiums_batch.py
-# Reads symbols from input.txt with header: #Symbol LOT_SIZE OTM%
-# Computes CE & PE for nearest + next 2 monthly expiries and writes to CSV
-
 from nsepython import nse_fno, nsefetch
 import pandas as pd
 from math import isfinite
@@ -16,6 +12,7 @@ import requests
 DATE_FMT = "%d-%b-%Y"
 INPUT_FILE_DEFAULT = "input.txt"
 OUTPUT_CSV_DEFAULT = "otm_premiums_batch.csv"
+
 
 # ----------------------------- Input parser -----------------------------
 def read_symbols_with_params(path: str):
@@ -36,11 +33,12 @@ def read_symbols_with_params(path: str):
             except:
                 lot = 0
             try:
-                pct = float(parts[2]) / 100.0  # convert to decimal
+                pct = float(parts[2]) / 100.0  # percent to decimal
             except:
                 pct = 0.10
             out.append((sym, lot, pct))
     return out
+
 
 # ----------------------------- Lot size fetcher -----------------------------
 def _pick_lot_from_json(obj):
@@ -56,11 +54,11 @@ def _pick_lot_from_json(obj):
         return int(info["marketLot"])
     return None
 
+
 def get_lot_size(symbol: str, override: int | None = None):
     if override and override > 0:
         return override
     sym = symbol.upper()
-    # Try nse_fno
     try:
         d = nse_fno(sym)
         lot = _pick_lot_from_json(d)
@@ -68,7 +66,6 @@ def get_lot_size(symbol: str, override: int | None = None):
             return lot
     except:
         pass
-    # Try quote-derivative
     try:
         qd = nsefetch(f"https://www.nseindia.com/api/quote-derivative?symbol={sym}")
         lot = _pick_lot_from_json(qd)
@@ -78,22 +75,26 @@ def get_lot_size(symbol: str, override: int | None = None):
         pass
     raise RuntimeError(f"Could not determine lot size for {sym} (no override).")
 
+
 # ----------------------------- Date helpers -----------------------------
 def to_date(s: str) -> datetime:
     return datetime.strptime(s, DATE_FMT)
 
+
 def is_last_thursday(dt: datetime) -> bool:
     last_day = monthrange(dt.year, dt.month)[1]
-    last_dt  = datetime(dt.year, dt.month, last_day)
+    last_dt = datetime(dt.year, dt.month, last_day)
     while last_dt.weekday() != 3:
         last_dt -= timedelta(days=1)
     return dt.date() == last_dt.date()
+
 
 def nearest_expiry(records) -> str:
     exps = records.get("expiryDates", [])
     if not exps:
         raise RuntimeError("No expiries available.")
-    return exps[0]
+    return exps
+
 
 def next_two_monthlies(records, start_exp: str) -> list[str]:
     exps = records.get("expiryDates", [])
@@ -111,55 +112,43 @@ def next_two_monthlies(records, start_exp: str) -> list[str]:
             picks.append(e)
     return picks[:2]
 
+
 # ----------------------------- Option chain helpers -----------------------------
 def fetch_records(symbol: str):
-    cookies = {}
+    url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/json',
-        'Accept-Encoding': 'gzip, deflate, br',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
-        'DNT': '1',
-        'sec-fetch-site': 'same-origin',
-        'sec-fetch-mode': 'cors'
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Referer': f'https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}',
     }
 
     with requests.Session() as session:
         try:
-            # Step 1: Get cookies from main page
-            resp = session.get('https://www.nseindia.com', headers=headers, timeout=15)
-            cookies.update(session.cookies.get_dict())
+            # Step 1: Get initial cookies
+            session.get("https://www.nseindia.com", headers=headers, timeout=10)
             time.sleep(2)
-
-            # Step 2: Get cookies from markets page
-            markets_url = 'https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market'
-            resp = session.get(markets_url, headers=headers, cookies=cookies, timeout=15)
-            cookies.update(session.cookies.get_dict())
+            # Step 2: Access derivatives page to update session
+            session.get(headers['Referer'], headers=headers, timeout=10)
             time.sleep(2)
-
-            # Step 3: Finally get the option chain data
-            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-            headers['Referer'] = 'https://www.nseindia.com/get-quotes/derivatives'
-            resp = session.get(url, headers=headers, cookies=cookies, timeout=15)
-            
-            if resp.status_code == 401:
-                print(f"Session expired for {symbol}, retrying...")
-                time.sleep(5)
-                resp = session.get(url, headers=headers, cookies=cookies, timeout=15)
-
-            resp.raise_for_status()
-            return resp.json()['records']
-
-        except Exception as e:
-            print(f"Failed to fetch {symbol}: {str(e)}")
-            print(f"Response status: {getattr(resp, 'status_code', 'N/A')}")
-            print(f"Response headers: {getattr(resp, 'headers', {})}")
+            # Step 3: Get option chain data
+            response = session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("records") or not data["records"].get("data"):
+                raise RuntimeError(f"No option chain data available for {symbol}")
+            return data["records"]
+        except requests.RequestException as e:
+            print(f"Request failed for {symbol}: {str(e)}")
             raise
+
 
 def available_strikes(records, expiry: str) -> list[float]:
     rows = records.get("data", [])
     strikes = sorted({float(r.get("strikePrice")) for r in rows if r.get("expiryDate") == expiry})
     return strikes
+
 
 def pick_strike(strikes: list[float], target: float, side: str) -> float:
     if side.upper() == "CE":
@@ -169,11 +158,13 @@ def pick_strike(strikes: list[float], target: float, side: str) -> float:
         cands = [s for s in strikes if s <= target]
         return max(cands) if cands else strikes[0]
 
+
 def row_for(records, expiry: str, strike: float):
     for r in records.get("data", []):
         if r.get("expiryDate") == expiry and float(r.get("strikePrice")) == float(strike):
             return r
     return None
+
 
 def extract_leg(row: dict, leg_key: str) -> dict:
     leg = row.get(leg_key, {}) or {}
@@ -187,6 +178,7 @@ def extract_leg(row: dict, leg_key: str) -> dict:
         "IV": leg.get("impliedVolatility"),
         "Volume": leg.get("totalTradedVolume"),
     }
+
 
 # ----------------------------- Main logic -----------------------------
 def compute_for_symbol(symbol: str, lot: int, pct: float):
@@ -227,23 +219,38 @@ def compute_for_symbol(symbol: str, lot: int, pct: float):
         })
     return rows_out
 
-# ----------------------------- Runner -----------------------------
+
+# ----------------------------- Output -----------------------------
+def write_output_csv(rows, path: str):
+    if not rows:
+        print(f"No data to write to {path}")
+        return
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False)
+    print(f"✓ Data written to {path}")
+
+
+# ----------------------------- Main entry -----------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--file", default=INPUT_FILE_DEFAULT, help="Path to input.txt with header #Symbol LOT_SIZE OTM%")
-    parser.add_argument("--out", default=OUTPUT_CSV_DEFAULT, help="Output CSV file")
+    parser = argparse.ArgumentParser(description="NSE Option Premiums Scraper")
+    parser.add_argument("-i", "--input", help=f"Input file with symbols (default: {INPUT_FILE_DEFAULT})")
+    parser.add_argument("-o", "--output", help=f"Output CSV file (default: {OUTPUT_CSV_DEFAULT})")
     args = parser.parse_args()
 
+    input_file = args.input if args.input else INPUT_FILE_DEFAULT
+    output_file = args.output if args.output else OUTPUT_CSV_DEFAULT
+
     try:
-        sym_data = read_symbols_with_params(args.file)
+        sym_data = read_symbols_with_params(input_file)
+        print(f"Read {len(sym_data)} symbols from {input_file}")
     except Exception as e:
-        print(f"Error reading file: {e}")
+        print(f"Error reading symbols: {str(e)}")
         sys.exit(1)
 
-    MAX_RETRIES = 3
-    RETRY_DELAY = 10  # seconds
-
     all_rows = []
+    MAX_RETRIES = 3
+    RETRY_DELAY = 5
+
     for sym, lot, pct in sym_data:
         for attempt in range(MAX_RETRIES):
             try:
@@ -259,28 +266,12 @@ def main():
                 else:
                     print(f"Failed to process {sym} after {MAX_RETRIES} attempts: {str(e)}")
 
-    if not all_rows:
-        print("No data fetched.")
-        sys.exit(2)
-
-    df = pd.DataFrame(all_rows)
-    before = len(df)
-    df = df.drop_duplicates(subset=["Symbol", "Underlying", "Expiry", "Strike"], keep="first").reset_index(drop=True)
-    
-    print(f"Removed {before - len(df)} duplicate rows on (Symbol,Underlying,Expiry,Strike).")
-    df.to_csv(args.out, index=False)
-    print(f"Saved: {args.out} ({len(df)} rows)")
-
-    # Call sort_by_premium.py to sort the output CSV
     try:
-        import subprocess
-        subprocess.run(
-            ["python", os.path.join(os.path.dirname(__file__), "sort_by_premium.py"), args.out],
-            check=True
-        )
-        print(f"Sorted output saved as 'sorted_output.csv'")
+        write_output_csv(all_rows, output_file)
     except Exception as e:
-        print(f"Sorting failed: {e}")
+        print(f"Error writing output: {str(e)}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

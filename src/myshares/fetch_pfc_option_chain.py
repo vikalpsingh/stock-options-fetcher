@@ -9,11 +9,13 @@ shares = [
     ("BAJFINANCE", "Bajaj Finance Ltd", 750),
     ("UNITDSPR", "United Spirits Ltd", 375),
     ("PFC", "Power Finance Corporation Ltd", 1300),
-    ("NAZARA", "Nazara tech", 420),
-    ("MAZDOCK", "Mazagon Dock Shipbuilders Ltd", 150),
+    ("MAZDOCK", "Mazagon Dock Shipbuilders Ltd", 175),
     ("TATACONSUM", "Tata Consumer Products Ltd", 550),
-    ("TITAN", "Titan", 505),
-    ("NTPC", "NTPC Ltd", 1500)
+    ("TITAN", "Titan", 350),
+    ("NTPC", "NTPC Ltd", 1500),
+     ("NAUKRI", "Info edge", 375),
+     ("HAVELLS", "HAVELLS Ltd ", 500),
+     ("CYIENT", "CYIENT Ltd ", 425)
 ]
 
 def fetch_option_chain(symbol):
@@ -71,7 +73,9 @@ def expiry_to_filename(expiry):
     return f"{dt.strftime('%b_%Y')}_options.csv"
 
 def main():
-    expiry_input = input("Enter NSE expiry date (e.g. 30-Sep-2025): ").strip()
+   # expiry_input = input("Enter NSE expiry date (e.g. 30-Sep-2025): ").strip()
+
+    expiry_input = "30-Sep-2025"
     results = []
 
     print(f"\nFetching ~10% OTM Call and Put option prices for expiry {expiry_input}\n")
@@ -109,7 +113,8 @@ def main():
 
     # Save results to CSV
     df = pd.DataFrame(results)
-    out_csv = expiry_to_filename(expiry_input)
+    output_dir = "analysis_outputs"
+    out_csv = expiry_to_filename(output_dir+expiry_input)
     df.to_csv(out_csv, index=False)
     print(f"\n✓ Results saved to {out_csv}")
 
