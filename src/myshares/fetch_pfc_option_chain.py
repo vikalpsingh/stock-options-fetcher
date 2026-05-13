@@ -75,7 +75,7 @@ def expiry_to_filename(expiry):
 def main():
    # expiry_input = input("Enter NSE expiry date (e.g. 30-Sep-2025): ").strip()
 
-    expiry_input = "30-Sep-2025"
+    expiry_input = "28-Apr-2026"
     results = []
 
     print(f"\nFetching ~10% OTM Call and Put option prices for expiry {expiry_input}\n")
@@ -114,7 +114,7 @@ def main():
     # Save results to CSV
     df = pd.DataFrame(results)
     output_dir = "analysis_outputs"
-    out_csv = expiry_to_filename(output_dir+expiry_input)
+    out_csv = f"{output_dir}/{expiry_to_filename(expiry_input)}"
     df.to_csv(out_csv, index=False)
     print(f"\n✓ Results saved to {out_csv}")
 

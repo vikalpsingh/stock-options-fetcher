@@ -7,7 +7,8 @@ from nsepython import equity_history
 import os
 from typing import List, Tuple, Optional
 
-# List of shares with (symbol, name, lot size) — kept as you provided
+
+# List of shares with (symbol, name, lot size)
 SHARES = [
     ("PGEL", "PG Electroplast Ltd", 700),
     ("ETERNAL", "Eternal Ltd", 2450),
@@ -20,12 +21,13 @@ SHARES = [
     ("NTPC", "NTPC Ltd", 1500),
     ("NAUKRI", "Info Edge", 375),
     ("HAVELLS", "Havells Ltd", 500),
-    ("CAMS", "CAMS", 125),
+    ("CMAS", "CAMS", 125),
     ("CDSL", "CDSL", 350),
     ("CYIENT", "Cyient Ltd", 425),
 ]
 
 # --------------------- Option chain helpers ---------------------
+
 
 def _nse_session() -> requests.Session:
     """Create an NSE-friendly session with warm-up requests."""
@@ -36,20 +38,20 @@ def _nse_session() -> requests.Session:
         "Referer": "https://www.nseindia.com/",
         "Connection": "keep-alive",
     }
-    ses = requests.Session()
-    ses.headers.update(headers)
-    # Warm up cookies
+    session = requests.Session()
+    session.headers.update(headers)
     try:
-        ses.get("https://www.nseindia.com", timeout=10)
+        session.get("https://www.nseindia.com", timeout=10)
         time.sleep(0.7)
     except Exception:
         pass
-    return ses
+    return session
 
-def fetch_option_chain(symbol: str):
+
+def fetch_option_chain(symbol: str) -> dict:
+    """Fetch option chain data for a symbol from NSE."""
     url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
     with _nse_session() as session:
-        # Optionally visit the derivatives quote page to further warm up (helps with some symbols)
         try:
             session.get(f"https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}", timeout=10)
             time.sleep(0.7)
@@ -59,7 +61,9 @@ def fetch_option_chain(symbol: str):
         resp.raise_for_status()
         return resp.json()
 
+
 def _parse_expiry_dates(expiry_list: List[str]) -> List[date]:
+    """Parse expiry date strings into date objects, sorted ascending."""
     out = []
     for s in expiry_list or []:
         try:
@@ -68,32 +72,34 @@ def _parse_expiry_dates(expiry_list: List[str]) -> List[date]:
             continue
     return sorted(out)
 
-def pick_current_and_next_month(expiries: List[date], today: Optional[date] = None) -> Tuple[Optional[date], Optional[date]]:
-    """Select last expiry in current calendar month and next calendar month from the provided expiryDates."""
+
+def pick_current_and_next_month(
+    expiries: List[date], today: Optional[date] = None
+) -> Tuple[Optional[date], Optional[date]]:
+    """Select last expiry in current and next calendar month."""
     if today is None:
         today = date.today()
     if not expiries:
         return None, None
 
-    cur_month = [d for d in expiries if d.month == today.month and d >= today]
+    cur_month_expiries = [d for d in expiries if d.month == today.month and d >= today]
     next_month_num = (today.month % 12) + 1
     next_month_year = today.year + (1 if today.month == 12 else 0)
-    nxt_month = [d for d in expiries if d.month == next_month_num and d.year == next_month_year]
+    next_month_expiries = [d for d in expiries if d.month == next_month_num and d.year == next_month_year]
 
-    cur_m = max(cur_month) if cur_month else None
-    nxt_m = max(nxt_month) if nxt_month else None
+    cur_m = max(cur_month_expiries) if cur_month_expiries else None
+    nxt_m = max(next_month_expiries) if next_month_expiries else None
     return cur_m, nxt_m
+
 
 def get_otm_option_premiums(records: dict, underlying: float, expiry: str, lot_size: int):
     """Pick closest listed strikes meeting 10% OTM thresholds and return prices + lot premiums."""
-    # Build strike set for this expiry only
     strikes = sorted({
         float(item["strikePrice"])
         for item in records.get("data", [])
         if item.get("expiryDate") == expiry and item.get("strikePrice") is not None
     })
 
-    # 10% OTM
     target_call = underlying * 1.10
     target_put = underlying * 0.90
 
@@ -114,7 +120,7 @@ def get_otm_option_premiums(records: dict, underlying: float, expiry: str, lot_s
         )
         if row:
             call_prem = row.get("lastPrice")
-            call_total = (call_prem or 0) * lot_size if call_prem else None
+            call_total = call_prem * lot_size if call_prem is not None else None
 
     if put_strike is not None:
         row = next(
@@ -124,13 +130,16 @@ def get_otm_option_premiums(records: dict, underlying: float, expiry: str, lot_s
         )
         if row:
             put_prem = row.get("lastPrice")
-            put_total = (put_prem or 0) * lot_size if put_prem else None
+            put_total = put_prem * lot_size if put_prem is not None else None
 
     return call_strike, call_prem, call_total, put_strike, put_prem, put_total
 
+
 # --------------------- Probability helpers ---------------------
 
-def remove_outliers_iqr(data: pd.DataFrame, column: str, k: float = 1.5):
+
+def remove_outliers_iqr(data: pd.DataFrame, column: str, k: float = 1.5) -> pd.DataFrame:
+    """Remove outliers from data based on IQR method."""
     q1 = data[column].quantile(0.25)
     q3 = data[column].quantile(0.75)
     iqr = q3 - q1
@@ -138,7 +147,15 @@ def remove_outliers_iqr(data: pd.DataFrame, column: str, k: float = 1.5):
     upper = q3 + k * iqr
     return data[(data[column] >= lower) & (data[column] <= upper)].reset_index(drop=True)
 
-def compute_probabilities(symbol: str, months_back: int = 24, alpha: float = 0.85, weight_scheme: str = "exp", iqr_k: float = 1.5):
+
+def compute_probabilities(
+    symbol: str,
+    months_back: int = 24,
+    alpha: float = 0.85,
+    weight_scheme: str = "exp",
+    iqr_k: float = 1.5
+) -> Optional[dict]:
+    """Compute probability of price increase or decrease based on historical data."""
     end_date = datetime.today()
     start_date = end_date - pd.DateOffset(months=months_back)
     data = equity_history(symbol, "EQ", start_date.strftime("%d-%m-%Y"), end_date.strftime("%d-%m-%Y"))
@@ -170,6 +187,7 @@ def compute_probabilities(symbol: str, months_back: int = 24, alpha: float = 0.8
     weighted_positive = np.sum(w for w, chg in zip(weights, trimmed["pct_change"]) if chg > 0)
     weighted_negative = np.sum(w for w, chg in zip(weights, trimmed["pct_change"]) if chg < 0)
     total_weight = weighted_positive + weighted_negative
+
     prob_inc = weighted_positive / total_weight if total_weight else 0
     prob_dec = weighted_negative / total_weight if total_weight else 0
     direction = "Increase" if prob_inc >= prob_dec else "Decrease"
@@ -180,13 +198,17 @@ def compute_probabilities(symbol: str, months_back: int = 24, alpha: float = 0.8
         "direction": direction,
     }
 
+
 # --------------------- I/O helpers ---------------------
+
 
 def expiry_to_filename(expiry: str) -> str:
     dt_ = datetime.strptime(expiry, "%d-%b-%Y")
     return dt_.strftime("%b_%Y") + "_predictions.csv"
 
+
 # --------------------- Main ---------------------
+
 
 def main():
     os.makedirs("analysis_outputs", exist_ok=True)
@@ -194,25 +216,23 @@ def main():
 
     for symbol, name, lot in SHARES:
         try:
-            # 1) Probabilities
+            # 1) Compute probabilities
             prob = compute_probabilities(symbol)
             if prob is None:
                 print(f"{symbol}: Not enough data for probability calculation. Skipping probability fields.")
-                # We'll still try to collect option premiums for the expiries
 
-            # 2) Option chain
+            # 2) Fetch option chain
             chain = fetch_option_chain(symbol)
             records = chain.get("records", {})
             underlying = records.get("underlyingValue")
             expiry_strs = records.get("expiryDates", [])
             if not underlying or not expiry_strs:
-                print(f"{symbol}: No option-chain/expiry data. Skipping.")
+                print(f"{symbol}: No option-chain or expiry data. Skipping.")
                 continue
 
             expiries = _parse_expiry_dates(expiry_strs)
             cur_m, nxt_m = pick_current_and_next_month(expiries)
 
-            # If current or next month not available, skip gracefully
             pairs = []
             if cur_m:
                 pairs.append(("Current", cur_m.strftime("%d-%b-%Y")))
@@ -223,7 +243,7 @@ def main():
                 print(f"{symbol}: No monthly expiries (current/next) found. Skipping.")
                 continue
 
-            # 3) For each monthly expiry, compute 10% OTM CALL/PUT legs
+            # 3) For each expiry, calculate 10% OTM call/put premiums
             for label, expiry_str in pairs:
                 cs, c_prem, c_total, ps, p_prem, p_total = get_otm_option_premiums(
                     records, underlying, expiry_str, lot
@@ -234,7 +254,7 @@ def main():
                     "Name": name,
                     "Lot Size": lot,
                     "Underlying": underlying,
-                    "Cycle": label,              # Current / Next
+                    "Cycle": label,  # Current / Next
                     "Expiry": expiry_str,
                     "10%OTM Call Strike": cs,
                     "Call LTP": c_prem,
@@ -244,8 +264,7 @@ def main():
                     "Put Premium (Lot)": p_total,
                 }
 
-                # Attach probability fields if we computed them
-                if prob is not None:
+                if prob:
                     row.update({
                         "Probability Increase": prob["prob_increase"],
                         "Probability Decrease": prob["prob_decrease"],
@@ -281,11 +300,10 @@ def main():
         print("\nNo results to save.")
         return
 
-    # Build combined DataFrame
+    # Create combined DataFrame
     df_all = pd.DataFrame(combined_rows)
 
-    # Write per-month files & combined
-    # Group by (Month_Year) of expiry to keep one file per monthly cycle
+    # Save per-month expiry files and combined file
     df_all["__monthfile__"] = pd.to_datetime(df_all["Expiry"], format="%d-%b-%Y").dt.strftime("%b_%Y")
     for mname, chunk in df_all.groupby("__monthfile__"):
         out_csv = os.path.join("analysis_outputs", f"{mname}_predictions.csv")
@@ -295,6 +313,7 @@ def main():
     combined_csv = os.path.join("analysis_outputs", "combined_predictions.csv")
     df_all.drop(columns=["__monthfile__"]).to_csv(combined_csv, index=False)
     print(f"✓ Saved {combined_csv}")
+
 
 if __name__ == "__main__":
     main()

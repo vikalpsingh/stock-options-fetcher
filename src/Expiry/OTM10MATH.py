@@ -27,7 +27,7 @@ alpha = 0.85
 months_back = 24
 weight_scheme = "exp"
 iqr_k = 1.5
-expiry_input = "30-Sep-2025"
+expiry_input = "28-Apr-2026"
 output_dir = "analysis_outputs"
 output_excel = "merged_option_direction_output.xlsx"
 

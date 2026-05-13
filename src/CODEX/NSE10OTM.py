@@ -126,7 +126,7 @@ def expiry_to_filename(expiry: str) -> str:
     return dt.strftime("%b_%Y") + "_predictions.csv"
 
 def main():
-    expiry_input = "30-Sep-2025"
+    expiry_input = "28-Apr-2026"
     os.makedirs("analysis_outputs", exist_ok=True)
     results = []
     print(f"\nProcessing probability and premium data for expiry {expiry_input}\n")
