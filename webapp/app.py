@@ -23,12 +23,13 @@ import re
 import sys
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -81,6 +82,43 @@ DISPLAY_FIELDS = [
 ]
 MMI_URL = "https://www.tickertape.in/market-mood-index"
 DEFAULT_GPT_SHARE_URL = "https://chatgpt.com/share/6a058d56-7558-83a4-ac3d-d4ea9058b663"
+DEFAULT_OPENAI_MODEL = "gpt-5.2"
+DEFAULT_OPENAI_PROMPT = (
+    "Generate a Kite order CSV for a conservative income options basket. "
+    "Return only CSV with header: exchange,tradingsymbol,quantity,"
+    "transaction_type,product,order_type,price,validity."
+)
+TOP_WATCHLIST = [
+    "BAJFINANCE",
+    "TATACONSUM",
+    "PGEL",
+    "TITAN",
+    "ETERNAL",
+    "UNITDSPR",
+    "HAVELLS",
+    "NAUKRI",
+    "PFC",
+    "CAMS",
+    "CDSL",
+    "MAZDOCK",
+    "NUVAMA",
+    "NTPC",
+    "WAAREEENER",
+]
+MONTH_CODES = {
+    "JAN": 1,
+    "FEB": 2,
+    "MAR": 3,
+    "APR": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AUG": 8,
+    "SEP": 9,
+    "OCT": 10,
+    "NOV": 11,
+    "DEC": 12,
+}
 
 for env_name, env_value_default in DEFAULT_KITE_ENV.items():
     os.environ[env_name] = env_value_default
@@ -131,6 +169,9 @@ class PageState:
     gpt_url: str = DEFAULT_GPT_SHARE_URL
     gpt_conversation: str = ""
     gpt_csv_text: str = ""
+    openai_api_key: str = ""
+    openai_model: str = DEFAULT_OPENAI_MODEL
+    openai_prompt: str = DEFAULT_OPENAI_PROMPT
 
 
 def mask_secret(value: str | None) -> str:
@@ -156,6 +197,9 @@ def set_kite_env(form: dict[str, list[str]]) -> None:
         value = first(form, field)
         if value != "":
             os.environ[env_name] = value.strip()
+    openai_api_key = first(form, "openai_api_key")
+    if openai_api_key:
+        os.environ["OPENAI_API_KEY"] = openai_api_key.strip()
 
 
 def first(form: dict[str, list[str]], name: str, default: str = "") -> str:
@@ -192,6 +236,100 @@ def parse_csv_text(csv_text: str) -> list[dict[str, str]]:
     if not rows:
         raise ValueError("CSV has no order rows.")
     return rows
+
+
+def safe_csv_rows(csv_text: str) -> list[dict[str, str]]:
+    try:
+        return parse_csv_text(csv_text)
+    except Exception:
+        return []
+
+
+def csv_trading_symbols(csv_text: str) -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for row in safe_csv_rows(csv_text):
+        symbol = (row.get("tradingsymbol") or row.get("symbol") or "").strip().upper()
+        if symbol and symbol not in seen:
+            symbols.append(symbol)
+            seen.add(symbol)
+    return symbols
+
+
+def option_symbol_parts(symbol: str) -> dict[str, Any] | None:
+    match = re.match(
+        r"^(?P<underlying>[A-Z0-9-]+?)(?P<yy>\d{2})(?P<mon>JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(?P<strike>\d+(?:\.\d+)?)(?P<type>CE|PE)$",
+        symbol.upper(),
+    )
+    if not match:
+        return None
+    data = match.groupdict()
+    year = 2000 + int(data["yy"])
+    month = MONTH_CODES[data["mon"]]
+    return {
+        "underlying": data["underlying"],
+        "year": year,
+        "month": month,
+        "month_code": data["mon"],
+        "strike": data["strike"],
+        "option_type": data["type"],
+    }
+
+
+def underlying_for_symbol(symbol: str) -> str:
+    parts = option_symbol_parts(symbol)
+    return parts["underlying"] if parts else symbol.upper()
+
+
+def last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        current = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        current = date(year, month + 1, 1) - timedelta(days=1)
+    while current.weekday() != weekday:
+        current -= timedelta(days=1)
+    return current
+
+
+def expiry_date_for_parts(parts: dict[str, Any]) -> date:
+    switch_date = date(2025, 9, 1)
+    contract_month = date(parts["year"], parts["month"], 1)
+    weekday = 1 if contract_month >= switch_date else 3
+    return last_weekday_of_month(parts["year"], parts["month"], weekday)
+
+
+def trading_days_remaining(expiry: date, today: date | None = None) -> int:
+    today = today or datetime.now().date()
+    if expiry <= today:
+        return 0
+    days = 0
+    current = today + timedelta(days=1)
+    while current <= expiry:
+        if current.weekday() < 5:
+            days += 1
+        current += timedelta(days=1)
+    return days
+
+
+def expiry_summaries(symbols: list[str]) -> list[dict[str, Any]]:
+    summaries: dict[date, dict[str, Any]] = {}
+    for symbol in symbols:
+        parts = option_symbol_parts(symbol)
+        if not parts:
+            continue
+        expiry = expiry_date_for_parts(parts)
+        summary = summaries.setdefault(
+            expiry,
+            {
+                "expiry": expiry,
+                "month": expiry.strftime("%b %Y").upper(),
+                "day": expiry.strftime("%A, %d %b %Y"),
+                "trading_days": trading_days_remaining(expiry),
+                "symbols": [],
+            },
+        )
+        summary["symbols"].append(symbol)
+    return [summaries[key] for key in sorted(summaries)]
 
 
 def load_rows(csv_path: str, csv_text: str) -> tuple[list[dict[str, str]], str]:
@@ -279,6 +417,47 @@ def fetch_mmi_snapshot() -> dict[str, Any]:
     }
 
 
+def csv_underlyings(csv_text: str) -> list[str]:
+    underlyings: list[str] = []
+    seen: set[str] = set()
+    for symbol in csv_trading_symbols(csv_text):
+        underlying = underlying_for_symbol(symbol)
+        if underlying and underlying not in seen:
+            underlyings.append(underlying)
+            seen.add(underlying)
+    return underlyings
+
+
+def fetch_csv_market_quotes() -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+
+    underlyings = TOP_WATCHLIST
+    if not underlyings:
+        return {"ok": True, "quotes": []}
+
+    kite = kite_orders.kite_client()
+    instruments = [f"NSE:{symbol}" for symbol in underlyings]
+    raw_quotes = kite.quote(instruments)
+    quotes: list[dict[str, Any]] = []
+    for symbol in underlyings:
+        key = f"NSE:{symbol}"
+        quote = raw_quotes.get(key, {})
+        ltp = float(quote.get("last_price") or 0)
+        close = float((quote.get("ohlc") or {}).get("close") or 0)
+        change_percent = ((ltp - close) / close * 100) if close > 0 else None
+        quotes.append(
+            {
+                "symbol": symbol,
+                "ltp": round(ltp, 2),
+                "change_percent": round(change_percent, 2)
+                if change_percent is not None
+                else None,
+            }
+        )
+    return {"ok": True, "quotes": quotes}
+
+
 def compact_text(value: str) -> str:
     value = re.sub(r"\r\n?", "\n", value)
     value = re.sub(r"[ \t]+\n", "\n", value)
@@ -360,6 +539,63 @@ def extract_csv_from_text(text: str) -> str:
     raise ValueError(
         "Could not find a valid Kite order CSV. Paste the GPT CSV output into the text box and try again."
     )
+
+
+def response_output_text(payload: dict[str, Any]) -> str:
+    if isinstance(payload.get("output_text"), str):
+        return payload["output_text"]
+    chunks: list[str] = []
+    for item in payload.get("output", []):
+        for content in item.get("content", []):
+            if isinstance(content.get("text"), str):
+                chunks.append(content["text"])
+    return "\n".join(chunks).strip()
+
+
+def generate_csv_with_openai(prompt: str, model: str) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Missing OPENAI_API_KEY. Enter it in the GPT CSV Generator tab.")
+
+    instructions = (
+        "You generate Zerodha Kite order CSV only. "
+        "Output must be plain CSV text, no markdown, no explanation. "
+        "Required header exactly: exchange,tradingsymbol,quantity,transaction_type,"
+        "product,order_type,price,validity. "
+        "Use exchange NFO for options unless the user explicitly says otherwise. "
+        "transaction_type must be BUY or SELL. product should usually be NRML. "
+        "order_type should usually be LIMIT. validity should usually be DAY. "
+        "Follow these risk rules: SELL only when the user says stock is held; "
+        "SELL PUT only when the user says cash is available."
+    )
+    body = {
+        "model": model.strip() or DEFAULT_OPENAI_MODEL,
+        "instructions": instructions,
+        "input": prompt,
+        "max_output_tokens": 2500,
+    }
+    request = Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"OpenAI API error {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"OpenAI API network error: {exc}") from exc
+
+    output = response_output_text(payload)
+    if not output:
+        raise RuntimeError("OpenAI returned an empty response.")
+    return extract_csv_from_text(output)
 
 
 def default_args(no_ltp_price: bool, keep_existing_orders: bool) -> argparse.Namespace:
@@ -607,6 +843,15 @@ def render_checkbox(name: str, label: str, is_checked: bool, hint: str = "") -> 
     )
 
 
+def display_cell(field: str, value: Any) -> str:
+    if field.lower() == "pnl":
+        try:
+            return str(int(float(value)))
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] | None = None) -> str:
     if not orders:
         return ""
@@ -616,7 +861,8 @@ def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] 
     for index, order in enumerate(orders):
         checked_attr = " checked" if index in selected else ""
         cells = "".join(
-            f"<td>{html.escape(str(order.get(field, '')))}</td>" for field in DISPLAY_FIELDS
+            f"<td>{html.escape(display_cell(field, order.get(field, '')))}</td>"
+            for field in DISPLAY_FIELDS
         )
         rows.append(
             "<tr>"
@@ -641,7 +887,10 @@ def render_position_orders_table(
     rows = []
     for index, order in enumerate(orders):
         checked_attr = " checked" if index in selected else ""
-        cells = "".join(f"<td>{html.escape(str(order.get(field, '')))}</td>" for field in fields)
+        cells = "".join(
+            f"<td>{html.escape(display_cell(field, order.get(field, '')))}</td>"
+            for field in fields
+        )
         rows.append(
             "<tr>"
             f'<td><input type="checkbox" name="position_selected" value="{index}"{checked_attr}></td>'
@@ -683,17 +932,62 @@ def render_console(console_log: str) -> str:
     )
 
 
-def render_market_topper() -> str:
+def render_market_topper(state: PageState) -> str:
+    csv_text = state.csv_text or read_default_csv_text()
+    order_symbols = csv_trading_symbols(csv_text)
+    underlyings = TOP_WATCHLIST
+    quote_cards = "".join(
+        '<div class="quote-card" data-symbol="'
+        f'{html.escape(underlying, quote=True)}">'
+        f'<div class="quote-symbol">{html.escape(underlying)}</div>'
+        '<div class="quote-ltp">Loading...</div>'
+        '<div class="quote-change">--</div>'
+        "</div>"
+        for underlying in underlyings
+    )
+    if not quote_cards:
+        quote_cards = (
+            '<div class="quote-card"><div class="quote-symbol">No tickers</div>'
+            '<div class="quote-ltp">Load CSV</div><div class="quote-change">--</div></div>'
+        )
+    summaries = expiry_summaries(order_symbols)
+    if summaries:
+        expiry_cards = "".join(
+            '<div class="expiry-card">'
+            f'<span class="expiry-month">{html.escape(summary["month"])}</span>'
+            '<span class="expiry-sep">|</span>'
+            f'<span class="expiry-day">Expiry: {html.escape(summary["day"])}</span>'
+            '<span class="expiry-sep">|</span>'
+            f'<span class="expiry-days">{summary["trading_days"]} trading days remaining</span>'
+            "</div>"
+            for summary in summaries
+        )
+        near_expiry = any(0 < summary["trading_days"] <= 5 for summary in summaries)
+    else:
+        expiry_cards = (
+            '<div class="expiry-card"><span class="expiry-month">EXPIRY</span>'
+            '<span class="expiry-sep">|</span>'
+            '<span class="expiry-day">No option expiry found in CSV symbols</span>'
+            '<span class="expiry-sep">|</span>'
+            '<span class="expiry-days">Load option symbols like ETERNAL26MAY260CE</span></div>'
+        )
+        near_expiry = False
+    warning_html = (
+        '<div class="expiry-warning active">DO NOT take new position 5 trading DAYS near to expiry</div>'
+        if near_expiry
+        else ""
+    )
+    quote_date = datetime.now().strftime("%d %b %Y")
     return f"""
     <section class="market-shell">
       <div class="rule-strip">
         <div class="rule-card sell-stock">
           <div class="rule-kicker">Rule 1</div>
-          <div class="rule-title">SELL only when you hold the stock</div>
+          <div class="rule-title">SELL CALL only when you hold the stock with lot size</div>
         </div>
         <div class="rule-card sell-put">
           <div class="rule-kicker">Rule 2</div>
-          <div class="rule-title">SELL PUT only when you have cash</div>
+          <div class="rule-title">SELL PUT only when you have cash to buy all lots</div>
         </div>
         <div class="mmi-card">
           <div class="rule-kicker">Market Mood Index</div>
@@ -702,30 +996,13 @@ def render_market_topper() -> str:
           <a href="{MMI_URL}" target="_blank" rel="noopener">Open MMI</a>
         </div>
       </div>
+      <div class="expiry-strip">
+        {expiry_cards}
+        {warning_html}
+      </div>
       <div class="ticker-panel">
-        <div class="ticker-title">NSE Live Ticker</div>
-        <div class="tradingview-widget-container">
-          <div class="tradingview-widget-container__widget"></div>
-          <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
-          {{
-            "symbols": [
-              {{"proName": "NSE:NIFTY", "title": "NIFTY 50"}},
-              {{"proName": "NSE:BANKNIFTY", "title": "BANK NIFTY"}},
-              {{"proName": "NSE:FINNIFTY", "title": "FIN NIFTY"}},
-              {{"proName": "NSE:RELIANCE", "title": "RELIANCE"}},
-              {{"proName": "NSE:HDFCBANK", "title": "HDFC BANK"}},
-              {{"proName": "NSE:ICICIBANK", "title": "ICICI BANK"}},
-              {{"proName": "NSE:TCS", "title": "TCS"}},
-              {{"proName": "NSE:INFY", "title": "INFY"}}
-            ],
-            "showSymbolLogo": true,
-            "colorTheme": "dark",
-            "isTransparent": true,
-            "displayMode": "adaptive",
-            "locale": "in"
-          }}
-          </script>
-        </div>
+        <div class="ticker-title live-title">Kite LTP and Day Change | {quote_date}</div>
+        <div class="quote-grid" id="quote-grid">{quote_cards}</div>
       </div>
     </section>"""
 
@@ -762,9 +1039,11 @@ def render_page(state: PageState) -> bytes:
     place_tab_class = "active" if state.active_tab == "place" else ""
     positions_tab_class = "active" if state.active_tab == "positions" else ""
     gpt_tab_class = "active" if state.active_tab == "gpt" else ""
+    kite_setup_tab_class = "active" if state.active_tab == "kite-setup" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     positions_panel_style = "" if state.active_tab == "positions" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
+    kite_setup_panel_style = "" if state.active_tab == "kite-setup" else ' style="display:none"'
     env_panel = f"""
         <section class="panel">
           <div class="panel-title">Kite Environment</div>
@@ -775,6 +1054,12 @@ def render_page(state: PageState) -> bytes:
           {render_checkbox("show_credentials", "Show credential values", False, "Reveals KITE_API_SECRET and KITE_ACCESS_TOKEN in this local browser page.")}
           <div class="status">{status}</div>
         </section>"""
+    env_hidden = (
+        f'<input type="hidden" name="api_key" value="{html.escape(env_value("KITE_API_KEY"), quote=True)}">'
+        f'<input type="hidden" name="api_secret" value="{html.escape(env_value("KITE_API_SECRET"), quote=True)}">'
+        f'<input type="hidden" name="access_token" value="{html.escape(env_value("KITE_ACCESS_TOKEN"), quote=True)}">'
+        f'<input type="hidden" name="confirm_live_order" value="{html.escape(env_value("KITE_CONFIRM_LIVE_ORDER"), quote=True)}">'
+    )
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -805,11 +1090,31 @@ def render_page(state: PageState) -> bytes:
     header {{
       background: linear-gradient(135deg, #0f172a 0%, #164e63 54%, #0f766e 100%);
       border-bottom: 1px solid var(--line);
-      padding: 22px 24px;
+      padding: 10px 18px;
       color: #ffffff;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      gap: 18px;
     }}
-    header h1 {{ margin: 0 0 6px; font-size: 30px; letter-spacing: 0; }}
-    header p {{ margin: 0; color: #d5eef3; font-size: 14px; }}
+    header h1 {{ margin: 0 0 3px; font-size: 22px; letter-spacing: 0; }}
+    header p {{ margin: 0; color: #d5eef3; font-size: 12px; }}
+    .naval-quote {{
+      margin: 0;
+      color: #d1fae5;
+      font-size: 13px;
+      font-weight: 700;
+      text-align: right;
+      max-width: 520px;
+      line-height: 1.25;
+    }}
+    .blessing {{
+      color: #fef3c7;
+      font-size: 17px;
+      font-weight: 900;
+      text-align: center;
+      white-space: nowrap;
+    }}
     main {{
       width: min(1180px, calc(100vw - 32px));
       margin: 22px auto 40px;
@@ -820,68 +1125,193 @@ def render_page(state: PageState) -> bytes:
     .rule-strip {{
       display: grid;
       grid-template-columns: 1.1fr 1.1fr 0.9fr;
-      gap: 14px;
-      margin-bottom: 12px;
+      gap: 12px;
+      margin-bottom: 10px;
     }}
     .rule-card, .mmi-card {{
       border-radius: 8px;
-      padding: 16px;
+      padding: 6px 12px;
       color: #ffffff;
-      min-height: 108px;
+      min-height: 42px;
       box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
       border: 1px solid rgba(255, 255, 255, 0.18);
     }}
     .sell-stock {{
-      background: linear-gradient(135deg, #123c69 0%, #1769aa 100%);
+      background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
+      color: #0f3b65;
     }}
     .sell-put {{
-      background: linear-gradient(135deg, #14532d 0%, #0f766e 100%);
+      background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
+      color: #064e3b;
     }}
     .mmi-card {{
-      background: linear-gradient(135deg, #3f1d64 0%, #7c3aed 100%);
+      background: linear-gradient(135deg, #ede9fe 0%, #ddd6fe 100%);
+      color: #4c1d95;
     }}
     .rule-kicker {{
-      font-size: 12px;
+      font-size: 10px;
       text-transform: uppercase;
       font-weight: 700;
-      color: rgba(255, 255, 255, 0.76);
-      margin-bottom: 10px;
+      color: currentColor;
+      opacity: 0.72;
+      margin-bottom: 3px;
     }}
     .rule-title {{
-      font-size: 22px;
-      line-height: 1.15;
+      font-size: 16px;
+      line-height: 1;
       font-weight: 800;
     }}
     .mmi-value {{
-      font-size: 30px;
+      font-size: 18px;
       font-weight: 800;
       line-height: 1;
-      margin-bottom: 7px;
+      margin-bottom: 1px;
     }}
     .mmi-zone {{
-      color: rgba(255, 255, 255, 0.82);
+      color: currentColor;
+      opacity: 0.82;
       font-weight: 700;
-      margin-bottom: 8px;
+      margin-bottom: 0;
+      font-size: 12px;
     }}
     .mmi-card a {{
-      color: #ffffff;
-      font-size: 13px;
+      color: #5b21b6;
+      font-size: 11px;
       font-weight: 700;
     }}
     .ticker-panel {{
-      background: #0b1220;
-      color: #ffffff;
+      background: #ffffff;
+      color: var(--ink);
       border-radius: 8px;
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      border: 1px solid var(--line);
       overflow: hidden;
       box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
     }}
     .ticker-title {{
       padding: 10px 14px 0;
-      color: #a7f3d0;
+      color: #0f766e;
       font-size: 12px;
       font-weight: 800;
       text-transform: uppercase;
+    }}
+    .live-title {{
+      padding-top: 8px;
+      color: #1769aa;
+    }}
+    .ticker-pills {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 14px 2px;
+    }}
+    .ticker-pill {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      border-radius: 999px;
+      padding: 5px 10px;
+      background: #eef6fb;
+      border: 1px solid #cfe4f3;
+      color: #0f3b65;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+    .quote-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+      gap: 6px;
+      padding: 6px 10px 10px;
+    }}
+    .quote-card {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: #f8fafc;
+      min-height: 48px;
+    }}
+    .quote-card.strong-up {{
+      background: #dcfce7;
+      border-color: #86efac;
+    }}
+    .quote-card.strong-down {{
+      background: #fee2e2;
+      border-color: #fca5a5;
+    }}
+    .quote-symbol {{
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      margin-bottom: 3px;
+    }}
+    .quote-ltp {{
+      font-size: 15px;
+      font-weight: 900;
+      margin-bottom: 2px;
+    }}
+    .quote-change {{
+      font-size: 11px;
+      font-weight: 800;
+      color: var(--muted);
+    }}
+    .quote-change.up {{ color: #047857; }}
+    .quote-change.down {{ color: #b42318; }}
+    .expiry-strip {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      margin-bottom: 12px;
+    }}
+    .expiry-card {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 7px;
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 14px;
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+    }}
+    .expiry-month {{
+      color: var(--accent);
+      font-size: 15px;
+      font-weight: 800;
+    }}
+    .expiry-day {{
+      font-weight: 800;
+      font-size: 18px;
+    }}
+    .expiry-days {{
+      color: var(--ink);
+      font-weight: 700;
+      font-size: 18px;
+    }}
+    .expiry-sep {{
+      color: var(--muted);
+      font-weight: 800;
+    }}
+    .expiry-warning {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 8px;
+      padding: 14px 16px;
+      background: #fff7ed;
+      color: #9a3412;
+      border: 1px solid #fed7aa;
+      font-weight: 900;
+      text-align: center;
+      max-width: 360px;
+    }}
+    .expiry-warning.active {{
+      background: #fee2e2;
+      color: #991b1b;
+      border-color: #fecaca;
+      animation: expiryFlash 1s infinite alternate;
+    }}
+    @keyframes expiryFlash {{
+      from {{ box-shadow: 0 0 0 rgba(185, 28, 28, 0); transform: scale(1); }}
+      to {{ box-shadow: 0 0 18px rgba(185, 28, 28, 0.35); transform: scale(1.01); }}
     }}
     .tradingview-widget-container {{
       min-height: 74px;
@@ -920,9 +1350,21 @@ def render_page(state: PageState) -> bytes:
       color: var(--ink);
       padding: 10px 14px;
     }}
+    .tab-button.primary-action {{
+      padding: 14px 24px;
+      font-size: 16px;
+      font-weight: 900;
+      background: #ffffff;
+      color: #0f3b65;
+    }}
+    .tab-button.utility-action {{
+      padding: 10px 14px;
+      font-size: 13px;
+    }}
     .tab-button.active {{
       background: #ffffff;
       color: var(--accent);
+      box-shadow: inset 0 3px 0 var(--accent);
     }}
     label {{ display: block; margin-bottom: 12px; }}
     label span {{ display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }}
@@ -1026,35 +1468,44 @@ def render_page(state: PageState) -> bytes:
     th {{ color: var(--muted); font-weight: 700; background: #f9fafb; }}
     @media (max-width: 820px) {{
       .rule-strip {{ grid-template-columns: 1fr; }}
+      .expiry-strip {{ grid-template-columns: 1fr; }}
+      .expiry-warning {{ max-width: none; }}
       .grid {{ grid-template-columns: 1fr; }}
-      header {{ padding: 16px; }}
+      header {{ padding: 10px 12px; grid-template-columns: 1fr; align-items: flex-start; }}
+      .blessing {{ text-align: left; white-space: normal; }}
+      .naval-quote {{ text-align: left; max-width: none; }}
       main {{ width: calc(100vw - 20px); }}
     }}
   </style>
 </head>
 <body>
   <header>
-    <h1>Kite Trader</h1>
-    <p>Place CSV orders or build BUY orders from existing Kite positions.</p>
+    <div>
+      <h1>Kite Trader</h1>
+      <p>Place CSV orders or build BUY orders from existing Kite positions.</p>
+    </div>
+    <div class="blessing">ॐ | Jai Sri Ram | Jai Laxmi Mata</div>
+    <p class="naval-quote">"Trade money for time, not time for money. You're going to run out of time first." - Naval</p>
   </header>
   <main>
-    {render_market_topper()}
+    {render_market_topper(state)}
     {alert}
     <div class="tabs">
-      <button class="tab-button {place_tab_class}" type="button" data-tab="place">Place Order</button>
-      <button class="tab-button {positions_tab_class}" type="button" data-tab="positions">Current Position BUY</button>
-      <button class="tab-button {gpt_tab_class}" type="button" data-tab="gpt">GPT CSV Generator</button>
+      <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Place Order</button>
+      <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">Current Position BUY Options</button>
+      <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT CSV Generator</button>
+      <button class="tab-button utility-action {kite_setup_tab_class}" type="button" data-tab="kite-setup">Kite Setup</button>
     </div>
     <form id="place-panel" method="post" action="/load"{place_panel_style}>
+      {env_hidden}
       <input type="hidden" name="rows_payload" value="{html.escape(rows_payload, quote=True)}">
-      <div class="grid">
+      <div>
         <section class="panel">
           <div class="panel-title">CSV Source</div>
           {render_input("csv_path", "CSV path", state.csv_path)}
           <label><span>Upload CSV</span><input id="csv-file" type="file" accept=".csv,text/csv"></label>
           <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
         </section>
-        {env_panel}
       </div>
       <section class="panel">
         <div class="panel-title">Execution Options</div>
@@ -1071,22 +1522,8 @@ def render_page(state: PageState) -> bytes:
       {render_console(state.console_log)}
     </form>
     <form id="positions-panel" method="post" action="/positions/load"{positions_panel_style}>
+      {env_hidden}
       <input type="hidden" name="position_orders_payload" value="{html.escape(position_orders_payload, quote=True)}">
-      <div class="grid">
-        <section class="panel">
-          <div class="panel-title">Position BUY Options</div>
-          {render_number_input("position_discount_percent", "Discount percent", state.position_discount_percent, "0.05")}
-          {render_input("position_exchange", "Exchange", state.position_exchange)}
-          {render_input("position_product", "Product filter", state.position_product)}
-          {render_input("position_symbols", "Symbol filter, comma-separated", state.position_symbols)}
-          {render_input("position_variety", "Variety", state.position_variety)}
-          {render_input("position_validity", "Validity", state.position_validity)}
-          {render_input("position_tag", "Tag", state.position_tag)}
-          {render_number_input("position_tick_size", "Tick size", state.position_tick_size, "0.01")}
-          {render_input("position_max_orders", "Max orders", state.position_max_orders)}
-        </section>
-        {env_panel}
-      </div>
       <section class="panel">
         <div class="panel-title">Execution Options</div>
         {render_checkbox("position_dry_run", "Dry run", state.position_dry_run, "Build BUY orders and show what would happen without sending anything to Kite.")}
@@ -1102,11 +1539,39 @@ def render_page(state: PageState) -> bytes:
       {position_orders_table}
       {render_results(state.position_results)}
       {render_console(state.console_log)}
+      <section class="panel">
+        <div class="panel-title">Position BUY Options</div>
+        {render_number_input("position_discount_percent", "Discount percent", state.position_discount_percent, "0.05")}
+        {render_input("position_exchange", "Exchange", state.position_exchange)}
+        {render_input("position_product", "Product filter", state.position_product)}
+        {render_input("position_symbols", "Symbol filter, comma-separated", state.position_symbols)}
+        {render_input("position_variety", "Variety", state.position_variety)}
+        {render_input("position_validity", "Validity", state.position_validity)}
+        {render_input("position_tag", "Tag", state.position_tag)}
+        {render_number_input("position_tick_size", "Tick size", state.position_tick_size, "0.01")}
+        {render_input("position_max_orders", "Max orders", state.position_max_orders)}
+      </section>
+    </form>
+    <form id="kite-setup-panel" method="post" action="/kite-setup"{kite_setup_panel_style}>
+      {env_panel}
+      <div class="actions">
+        <button type="submit" formaction="/kite-setup">Save Kite Setup</button>
+      </div>
     </form>
     <form id="gpt-panel" method="post" action="/gpt/load"{gpt_panel_style}>
+      {env_hidden}
       <div class="grid">
         <section class="panel">
-          <div class="panel-title">GPT Conversation</div>
+          <div class="panel-title">OpenAI CSV Generator</div>
+          {render_input("openai_api_key", "OPENAI_API_KEY", state.openai_api_key or env_value("OPENAI_API_KEY"), "password")}
+          {render_input("openai_model", "Model", state.openai_model)}
+          <label><span>Prompt for CSV generation</span><textarea class="conversation" name="openai_prompt" placeholder="Describe holdings, cash, expiry, symbols, strikes, lots, prices, and risk preference">{html.escape(state.openai_prompt)}</textarea></label>
+          <div class="actions">
+            <button type="submit" formaction="/gpt/generate">Generate CSV with OpenAI</button>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-title">GPT Share / Paste Fallback</div>
           {render_input("gpt_url", "GPT share URL", state.gpt_url)}
           <a class="inline-link" href="{html.escape(state.gpt_url, quote=True)}" target="_blank" rel="noopener">Open GPT Share</a>
           <label><span>Conversation / GPT output</span><textarea class="conversation" name="gpt_conversation" placeholder="Fetch the share link, or paste GPT output here">{html.escape(state.gpt_conversation)}</textarea></label>
@@ -1115,6 +1580,8 @@ def render_page(state: PageState) -> bytes:
             <button type="submit" formaction="/gpt/extract">Extract CSV</button>
           </div>
         </section>
+      </div>
+      <div class="grid">
         <section class="panel">
           <div class="panel-title">CSV To Save</div>
           <label><span>Extracted CSV</span><textarea class="csv-output" name="gpt_csv_text" placeholder="CSV generated from GPT appears here">{html.escape(state.gpt_csv_text)}</textarea></label>
@@ -1155,6 +1622,7 @@ def render_page(state: PageState) -> bytes:
         document.getElementById('place-panel').style.display = active === 'place' ? '' : 'none';
         document.getElementById('positions-panel').style.display = active === 'positions' ? '' : 'none';
         document.getElementById('gpt-panel').style.display = active === 'gpt' ? '' : 'none';
+        document.getElementById('kite-setup-panel').style.display = active === 'kite-setup' ? '' : 'none';
         for (const item of document.querySelectorAll('.tab-button')) {{
           item.classList.toggle('active', item.dataset.tab === active);
         }}
@@ -1180,6 +1648,47 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     refreshMmi();
+    async function refreshQuotes() {{
+      const cards = Array.from(document.querySelectorAll('.quote-card[data-symbol]'));
+      if (!cards.length) return;
+      try {{
+        const response = await fetch('/market-quotes', {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load quotes');
+        const bySymbol = new Map((data.quotes || []).map((quote) => [quote.symbol, quote]));
+        for (const card of cards) {{
+          const symbol = card.dataset.symbol;
+          const quote = bySymbol.get(symbol);
+          const ltp = card.querySelector('.quote-ltp');
+          const change = card.querySelector('.quote-change');
+          if (!quote || !quote.ltp) {{
+            ltp.textContent = 'N/A';
+            change.textContent = 'Quote unavailable';
+            change.className = 'quote-change';
+            continue;
+          }}
+          ltp.textContent = Number(quote.ltp).toFixed(2);
+          if (quote.change_percent === null || quote.change_percent === undefined) {{
+            change.textContent = '--';
+            change.className = 'quote-change';
+          }} else {{
+            const pct = Number(quote.change_percent);
+            const sign = pct > 0 ? '+' : '';
+            change.textContent = `${{sign}}${{pct.toFixed(2)}}%`;
+            change.className = `quote-change ${{pct >= 0 ? 'up' : 'down'}}`;
+            card.classList.toggle('strong-up', pct > 2);
+            card.classList.toggle('strong-down', pct < -2);
+          }}
+        }}
+      }} catch (error) {{
+        for (const card of cards) {{
+          card.querySelector('.quote-ltp').textContent = 'N/A';
+          card.querySelector('.quote-change').textContent = 'Kite quote error';
+        }}
+      }}
+    }}
+    refreshQuotes();
+    setInterval(refreshQuotes, 10000);
   </script>
 </body>
 </html>"""
@@ -1202,6 +1711,18 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     }
                 )
             return
+        if self.path == "/market-quotes":
+            try:
+                self.send_json(fetch_csv_market_quotes())
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "quotes": [],
+                    }
+                )
+            return
         self.send_page(PageState())
 
     def do_POST(self) -> None:
@@ -1216,6 +1737,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if self.path.startswith("/positions")
                 else "gpt"
                 if self.path.startswith("/gpt")
+                else "kite-setup"
+                if self.path.startswith("/kite-setup")
                 else "place"
             ),
             csv_path=first(form, "csv_path", str(DEFAULT_CSV_PATH)),
@@ -1244,6 +1767,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             gpt_url=first(form, "gpt_url", DEFAULT_GPT_SHARE_URL),
             gpt_conversation=first(form, "gpt_conversation"),
             gpt_csv_text=first(form, "gpt_csv_text"),
+            openai_api_key=first(form, "openai_api_key"),
+            openai_model=first(form, "openai_model", DEFAULT_OPENAI_MODEL),
+            openai_prompt=first(form, "openai_prompt", DEFAULT_OPENAI_PROMPT),
         )
 
         try:
@@ -1330,6 +1856,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             elif self.path == "/gpt/extract":
                 state.gpt_csv_text = extract_csv_from_text(state.gpt_conversation)
                 state.message = "Extracted CSV from GPT conversation."
+            elif self.path == "/gpt/generate":
+                state.gpt_csv_text, state.console_log = call_with_console(
+                    generate_csv_with_openai,
+                    state.openai_prompt,
+                    state.openai_model,
+                )
+                state.message = "Generated Kite order CSV with OpenAI. Review before saving or placing orders."
             elif self.path in {"/gpt/save", "/gpt/save-preview"}:
                 if not state.gpt_csv_text.strip():
                     state.gpt_csv_text = extract_csv_from_text(state.gpt_conversation)
@@ -1350,6 +1883,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     ).strip()
                 else:
                     state.message = persist_message
+            elif self.path == "/kite-setup":
+                state.message = "Kite setup saved for this running web app session."
             else:
                 state.error = f"Unknown path: {self.path}"
         except Exception as exc:
