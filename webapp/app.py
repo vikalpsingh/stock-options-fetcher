@@ -18,16 +18,18 @@ import csv
 import html
 import io
 import json
+import math
 import os
 import re
 import sys
+import threading
 import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -54,7 +56,7 @@ DEFAULT_KITE_ENV = {
     "KITE_CONFIRM_LIVE_ORDER": "YES",
     "KITE_API_KEY": "vr6yz47r650vum8p",
     "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
-    "KITE_ACCESS_TOKEN": "CPtYMoCuAxtMvoNNnGKSnCFERiRK94Lx",
+    "KITE_ACCESS_TOKEN": "TqL81HKQXjdi6KQ9jxsYUz5AIUgrrwxB",
 }
 ORDER_FIELDS = [
     "variety",
@@ -83,6 +85,8 @@ DISPLAY_FIELDS = [
 MMI_URL = "https://www.tickertape.in/market-mood-index"
 DEFAULT_GPT_SHARE_URL = "https://chatgpt.com/share/6a058d56-7558-83a4-ac3d-d4ea9058b663"
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
+KITE_CALLBACK_HOST = "127.0.0.1"
+KITE_CALLBACK_PORT = 8000
 DEFAULT_OPENAI_PROMPT = (
     "Generate a Kite order CSV for a conservative income options basket. "
     "Return only CSV with header: exchange,tradingsymbol,quantity,"
@@ -172,6 +176,12 @@ class PageState:
     openai_api_key: str = ""
     openai_model: str = DEFAULT_OPENAI_MODEL
     openai_prompt: str = DEFAULT_OPENAI_PROMPT
+    analytics_symbol: str = ""
+    analytics_data: dict[str, Any] | None = None
+    research_rows: list[dict[str, Any]] | None = None
+            positions_rows: list[dict[str, Any]] | None = None
+            positions_summary: dict[str, Any] | None = None
+    kite_request_token: str = ""
 
 
 def mask_secret(value: str | None) -> str:
@@ -200,6 +210,30 @@ def set_kite_env(form: dict[str, list[str]]) -> None:
     openai_api_key = first(form, "openai_api_key")
     if openai_api_key:
         os.environ["OPENAI_API_KEY"] = openai_api_key.strip()
+
+
+def kite_login_url() -> str:
+    api_key = env_value("KITE_API_KEY") or DEFAULT_KITE_ENV["KITE_API_KEY"]
+    return f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
+
+
+def generate_kite_access_token(request_token: str) -> str:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    token = request_token.strip()
+    if not token:
+        raise ValueError("request_token cannot be empty.")
+    api_key = env_value("KITE_API_KEY")
+    api_secret = env_value("KITE_API_SECRET")
+    if not api_key or not api_secret:
+        raise ValueError("KITE_API_KEY and KITE_API_SECRET are required.")
+    KiteConnect = kite_orders.load_kite_connect_class()
+    kite = KiteConnect(api_key=api_key)
+    data = kite.generate_session(token, api_secret=api_secret)
+    access_token = data["access_token"]
+    os.environ["KITE_ACCESS_TOKEN"] = access_token
+    DEFAULT_KITE_ENV["KITE_ACCESS_TOKEN"] = access_token
+    return access_token
 
 
 def first(form: dict[str, list[str]], name: str, default: str = "") -> str:
@@ -330,6 +364,842 @@ def expiry_summaries(symbols: list[str]) -> list[dict[str, Any]]:
         )
         summary["symbols"].append(symbol)
     return [summaries[key] for key in sorted(summaries)]
+
+
+def normal_cdf(value: float) -> float:
+    return 0.5 * (1 + math.erf(value / math.sqrt(2)))
+
+
+def normal_pdf(value: float) -> float:
+    return math.exp(-0.5 * value * value) / math.sqrt(2 * math.pi)
+
+
+def bs_d1(spot: float, strike: float, years: float, rate: float, iv: float) -> float:
+    return (math.log(spot / strike) + (rate + 0.5 * iv * iv) * years) / (
+        iv * math.sqrt(years)
+    )
+
+
+def bs_price(spot: float, strike: float, years: float, rate: float, iv: float, option_type: str) -> float:
+    if years <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
+        return 0.0
+    d1 = bs_d1(spot, strike, years, rate, iv)
+    d2 = d1 - iv * math.sqrt(years)
+    if option_type == "CE":
+        return spot * normal_cdf(d1) - strike * math.exp(-rate * years) * normal_cdf(d2)
+    return strike * math.exp(-rate * years) * normal_cdf(-d2) - spot * normal_cdf(-d1)
+
+
+def bs_greeks(spot: float, strike: float, years: float, rate: float, iv: float, option_type: str) -> dict[str, float]:
+    if years <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    d1 = bs_d1(spot, strike, years, rate, iv)
+    d2 = d1 - iv * math.sqrt(years)
+    delta = normal_cdf(d1) if option_type == "CE" else normal_cdf(d1) - 1
+    gamma = normal_pdf(d1) / (spot * iv * math.sqrt(years))
+    vega = spot * normal_pdf(d1) * math.sqrt(years) / 100
+    if option_type == "CE":
+        theta = (
+            -(spot * normal_pdf(d1) * iv) / (2 * math.sqrt(years))
+            - rate * strike * math.exp(-rate * years) * normal_cdf(d2)
+        ) / 365
+    else:
+        theta = (
+            -(spot * normal_pdf(d1) * iv) / (2 * math.sqrt(years))
+            + rate * strike * math.exp(-rate * years) * normal_cdf(-d2)
+        ) / 365
+    return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
+
+
+def implied_volatility(
+    option_price: float,
+    spot: float,
+    strike: float,
+    years: float,
+    rate: float,
+    option_type: str,
+) -> float | None:
+    if option_price <= 0 or spot <= 0 or strike <= 0 or years <= 0:
+        return None
+    low = 0.0001
+    high = 5.0
+    for _ in range(80):
+        mid = (low + high) / 2
+        price = bs_price(spot, strike, years, rate, mid, option_type)
+        if abs(price - option_price) < 0.0001:
+            return mid
+        if price > option_price:
+            high = mid
+        else:
+            low = mid
+    return (low + high) / 2
+
+
+def quote_ltp(quote: dict[str, Any]) -> float:
+    return float(quote.get("last_price") or 0)
+
+
+def quote_oi(quote: dict[str, Any]) -> int:
+    return int(quote.get("oi") or 0)
+
+
+def option_analytics_for_symbol(symbol: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    symbol = symbol.strip().upper()
+    parts = option_symbol_parts(symbol)
+    if not parts:
+        raise ValueError(f"Could not parse option symbol: {symbol}")
+
+    kite = kite_orders.kite_client()
+    expiry = expiry_date_for_parts(parts)
+    today = datetime.now().date()
+    dte = max((expiry - today).days, 0)
+    years = max(dte / 365, 1 / 365)
+    rate = 0.065
+    strike = float(parts["strike"])
+    option_key = f"NFO:{symbol}"
+    spot_key = f"NSE:{parts['underlying']}"
+    quotes = kite.quote([option_key, spot_key])
+    option_quote = quotes.get(option_key, {})
+    spot_quote = quotes.get(spot_key, {})
+    option_price = quote_ltp(option_quote)
+    spot = quote_ltp(spot_quote)
+    iv = implied_volatility(option_price, spot, strike, years, rate, parts["option_type"])
+    greeks = bs_greeks(spot, strike, years, rate, iv or 0, parts["option_type"])
+    expected_move = spot * (iv or 0) * math.sqrt(dte / 365) if dte > 0 else 0
+    buy_pop = abs(greeks["delta"])
+    sell_pop = max(0.0, min(1.0, 1 - abs(greeks["delta"])))
+    chain = option_chain_analytics(kite, parts, spot)
+    data = {
+        "symbol": symbol,
+        "underlying": parts["underlying"],
+        "option_type": parts["option_type"],
+        "strike": strike,
+        "expiry": expiry.strftime("%d %b %Y"),
+        "dte": dte,
+        "spot": spot,
+        "option_price": option_price,
+        "oi": quote_oi(option_quote),
+        "rate": rate,
+        "iv": iv,
+        "iv_percent": (iv * 100) if iv is not None else None,
+        "delta": greeks["delta"],
+        "gamma": greeks["gamma"],
+        "theta": greeks["theta"],
+        "vega": greeks["vega"],
+        "buy_pop": buy_pop * 100,
+        "sell_pop": sell_pop * 100,
+        "expected_move": expected_move,
+        "pcr": chain.get("pcr"),
+        "max_pain": chain.get("max_pain"),
+        "support": chain.get("support"),
+        "resistance": chain.get("resistance"),
+        "chain_rows": chain.get("rows", 0),
+        "iv_rank": "Requires historical IV database",
+        "iv_percentile": "Requires historical IV database",
+    }
+    data["decision"] = option_decision_metrics(data)
+    return data
+
+
+def option_decision_metrics(data: dict[str, Any]) -> dict[str, Any]:
+    spot = float(data.get("spot") or 0)
+    strike = float(data.get("strike") or 0)
+    option_price = float(data.get("option_price") or 0)
+    option_type = str(data.get("option_type") or "").upper()
+    delta = float(data.get("delta") or 0)
+    sell_pop = float(data.get("sell_pop") or 0)
+    buy_pop = float(data.get("buy_pop") or 0)
+    expected_move = float(data.get("expected_move") or 0)
+    theta = float(data.get("theta") or 0)
+    gamma = float(data.get("gamma") or 0)
+    vega = float(data.get("vega") or 0)
+    support = data.get("support")
+    resistance = data.get("resistance")
+    upper_range = spot + expected_move
+    lower_range = max(spot - expected_move, 0)
+    otm_distance = ((strike - spot) / spot * 100) if option_type == "CE" and spot else None
+    if option_type == "PE" and spot:
+        otm_distance = ((spot - strike) / spot * 100)
+
+    def near(value: Any, target: float, tolerance: float = 0.01) -> bool:
+        try:
+            return abs(float(value) - target) <= tolerance
+        except (TypeError, ValueError):
+            return False
+
+    is_ce = option_type == "CE"
+    is_pe = option_type == "PE"
+    ce_sell_fit = (
+        is_ce
+        and delta < 0.15
+        and sell_pop >= 75
+        and strike >= upper_range
+        and near(resistance, strike)
+    )
+    pe_sell_fit = (
+        is_pe
+        and delta > -0.20
+        and sell_pop >= 75
+        and strike <= lower_range
+        and near(support, strike)
+    )
+    ce_buy_fit = is_ce and 0.35 <= delta <= 0.60 and buy_pop >= 35 and spot > strike
+    pe_buy_fit = is_pe and -0.60 <= delta <= -0.35 and buy_pop >= 35 and spot < strike
+
+    support_text = fmt_number(support) if support is not None else "support"
+    resistance_text = fmt_number(resistance) if resistance is not None else "resistance"
+    risk_lights = option_risk_lights(data)
+    if is_ce:
+        sell_call = "SELL_CALL_COVERED_ONLY" if ce_sell_fit else "SELL_CALL_CHECK_COVERAGE"
+        buy_call = "BUY_CALL_AVOID" if not ce_buy_fit else "BUY_CALL_POSSIBLE_BREAKOUT"
+        sell_put = "SELL_PUT_NEED_PE_CHAIN"
+        buy_put = f"BUY_PUT_ONLY_IF_{support_text}_BREAKDOWN"
+    elif is_pe:
+        sell_call = "SELL_CALL_NEED_CE_CHAIN"
+        buy_call = f"BUY_CALL_ONLY_IF_{resistance_text}_BREAKOUT"
+        sell_put = "SELL_PUT_CASH_SECURED_ONLY" if pe_sell_fit else "SELL_PUT_CHECK_CASH_AND_SUPPORT"
+        buy_put = "BUY_PUT_POSSIBLE_BREAKDOWN" if pe_buy_fit else "BUY_PUT_AVOID"
+    else:
+        sell_call = "UNKNOWN"
+        buy_call = "UNKNOWN"
+        sell_put = "UNKNOWN"
+        buy_put = "UNKNOWN"
+
+    rows = [
+        {
+            "indicator": "Delta",
+            "sell_call": "Good" if is_ce and delta < 0.15 else "Needs CE delta < 0.15",
+            "buy_call": "Good" if is_ce and 0.35 <= delta <= 0.60 else "Needs CE delta 0.35-0.60",
+            "sell_put": "Use PE delta > -0.20",
+            "buy_put": "Use PE delta -0.35 to -0.60",
+        },
+        {
+            "indicator": "POP",
+            "sell_call": "Good" if is_ce and sell_pop > 75 else "Needs Sell POP > 75%",
+            "buy_call": "Weak" if is_ce and buy_pop < 35 else "Buy POP improving",
+            "sell_put": "Needs PE Sell POP > 75%",
+            "buy_put": "Buy POP improving",
+        },
+        {
+            "indicator": "Expected move",
+            "sell_call": "Good" if is_ce and strike > upper_range else "Strike should be above upper range",
+            "buy_call": "Needs spot above upper range",
+            "sell_put": "PE strike should be below lower range",
+            "buy_put": "Needs spot below lower range",
+        },
+        {
+            "indicator": "OI",
+            "sell_call": "Good" if is_ce and near(resistance, strike) else "Prefer CE strike at resistance",
+            "buy_call": "Needs resistance broken",
+            "sell_put": "Prefer PE strike at support",
+            "buy_put": "Needs support broken",
+        },
+        {
+            "indicator": "Trend",
+            "sell_call": "Sideways / sell-on-rise preferred",
+            "buy_call": "Needs strong breakout",
+            "sell_put": "Buy-on-dips preferred",
+            "buy_put": "Needs breakdown",
+        },
+        {
+            "indicator": "VWAP / EMA",
+            "sell_call": "Requires intraday candle data",
+            "buy_call": "Requires above VWAP + 20 EMA",
+            "sell_put": "Requires holding VWAP/support",
+            "buy_put": "Requires below VWAP + lower highs",
+        },
+        {
+            "indicator": "Theta",
+            "sell_call": "Positive for seller",
+            "buy_call": "Negative for buyer",
+            "sell_put": "Positive for seller",
+            "buy_put": "Negative for buyer",
+        },
+        {
+            "indicator": "Coverage",
+            "sell_call": "Shares available required",
+            "buy_call": "Premium risk only",
+            "sell_put": "Cash available required",
+            "buy_put": "Premium risk only",
+        },
+    ]
+    return {
+        "sell_call": sell_call,
+        "buy_call": buy_call,
+        "sell_put": sell_put,
+        "buy_put": buy_put,
+        "otm_distance": otm_distance,
+        "upper_range": upper_range,
+        "lower_range": lower_range,
+        "breakeven": strike + option_price if is_ce else strike - option_price,
+        "risk_lights": risk_lights,
+        "summary": rows,
+    }
+
+
+def color_for_signal(signal: str) -> str:
+    if signal.startswith("GREEN"):
+        return "green"
+    if signal.startswith("YELLOW"):
+        return "yellow"
+    if signal.startswith("RED"):
+        return "red"
+    return "neutral"
+
+
+def color_otm(otm_pct: float | None) -> str:
+    if otm_pct is None:
+        return "neutral"
+    if otm_pct >= 10:
+        return "lightgreen"
+    if otm_pct >= 7:
+        return "yellow"
+    if otm_pct >= 5:
+        return "orange"
+    return "lightcoral"
+
+
+def color_iv(iv_pct: float | None, event_risk: bool = False) -> str:
+    if iv_pct is None:
+        return "neutral"
+    if event_risk:
+        return "lightcoral"
+    if 15 <= iv_pct <= 35:
+        return "lightgreen"
+    if 35 < iv_pct <= 50 or iv_pct < 12:
+        return "yellow"
+    if 50 < iv_pct <= 65:
+        return "orange"
+    return "lightcoral"
+
+
+def color_sell_pop(pop_pct: float | None) -> str:
+    if pop_pct is None:
+        return "neutral"
+    if pop_pct >= 80:
+        return "lightgreen"
+    if pop_pct >= 70:
+        return "yellow"
+    return "lightcoral"
+
+
+def color_pcr_for_sell_call(pcr: float | None) -> str:
+    if pcr is None:
+        return "neutral"
+    if pcr < 0.60:
+        return "lightgreen"
+    if pcr <= 1.00:
+        return "yellow"
+    return "lightcoral"
+
+
+def color_pcr_for_sell_put(pcr: float | None) -> str:
+    if pcr is None:
+        return "neutral"
+    if pcr > 0.80:
+        return "lightgreen"
+    if pcr >= 0.60:
+        return "yellow"
+    return "lightcoral"
+
+
+def strike_oi_color(option_type: str, strike: float, support: Any, resistance: Any) -> tuple[str, str]:
+    try:
+        support_value = float(support)
+    except (TypeError, ValueError):
+        support_value = None
+    try:
+        resistance_value = float(resistance)
+    except (TypeError, ValueError):
+        resistance_value = None
+    if option_type == "CE":
+        if resistance_value is None:
+            return "neutral", "Resistance unavailable"
+        if abs(strike - resistance_value) <= 0.01:
+            return "lightgreen", "CE strike is at OI resistance"
+        if strike < resistance_value:
+            return "yellow", "CE strike below resistance"
+        return "orange", "CE strike above resistance; check liquidity"
+    if option_type == "PE":
+        if support_value is None:
+            return "neutral", "Support unavailable"
+        if abs(strike - support_value) <= 0.01:
+            return "lightgreen", "PE strike is at OI support"
+        if strike < support_value:
+            return "lightgreen", "PE strike below support"
+        return "lightcoral", "PE strike above/broken support"
+    return "neutral", "Unknown option type"
+
+
+def strategy_strength_lights(data: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    option_type = str(data.get("option_type") or "").upper()
+    strike = float(data.get("strike") or 0)
+    otm_pct = decision.get("otm_distance")
+    iv_pct = data.get("iv_percent")
+    sell_pop = data.get("sell_pop")
+    pcr = data.get("pcr")
+    pcr_color = (
+        color_pcr_for_sell_call(pcr)
+        if option_type == "CE"
+        else color_pcr_for_sell_put(pcr)
+        if option_type == "PE"
+        else "neutral"
+    )
+    oi_color, oi_note = strike_oi_color(
+        option_type, strike, data.get("support"), data.get("resistance")
+    )
+    rows = [
+        (
+            "OTM distance",
+            f"{fmt_number(otm_pct)}%",
+            color_otm(otm_pct),
+            "Great when >= 10%; avoid when < 5%",
+        ),
+        (
+            "Implied Volatility",
+            f"{fmt_number(iv_pct)}%",
+            color_iv(iv_pct),
+            "15-35% calm; 35-50% premium good; >65% avoid/event risk",
+        ),
+        (
+            "SELL Probability of Profit",
+            f"{fmt_number(sell_pop)}%",
+            color_sell_pop(sell_pop),
+            ">= 80% is preferred for selling",
+        ),
+        (
+            "PCR",
+            fmt_number(pcr),
+            pcr_color,
+            "SELL CALL prefers PCR < 0.60; SELL PUT prefers PCR > 0.80",
+        ),
+        (
+            "Strike vs OI",
+            f"Support {fmt_number(data.get('support'))} / Resistance {fmt_number(data.get('resistance'))}",
+            oi_color,
+            oi_note,
+        ),
+    ]
+    green_count = sum(1 for row in rows[:4] if row[2] == "lightgreen")
+    yellow_count = sum(1 for row in rows[:4] if row[2] == "yellow")
+    red_count = sum(1 for row in rows[:4] if row[2] == "lightcoral")
+    if red_count:
+        final = "RED_AVOID"
+        color = "lightcoral"
+    elif green_count >= 3 and yellow_count <= 1:
+        final = "GREEN_SELL_CALL" if option_type == "CE" else "GREEN_SELL_PUT"
+        color = "lightgreen"
+    elif green_count >= 2:
+        final = "YELLOW_REDUCE_SIZE_OR_WAIT"
+        color = "yellow"
+    else:
+        final = "ORANGE_RISKY_RECHECK"
+        color = "orange"
+    if option_type == "PE" and pcr_color == "lightcoral":
+        final = "RED_AVOID_SELL_PUT_PCR_WEAK"
+        color = "lightcoral"
+    return {"rows": rows, "final": final, "color": color}
+
+
+def strength_label(color: str, text: str) -> str:
+    return f"{color.upper()}: {text}"
+
+
+def sell_call_signal(
+    delta: float,
+    pop_sell: float,
+    theta: float,
+    vega: float,
+    gamma: float,
+    spot: float,
+    ltp: float,
+    is_covered: bool,
+    is_breakout: bool,
+) -> str:
+    if ltp <= 0:
+        return "RED_AVOID_SELL_CALL"
+    delta_abs = abs(delta)
+    seller_theta = -theta
+    theta_yield_pct = seller_theta / ltp * 100
+    vega_risk_pct = vega / ltp * 100
+    gamma_1pct = gamma * spot * 0.01
+    if not is_covered:
+        return "RED_NAKED_CE_NOT_ALLOWED"
+    if is_breakout:
+        return "RED_AVOID_CALL_SELL"
+    green = (
+        0.05 <= delta_abs <= 0.15
+        and pop_sell >= 80
+        and theta_yield_pct >= 5
+        and gamma_1pct <= 0.03
+        and vega_risk_pct <= 10
+    )
+    yellow = (
+        0.15 < delta_abs <= 0.25
+        or 70 <= pop_sell < 80
+        or 0.03 < gamma_1pct <= 0.06
+        or 10 < vega_risk_pct <= 15
+    )
+    if green:
+        return "GREEN_SELL_CALL_COVERED"
+    if yellow:
+        return "YELLOW_SELL_CALL_SMALL_SIZE"
+    return "RED_AVOID_SELL_CALL"
+
+
+def sell_put_signal(
+    delta: float,
+    pop_sell: float,
+    theta: float,
+    vega: float,
+    gamma: float,
+    spot: float,
+    ltp: float,
+    is_cash_secured: bool,
+    is_breakdown: bool,
+) -> str:
+    if ltp <= 0:
+        return "RED_AVOID_SELL_PUT"
+    delta_abs = abs(delta)
+    seller_theta = -theta
+    theta_yield_pct = seller_theta / ltp * 100
+    vega_risk_pct = vega / ltp * 100
+    gamma_1pct = gamma * spot * 0.01
+    if not is_cash_secured:
+        return "RED_NOT_CASH_SECURED"
+    if is_breakdown:
+        return "RED_AVOID_PUT_SELL"
+    green = (
+        0.10 <= delta_abs <= 0.20
+        and pop_sell >= 80
+        and theta_yield_pct >= 5
+        and gamma_1pct <= 0.03
+        and vega_risk_pct <= 10
+    )
+    yellow = (
+        0.20 < delta_abs <= 0.30
+        or 70 <= pop_sell < 80
+        or 0.03 < gamma_1pct <= 0.06
+        or 10 < vega_risk_pct <= 15
+    )
+    if green:
+        return "GREEN_SELL_PUT_CASH_SECURED"
+    if yellow:
+        return "YELLOW_SELL_PUT_SMALL_SIZE"
+    return "RED_AVOID_SELL_PUT"
+
+
+def option_risk_lights(data: dict[str, Any]) -> dict[str, Any]:
+    option_type = str(data.get("option_type") or "").upper()
+    delta = float(data.get("delta") or 0)
+    delta_abs = abs(delta)
+    pop_sell = float(data.get("sell_pop") or 0)
+    theta = float(data.get("theta") or 0)
+    gamma = float(data.get("gamma") or 0)
+    vega = float(data.get("vega") or 0)
+    spot = float(data.get("spot") or 0)
+    ltp = float(data.get("option_price") or 0)
+    seller_delta = -delta
+    seller_gamma = -gamma
+    seller_theta = -theta
+    seller_vega = -vega
+    theta_yield_pct = seller_theta / ltp * 100 if ltp > 0 else 0
+    vega_risk_pct = vega / ltp * 100 if ltp > 0 else 0
+    gamma_1pct = gamma * spot * 0.01
+    is_ce = option_type == "CE"
+    is_pe = option_type == "PE"
+    if is_ce:
+        if 0.05 <= delta_abs <= 0.15:
+            delta_light = ("green", "Green for SELL CALL")
+        elif 0.15 < delta_abs <= 0.25:
+            delta_light = ("yellow", "Yellow for SELL CALL")
+        else:
+            delta_light = ("red", "Red for SELL CALL")
+    else:
+        if 0.10 <= delta_abs <= 0.20:
+            delta_light = ("green", "Green for SELL PUT")
+        elif 0.20 < delta_abs <= 0.30:
+            delta_light = ("yellow", "Yellow for SELL PUT")
+        else:
+            delta_light = ("red", "Red for SELL PUT")
+    if pop_sell > 80:
+        pop_light = ("green", "Sell POP above 80%")
+    elif 70 <= pop_sell <= 80:
+        pop_light = ("yellow", "Sell POP 70-80%")
+    else:
+        pop_light = ("red", "Sell POP below 70%")
+    if gamma_1pct <= 0.03:
+        gamma_light = ("green", "Low gamma risk")
+    elif gamma_1pct <= 0.06:
+        gamma_light = ("yellow", "Medium gamma risk")
+    else:
+        gamma_light = ("red", "High gamma risk")
+    if theta_yield_pct > 5:
+        theta_light = ("green", "Theta yield above 5% premium/day")
+    elif theta_yield_pct >= 2:
+        theta_light = ("yellow", "Theta yield 2-5% premium/day")
+    else:
+        theta_light = ("red", "Theta yield below 2% premium/day")
+    if vega_risk_pct < 5:
+        vega_light = ("green", "Low IV spike risk")
+    elif vega_risk_pct <= 10:
+        vega_light = ("yellow", "Moderate IV spike risk")
+    else:
+        vega_light = ("red", "High IV spike risk")
+    final_sell = (
+        sell_call_signal(delta, pop_sell, theta, vega, gamma, spot, ltp, True, False)
+        if is_ce
+        else sell_put_signal(delta, pop_sell, theta, vega, gamma, spot, ltp, True, False)
+    )
+    buy_signal = "RED_BUY_CALL_LOW_POP" if is_ce else "RED_BUY_PUT_NEEDS_BREAKDOWN"
+    return {
+        "seller_delta": seller_delta,
+        "seller_gamma": seller_gamma,
+        "seller_theta": seller_theta,
+        "seller_vega": seller_vega,
+        "theta_yield_pct": theta_yield_pct,
+        "vega_risk_pct": vega_risk_pct,
+        "gamma_1pct": gamma_1pct,
+        "final_sell": final_sell,
+        "final_sell_color": color_for_signal(final_sell),
+        "buy_signal": buy_signal,
+        "buy_signal_color": color_for_signal(buy_signal),
+        "naked_ce_signal": "RED_NAKED_CE_NOT_ALLOWED" if is_ce else "N/A",
+        "cash_rule": "Cash backing 90%+ required for CSP" if is_pe else "N/A",
+        "rows": [
+            ("Delta / POP", delta_abs, delta_light[0], delta_light[1]),
+            ("SELL POP", pop_sell, pop_light[0], pop_light[1]),
+            ("Gamma 1% move risk", gamma_1pct, gamma_light[0], gamma_light[1]),
+            ("Theta / premium / day", theta_yield_pct, theta_light[0], theta_light[1]),
+            ("Vega / premium", vega_risk_pct, vega_light[0], vega_light[1]),
+            (
+                "Coverage / cash backing",
+                "Required",
+                "green",
+                "Covered CALL required" if is_ce else "90%+ cash ready required",
+            ),
+        ],
+    }
+
+
+def option_chain_analytics(kite: Any, parts: dict[str, Any], spot: float) -> dict[str, Any]:
+    instruments = [
+        item
+        for item in kite.instruments("NFO")
+        if str(item.get("name", "")).upper() == parts["underlying"]
+        and str(item.get("instrument_type", "")).upper() in {"CE", "PE"}
+        and item.get("expiry") == expiry_date_for_parts(parts)
+    ]
+    if not instruments:
+        return {}
+
+    keys = [f"NFO:{item['tradingsymbol']}" for item in instruments]
+    quotes: dict[str, Any] = {}
+    for index in range(0, len(keys), 400):
+        quotes.update(kite.quote(keys[index : index + 400]))
+
+    by_strike: dict[float, dict[str, int]] = {}
+    for item in instruments:
+        strike = float(item.get("strike") or 0)
+        option_type = str(item.get("instrument_type", "")).upper()
+        key = f"NFO:{item['tradingsymbol']}"
+        by_strike.setdefault(strike, {"CE": 0, "PE": 0})[option_type] += quote_oi(
+            quotes.get(key, {})
+        )
+
+    total_pe_oi = sum(row["PE"] for row in by_strike.values())
+    total_ce_oi = sum(row["CE"] for row in by_strike.values())
+    pcr = (total_pe_oi / total_ce_oi) if total_ce_oi else None
+    support = max(by_strike.items(), key=lambda item: item[1]["PE"])[0] if by_strike else None
+    resistance = max(by_strike.items(), key=lambda item: item[1]["CE"])[0] if by_strike else None
+    max_pain = None
+    min_pain = None
+    for test_strike in by_strike:
+        pain = 0.0
+        for strike, oi in by_strike.items():
+            pain += max(test_strike - strike, 0) * oi["CE"]
+            pain += max(strike - test_strike, 0) * oi["PE"]
+        if min_pain is None or pain < min_pain:
+            min_pain = pain
+            max_pain = test_strike
+    return {
+        "pcr": pcr,
+        "support": support,
+        "resistance": resistance,
+        "max_pain": max_pain,
+        "rows": len(by_strike),
+    }
+
+
+def open_option_positions() -> list[dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    positions = kite.positions().get("net", [])
+    active: list[dict[str, Any]] = []
+    for position in positions:
+        quantity = int(position.get("quantity") or 0)
+        symbol = str(position.get("tradingsymbol") or "").upper()
+        if quantity == 0 or not option_symbol_parts(symbol):
+            continue
+        active.append(
+            {
+                "exchange": str(position.get("exchange") or ""),
+                "tradingsymbol": symbol,
+                "quantity": quantity,
+                "product": str(position.get("product") or ""),
+                "average_price": float(position.get("average_price") or 0),
+                "ltp": float(position.get("last_price") or position.get("ltp") or 0),
+                "pnl": float(position.get("pnl") or 0),
+            }
+        )
+    return active
+
+
+def research_csv_symbols() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for symbol in csv_trading_symbols(read_default_csv_text()):
+        try:
+            data = option_analytics_for_symbol(symbol)
+            decision = data.get("decision", {})
+            risk = decision.get("risk_lights", {})
+            strength = strategy_strength_lights(data, decision)
+            risk_by_name = {row[0]: row for row in risk.get("rows", [])}
+            strength_by_name = {row[0]: row for row in strength.get("rows", [])}
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "option_type": data.get("option_type"),
+                    "spot": data.get("spot"),
+                    "strike": data.get("strike"),
+                    "expiry": data.get("expiry"),
+                    "sell_signal": risk.get("final_sell"),
+                    "sell_color": risk.get("final_sell_color"),
+                    "buy_signal": risk.get("buy_signal"),
+                    "buy_color": risk.get("buy_signal_color"),
+                    "strategy_strength": strength.get("final"),
+                    "strategy_color": strength.get("color"),
+                    "delta": abs(float(data.get("delta") or 0)),
+                    "sell_pop": data.get("sell_pop"),
+                    "gamma_1pct": risk.get("gamma_1pct"),
+                    "theta_yield_pct": risk.get("theta_yield_pct"),
+                    "vega_risk_pct": risk.get("vega_risk_pct"),
+                    "otm_distance": decision.get("otm_distance"),
+                    "iv_percent": data.get("iv_percent"),
+                    "pcr": data.get("pcr"),
+                    "support": data.get("support"),
+                    "resistance": data.get("resistance"),
+                    "risk_rows": risk_by_name,
+                    "strength_rows": strength_by_name,
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "option_type": "",
+                    "error": str(exc),
+                    "sell_signal": "ERROR",
+                    "sell_color": "red",
+                    "strategy_strength": "ERROR",
+                    "strategy_color": "lightcoral",
+                }
+            )
+    return rows
+
+
+def margin_required_for_position(kite: Any, position: dict[str, Any]) -> float:
+    quantity = int(position.get("quantity") or 0)
+    if quantity == 0:
+        return 0.0
+    order = {
+        "exchange": position.get("exchange") or "NFO",
+        "tradingsymbol": position["tradingsymbol"],
+        "transaction_type": "SELL" if quantity < 0 else "BUY",
+        "variety": "regular",
+        "product": position.get("product") or "NRML",
+        "order_type": "MARKET",
+        "quantity": abs(quantity),
+    }
+    margin_rows = kite.order_margins([order])
+    if not margin_rows:
+        return 0.0
+    margin = margin_rows[0]
+    return float(
+        margin.get("total")
+        or margin.get("final", {}).get("total")
+        or margin.get("initial", {}).get("total")
+        or 0
+    )
+
+
+def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    positions = open_option_positions()
+    rows: list[dict[str, Any]] = []
+    total_pnl = 0.0
+    total_deployed = 0.0
+    for position in positions:
+        symbol = position["tradingsymbol"]
+        try:
+            data = option_analytics_for_symbol(symbol)
+            decision = data.get("decision", {})
+            risk = decision.get("risk_lights", {})
+            strength = strategy_strength_lights(data, decision)
+            deployed = margin_required_for_position(kite, position)
+            pnl = float(position.get("pnl") or 0)
+            total_pnl += pnl
+            total_deployed += deployed
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "quantity": position.get("quantity"),
+                    "product": position.get("product"),
+                    "average_price": position.get("average_price"),
+                    "ltp": position.get("ltp"),
+                    "pnl": pnl,
+                    "deployed": deployed,
+                    "return_pct": (pnl / deployed * 100) if deployed > 0 else None,
+                    "sell_signal": risk.get("final_sell"),
+                    "sell_color": risk.get("final_sell_color"),
+                    "buy_signal": risk.get("buy_signal"),
+                    "buy_color": risk.get("buy_signal_color"),
+                    "strategy_strength": strength.get("final"),
+                    "strategy_color": strength.get("color"),
+                    "delta": abs(float(data.get("delta") or 0)),
+                    "sell_pop": data.get("sell_pop"),
+                    "otm_distance": decision.get("otm_distance"),
+                    "iv_percent": data.get("iv_percent"),
+                    "pcr": data.get("pcr"),
+                    "support": data.get("support"),
+                    "resistance": data.get("resistance"),
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "quantity": position.get("quantity"),
+                    "product": position.get("product"),
+                    "average_price": position.get("average_price"),
+                    "ltp": position.get("ltp"),
+                    "pnl": position.get("pnl"),
+                    "error": str(exc),
+                    "strategy_strength": "ERROR",
+                    "strategy_color": "lightcoral",
+                }
+            )
+    summary = {
+        "count": len(rows),
+        "total_pnl": total_pnl,
+        "total_deployed": total_deployed,
+        "return_pct": (total_pnl / total_deployed * 100) if total_deployed > 0 else None,
+    }
+    return rows, summary
 
 
 def load_rows(csv_path: str, csv_text: str) -> tuple[list[dict[str, str]], str]:
@@ -852,6 +1722,16 @@ def display_cell(field: str, value: Any) -> str:
     return str(value)
 
 
+def render_symbol_value(field: str, value: Any) -> str:
+    text = display_cell(field, value)
+    if field == "tradingsymbol" and text:
+        return (
+            f'<a class="symbol-link" href="/analytics?symbol={html.escape(text, quote=True)}">'
+            f"{html.escape(text)}</a>"
+        )
+    return html.escape(text)
+
+
 def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] | None = None) -> str:
     if not orders:
         return ""
@@ -861,7 +1741,7 @@ def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] 
     for index, order in enumerate(orders):
         checked_attr = " checked" if index in selected else ""
         cells = "".join(
-            f"<td>{html.escape(display_cell(field, order.get(field, '')))}</td>"
+            f"<td>{render_symbol_value(field, order.get(field, ''))}</td>"
             for field in DISPLAY_FIELDS
         )
         rows.append(
@@ -888,7 +1768,7 @@ def render_position_orders_table(
     for index, order in enumerate(orders):
         checked_attr = " checked" if index in selected else ""
         cells = "".join(
-            f"<td>{html.escape(display_cell(field, order.get(field, '')))}</td>"
+            f"<td>{render_symbol_value(field, order.get(field, ''))}</td>"
             for field in fields
         )
         rows.append(
@@ -920,6 +1800,395 @@ def render_results(results: list[dict[str, Any]] | None) -> str:
         '<section class="panel"><div class="panel-title">Execution Results</div>'
         "<table><thead><tr><th>Symbol</th><th>Status</th><th>Order ID</th><th>Detail</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></section>"
+    )
+
+
+def render_signal_cell(value: str) -> str:
+    class_name = "signal-good" if value.strip().lower() == "good" else ""
+    return f'<td class="{class_name}">{html.escape(value)}</td>'
+
+
+def fmt_number(value: Any, decimals: int = 2) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, str):
+        return value
+    try:
+        return f"{float(value):.{decimals}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def render_analytics_panel(state: PageState) -> str:
+    symbols = csv_trading_symbols(read_default_csv_text())
+    active_positions: list[dict[str, Any]] = []
+    active_error = ""
+    if state.active_tab == "analytics":
+        try:
+            active_positions = open_option_positions()
+        except Exception as exc:
+            active_error = str(exc)
+    links = "".join(
+        f'<a class="analytics-chip" href="/analytics?symbol={html.escape(symbol, quote=True)}">{html.escape(symbol)}</a>'
+        for symbol in symbols
+    )
+    active_rows = "".join(
+        "<tr>"
+        f"<td>{render_symbol_value('tradingsymbol', position['tradingsymbol'])}</td>"
+        f"<td>{html.escape(str(position['quantity']))}</td>"
+        f"<td>{html.escape(position['product'])}</td>"
+        f"<td>{html.escape(fmt_number(position['average_price']))}</td>"
+        f"<td>{html.escape(fmt_number(position['ltp']))}</td>"
+        f"<td>{html.escape(display_cell('pnl', position['pnl']))}</td>"
+        "</tr>"
+        for position in active_positions
+    )
+    active_section = (
+        '<section class="panel active-trades-panel"><div class="panel-title">Active Option Trades</div>'
+        '<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Qty</th><th>Product</th>'
+        '<th>Avg</th><th>LTP</th><th>P&L</th></tr></thead>'
+        f"<tbody>{active_rows}</tbody></table></div></section>"
+        if active_rows
+        else (
+            '<section class="panel active-trades-panel"><div class="panel-title">Active Option Trades</div>'
+            f'<div class="status">{html.escape(active_error or "No active option trades found.")}</div></section>'
+        )
+    )
+    selected = state.analytics_symbol or (symbols[0] if symbols else "")
+    data = state.analytics_data
+    detail = ""
+    if data:
+        decision = data.get("decision", {})
+        risk_lights = decision.get("risk_lights", {})
+        strength_lights = strategy_strength_lights(data, decision)
+        option_type = str(data.get("option_type", "")).upper()
+        sell_recommendation = (
+            "CALL SELL"
+            if option_type == "CE"
+            else "PUT SELL"
+            if option_type == "PE"
+            else "SELL"
+        )
+        decision_title = (
+            f"Decision Labels - {data.get('symbol', '')} - {sell_recommendation} Recommendation"
+        )
+        if option_type == "CE":
+            decision_items = [
+                ("SELL CALL", decision.get("sell_call", "N/A")),
+                ("BUY CALL", decision.get("buy_call", "N/A")),
+            ]
+            matrix_headers = "<th>Indicator</th><th>SELL CALL</th><th>BUY CALL</th>"
+            signal_rows = "".join(
+                "<tr>"
+                f"<th>{html.escape(row['indicator'])}</th>"
+                f"{render_signal_cell(row['sell_call'])}"
+                f"{render_signal_cell(row['buy_call'])}"
+                "</tr>"
+                for row in decision.get("summary", [])
+            )
+        elif option_type == "PE":
+            decision_items = [
+                ("SELL PUT", decision.get("sell_put", "N/A")),
+                ("BUY PUT", decision.get("buy_put", "N/A")),
+            ]
+            matrix_headers = "<th>Indicator</th><th>SELL PUT</th><th>BUY PUT</th>"
+            signal_rows = "".join(
+                "<tr>"
+                f"<th>{html.escape(row['indicator'])}</th>"
+                f"{render_signal_cell(row['sell_put'])}"
+                f"{render_signal_cell(row['buy_put'])}"
+                "</tr>"
+                for row in decision.get("summary", [])
+            )
+        else:
+            decision_items = [("Decision", "UNKNOWN")]
+            matrix_headers = "<th>Indicator</th><th>Decision</th>"
+            signal_rows = ""
+        decision_cards = "".join(
+            f'<div class="decision-card"><div class="decision-label">{html.escape(label)}</div>'
+            f'<div class="decision-value">{html.escape(str(value))}</div></div>'
+            for label, value in decision_items
+        )
+        risk_cards = "".join(
+            '<div class="decision-card">'
+            f'<div class="decision-label">{html.escape(label)}</div>'
+            f'<div class="decision-value signal-{html.escape(color)}">{html.escape(str(value))}</div>'
+            "</div>"
+            for label, value, color in [
+                ("Final SELL signal", risk_lights.get("final_sell", "N/A"), risk_lights.get("final_sell_color", "neutral")),
+                ("BUY signal", risk_lights.get("buy_signal", "N/A"), risk_lights.get("buy_signal_color", "neutral")),
+                ("Naked CE rule", risk_lights.get("naked_ce_signal", "N/A"), "red" if risk_lights.get("naked_ce_signal", "").startswith("RED") else "neutral"),
+                ("Cash rule", risk_lights.get("cash_rule", "N/A"), "neutral"),
+            ]
+        )
+        risk_rows = "".join(
+            "<tr>"
+            f"<th>{html.escape(str(name))}</th>"
+            f"<td>{html.escape(fmt_number(value) if isinstance(value, (int, float)) else str(value))}</td>"
+            f'<td class="signal-{html.escape(color)}">{html.escape(color.upper())}</td>'
+            f"<td>{html.escape(str(note))}</td>"
+            "</tr>"
+            for name, value, color, note in risk_lights.get("rows", [])
+        )
+        seller_rows = "".join(
+            f"<tr><th>{label}</th><td>{html.escape(fmt_number(value, 6))}</td></tr>"
+            for label, value in [
+                ("Seller Delta", risk_lights.get("seller_delta")),
+                ("Seller Gamma", risk_lights.get("seller_gamma")),
+                ("Seller Theta / day", risk_lights.get("seller_theta")),
+                ("Seller Vega / 1% IV", risk_lights.get("seller_vega")),
+                ("Theta yield %", risk_lights.get("theta_yield_pct")),
+                ("Vega risk %", risk_lights.get("vega_risk_pct")),
+                ("Gamma 1% delta change", risk_lights.get("gamma_1pct")),
+            ]
+        )
+        strength_rows = "".join(
+            "<tr>"
+            f"<th>{html.escape(str(name))}</th>"
+            f'<td class="strength-{html.escape(color)}">{html.escape(str(value))}</td>'
+            f'<td class="strength-{html.escape(color)}">{html.escape(color.upper())}</td>'
+            f"<td>{html.escape(str(note))}</td>"
+            "</tr>"
+            for name, value, color, note in strength_lights["rows"]
+        )
+        rows = [
+            ("Underlying", data["underlying"]),
+            ("Spot", fmt_number(data["spot"])),
+            ("Option LTP", fmt_number(data["option_price"])),
+            ("Strike", fmt_number(data["strike"])),
+            ("OTM distance", f'{fmt_number(decision.get("otm_distance"))}%'),
+            ("Expiry", data["expiry"]),
+            ("DTE", data["dte"]),
+            ("OI", data["oi"]),
+            ("Implied Volatility", f'{fmt_number(data["iv_percent"])}%'),
+            ("Delta", fmt_number(data["delta"], 4)),
+            ("Gamma", fmt_number(data["gamma"], 6)),
+            ("Theta / day", fmt_number(data["theta"], 4)),
+            ("Vega / 1% IV", fmt_number(data["vega"], 4)),
+            ("BUY Probability of Profit", f'{fmt_number(data["buy_pop"])}%'),
+            ("SELL Probability of Profit", f'{fmt_number(data["sell_pop"])}%'),
+            ("Expected Move", fmt_number(data["expected_move"])),
+            ("Expected Upper Range", fmt_number(decision.get("upper_range"))),
+            ("Expected Lower Range", fmt_number(decision.get("lower_range"))),
+            ("Breakeven", fmt_number(decision.get("breakeven"))),
+            ("PCR", fmt_number(data["pcr"])),
+            ("Max Pain", fmt_number(data["max_pain"])),
+            ("Support from OI", fmt_number(data["support"])),
+            ("Resistance from OI", fmt_number(data["resistance"])),
+            ("Chain strikes used", data["chain_rows"]),
+            ("IV Rank", data["iv_rank"]),
+            ("IV Percentile", data["iv_percentile"]),
+        ]
+        cells = "".join(
+            f"<tr><th>{html.escape(str(label))}</th><td>{html.escape(str(value))}</td></tr>"
+            for label, value in rows
+        )
+        detail = (
+            f'<section class="panel"><div class="panel-title">{html.escape(decision_title)}</div>'
+            f'<div class="decision-grid">{decision_cards}</div></section>'
+            '<section class="panel"><div class="panel-title">Greek Risk Lights</div>'
+            f'<div class="decision-grid">{risk_cards}</div>'
+            '<div class="table-wrap"><table class="analytics-table">'
+            "<tr><th>Indicator</th><th>Value</th><th>Strength</th><th>Meaning</th></tr>"
+            f"{risk_rows}</table></div></section>"
+            '<section class="panel"><div class="panel-title">Strategy Strength Indicators</div>'
+            '<div class="decision-grid">'
+            f'<div class="decision-card strength-{html.escape(strength_lights["color"])}">'
+            '<div class="decision-label">Final Strategy Strength</div>'
+            f'<div class="decision-value">{html.escape(strength_lights["final"])}</div></div></div>'
+            '<div class="table-wrap"><table class="analytics-table">'
+            "<tr><th>Indicator</th><th>Value</th><th>Strength</th><th>Rule</th></tr>"
+            f"{strength_rows}</table></div></section>"
+            '<section class="panel"><div class="panel-title">Seller View Greeks</div>'
+            '<div class="table-wrap"><table class="analytics-table">'
+            f"{seller_rows}</table></div></section>"
+            '<section class="panel"><div class="panel-title">Analytics Details</div>'
+            '<div class="table-wrap"><table class="analytics-table">'
+            f"{cells}</table></div></section>"
+            '<section class="panel"><div class="panel-title">Decision Signal Matrix</div>'
+            '<div class="table-wrap"><table class="analytics-table">'
+            f"<tr>{matrix_headers}</tr>"
+            f"{signal_rows}</table></div></section>"
+        )
+
+    return f"""
+    <form id="analytics-panel" method="post" action="/analytics/load"{'' if state.active_tab == 'analytics' else ' style="display:none"'}>
+      <section class="panel">
+        <div class="panel-title">Option Analytics</div>
+        <div class="analytics-links">{links or '<span class="status">No CSV symbols found.</span>'}</div>
+        <div class="analytics-form">
+          {render_input("analytics_symbol", "Trading symbol", selected)}
+          {env_hidden_fields_for_render()}
+          <button type="submit" formaction="/analytics/load">Load Analytics</button>
+        </div>
+      </section>
+      {active_section}
+      {detail}
+      {render_console(state.console_log)}
+    </form>"""
+
+
+def strength_class(color: Any) -> str:
+    text = str(color or "neutral").lower()
+    if text == "green":
+        return "signal-green"
+    if text == "yellow":
+        return "signal-yellow"
+    if text == "red":
+        return "signal-red"
+    if text in {"lightgreen", "lightcoral", "orange"}:
+        return f"strength-{text}"
+    return "signal-neutral"
+
+
+def research_indicator_cell(row: dict[str, Any], group: str, name: str) -> str:
+    source = row.get(group) or {}
+    item = source.get(name)
+    if not item:
+        return '<td class="signal-neutral">N/A</td>'
+    _, value, color, note = item
+    if isinstance(value, (int, float)):
+        value_text = fmt_number(value)
+    else:
+        value_text = str(value)
+    return (
+        f'<td class="{strength_class(color)}" title="{html.escape(str(note), quote=True)}">'
+        f"{html.escape(value_text)}<br><small>{html.escape(str(color).upper())}</small></td>"
+    )
+
+
+def render_research_panel(state: PageState) -> str:
+    rows = state.research_rows or []
+    table_rows = "".join(
+        "<tr>"
+        f"<td>{render_symbol_value('tradingsymbol', row.get('symbol', ''))}</td>"
+        f"<td>{html.escape(str(row.get('option_type', '')))}</td>"
+        f'<td class="{strength_class(row.get("sell_color"))}">{html.escape(str(row.get("sell_signal", "")))}</td>'
+        f'<td class="{strength_class(row.get("buy_color"))}">{html.escape(str(row.get("buy_signal", "")))}</td>'
+        f'<td class="{strength_class(row.get("strategy_color"))}">{html.escape(str(row.get("strategy_strength", "")))}</td>'
+        f"<td>{html.escape(fmt_number(row.get('delta')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('sell_pop')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('gamma_1pct')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('theta_yield_pct')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('vega_risk_pct')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('otm_distance')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('iv_percent')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('pcr')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('support')))} / {html.escape(fmt_number(row.get('resistance')))}</td>"
+        f"{research_indicator_cell(row, 'risk_rows', 'Delta / POP')}"
+        f"{research_indicator_cell(row, 'risk_rows', 'SELL POP')}"
+        f"{research_indicator_cell(row, 'risk_rows', 'Gamma 1% move risk')}"
+        f"{research_indicator_cell(row, 'risk_rows', 'Theta / premium / day')}"
+        f"{research_indicator_cell(row, 'risk_rows', 'Vega / premium')}"
+        f"{research_indicator_cell(row, 'risk_rows', 'Coverage / cash backing')}"
+        f"{research_indicator_cell(row, 'strength_rows', 'OTM distance')}"
+        f"{research_indicator_cell(row, 'strength_rows', 'Implied Volatility')}"
+        f"{research_indicator_cell(row, 'strength_rows', 'SELL Probability of Profit')}"
+        f"{research_indicator_cell(row, 'strength_rows', 'PCR')}"
+        f"{research_indicator_cell(row, 'strength_rows', 'Strike vs OI')}"
+        f"<td>{html.escape(str(row.get('error', '')))}</td>"
+        "</tr>"
+        for row in rows
+    )
+    table = (
+        '<section class="panel"><div class="panel-title">CSV Symbol Research Comparison</div>'
+        '<div class="table-wrap"><table class="research-table"><thead><tr>'
+        '<th>Symbol</th><th>Type</th><th>SELL Decision</th><th>BUY Decision</th>'
+        '<th>Strategy Strength</th><th>Delta</th><th>SELL POP</th><th>Gamma 1%</th>'
+        '<th>Theta/Premium</th><th>Vega/Premium</th><th>OTM</th><th>IV</th><th>PCR</th>'
+        '<th>Support / Resistance</th>'
+        '<th>Risk: Delta / POP</th><th>Risk: SELL POP</th><th>Risk: Gamma</th>'
+        '<th>Risk: Theta</th><th>Risk: Vega</th><th>Risk: Coverage/Cash</th>'
+        '<th>Strength: OTM</th><th>Strength: IV</th><th>Strength: SELL POP</th>'
+        '<th>Strength: PCR</th><th>Strength: Strike vs OI</th><th>Error</th></tr></thead>'
+        f"<tbody>{table_rows}</tbody></table></div></section>"
+        if rows
+        else ""
+    )
+    return f"""
+    <form id="research-panel" method="post" action="/research/load"{'' if state.active_tab == 'research' else ' style="display:none"'}>
+      {env_hidden_fields_for_render()}
+      <section class="panel">
+        <div class="panel-title">Research</div>
+        <p class="status">Compare every trading symbol from kite_orders.csv for SELL CALL / SELL PUT decisions using live Kite analytics.</p>
+        <div class="actions">
+          <button type="submit" formaction="/research/load">Run Research on CSV Symbols</button>
+        </div>
+      </section>
+      {table}
+      {render_console(state.console_log)}
+    </form>"""
+
+
+def render_positions_panel(state: PageState) -> str:
+    rows = state.positions_rows or []
+    summary = state.positions_summary or {}
+    summary_cards = "".join(
+        f'<div class="decision-card"><div class="decision-label">{html.escape(label)}</div>'
+        f'<div class="decision-value">{html.escape(value)}</div></div>'
+        for label, value in [
+            ("Active option trades", str(summary.get("count", 0))),
+            ("Current P&L", fmt_number(summary.get("total_pnl"))),
+            ("Margin required", fmt_number(summary.get("total_deployed"))),
+            ("Return on margin", f"{fmt_number(summary.get('return_pct'))}%"),
+        ]
+    )
+    table_rows = "".join(
+        "<tr>"
+        f"<td>{render_symbol_value('tradingsymbol', row.get('symbol', ''))}</td>"
+        f"<td>{html.escape(str(row.get('quantity', '')))}</td>"
+        f"<td>{html.escape(str(row.get('product', '')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('average_price')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('ltp')))}</td>"
+        f"<td>{html.escape(display_cell('pnl', row.get('pnl', '')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('deployed')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('return_pct')))}%</td>"
+        f'<td class="{strength_class(row.get("buy_color"))}">{html.escape(str(row.get("buy_signal", "")))}</td>'
+        f"<td>{html.escape(fmt_number(row.get('sell_pop')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('otm_distance')))}%</td>"
+        f'<td class="{strength_class(row.get("sell_color"))}">{html.escape(str(row.get("sell_signal", "")))}</td>'
+        f'<td class="{strength_class(row.get("strategy_color"))}">{html.escape(str(row.get("strategy_strength", "")))}</td>'
+        f"<td>{html.escape(fmt_number(row.get('delta')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('iv_percent')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('pcr')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('support')))} / {html.escape(fmt_number(row.get('resistance')))}</td>"
+        f"<td>{html.escape(str(row.get('error', '')))}</td>"
+        "</tr>"
+        for row in rows
+    )
+    table = (
+        '<section class="panel"><div class="panel-title">Active Position Analytics</div>'
+        '<div class="table-wrap"><table class="research-table"><thead><tr>'
+        '<th>Symbol</th><th>Qty</th><th>Product</th><th>Avg</th><th>LTP</th><th>P&L</th>'
+        '<th>Margin required</th><th>Return %</th><th>BUY Decision</th><th>SELL POP</th><th>OTM</th>'
+        '<th>SELL Decision</th><th>Strategy Strength</th><th>Delta</th><th>IV</th>'
+        '<th>PCR</th><th>Support / Resistance</th><th>Error</th></tr></thead>'
+        f"<tbody>{table_rows}</tbody></table></div></section>"
+        if rows
+        else ""
+    )
+    return f"""
+    <form id="positions-research-panel" method="post" action="/positions-research/load"{'' if state.active_tab == 'positions-research' else ' style="display:none"'}>
+      {env_hidden_fields_for_render()}
+      <section class="panel">
+        <div class="panel-title">Positions</div>
+        <p class="status">Evaluate active Kite option trades with the same analytics and summarize current P&L / Kite margin required.</p>
+        <div class="actions">
+          <button type="submit" formaction="/positions-research/load">Load Active Positions</button>
+        </div>
+      </section>
+      <section class="panel"><div class="panel-title">Positions Summary</div><div class="decision-grid">{summary_cards}</div></section>
+      {table}
+      {render_console(state.console_log)}
+    </form>"""
+
+
+def env_hidden_fields_for_render() -> str:
+    return (
+        f'<input type="hidden" name="api_key" value="{html.escape(env_value("KITE_API_KEY"), quote=True)}">'
+        f'<input type="hidden" name="api_secret" value="{html.escape(env_value("KITE_API_SECRET"), quote=True)}">'
+        f'<input type="hidden" name="access_token" value="{html.escape(env_value("KITE_ACCESS_TOKEN"), quote=True)}">'
+        f'<input type="hidden" name="confirm_live_order" value="{html.escape(env_value("KITE_CONFIRM_LIVE_ORDER"), quote=True)}">'
     )
 
 
@@ -992,7 +2261,7 @@ def render_market_topper(state: PageState) -> str:
         <div class="mmi-card">
           <div class="rule-kicker">Market Mood Index</div>
           <div class="mmi-value" id="mmi-value">Loading...</div>
-          <div class="mmi-zone" id="mmi-zone">Tickertape MMI</div>
+          <div class="mmi-line"><span id="mmi-zone">Tickertape MMI</span><span id="mmi-action">| Signal: <strong>Checking...</strong></span></div>
           <a href="{MMI_URL}" target="_blank" rel="noopener">Open MMI</a>
         </div>
       </div>
@@ -1002,6 +2271,7 @@ def render_market_topper(state: PageState) -> str:
       </div>
       <div class="ticker-panel">
         <div class="ticker-title live-title">Kite LTP and Day Change | {quote_date}</div>
+        <div class="quote-error" id="quote-error"></div>
         <div class="quote-grid" id="quote-grid">{quote_cards}</div>
       </div>
     </section>"""
@@ -1040,6 +2310,9 @@ def render_page(state: PageState) -> bytes:
     positions_tab_class = "active" if state.active_tab == "positions" else ""
     gpt_tab_class = "active" if state.active_tab == "gpt" else ""
     kite_setup_tab_class = "active" if state.active_tab == "kite-setup" else ""
+    analytics_tab_class = "active" if state.active_tab == "analytics" else ""
+    research_tab_class = "active" if state.active_tab == "research" else ""
+    positions_research_tab_class = "active" if state.active_tab == "positions-research" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     positions_panel_style = "" if state.active_tab == "positions" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
@@ -1051,15 +2324,19 @@ def render_page(state: PageState) -> bytes:
           {render_input("api_secret", "KITE_API_SECRET", state.api_secret or env_value("KITE_API_SECRET"), "password")}
           {render_input("access_token", "KITE_ACCESS_TOKEN", state.access_token or env_value("KITE_ACCESS_TOKEN"), "password")}
           {render_input("confirm_live_order", "KITE_CONFIRM_LIVE_ORDER", state.confirm_live_order or env_value("KITE_CONFIRM_LIVE_ORDER"))}
-          {render_checkbox("show_credentials", "Show credential values", False, "Reveals KITE_API_SECRET and KITE_ACCESS_TOKEN in this local browser page.")}
+          {render_checkbox("show_credentials", "Show credential values", True, "Reveals KITE_API_SECRET and KITE_ACCESS_TOKEN in this local browser page.")}
           <div class="status">{status}</div>
+          <div class="panel-title token-title">Generate Kite Access Token</div>
+          <div class="actions">
+            <a class="button-link" href="{html.escape(kite_login_url(), quote=True)}" target="_blank" rel="noopener">Open Kite Login</a>
+          </div>
+          <div class="status">After login, Kite redirects to <code>http://127.0.0.1:8000</code>. This app listens there and updates KITE_ACCESS_TOKEN automatically.</div>
+          {render_input("kite_request_token", "Manual request_token fallback", state.kite_request_token)}
+          <div class="actions">
+            <button type="submit" formaction="/kite-token/generate">Generate Access Token</button>
+          </div>
         </section>"""
-    env_hidden = (
-        f'<input type="hidden" name="api_key" value="{html.escape(env_value("KITE_API_KEY"), quote=True)}">'
-        f'<input type="hidden" name="api_secret" value="{html.escape(env_value("KITE_API_SECRET"), quote=True)}">'
-        f'<input type="hidden" name="access_token" value="{html.escape(env_value("KITE_ACCESS_TOKEN"), quote=True)}">'
-        f'<input type="hidden" name="confirm_live_order" value="{html.escape(env_value("KITE_CONFIRM_LIVE_ORDER"), quote=True)}">'
-    )
+    env_hidden = env_hidden_fields_for_render()
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1167,12 +2444,26 @@ def render_page(state: PageState) -> bytes:
       line-height: 1;
       margin-bottom: 1px;
     }}
-    .mmi-zone {{
+    .mmi-line {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 1px 0 2px;
+    }}
+    .mmi-line span:first-child {{
       color: currentColor;
       opacity: 0.82;
       font-weight: 700;
-      margin-bottom: 0;
       font-size: 12px;
+    }}
+    .mmi-action {{
+      color: #4c1d95;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .mmi-action strong {{
+      font-weight: 950;
     }}
     .mmi-card a {{
       color: #5b21b6;
@@ -1221,6 +2512,16 @@ def render_page(state: PageState) -> bytes:
       grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
       gap: 6px;
       padding: 6px 10px 10px;
+    }}
+    .quote-error {{
+      display: none;
+      margin: 6px 10px 0;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: #fee2e2;
+      color: #991b1b;
+      font-size: 12px;
+      font-weight: 800;
     }}
     .quote-card {{
       border: 1px solid var(--line);
@@ -1412,6 +2713,19 @@ def render_page(state: PageState) -> bytes:
     }}
     button.secondary {{ background: #4b5563; }}
     button.danger {{ background: linear-gradient(135deg, #b42318 0%, #7f1d1d 100%); }}
+    .button-link {{
+      display: inline-block;
+      border-radius: 6px;
+      padding: 10px 14px;
+      background: linear-gradient(135deg, #1769aa 0%, #0f766e 100%);
+      color: #ffffff;
+      cursor: pointer;
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    .token-title {{
+      margin-top: 18px;
+    }}
     .alert {{
       border-radius: 8px;
       padding: 12px 14px;
@@ -1453,6 +2767,125 @@ def render_page(state: PageState) -> bytes:
       font-size: 13px;
       font-weight: 700;
     }}
+    .symbol-link, .analytics-chip {{
+      color: var(--accent);
+      font-weight: 800;
+      text-decoration: none;
+    }}
+    .analytics-links {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }}
+    .analytics-chip {{
+      border: 1px solid #cfe4f3;
+      border-radius: 999px;
+      background: #eef6fb;
+      padding: 6px 10px;
+      font-size: 12px;
+    }}
+    .analytics-form {{
+      display: grid;
+      grid-template-columns: minmax(240px, 1fr) auto;
+      gap: 10px;
+      align-items: end;
+    }}
+    .analytics-table th {{
+      width: 260px;
+    }}
+    .research-table {{
+      min-width: 2600px;
+    }}
+    .research-table small {{
+      font-size: 10px;
+      opacity: 0.9;
+    }}
+    .active-trades-panel {{
+      background: #f0fdf4;
+      border-color: #86efac;
+    }}
+    .active-trades-panel .panel-title {{
+      color: #047857;
+    }}
+    .decision-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+    }}
+    .decision-card {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #f8fafc;
+    }}
+    .decision-label {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 6px;
+    }}
+    .decision-value {{
+      color: var(--ink);
+      font-size: 17px;
+      font-weight: 900;
+      overflow-wrap: anywhere;
+    }}
+    .signal-good {{
+      color: #047857;
+      font-weight: 900;
+      background: #ecfdf5;
+    }}
+    .signal-green {{
+      color: #047857;
+      font-weight: 900;
+      background: #ecfdf5;
+      border-radius: 4px;
+      padding: 2px 4px;
+    }}
+    .signal-yellow {{
+      color: #a16207;
+      font-weight: 900;
+      background: #fef9c3;
+      border-radius: 4px;
+      padding: 2px 4px;
+    }}
+    .signal-red {{
+      color: #b42318;
+      font-weight: 900;
+      background: #fee2e2;
+      border-radius: 4px;
+      padding: 2px 4px;
+    }}
+    .signal-neutral {{
+      color: var(--muted);
+      font-weight: 800;
+    }}
+    .strength-lightgreen {{
+      background: #dcfce7;
+      color: #047857;
+      font-weight: 900;
+    }}
+    .strength-yellow {{
+      background: #fef9c3;
+      color: #a16207;
+      font-weight: 900;
+    }}
+    .strength-orange {{
+      background: #ffedd5;
+      color: #c2410c;
+      font-weight: 900;
+    }}
+    .strength-lightcoral {{
+      background: #fee2e2;
+      color: #b42318;
+      font-weight: 900;
+    }}
+    .strength-neutral {{
+      background: #f8fafc;
+      color: var(--muted);
+      font-weight: 800;
+    }}
     .table-wrap {{ overflow-x: auto; }}
     table {{
       width: 100%;
@@ -1471,6 +2904,7 @@ def render_page(state: PageState) -> bytes:
       .expiry-strip {{ grid-template-columns: 1fr; }}
       .expiry-warning {{ max-width: none; }}
       .grid {{ grid-template-columns: 1fr; }}
+      .analytics-form {{ grid-template-columns: 1fr; }}
       header {{ padding: 10px 12px; grid-template-columns: 1fr; align-items: flex-start; }}
       .blessing {{ text-align: left; white-space: normal; }}
       .naval-quote {{ text-align: left; max-width: none; }}
@@ -1491,8 +2925,11 @@ def render_page(state: PageState) -> bytes:
     {render_market_topper(state)}
     {alert}
     <div class="tabs">
-      <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Place Order</button>
-      <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">Current Position BUY Options</button>
+      <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
+      <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">CLOSE Positions</button>
+      <button class="tab-button utility-action {positions_research_tab_class}" type="button" data-tab="positions-research">Positions</button>
+      <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
+      <button class="tab-button utility-action {research_tab_class}" type="button" data-tab="research">Research</button>
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT CSV Generator</button>
       <button class="tab-button utility-action {kite_setup_tab_class}" type="button" data-tab="kite-setup">Kite Setup</button>
     </div>
@@ -1595,6 +3032,9 @@ def render_page(state: PageState) -> bytes:
       {orders_table}
       {render_console(state.console_log)}
     </form>
+    {render_analytics_panel(state)}
+    {render_research_panel(state)}
+    {render_positions_panel(state)}
   </main>
   <script>
     const fileInput = document.getElementById('csv-file');
@@ -1616,6 +3056,11 @@ def render_page(state: PageState) -> bytes:
         }}
       }});
     }}
+    if (showCredentials.some((toggle) => toggle.checked)) {{
+      for (const field of secretFields) {{
+        field.type = 'text';
+      }}
+    }}
     for (const button of document.querySelectorAll('.tab-button')) {{
       button.addEventListener('click', () => {{
         const active = button.dataset.tab;
@@ -1623,6 +3068,9 @@ def render_page(state: PageState) -> bytes:
         document.getElementById('positions-panel').style.display = active === 'positions' ? '' : 'none';
         document.getElementById('gpt-panel').style.display = active === 'gpt' ? '' : 'none';
         document.getElementById('kite-setup-panel').style.display = active === 'kite-setup' ? '' : 'none';
+        document.getElementById('analytics-panel').style.display = active === 'analytics' ? '' : 'none';
+        document.getElementById('research-panel').style.display = active === 'research' ? '' : 'none';
+        document.getElementById('positions-research-panel').style.display = active === 'positions-research' ? '' : 'none';
         for (const item of document.querySelectorAll('.tab-button')) {{
           item.classList.toggle('active', item.dataset.tab === active);
         }}
@@ -1631,30 +3079,46 @@ def render_page(state: PageState) -> bytes:
     async function refreshMmi() {{
       const value = document.getElementById('mmi-value');
       const zone = document.getElementById('mmi-zone');
-      if (!value || !zone) return;
+      const action = document.getElementById('mmi-action');
+      if (!value || !zone || !action) return;
       try {{
         const response = await fetch('/market-mmi', {{ cache: 'no-store' }});
         const data = await response.json();
         if (data.ok) {{
           value.textContent = data.value;
           zone.textContent = data.zone;
+          const mmi = Number(data.value);
+          if (mmi > 60) {{
+            action.innerHTML = '| Signal: <strong>SELL CALL</strong>';
+          }} else if (mmi < 40) {{
+            action.innerHTML = '| Signal: <strong>SELL PUT</strong>';
+          }} else {{
+            action.innerHTML = '| Signal: <strong>WAIT / NEUTRAL</strong>';
+          }}
         }} else {{
           value.textContent = 'Open';
           zone.textContent = 'Tickertape live MMI';
+          action.innerHTML = '| Signal: <strong>unavailable</strong>';
         }}
       }} catch (error) {{
         value.textContent = 'Open';
         zone.textContent = 'Tickertape live MMI';
+        action.innerHTML = '| Signal: <strong>unavailable</strong>';
       }}
     }}
     refreshMmi();
     async function refreshQuotes() {{
       const cards = Array.from(document.querySelectorAll('.quote-card[data-symbol]'));
       if (!cards.length) return;
+      const quoteError = document.getElementById('quote-error');
       try {{
         const response = await fetch('/market-quotes', {{ cache: 'no-store' }});
         const data = await response.json();
         if (!data.ok) throw new Error(data.error || 'Could not load quotes');
+        if (quoteError) {{
+          quoteError.style.display = 'none';
+          quoteError.textContent = '';
+        }}
         const bySymbol = new Map((data.quotes || []).map((quote) => [quote.symbol, quote]));
         for (const card of cards) {{
           const symbol = card.dataset.symbol;
@@ -1681,9 +3145,15 @@ def render_page(state: PageState) -> bytes:
           }}
         }}
       }} catch (error) {{
+        if (quoteError) {{
+          quoteError.style.display = 'block';
+          quoteError.textContent = `Kite quote error: ${{error.message}}`;
+        }}
         for (const card of cards) {{
           card.querySelector('.quote-ltp').textContent = 'N/A';
-          card.querySelector('.quote-change').textContent = 'Kite quote error';
+          card.querySelector('.quote-change').textContent = error.message.includes('api_key') || error.message.includes('access_token')
+            ? 'Auth error'
+            : 'Kite quote error';
         }}
       }}
     }}
@@ -1699,6 +3169,21 @@ class KiteWebHandler(BaseHTTPRequestHandler):
     server_version = "KiteCSVTrader/1.0"
 
     def do_GET(self) -> None:
+        parsed_url = urlparse(self.path)
+        if parsed_url.path == "/analytics":
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            symbol = first(query, "symbol")
+            state = PageState(active_tab="analytics", analytics_symbol=symbol)
+            if symbol:
+                try:
+                    state.analytics_data, state.console_log = call_with_console(
+                        option_analytics_for_symbol,
+                        symbol,
+                    )
+                except Exception as exc:
+                    state.error = f"{exc}\n\n{traceback.format_exc()}"
+            self.send_page(state)
+            return
         if self.path == "/market-mmi":
             try:
                 self.send_json(fetch_mmi_snapshot())
@@ -1739,6 +3224,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if self.path.startswith("/gpt")
                 else "kite-setup"
                 if self.path.startswith("/kite-setup")
+                else "analytics"
+                if self.path.startswith("/analytics")
+                else "research"
+                if self.path.startswith("/research")
+                else "positions-research"
+                if self.path.startswith("/positions-research")
                 else "place"
             ),
             csv_path=first(form, "csv_path", str(DEFAULT_CSV_PATH)),
@@ -1770,6 +3261,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             openai_api_key=first(form, "openai_api_key"),
             openai_model=first(form, "openai_model", DEFAULT_OPENAI_MODEL),
             openai_prompt=first(form, "openai_prompt", DEFAULT_OPENAI_PROMPT),
+            analytics_symbol=first(form, "analytics_symbol"),
+            kite_request_token=first(form, "kite_request_token"),
         )
 
         try:
@@ -1885,6 +3378,30 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.message = persist_message
             elif self.path == "/kite-setup":
                 state.message = "Kite setup saved for this running web app session."
+            elif self.path == "/kite-token/generate":
+                access_token, state.console_log = call_with_console(
+                    generate_kite_access_token,
+                    state.kite_request_token,
+                )
+                state.access_token = access_token
+                state.message = "Generated and saved KITE_ACCESS_TOKEN for this running web app session."
+            elif self.path == "/analytics/load":
+                state.analytics_data, state.console_log = call_with_console(
+                    option_analytics_for_symbol,
+                    state.analytics_symbol,
+                )
+                state.message = f"Loaded analytics for {state.analytics_symbol.upper()}."
+            elif self.path == "/research/load":
+                state.research_rows, state.console_log = call_with_console(research_csv_symbols)
+                state.message = f"Research completed for {len(state.research_rows)} CSV symbol(s)."
+            elif self.path == "/positions-research/load":
+                (
+                    state.positions_rows,
+                    state.positions_summary,
+                ), state.console_log = call_with_console(positions_research)
+                state.message = (
+                    f"Loaded analytics for {len(state.positions_rows)} active option position(s)."
+                )
             else:
                 state.error = f"Unknown path: {self.path}"
         except Exception as exc:

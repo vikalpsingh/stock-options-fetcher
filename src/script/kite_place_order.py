@@ -122,6 +122,30 @@ def mask_secret(value: str | None) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
+def load_env_files() -> None:
+    """Load KEY=VALUE pairs from local .env files."""
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parents[1]
+    candidates = [repo_root / ".env", script_dir / ".env", Path.cwd() / ".env"]
+    seen: set[Path] = set()
+
+    for path in candidates:
+        path = path.resolve()
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        with path.open(encoding="utf-8") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    os.environ[key] = value
+
+
 def kite_client() -> Any:
     KiteConnect = load_kite_connect_class()
     api_key = os.getenv("KITE_API_KEY")
@@ -149,7 +173,13 @@ def generate_access_token() -> int:
     print("Open this URL in your browser and login:")
     print(kite.login_url())
     print("\nAfter login, copy request_token from the redirected URL.")
-    request_token = input("Paste request_token: ").strip()
+    try:
+        request_token = input("Paste request_token: ").strip()
+    except EOFError as exc:
+        raise SystemExit(
+            "Could not read request_token. Run this command in an interactive terminal, "
+            "open the login URL, then paste the request_token from the redirected URL."
+        ) from exc
 
     if not request_token:
         raise SystemExit("request_token cannot be empty.")
@@ -499,6 +529,7 @@ def print_order_history(kite: Any, order_id: str) -> None:
 
 
 def main() -> int:
+    load_env_files()
     args = parse_args()
     if args.login:
         return generate_access_token()

@@ -105,6 +105,30 @@ def mask_secret(value: str | None) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
+def load_env_files() -> None:
+    """Load KEY=VALUE pairs from local .env files."""
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parents[1]
+    candidates = [repo_root / ".env", script_dir / ".env", Path.cwd() / ".env"]
+    seen: set[Path] = set()
+
+    for path in candidates:
+        path = path.resolve()
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        with path.open(encoding="utf-8") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    os.environ[key] = value
+
+
 def kite_client() -> Any:
     KiteConnect = load_kite_connect_class()
     api_key = os.getenv("KITE_API_KEY")
@@ -386,6 +410,7 @@ def write_orders_csv(orders: list[dict[str, Any]], output_csv: str) -> None:
 
 
 def main() -> int:
+    load_env_files()
     args = parse_args()
     if args.live and os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
         raise SystemExit("Refusing live order. Set KITE_CONFIRM_LIVE_ORDER=YES first.")

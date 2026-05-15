@@ -136,3 +136,129 @@ Show compact top cards:
 - Never place live orders unless user explicitly disables dry run.
 - Show clear execution results and Kite console messages.
 - Preserve previous CSV input files before overwriting.
+
+Implemented the new Analytics tab in app.py.
+
+What it adds:
+
+
+New Analytics tab.
+
+Each tradingsymbol in order tables is now a clickable analytics link, e.g. PFC26MAY500CE.
+
+Analytics uses live Kite data for:
+
+Spot
+
+Option LTP
+
+OI
+
+Implied volatility
+
+Delta
+
+Gamma
+
+Theta
+
+Vega
+
+BUY/SELL probability approximation
+
+Expected move
+
+PCR
+
+Max pain
+
+Support from highest PE OI
+
+Resistance from highest CE OI
+
+
+
+
+IV Rank / IV Percentile show: Requires historical IV database.
+
+
+Verified with Kite for PFC26MAY500CE:
+
+
+
+
+
+
+
+
+
+
+Implemented the Greek risk-light requirements in Analytics.
+
+Now the Analytics tab shows:
+
+Greek Risk Lights
+Final SELL signal
+BUY signal
+Naked CE rule
+Cash rule
+Risk strength table
+Delta / POP
+SELL POP
+Gamma 1% move risk
+Theta / premium / day
+Vega / premium
+Coverage / cash backing
+Seller View Greeks
+Seller Delta
+Seller Gamma
+Seller Theta/day
+Seller Vega/1% IV
+Theta yield %
+Vega risk %
+Gamma 1% delta change
+For your PFC example, the formula produces:
+
+Final SELL signal: GREEN_SELL_CALL_COVERED
+BUY signal: RED_BUY_CALL_LOW_POP
+Naked CE rule: RED_NAKED_CE_NOT_ALLOWED
+
+Delta / POP: GREEN
+SELL POP: GREEN
+Gamma 1% move risk: GREEN
+Theta / premium / day: GREEN
+Vega / premium: YELLOW
+Coverage: GREEN
+
+
+
+
+
+Implemented the new Strategy Strength Indicators in Analytics.
+
+It now highlights these with light colors based on selected CE/PE strategy:
+
+OTM distance
+Implied Volatility
+SELL Probability of Profit
+PCR
+Strike vs OI
+Color rules added:
+
+lightgreen = good
+yellow = acceptable / reduce size
+orange = risky
+lightcoral = avoid
+For the PFC CE example, the app now classifies:
+
+OTM distance: 10.75%       lightgreen
+IV: 40.58%                 yellow
+SELL POP: 90.70%           lightgreen
+PCR: 0.49                  lightgreen
+Strike vs OI: 500 CE at resistance  lightgreen
+
+Final Strategy Strength: GREEN_SELL_CALL
+Also corrected PCR logic:
+
+SELL CALL prefers PCR < 0.60
+SELL PUT prefers PCR > 0.80
