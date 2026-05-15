@@ -22,7 +22,6 @@ import math
 import os
 import re
 import sys
-import threading
 import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -87,6 +86,11 @@ DEFAULT_GPT_SHARE_URL = "https://chatgpt.com/share/6a058d56-7558-83a4-ac3d-d4ea9
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 KITE_CALLBACK_HOST = "127.0.0.1"
 KITE_CALLBACK_PORT = 8000
+PUBLIC_IP_ENDPOINTS = [
+    ("Current public IP", "https://api64.ipify.org?format=json"),
+    ("IPv4 public IP", "https://api.ipify.org?format=json"),
+    ("IPv6 public IP", "https://api6.ipify.org?format=json"),
+]
 DEFAULT_OPENAI_PROMPT = (
     "Generate a Kite order CSV for a conservative income options basket. "
     "Return only CSV with header: exchange,tradingsymbol,quantity,"
@@ -179,9 +183,10 @@ class PageState:
     analytics_symbol: str = ""
     analytics_data: dict[str, Any] | None = None
     research_rows: list[dict[str, Any]] | None = None
-            positions_rows: list[dict[str, Any]] | None = None
-            positions_summary: dict[str, Any] | None = None
+    positions_rows: list[dict[str, Any]] | None = None
+    positions_summary: dict[str, Any] | None = None
     kite_request_token: str = ""
+    kite_ip_data: list[dict[str, str]] | None = None
 
 
 def mask_secret(value: str | None) -> str:
@@ -234,6 +239,29 @@ def generate_kite_access_token(request_token: str) -> str:
     os.environ["KITE_ACCESS_TOKEN"] = access_token
     DEFAULT_KITE_ENV["KITE_ACCESS_TOKEN"] = access_token
     return access_token
+
+
+def fetch_public_ip_data() -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    for label, url in PUBLIC_IP_ENDPOINTS:
+        try:
+            request = Request(
+                url,
+                headers={
+                    "User-Agent": "KiteTraderLocalApp/1.0",
+                },
+            )
+            with urlopen(request, timeout=8) as response:
+                text = response.read().decode("utf-8", errors="ignore").strip()
+            try:
+                payload = json.loads(text)
+                ip_value = str(payload.get("ip") or text)
+            except json.JSONDecodeError:
+                ip_value = text
+            results.append({"label": label, "ip": ip_value, "error": ""})
+        except Exception as exc:
+            results.append({"label": label, "ip": "", "error": str(exc)})
+    return results
 
 
 def first(form: dict[str, list[str]], name: str, default: str = "") -> str:
@@ -2201,6 +2229,24 @@ def render_console(console_log: str) -> str:
     )
 
 
+def render_kite_ip_data(ip_data: list[dict[str, str]] | None) -> str:
+    if not ip_data:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f"<th>{html.escape(item.get('label', ''))}</th>"
+        f"<td><code>{html.escape(item.get('ip') or 'N/A')}</code></td>"
+        f"<td>{html.escape(item.get('error') or '')}</td>"
+        "</tr>"
+        for item in ip_data
+    )
+    return (
+        '<div class="table-wrap"><table class="ip-table">'
+        "<thead><tr><th>Type</th><th>IP to allow in Kite</th><th>Error</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>"
+    )
+
+
 def render_market_topper(state: PageState) -> str:
     csv_text = state.csv_text or read_default_csv_text()
     order_symbols = csv_trading_symbols(csv_text)
@@ -2297,7 +2343,7 @@ def render_page(state: PageState) -> bytes:
         state.position_orders, state.position_selected_indexes
     )
     execute_button = (
-        '<button type="submit" formaction="/execute" class="danger">Execute Selected</button>'
+        '<button type="submit" formaction="/execute" class="danger" id="execute-selected-button">Execute Selected</button>'
         if state.rows
         else ""
     )
@@ -2330,11 +2376,18 @@ def render_page(state: PageState) -> bytes:
           <div class="actions">
             <a class="button-link" href="{html.escape(kite_login_url(), quote=True)}" target="_blank" rel="noopener">Open Kite Login</a>
           </div>
-          <div class="status">After login, Kite redirects to <code>http://127.0.0.1:8000</code>. This app listens there and updates KITE_ACCESS_TOKEN automatically.</div>
+          <div class="status">After login, copy <code>request_token</code> from the redirected URL and paste it below.</div>
           {render_input("kite_request_token", "Manual request_token fallback", state.kite_request_token)}
           <div class="actions">
             <button type="submit" formaction="/kite-token/generate">Generate Access Token</button>
           </div>
+          <div class="panel-title token-title">Allowed IP for Kite Orders</div>
+          <div class="status">If Kite says your IP is not allowed, add the matching public IP below in the Kite developer console allowed IP list.</div>
+          <div class="actions">
+            <button type="submit" formaction="/kite-ip/check">Check Current Public IP</button>
+            <a class="inline-link" href="https://developers.kite.trade" target="_blank" rel="noopener">Open Kite Developer Console</a>
+          </div>
+          {render_kite_ip_data(state.kite_ip_data)}
         </section>"""
     env_hidden = env_hidden_fields_for_render()
     html_doc = f"""<!doctype html>
@@ -2479,9 +2532,9 @@ def render_page(state: PageState) -> bytes:
       box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
     }}
     .ticker-title {{
-      padding: 10px 14px 0;
+      padding: 8px 10px 0;
       color: #0f766e;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 800;
       text-transform: uppercase;
     }}
@@ -2509,9 +2562,9 @@ def render_page(state: PageState) -> bytes:
     }}
     .quote-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
-      gap: 6px;
-      padding: 6px 10px 10px;
+      grid-template-columns: repeat(auto-fit, minmax(76px, 1fr));
+      gap: 5px;
+      padding: 5px 8px 8px;
     }}
     .quote-error {{
       display: none;
@@ -2525,10 +2578,10 @@ def render_page(state: PageState) -> bytes:
     }}
     .quote-card {{
       border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 6px 8px;
+      border-radius: 6px;
+      padding: 5px 6px;
       background: #f8fafc;
-      min-height: 48px;
+      min-height: 42px;
     }}
     .quote-card.strong-up {{
       background: #dcfce7;
@@ -2540,17 +2593,17 @@ def render_page(state: PageState) -> bytes:
     }}
     .quote-symbol {{
       color: var(--muted);
-      font-size: 10px;
+      font-size: 9px;
       font-weight: 800;
-      margin-bottom: 3px;
-    }}
-    .quote-ltp {{
-      font-size: 15px;
-      font-weight: 900;
       margin-bottom: 2px;
     }}
+    .quote-ltp {{
+      font-size: 13px;
+      font-weight: 900;
+      margin-bottom: 1px;
+    }}
     .quote-change {{
-      font-size: 11px;
+      font-size: 10px;
       font-weight: 800;
       color: var(--muted);
     }}
@@ -2631,6 +2684,10 @@ def render_page(state: PageState) -> bytes:
       padding: 16px;
       margin-bottom: 16px;
       box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+    }}
+    .trading-actions-panel {{
+      border-color: #bfdbfe;
+      background: #f8fbff;
     }}
     .panel-title {{
       font-weight: 700;
@@ -2735,6 +2792,58 @@ def render_page(state: PageState) -> bytes:
     .alert.ok {{ color: var(--ok); background: #ecfdf5; border-color: #99f6e4; }}
     .alert.error {{ color: var(--danger); background: #fff1f2; border-color: #fecdd3; }}
     .alert pre {{ margin: 0; white-space: pre-wrap; font-family: Consolas, "Courier New", monospace; }}
+    .live-modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.58);
+      z-index: 50;
+      padding: 20px;
+    }}
+    .live-modal {{
+      width: min(520px, 100%);
+      border-radius: 8px;
+      background: #ffffff;
+      border: 1px solid var(--line);
+      box-shadow: 0 24px 80px rgba(15, 23, 42, 0.3);
+      padding: 20px;
+      text-align: center;
+    }}
+    .breath-circle {{
+      width: 118px;
+      height: 118px;
+      border-radius: 50%;
+      margin: 12px auto;
+      background: radial-gradient(circle, #d1fae5 0%, #60a5fa 100%);
+      animation: breathe 4s ease-in-out infinite;
+    }}
+    @keyframes breathe {{
+      0%, 100% {{ transform: scale(0.78); opacity: 0.78; }}
+      50% {{ transform: scale(1); opacity: 1; }}
+    }}
+    .breath-text {{
+      font-size: 18px;
+      font-weight: 900;
+      color: var(--accent);
+      margin: 8px 0;
+    }}
+    .countdown {{
+      font-size: 34px;
+      font-weight: 900;
+      color: var(--danger);
+    }}
+    .modal-actions {{
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      margin-top: 18px;
+    }}
+    .modal-actions button:disabled {{
+      opacity: 0.5;
+      cursor: not-allowed;
+    }}
     .console {{
       margin: 0;
       padding: 12px;
@@ -2800,6 +2909,15 @@ def render_page(state: PageState) -> bytes:
     .research-table small {{
       font-size: 10px;
       opacity: 0.9;
+    }}
+    .ip-table th {{
+      width: 190px;
+    }}
+    .ip-table code {{
+      background: #f1f5f9;
+      border-radius: 4px;
+      padding: 3px 5px;
+      font-weight: 800;
     }}
     .active-trades-panel {{
       background: #f0fdf4;
@@ -2935,16 +3053,9 @@ def render_page(state: PageState) -> bytes:
     </div>
     <form id="place-panel" method="post" action="/load"{place_panel_style}>
       {env_hidden}
+      <input type="hidden" name="live_confirmed" id="live-confirmed" value="0">
       <input type="hidden" name="rows_payload" value="{html.escape(rows_payload, quote=True)}">
-      <div>
-        <section class="panel">
-          <div class="panel-title">CSV Source</div>
-          {render_input("csv_path", "CSV path", state.csv_path)}
-          <label><span>Upload CSV</span><input id="csv-file" type="file" accept=".csv,text/csv"></label>
-          <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
-        </section>
-      </div>
-      <section class="panel">
+      <section class="panel trading-actions-panel">
         <div class="panel-title">Execution Options</div>
         {render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}
         {render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}
@@ -2954,6 +3065,14 @@ def render_page(state: PageState) -> bytes:
           {execute_button}
         </div>
       </section>
+      <div>
+        <section class="panel">
+          <div class="panel-title">CSV Source</div>
+          {render_input("csv_path", "CSV path", state.csv_path)}
+          <label><span>Upload CSV</span><input id="csv-file" type="file" accept=".csv,text/csv"></label>
+          <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
+        </section>
+      </div>
       {orders_table}
       {render_results(state.results)}
       {render_console(state.console_log)}
@@ -3036,6 +3155,19 @@ def render_page(state: PageState) -> bytes:
     {render_research_panel(state)}
     {render_positions_panel(state)}
   </main>
+  <div class="live-modal-backdrop" id="live-confirm-modal">
+    <div class="live-modal">
+      <h2>Pause Before Live Trade</h2>
+      <p>Live order placement is about to run. Breathe in, breathe out, then confirm.</p>
+      <div class="breath-circle"></div>
+      <div class="breath-text" id="breath-text">Breathe in</div>
+      <div class="countdown" id="live-countdown">10</div>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="live-cancel">Cancel</button>
+        <button type="button" class="danger" id="live-good" disabled>Good to go</button>
+      </div>
+    </div>
+  </div>
   <script>
     const fileInput = document.getElementById('csv-file');
     const textArea = document.getElementById('csv-text');
@@ -3076,6 +3208,72 @@ def render_page(state: PageState) -> bytes:
         }}
       }});
     }}
+    const executeButton = document.getElementById('execute-selected-button');
+    const placeForm = document.getElementById('place-panel');
+    const liveModal = document.getElementById('live-confirm-modal');
+    const liveCancel = document.getElementById('live-cancel');
+    const liveGood = document.getElementById('live-good');
+    const liveCountdown = document.getElementById('live-countdown');
+    const breathText = document.getElementById('breath-text');
+    const liveConfirmed = document.getElementById('live-confirmed');
+    let pendingLiveSubmit = false;
+    let countdownTimer = null;
+    function stopLiveCountdown() {{
+      if (countdownTimer) {{
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+      }}
+    }}
+    function openLiveModal() {{
+      let remaining = 10;
+      pendingLiveSubmit = true;
+      liveGood.disabled = true;
+      liveCountdown.textContent = String(remaining);
+      breathText.textContent = 'Breathe in';
+      liveModal.style.display = 'flex';
+      stopLiveCountdown();
+      countdownTimer = setInterval(() => {{
+        remaining -= 1;
+        liveCountdown.textContent = String(Math.max(remaining, 0));
+        breathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          stopLiveCountdown();
+          breathText.textContent = 'Ready';
+          liveGood.disabled = false;
+        }}
+      }}, 1000);
+    }}
+    function closeLiveModal() {{
+      pendingLiveSubmit = false;
+      if (liveConfirmed) liveConfirmed.value = '0';
+      liveModal.style.display = 'none';
+      stopLiveCountdown();
+    }}
+    placeForm && placeForm.addEventListener('submit', (event) => {{
+      const submitter = event.submitter;
+      if (!submitter || submitter.id !== 'execute-selected-button') {{
+        return;
+      }}
+      const dryRun = placeForm.querySelector('input[name="dry_run"]');
+      if (dryRun && dryRun.checked) {{
+        return;
+      }}
+      if (liveConfirmed && liveConfirmed.value === '1') {{
+        return;
+      }}
+      event.preventDefault();
+      openLiveModal();
+    }});
+    liveCancel && liveCancel.addEventListener('click', closeLiveModal);
+    liveGood && liveGood.addEventListener('click', () => {{
+      if (liveGood.disabled || !pendingLiveSubmit) return;
+      pendingLiveSubmit = false;
+      stopLiveCountdown();
+      liveModal.style.display = 'none';
+      if (liveConfirmed) liveConfirmed.value = '1';
+      executeButton.setAttribute('formaction', '/execute');
+      placeForm.requestSubmit(executeButton);
+    }});
     async function refreshMmi() {{
       const value = document.getElementById('mmi-value');
       const zone = document.getElementById('mmi-zone');
@@ -3223,7 +3421,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 else "gpt"
                 if self.path.startswith("/gpt")
                 else "kite-setup"
-                if self.path.startswith("/kite-setup")
+                if self.path.startswith("/kite-setup") or self.path.startswith("/kite-token") or self.path.startswith("/kite-ip")
                 else "analytics"
                 if self.path.startswith("/analytics")
                 else "research"
@@ -3385,6 +3583,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 state.access_token = access_token
                 state.message = "Generated and saved KITE_ACCESS_TOKEN for this running web app session."
+            elif self.path == "/kite-ip/check":
+                state.kite_ip_data, state.console_log = call_with_console(fetch_public_ip_data)
+                ips = [item["ip"] for item in state.kite_ip_data if item.get("ip")]
+                state.message = (
+                    "Fetched current public IP. Add the matching IP to Kite developer console."
+                    if ips
+                    else "Could not fetch public IP. Check network and try again."
+                )
             elif self.path == "/analytics/load":
                 state.analytics_data, state.console_log = call_with_console(
                     option_analytics_for_symbol,
