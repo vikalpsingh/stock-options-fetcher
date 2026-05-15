@@ -25,12 +25,14 @@ import sys
 import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from xml.etree import ElementTree
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -262,6 +264,132 @@ def fetch_public_ip_data() -> list[dict[str, str]]:
         except Exception as exc:
             results.append({"label": label, "ip": "", "error": str(exc)})
     return results
+
+
+POSITIVE_NEWS_TERMS = {
+    "advance",
+    "approves",
+    "beat",
+    "beats",
+    "bonus",
+    "buy",
+    "climb",
+    "climbs",
+    "dividend",
+    "gain",
+    "gains",
+    "growth",
+    "higher",
+    "jumps",
+    "outperform",
+    "profit",
+    "rally",
+    "record",
+    "rises",
+    "surge",
+    "surges",
+    "upgrade",
+    "upside",
+    "wins",
+}
+
+NEGATIVE_NEWS_TERMS = {
+    "avoid",
+    "bearish",
+    "concern",
+    "concerns",
+    "decline",
+    "declines",
+    "downgrade",
+    "fall",
+    "falls",
+    "fraud",
+    "lower",
+    "loss",
+    "miss",
+    "plunge",
+    "pressure",
+    "probe",
+    "red",
+    "risk",
+    "sell",
+    "slips",
+    "slump",
+    "tumbles",
+    "weak",
+}
+
+
+def classify_news_sentiment(title: str) -> str:
+    words = set(re.findall(r"[a-z]+", title.lower()))
+    positive_score = len(words & POSITIVE_NEWS_TERMS)
+    negative_score = len(words & NEGATIVE_NEWS_TERMS)
+    if positive_score > negative_score:
+        return "positive"
+    if negative_score > positive_score:
+        return "negative"
+    return "neutral"
+
+
+def parse_news_pubdate(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_stock_news(symbols: list[str]) -> list[dict[str, str]]:
+    underlyings: list[str] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        underlying = underlying_for_symbol(symbol.strip().upper())
+        if underlying and underlying not in seen:
+            underlyings.append(underlying)
+            seen.add(underlying)
+
+    news: list[dict[str, str]] = []
+    min_published_at = datetime.now().astimezone() - timedelta(days=5)
+    for underlying in underlyings[:5]:
+        query = quote_plus(f"{underlying} NSE stock")
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+        try:
+            request = Request(url, headers={"User-Agent": "KiteTraderLocalApp/1.0"})
+            with urlopen(request, timeout=8) as response:
+                xml_text = response.read().decode("utf-8", errors="ignore")
+            root = ElementTree.fromstring(xml_text)
+            for item in root.findall(".//item"):
+                title = item.findtext("title") or ""
+                link = item.findtext("link") or ""
+                published = item.findtext("pubDate") or ""
+                published_at = parse_news_pubdate(published)
+                if not published_at or published_at.astimezone() < min_published_at:
+                    continue
+                if title and link:
+                    news.append(
+                        {
+                            "symbol": underlying,
+                            "title": title,
+                            "link": link,
+                            "published": published,
+                            "published_date": published_at.strftime("%d %b %Y"),
+                            "sentiment": classify_news_sentiment(title),
+                        }
+                    )
+                if len(news) >= 3:
+                    return news
+        except Exception as exc:
+            news.append(
+                {
+                    "symbol": underlying,
+                    "title": f"Could not fetch news: {exc}",
+                    "link": "",
+                    "published": "",
+                    "sentiment": "neutral",
+                }
+            )
+    return news[:3]
 
 
 def first(form: dict[str, list[str]], name: str, default: str = "") -> str:
@@ -1088,7 +1216,11 @@ def open_option_positions() -> list[dict[str, Any]]:
 
 def research_csv_symbols() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for symbol in csv_trading_symbols(read_default_csv_text()):
+    for csv_row in safe_csv_rows(read_default_csv_text()):
+        symbol = (csv_row.get("tradingsymbol") or csv_row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        quantity = int(float(csv_row.get("quantity") or 0))
         try:
             data = option_analytics_for_symbol(symbol)
             decision = data.get("decision", {})
@@ -1096,9 +1228,12 @@ def research_csv_symbols() -> list[dict[str, Any]]:
             strength = strategy_strength_lights(data, decision)
             risk_by_name = {row[0]: row for row in risk.get("rows", [])}
             strength_by_name = {row[0]: row for row in strength.get("rows", [])}
+            max_profit = float(data.get("option_price") or 0) * abs(quantity)
             rows.append(
                 {
                     "symbol": symbol,
+                    "quantity": quantity,
+                    "max_profit": max_profit,
                     "option_type": data.get("option_type"),
                     "spot": data.get("spot"),
                     "strike": data.get("strike"),
@@ -1860,6 +1995,18 @@ def render_analytics_panel(state: PageState) -> str:
         f'<a class="analytics-chip" href="/analytics?symbol={html.escape(symbol, quote=True)}">{html.escape(symbol)}</a>'
         for symbol in symbols
     )
+    active_total_pnl = sum(float(position.get("pnl") or 0) for position in active_positions)
+    active_total_class = (
+        "pnl-positive" if active_total_pnl > 0 else "pnl-negative" if active_total_pnl < 0 else ""
+    )
+    active_total_html = (
+        '<div class="active-pnl-summary">'
+        '<span>Overall P&L</span>'
+        f'<strong class="{active_total_class}">{html.escape(display_cell("pnl", active_total_pnl))}</strong>'
+        "</div>"
+        if active_positions
+        else ""
+    )
     active_rows = "".join(
         "<tr>"
         f"<td>{render_symbol_value('tradingsymbol', position['tradingsymbol'])}</td>"
@@ -1871,11 +2018,20 @@ def render_analytics_panel(state: PageState) -> str:
         "</tr>"
         for position in active_positions
     )
+    active_total_row = (
+        "<tr class=\"total-row\">"
+        "<td><strong>Total</strong></td><td></td><td></td><td></td><td></td>"
+        f'<td><strong class="{active_total_class}">{html.escape(display_cell("pnl", active_total_pnl))}</strong></td>'
+        "</tr>"
+        if active_rows
+        else ""
+    )
     active_section = (
         '<section class="panel active-trades-panel"><div class="panel-title">Active Option Trades</div>'
+        f"{active_total_html}"
         '<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Qty</th><th>Product</th>'
         '<th>Avg</th><th>LTP</th><th>P&L</th></tr></thead>'
-        f"<tbody>{active_rows}</tbody></table></div></section>"
+        f"<tbody>{active_rows}{active_total_row}</tbody></table></div></section>"
         if active_rows
         else (
             '<section class="panel active-trades-panel"><div class="panel-title">Active Option Trades</div>'
@@ -2069,6 +2225,51 @@ def strength_class(color: Any) -> str:
     return "signal-neutral"
 
 
+def indicator_text_from_color(color: Any) -> str:
+    text = str(color or "neutral").lower()
+    if text in {"green", "lightgreen"}:
+        return "GREEN"
+    if text == "yellow":
+        return "YELLOW"
+    if text in {"red", "lightcoral"}:
+        return "RED"
+    if text == "orange":
+        return "ORANGE"
+    return "N/A"
+
+
+def compact_indicator_cell(color: Any, detail: Any) -> str:
+    return (
+        f'<td class="{strength_class(color)} compact-indicator" '
+        f'title="{html.escape(str(detail or ""), quote=True)}">'
+        f"{indicator_text_from_color(color)}</td>"
+    )
+
+
+def color_profit(value: Any) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "neutral"
+    if amount > 7500:
+        return "green"
+    if amount >= 5000:
+        return "yellow"
+    return "red"
+
+
+def color_pop(value: Any) -> str:
+    try:
+        pop = float(value)
+    except (TypeError, ValueError):
+        return "neutral"
+    if pop > 85:
+        return "green"
+    if pop >= 70:
+        return "yellow"
+    return "red"
+
+
 def research_indicator_cell(row: dict[str, Any], group: str, name: str) -> str:
     source = row.get(group) or {}
     item = source.get(name)
@@ -2085,24 +2286,71 @@ def research_indicator_cell(row: dict[str, Any], group: str, name: str) -> str:
     )
 
 
+def research_indicator_color(row: dict[str, Any], group: str, name: str) -> str:
+    source = row.get(group) or {}
+    item = source.get(name)
+    if not item:
+        return "neutral"
+    return str(item[2])
+
+
+def color_score_value(color: str) -> float:
+    color = str(color or "").lower()
+    if color in {"green", "lightgreen"}:
+        return 1.0
+    if color == "yellow":
+        return 0.5
+    return 0.2
+
+
+def row_sell_score(row: dict[str, Any]) -> tuple[str, str]:
+    colors = [
+        row.get("sell_color"),
+        row.get("strategy_color"),
+        color_profit(row.get("max_profit")),
+        color_pop(row.get("sell_pop")),
+        research_indicator_color(row, "risk_rows", "Delta / POP"),
+        research_indicator_color(row, "risk_rows", "Gamma 1% move risk"),
+        research_indicator_color(row, "risk_rows", "Theta / premium / day"),
+        research_indicator_color(row, "risk_rows", "Vega / premium"),
+        research_indicator_color(row, "risk_rows", "Coverage / cash backing"),
+        research_indicator_color(row, "strength_rows", "OTM distance"),
+        research_indicator_color(row, "strength_rows", "Implied Volatility"),
+        research_indicator_color(row, "strength_rows", "PCR"),
+        research_indicator_color(row, "strength_rows", "Strike vs OI"),
+    ]
+    raw_score = sum(color_score_value(color) for color in colors)
+    score = raw_score * 2
+    max_score = len(colors) * 2
+    ratio = score / max_score if max_score else 0
+    score_text = f"{score:.1f}/{max_score}"
+    if ratio >= 0.75:
+        return "lightgreen", f"SELL score {score_text}"
+    if ratio >= 0.55:
+        return "yellow", f"SELL score {score_text}"
+    return "lightcoral", f"SELL score {score_text}"
+
+
 def render_research_panel(state: PageState) -> str:
     rows = state.research_rows or []
     table_rows = "".join(
         "<tr>"
-        f"<td>{render_symbol_value('tradingsymbol', row.get('symbol', ''))}</td>"
+        f'<td class="{strength_class(row_sell_score(row)[0])}" title="{html.escape(row_sell_score(row)[1], quote=True)}">{render_symbol_value("tradingsymbol", row.get("symbol", ""))}</td>'
+        f'<td class="{strength_class(row_sell_score(row)[0])}">{html.escape(row_sell_score(row)[1].replace("SELL score ", ""))}</td>'
         f"<td>{html.escape(str(row.get('option_type', '')))}</td>"
-        f'<td class="{strength_class(row.get("sell_color"))}">{html.escape(str(row.get("sell_signal", "")))}</td>'
-        f'<td class="{strength_class(row.get("buy_color"))}">{html.escape(str(row.get("buy_signal", "")))}</td>'
-        f'<td class="{strength_class(row.get("strategy_color"))}">{html.escape(str(row.get("strategy_strength", "")))}</td>'
-        f"<td>{html.escape(fmt_number(row.get('delta')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('sell_pop')))}%</td>"
-        f"<td>{html.escape(fmt_number(row.get('gamma_1pct')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('theta_yield_pct')))}%</td>"
-        f"<td>{html.escape(fmt_number(row.get('vega_risk_pct')))}%</td>"
-        f"<td>{html.escape(fmt_number(row.get('otm_distance')))}%</td>"
-        f"<td>{html.escape(fmt_number(row.get('iv_percent')))}%</td>"
-        f"<td>{html.escape(fmt_number(row.get('pcr')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('support')))} / {html.escape(fmt_number(row.get('resistance')))}</td>"
+        f"{compact_indicator_cell(row.get('sell_color'), row.get('sell_signal'))}"
+        f"{compact_indicator_cell(row.get('buy_color'), row.get('buy_signal'))}"
+        f"{compact_indicator_cell(row.get('strategy_color'), row.get('strategy_strength'))}"
+        f'<td class="{strength_class(research_indicator_color(row, "risk_rows", "Delta / POP"))}">{html.escape(fmt_number(row.get("delta")))}</td>'
+        f'<td class="{strength_class(color_profit(row.get("max_profit")))}">{html.escape(fmt_number(row.get("max_profit")))}</td>'
+        f'<td class="{strength_class(color_pop(row.get("sell_pop")))}">{html.escape(fmt_number(row.get("sell_pop")))}%</td>'
+        f'<td class="{strength_class(research_indicator_color(row, "risk_rows", "Gamma 1% move risk"))}">{html.escape(fmt_number(row.get("gamma_1pct")))}</td>'
+        f'<td class="{strength_class(research_indicator_color(row, "risk_rows", "Theta / premium / day"))}">{html.escape(fmt_number(row.get("theta_yield_pct")))}%</td>'
+        f'<td class="{strength_class(research_indicator_color(row, "risk_rows", "Vega / premium"))}">{html.escape(fmt_number(row.get("vega_risk_pct")))}%</td>'
+        f'<td class="{strength_class(research_indicator_color(row, "strength_rows", "OTM distance"))}">{html.escape(fmt_number(row.get("otm_distance")))}%</td>'
+        f'<td class="{strength_class(research_indicator_color(row, "strength_rows", "Implied Volatility"))}">{html.escape(fmt_number(row.get("iv_percent")))}%</td>'
+        f'<td class="{strength_class(research_indicator_color(row, "strength_rows", "PCR"))}">{html.escape(fmt_number(row.get("pcr")))}</td>'
+        f'<td class="{strength_class(research_indicator_color(row, "strength_rows", "Strike vs OI"))}">{html.escape(fmt_number(row.get("support")))} / {html.escape(fmt_number(row.get("resistance")))}</td>'
         f"{research_indicator_cell(row, 'risk_rows', 'Delta / POP')}"
         f"{research_indicator_cell(row, 'risk_rows', 'SELL POP')}"
         f"{research_indicator_cell(row, 'risk_rows', 'Gamma 1% move risk')}"
@@ -2121,8 +2369,8 @@ def render_research_panel(state: PageState) -> str:
     table = (
         '<section class="panel"><div class="panel-title">CSV Symbol Research Comparison</div>'
         '<div class="table-wrap"><table class="research-table"><thead><tr>'
-        '<th>Symbol</th><th>Type</th><th>SELL Decision</th><th>BUY Decision</th>'
-        '<th>Strategy Strength</th><th>Delta</th><th>SELL POP</th><th>Gamma 1%</th>'
+        '<th>Symbol</th><th>Score /26</th><th>Type</th><th>SELL Decision</th><th>BUY Decision</th>'
+        '<th>Strategy Strength</th><th>Delta</th><th>Maximum Profit</th><th>SELL POP</th><th>Gamma 1%</th>'
         '<th>Theta/Premium</th><th>Vega/Premium</th><th>OTM</th><th>IV</th><th>PCR</th>'
         '<th>Support / Resistance</th>'
         '<th>Risk: Delta / POP</th><th>Risk: SELL POP</th><th>Risk: Gamma</th>'
@@ -2254,9 +2502,9 @@ def render_market_topper(state: PageState) -> str:
     quote_cards = "".join(
         '<div class="quote-card" data-symbol="'
         f'{html.escape(underlying, quote=True)}">'
-        f'<div class="quote-symbol">{html.escape(underlying)}</div>'
-        '<div class="quote-ltp">Loading...</div>'
-        '<div class="quote-change">--</div>'
+        f'<span class="quote-symbol">{html.escape(underlying)}</span>'
+        '<span class="quote-ltp">...</span>'
+        '<span class="quote-change">--</span>'
         "</div>"
         for underlying in underlyings
     )
@@ -2561,10 +2809,10 @@ def render_page(state: PageState) -> bytes:
       font-weight: 800;
     }}
     .quote-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(76px, 1fr));
-      gap: 5px;
-      padding: 5px 8px 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 4px 8px 8px;
     }}
     .quote-error {{
       display: none;
@@ -2577,11 +2825,14 @@ def render_page(state: PageState) -> bytes:
       font-weight: 800;
     }}
     .quote-card {{
+      display: inline-flex;
+      align-items: baseline;
+      gap: 5px;
       border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 5px 6px;
+      border-radius: 999px;
+      padding: 3px 7px;
       background: #f8fafc;
-      min-height: 42px;
+      min-height: 24px;
     }}
     .quote-card.strong-up {{
       background: #dcfce7;
@@ -2595,12 +2846,10 @@ def render_page(state: PageState) -> bytes:
       color: var(--muted);
       font-size: 9px;
       font-weight: 800;
-      margin-bottom: 2px;
     }}
     .quote-ltp {{
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 900;
-      margin-bottom: 1px;
     }}
     .quote-change {{
       font-size: 10px;
@@ -2689,6 +2938,10 @@ def render_page(state: PageState) -> bytes:
       border-color: #bfdbfe;
       background: #f8fbff;
     }}
+    .trading-actions-panel .panel {{
+      box-shadow: none;
+      margin: 12px 0;
+    }}
     .panel-title {{
       font-weight: 700;
       margin-bottom: 14px;
@@ -2758,6 +3011,11 @@ def render_page(state: PageState) -> bytes:
       flex-wrap: wrap;
       gap: 10px;
       margin-top: 10px;
+    }}
+    .execution-checks {{
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
     }}
     button {{
       border: 0;
@@ -2844,6 +3102,60 @@ def render_page(state: PageState) -> bytes:
       opacity: 0.5;
       cursor: not-allowed;
     }}
+    .news-box {{
+      margin-top: 14px;
+      text-align: left;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #f8fafc;
+      max-height: 190px;
+      overflow: auto;
+    }}
+    .news-box h3 {{
+      margin: 0 0 8px;
+      font-size: 14px;
+    }}
+    .news-box a {{
+      color: var(--accent);
+      font-weight: 800;
+      text-decoration: none;
+    }}
+    .news-date {{
+      display: block;
+      margin-top: 3px;
+      font-size: 10px;
+      font-weight: 800;
+      color: #64748b;
+    }}
+    .news-box li {{
+      margin-bottom: 8px;
+      font-size: 12px;
+      line-height: 1.35;
+      border-radius: 7px;
+      padding: 7px 8px;
+      list-style-position: inside;
+    }}
+    .news-sentiment-positive {{
+      background: #dcfce7;
+      border: 1px solid #86efac;
+    }}
+    .news-sentiment-negative {{
+      background: #fee2e2;
+      border: 1px solid #fca5a5;
+    }}
+    .news-sentiment-neutral {{
+      background: #fef9c3;
+      border: 1px solid #fde68a;
+    }}
+    .news-tag {{
+      display: inline-block;
+      margin-left: 6px;
+      font-size: 10px;
+      font-weight: 900;
+      text-transform: uppercase;
+      color: #475569;
+    }}
     .console {{
       margin: 0;
       padding: 12px;
@@ -2910,6 +3222,11 @@ def render_page(state: PageState) -> bytes:
       font-size: 10px;
       opacity: 0.9;
     }}
+    .compact-indicator {{
+      text-align: center;
+      min-width: 76px;
+      font-weight: 900;
+    }}
     .ip-table th {{
       width: 190px;
     }}
@@ -2925,6 +3242,33 @@ def render_page(state: PageState) -> bytes:
     }}
     .active-trades-panel .panel-title {{
       color: #047857;
+    }}
+    .active-pnl-summary {{
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin: 2px 0 10px;
+      padding: 7px 10px;
+      border: 1px solid #86efac;
+      border-radius: 8px;
+      background: #ffffff;
+      font-weight: 900;
+    }}
+    .active-pnl-summary span {{
+      color: #475569;
+      font-size: 12px;
+      text-transform: uppercase;
+    }}
+    .pnl-positive {{
+      color: #047857;
+    }}
+    .pnl-negative {{
+      color: #b91c1c;
+    }}
+    .total-row td {{
+      background: #ecfdf5;
+      border-top: 2px solid #86efac;
+      font-weight: 900;
     }}
     .decision-grid {{
       display: grid;
@@ -3057,12 +3401,15 @@ def render_page(state: PageState) -> bytes:
       <input type="hidden" name="rows_payload" value="{html.escape(rows_payload, quote=True)}">
       <section class="panel trading-actions-panel">
         <div class="panel-title">Execution Options</div>
-        {render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}
-        {render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}
-        {render_checkbox("keep_existing_orders", "Place new order instead of modifying similar open order", state.keep_existing_orders)}
+        {orders_table}
         <div class="actions">
           <button type="submit" formaction="/load">Load / Preview CSV</button>
           {execute_button}
+        </div>
+        <div class="execution-checks">
+          {render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}
+          {render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}
+          {render_checkbox("keep_existing_orders", "Place new order instead of modifying similar open order", state.keep_existing_orders)}
         </div>
       </section>
       <div>
@@ -3073,7 +3420,6 @@ def render_page(state: PageState) -> bytes:
           <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
         </section>
       </div>
-      {orders_table}
       {render_results(state.results)}
       {render_console(state.console_log)}
     </form>
@@ -3161,7 +3507,11 @@ def render_page(state: PageState) -> bytes:
       <p>Live order placement is about to run. Breathe in, breathe out, then confirm.</p>
       <div class="breath-circle"></div>
       <div class="breath-text" id="breath-text">Breathe in</div>
-      <div class="countdown" id="live-countdown">10</div>
+      <div class="countdown" id="live-countdown">20</div>
+      <div class="news-box">
+        <h3>Top Stock News Before Trade - Last 5 Days</h3>
+        <div id="trade-news">Loading selected stock news...</div>
+      </div>
       <div class="modal-actions">
         <button type="button" class="secondary" id="live-cancel">Cancel</button>
         <button type="button" class="danger" id="live-good" disabled>Good to go</button>
@@ -3216,6 +3566,7 @@ def render_page(state: PageState) -> bytes:
     const liveCountdown = document.getElementById('live-countdown');
     const breathText = document.getElementById('breath-text');
     const liveConfirmed = document.getElementById('live-confirmed');
+    const tradeNews = document.getElementById('trade-news');
     let pendingLiveSubmit = false;
     let countdownTimer = null;
     function stopLiveCountdown() {{
@@ -3225,12 +3576,13 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     function openLiveModal() {{
-      let remaining = 10;
+      let remaining = 20;
       pendingLiveSubmit = true;
       liveGood.disabled = true;
       liveCountdown.textContent = String(remaining);
       breathText.textContent = 'Breathe in';
       liveModal.style.display = 'flex';
+      loadTradeNews();
       stopLiveCountdown();
       countdownTimer = setInterval(() => {{
         remaining -= 1;
@@ -3242,6 +3594,58 @@ def render_page(state: PageState) -> bytes:
           liveGood.disabled = false;
         }}
       }}, 1000);
+    }}
+    function selectedTradingSymbols() {{
+      const symbols = [];
+      const rows = placeForm.querySelectorAll('table tbody tr');
+      for (const row of rows) {{
+        const checkbox = row.querySelector('input[name="selected"]');
+        if (checkbox && checkbox.checked && row.cells.length > 2) {{
+          symbols.push(row.cells[2].innerText.trim());
+        }}
+      }}
+      return symbols;
+    }}
+    async function loadTradeNews() {{
+      if (!tradeNews) return;
+      const symbols = selectedTradingSymbols();
+      if (!symbols.length) {{
+        tradeNews.textContent = 'No selected symbols found.';
+        return;
+      }}
+      tradeNews.textContent = 'Loading selected stock news...';
+      try {{
+        const response = await fetch(`/trade-news?symbols=${{encodeURIComponent(symbols.join(','))}}`, {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load news');
+        if (!data.news || !data.news.length) {{
+          tradeNews.textContent = 'No recent news found.';
+          return;
+        }}
+        tradeNews.innerHTML = '<ol>' + data.news.map((item) => {{
+          const title = escapeHtml(item.title || 'News item');
+          const symbol = item.symbol ? `<strong>${{escapeHtml(item.symbol)}}</strong>: ` : '';
+          const link = escapeHtml(item.link || '');
+          const publishedDate = item.published_date ? `<span class="news-date">${{escapeHtml(item.published_date)}}</span>` : '';
+          const sentiment = ['positive', 'negative', 'neutral'].includes(item.sentiment) ? item.sentiment : 'neutral';
+          const tag = `<span class="news-tag">${{sentiment}}</span>`;
+          if (item.link) {{
+            return `<li class="news-sentiment-${{sentiment}}">${{symbol}}<a href="${{link}}" target="_blank" rel="noopener">${{title}}</a>${{tag}}${{publishedDate}}</li>`;
+          }}
+          return `<li class="news-sentiment-${{sentiment}}">${{symbol}}${{title}}${{tag}}${{publishedDate}}</li>`;
+        }}).join('') + '</ol>';
+      }} catch (error) {{
+        tradeNews.textContent = `News error: ${{error.message}}`;
+      }}
+    }}
+    function escapeHtml(value) {{
+      return String(value).replace(/[&<>"']/g, (char) => ({{
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }}[char]));
     }}
     function closeLiveModal() {{
       pendingLiveSubmit = false;
@@ -3381,6 +3785,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     state.error = f"{exc}\n\n{traceback.format_exc()}"
             self.send_page(state)
+            return
+        if parsed_url.path == "/trade-news":
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            symbols_text = first(query, "symbols")
+            symbols = [item for item in symbols_text.split(",") if item.strip()]
+            try:
+                self.send_json({"ok": True, "news": fetch_stock_news(symbols)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc), "news": []})
             return
         if self.path == "/market-mmi":
             try:
