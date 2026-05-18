@@ -1,4 +1,5 @@
 streamlit>=1.28.0
 requests
 beautifulsoup4
+kiteconnect
 protobuf==3.20.0

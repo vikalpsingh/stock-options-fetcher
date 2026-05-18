@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import importlib
 import os
 import secrets
 from pathlib import Path
@@ -7,12 +8,25 @@ from typing import Any
 
 import streamlit as st
 
-import app as kite_app
+st.set_page_config(page_title="Kite Trader", page_icon="📈", layout="wide")
 
 
 SALT = b"f9d2a3d7b5f1e6bc"
 PASSWORD_HASH = "e58f90b3c2d2c1dd2ed8e22cecfc3f570c28f70f72a02add6b41bade777e13bb"
 USERNAME = "vikalpsingh"
+
+
+@st.cache_resource
+def load_kite_app():
+    return importlib.import_module("app")
+
+
+class LazyKiteApp:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(load_kite_app(), name)
+
+
+kite_app = LazyKiteApp()
 
 
 def hash_password(password: str) -> str:
@@ -225,7 +239,6 @@ def commodity_tab() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Kite Trader", page_icon="📈", layout="wide")
     if not login():
         return
     logout_button()
