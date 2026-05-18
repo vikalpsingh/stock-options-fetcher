@@ -52,7 +52,16 @@ else:
     IMPORT_ERROR = None
 
 
-DEFAULT_CSV_PATH = PROJECT_ROOT / "src" / "script" / "kite_orders.csv"
+INCOME_CSV_DIR = Path(r"C:\income")
+
+
+def dated_income_csv_path(day: date | None = None) -> Path:
+    day = day or datetime.now().date()
+    return INCOME_CSV_DIR / f"{day.day}{day.strftime('%b')}{day.year}.csv"
+
+
+DEFAULT_CSV_PATH = dated_income_csv_path()
+LEGACY_CSV_PATH = PROJECT_ROOT / "src" / "script" / "kite_orders.csv"
 SETTINGS_PATH = APP_ROOT / "app_settings.json"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_KITE_ENV = {
@@ -125,6 +134,7 @@ COMMODITY_ETFS = [
         "threshold": 6.0,
         "allocation": 0.50,
         "profit_target": 0.25,
+        "sell_trigger": "25% profit OR RSI > 78",
     },
     {
         "key": "gold",
@@ -132,7 +142,8 @@ COMMODITY_ETFS = [
         "symbol": "GOLDBEES",
         "threshold": 3.0,
         "allocation": 0.30,
-        "profit_target": 0.25,
+        "profit_target": 0.22,
+        "sell_trigger": "22% profit",
     },
     {
         "key": "silver",
@@ -140,7 +151,8 @@ COMMODITY_ETFS = [
         "symbol": "SILVERBEES",
         "threshold": 4.0,
         "allocation": 0.20,
-        "profit_target": 0.25,
+        "profit_target": 0.20,
+        "sell_trigger": "20% profit",
     },
 ]
 COMMODITY_YEARLY_BASE_AMOUNTS = {
@@ -152,6 +164,7 @@ COMMODITY_YEARLY_BASE_AMOUNTS = {
     2026: 75938.0,
 }
 COMMODITY_MAX_MULTIPLIER = 2
+INCOME_ROLL_TRADING_DAY_THRESHOLD = 9
 INCOME_UNDERLYINGS = [
     {
         "symbol": "PFC",
@@ -286,6 +299,10 @@ def commodity_action_text(amount: Any) -> str:
     return f"Buy the ETF of amount {format_buy_amount(amount)} today"
 
 
+def limit_price_one_percent_below_ltp(ltp: float) -> float:
+    return max(round(ltp * 0.99, 2), 0.01)
+
+
 def commodity_backtest_engine(
     price_history_by_symbol: dict[str, list[dict[str, Any]]],
     profit_target: float = 0.25,
@@ -391,12 +408,16 @@ def read_default_csv_text() -> str:
     return DEFAULT_CSV_PATH.read_text(encoding="utf-8-sig")
 
 
+def default_csv_label() -> str:
+    return str(DEFAULT_CSV_PATH)
+
+
 @dataclass
 class PageState:
     active_tab: str = "place"
     message: str = ""
     error: str = ""
-    csv_path: str = str(DEFAULT_CSV_PATH)
+    csv_path: str = field(default_factory=lambda: str(DEFAULT_CSV_PATH))
     csv_text: str = field(default_factory=read_default_csv_text)
     rows: list[dict[str, str]] | None = None
     orders: list[dict[str, Any]] | None = None
@@ -409,6 +430,8 @@ class PageState:
     access_token: str = ""
     confirm_live_order: str = ""
     results: list[dict[str, Any]] | None = None
+    order_book: list[dict[str, Any]] | None = None
+    order_book_error: str = ""
     console_log: str = ""
     position_orders: list[dict[str, Any]] | None = None
     position_selected_indexes: set[int] | None = None
@@ -1712,6 +1735,14 @@ def validate_trade_orders(orders: list[dict[str, Any]] | None) -> list[dict[str,
     return [trade_validation_for_order(order, news_cache) for order in orders or []]
 
 
+def income_selected_expiry(expiries: list[date], today: date) -> tuple[date, date | None, int | None]:
+    front_expiry = expiries[0]
+    front_trading_days = trading_days_remaining(front_expiry, today)
+    if front_trading_days < INCOME_ROLL_TRADING_DAY_THRESHOLD and len(expiries) > 1:
+        return expiries[1], front_expiry, front_trading_days
+    return front_expiry, None, None
+
+
 def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
     today = datetime.now().date()
     spot_quote = kite.quote([f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
@@ -1729,7 +1760,10 @@ def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
     if not instruments:
         raise ValueError(f"No monthly PE instruments found for {underlying}.")
     expiries = sorted({item["expiry"] for item in instruments})
-    expiry = expiries[0]
+    expiry, rolled_from_expiry, rolled_from_trading_days = income_selected_expiry(
+        expiries,
+        today,
+    )
     expiry_instruments = [item for item in instruments if item.get("expiry") == expiry]
     target_strike = spot * 0.90
     below_target = [
@@ -1745,6 +1779,8 @@ def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
         "spot": spot,
         "strike": float(selected.get("strike") or 0),
         "expiry": expiry,
+        "rolled_from_expiry": rolled_from_expiry,
+        "rolled_from_trading_days": rolled_from_trading_days,
         "target_strike": target_strike,
         "lot_size": int(selected.get("lot_size") or 0),
     }
@@ -1767,7 +1803,10 @@ def next_monthly_ce_candidate(kite: Any, underlying: str) -> dict[str, Any]:
     if not instruments:
         raise ValueError(f"No monthly CE instruments found for {underlying}.")
     expiries = sorted({item["expiry"] for item in instruments})
-    expiry = expiries[0]
+    expiry, rolled_from_expiry, rolled_from_trading_days = income_selected_expiry(
+        expiries,
+        today,
+    )
     expiry_instruments = [item for item in instruments if item.get("expiry") == expiry]
     target_strike = spot * 1.10
     above_target = [
@@ -1783,6 +1822,8 @@ def next_monthly_ce_candidate(kite: Any, underlying: str) -> dict[str, Any]:
         "spot": spot,
         "strike": float(selected.get("strike") or 0),
         "expiry": expiry,
+        "rolled_from_expiry": rolled_from_expiry,
+        "rolled_from_trading_days": rolled_from_trading_days,
         "target_strike": target_strike,
         "lot_size": int(selected.get("lot_size") or 0),
     }
@@ -1910,6 +1951,20 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             risk = decision.get("risk_lights", {})
             expiry = candidate["expiry"]
             trading_days = trading_days_remaining(expiry)
+            roll_note = ""
+            if candidate.get("rolled_from_expiry"):
+                rolled_from = candidate["rolled_from_expiry"]
+                roll_note = (
+                    f"Moved from {rolled_from.strftime('%d %b %Y')} "
+                    f"because only {candidate.get('rolled_from_trading_days')} trading days remain."
+                )
+            ce_roll_note = ""
+            if ce_candidate.get("rolled_from_expiry"):
+                ce_rolled_from = ce_candidate["rolled_from_expiry"]
+                ce_roll_note = (
+                    f"Moved from {ce_rolled_from.strftime('%d %b %Y')} "
+                    f"because only {ce_candidate.get('rolled_from_trading_days')} trading days remain."
+                )
             otm = decision.get("otm_distance")
             iv_percent = data.get("iv_percent")
             sell_pop = data.get("sell_pop")
@@ -1928,6 +1983,8 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 if entry_ok
                 else "WAIT / REVIEW FILTERS"
             )
+            if roll_note and not entry_ok:
+                action = "NEXT MONTH PE SELECTED - WAIT FOR ENTRY WINDOW"
             holding = holdings.get(underlying, {})
             held_qty = int(holding.get("quantity") or 0)
             ce_lot_size = int(ce_candidate.get("lot_size") or 0)
@@ -1944,6 +2001,7 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 {
                     **config,
                     "candidate": candidate["symbol"],
+                    "roll_note": roll_note,
                     "spot": data.get("spot"),
                     "strike": data.get("strike"),
                     "expiry": expiry.strftime("%d %b %Y"),
@@ -1963,6 +2021,7 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "stock_pnl": holding.get("pnl"),
                     "stock_return_pct": holding.get("return_pct"),
                     "ce_candidate": ce_candidate["symbol"],
+                    "ce_roll_note": ce_roll_note,
                     "ce_strike": ce_data.get("strike"),
                     "ce_expiry": ce_candidate["expiry"].strftime("%d %b %Y"),
                     "ce_lot_size": ce_lot_size,
@@ -1981,7 +2040,9 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 {
                     **config,
                     "candidate": "",
+                    "roll_note": "",
                     "ce_candidate": "",
+                    "ce_roll_note": "",
                     "action": "DATA ERROR",
                     "action_color": "red",
                     "ce_action": "DATA ERROR",
@@ -2164,20 +2225,20 @@ def persist_default_csv_text(csv_text: str) -> str:
     current_text = read_default_csv_text()
     normalized_new = text.rstrip() + "\n"
     if current_text == normalized_new:
-        return "kite_orders.csv already has these input details."
+        return f"{DEFAULT_CSV_PATH.name} already has these input details."
 
     archive_message = ""
     if DEFAULT_CSV_PATH.exists() and current_text.strip():
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         archive_path = DEFAULT_CSV_PATH.with_name(
-            f"kite_orders_last_input_order_{stamp}.csv"
+            f"{DEFAULT_CSV_PATH.stem}_last_input_order_{stamp}.csv"
         )
         DEFAULT_CSV_PATH.replace(archive_path)
         archive_message = f"Archived previous CSV to {archive_path.name}. "
 
     DEFAULT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     DEFAULT_CSV_PATH.write_text(normalized_new, encoding="utf-8")
-    return f"{archive_message}Updated kite_orders.csv from the input box."
+    return f"{archive_message}Updated {DEFAULT_CSV_PATH.name} from the input box."
 
 
 def mmi_zone(value: float) -> str:
@@ -2343,7 +2404,58 @@ def commodity_etf_by_symbol(symbol: str) -> dict[str, Any]:
     raise ValueError(f"Unknown ETF symbol: {symbol}")
 
 
-def place_commodity_etf_order(symbol: str) -> dict[str, Any]:
+def commodity_profit_target_pct(item: dict[str, Any]) -> float:
+    return float(item.get("profit_target") or 0.25) * 100
+
+
+def calculate_rsi(closes: list[float], period: int = 14) -> float | None:
+    if len(closes) <= period:
+        return None
+    gains: list[float] = []
+    losses: list[float] = []
+    for previous, current in zip(closes, closes[1:]):
+        change = current - previous
+        gains.append(max(change, 0))
+        losses.append(abs(min(change, 0)))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = ((avg_gain * (period - 1)) + gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + loss) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def commodity_etf_rsi(kite: Any, symbol: str) -> float | None:
+    try:
+        clean_symbol = symbol.strip().upper()
+        instrument = next(
+            (
+                item
+                for item in kite.instruments("NSE")
+                if str(item.get("tradingsymbol") or "").upper() == clean_symbol
+            ),
+            None,
+        )
+        if not instrument:
+            return None
+        today = datetime.now().date()
+        candles = kite.historical_data(
+            int(instrument["instrument_token"]),
+            today - timedelta(days=120),
+            today,
+            "day",
+        )
+        closes = [float(candle.get("close") or 0) for candle in candles if candle.get("close")]
+        rsi = calculate_rsi(closes)
+        return round(rsi, 2) if rsi is not None else None
+    except Exception:
+        return None
+
+
+def place_commodity_etf_order(symbol: str, allow_manual_override: bool = False) -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
@@ -2363,16 +2475,22 @@ def place_commodity_etf_order(symbol: str) -> dict[str, Any]:
         commodity_daily_fall_pct(previous_close, ltp),
     )
     if not sizing["buy_signal"]:
-        raise ValueError(
-            f"{clean_symbol} has not hit dip trigger. Fall {sizing['daily_fall_pct']:.2f}% "
-            f"is below trigger {sizing['dip_trigger']:.2f}%."
-        )
-    buy_amount = float(sizing["final_buy_amount"])
+        if not allow_manual_override:
+            raise ValueError(
+                f"{clean_symbol} has not hit dip trigger. Fall {sizing['daily_fall_pct']:.2f}% "
+                f"is below trigger {sizing['dip_trigger']:.2f}%. Validate again to the price?"
+            )
+        buy_amount = float(sizing["base_buy_amount"])
+        multiplier_text = "manual 1x override"
+    else:
+        buy_amount = float(sizing["final_buy_amount"])
+        multiplier_text = f"{sizing['multiplier']}x"
     quantity = int(buy_amount // ltp)
     if quantity < 1:
         raise ValueError(
             f"Strategy buy amount {format_buy_amount(buy_amount)} is less than one unit at LTP {ltp:.2f}."
         )
+    limit_price = limit_price_one_percent_below_ltp(ltp)
     order = {
         "variety": "regular",
         "exchange": "NSE",
@@ -2380,7 +2498,8 @@ def place_commodity_etf_order(symbol: str) -> dict[str, Any]:
         "transaction_type": "BUY",
         "quantity": quantity,
         "product": "CNC",
-        "order_type": "MARKET",
+        "order_type": "LIMIT",
+        "price": limit_price,
         "validity": "DAY",
         "tag": "ETF_BUY",
     }
@@ -2390,9 +2509,9 @@ def place_commodity_etf_order(symbol: str) -> dict[str, Any]:
         "status": "LIVE_SENT",
         "order_id": order_id,
         "detail": (
-            f"BUY {quantity} {clean_symbol} at MARKET for approx "
-            f"{quantity * ltp:.2f}. Strategy amount {format_buy_amount(buy_amount)} "
-            f"({sizing['multiplier']}x, fall {sizing['daily_fall_pct']:.2f}%)."
+            f"BUY {quantity} {clean_symbol} LIMIT {limit_price:.2f} "
+            f"(1% below LTP {ltp:.2f}). Strategy amount {format_buy_amount(buy_amount)} "
+            f"({multiplier_text}, fall {sizing['daily_fall_pct']:.2f}%)."
         ),
     }
 
@@ -2429,11 +2548,24 @@ def commodity_etf_holdings() -> list[dict[str, Any]]:
         market_value = ltp * quantity
         pnl = market_value - investment
         profit_pct = (pnl / investment * 100) if investment > 0 else None
-        book_profit = profit_pct is not None and profit_pct > 25 and quantity > 0
+        profit_target_pct = commodity_profit_target_pct(item)
+        rsi = commodity_etf_rsi(kite, symbol) if item.get("key") == "nasdaq" else None
+        rsi_book_profit = bool(rsi is not None and rsi > 78)
+        book_profit = (
+            quantity > 0
+            and (
+                (profit_pct is not None and profit_pct >= profit_target_pct)
+                or rsi_book_profit
+            )
+        )
         rows.append(
             {
                 "label": item["label"],
                 "symbol": symbol,
+                "sell_trigger": item.get("sell_trigger", f"{profit_target_pct:.0f}% profit"),
+                "profit_target_pct": profit_target_pct,
+                "rsi": rsi,
+                "rsi_book_profit": rsi_book_profit,
                 "quantity": quantity,
                 "sellable_quantity": sellable_quantity,
                 "average_price": average_price,
@@ -2464,12 +2596,19 @@ def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
     if not holding or int(holding.get("quantity") or 0) <= 0:
         raise ValueError(f"No ETF holding quantity found for {clean_symbol}.")
     if not holding.get("book_profit"):
+        target_pct = commodity_profit_target_pct(item)
         raise ValueError(
-            f"{clean_symbol} profit is {fmt_number(holding.get('profit_pct'))}%, below BOOK profit threshold 25%."
+            f"{clean_symbol} profit is {fmt_number(holding.get('profit_pct'))}%, below BOOK profit threshold {target_pct:.0f}%."
         )
     quantity = int(holding.get("sellable_quantity") or 0)
     if quantity <= 0:
         raise ValueError(f"No sellable ETF holding quantity found for {clean_symbol}.")
+    kite = kite_orders.kite_client()
+    quote = kite.quote([f"NSE:{clean_symbol}"]).get(f"NSE:{clean_symbol}", {})
+    ltp = float(quote.get("last_price") or holding.get("ltp") or 0)
+    if ltp <= 0:
+        raise ValueError(f"Could not read live LTP for {clean_symbol}.")
+    limit_price = limit_price_one_percent_below_ltp(ltp)
     order = {
         "variety": "regular",
         "exchange": "NSE",
@@ -2477,18 +2616,19 @@ def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
         "transaction_type": "SELL",
         "quantity": quantity,
         "product": "CNC",
-        "order_type": "MARKET",
+        "order_type": "LIMIT",
+        "price": limit_price,
         "validity": "DAY",
         "tag": "ETF_BOOK",
     }
-    kite = kite_orders.kite_client()
     order_id = kite_orders.place_order(kite, order)
     return {
         "tradingsymbol": clean_symbol,
         "status": "LIVE_SENT",
         "order_id": order_id,
         "detail": (
-            f"SELL full holding {quantity} {clean_symbol} at MARKET. "
+            f"SELL full holding {quantity} {clean_symbol} LIMIT {limit_price:.2f} "
+            f"(1% below LTP {ltp:.2f}). "
             f"Current profit {fmt_number(holding.get('profit_pct'))}%."
         ),
     }
@@ -2741,6 +2881,272 @@ def execute_orders(
                 }
             )
     return orders, results
+
+
+CANCELLABLE_ORDER_STATUSES = {
+    "OPEN",
+    "TRIGGER PENDING",
+    "VALIDATION PENDING",
+    "PUT ORDER REQ RECEIVED",
+}
+
+
+def kite_order_book() -> list[dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    rows: list[dict[str, Any]] = []
+    orders = list(reversed(kite.orders()))
+    quote_keys = sorted(
+        {
+            f"{str(order.get('exchange') or '').upper()}:{str(order.get('tradingsymbol') or '').upper()}"
+            for order in orders
+            if order.get("exchange") and order.get("tradingsymbol")
+        }
+    )
+    quotes = kite.quote(quote_keys) if quote_keys else {}
+    for order in orders:
+        status = str(order.get("status") or "").upper()
+        exchange = str(order.get("exchange") or "")
+        symbol = str(order.get("tradingsymbol") or "")
+        quote_key = f"{exchange.upper()}:{symbol.upper()}"
+        ltp = quote_ltp(quotes.get(quote_key, {})) if quote_key in quotes else None
+        price = order.get("price") or ""
+        price_diff_pct = None
+        try:
+            order_price = float(price or 0)
+            live_price = float(ltp or 0)
+            if order_price > 0 and live_price > 0:
+                price_diff_pct = ((order_price - live_price) / live_price) * 100
+        except Exception:
+            price_diff_pct = None
+        rows.append(
+            {
+                "order_id": str(order.get("order_id") or ""),
+                "variety": str(order.get("variety") or "regular"),
+                "exchange": exchange,
+                "tradingsymbol": symbol,
+                "transaction_type": str(order.get("transaction_type") or ""),
+                "quantity": order.get("quantity") or "",
+                "pending_quantity": order.get("pending_quantity") or "",
+                "product": str(order.get("product") or ""),
+                "order_type": str(order.get("order_type") or ""),
+                "price": price,
+                "ltp": ltp,
+                "price_diff_pct": price_diff_pct,
+                "status": status,
+                "status_message": str(order.get("status_message") or ""),
+                "is_cancellable": status in CANCELLABLE_ORDER_STATUSES,
+            }
+        )
+    return rows
+
+
+def order_form_key(order_key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", order_key)
+
+
+def cancel_selected_orders(order_keys: list[str]) -> list[dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'Cancel selected refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    selected = set(order_keys)
+    if not selected:
+        raise ValueError("Select at least one order to cancel.")
+    kite = kite_orders.kite_client()
+    by_key = {
+        f"{str(order.get('variety') or 'regular')}|{str(order.get('order_id') or '')}": order
+        for order in kite.orders()
+    }
+    results: list[dict[str, Any]] = []
+    for key in selected:
+        order = by_key.get(key)
+        if not order:
+            results.append(
+                {
+                    "tradingsymbol": key,
+                    "status": "ERROR",
+                    "order_id": key.split("|")[-1],
+                    "detail": "Order not found in current Kite order book.",
+                }
+            )
+            continue
+        status = str(order.get("status") or "").upper()
+        order_id = str(order.get("order_id") or "")
+        variety = str(order.get("variety") or "regular")
+        symbol = str(order.get("tradingsymbol") or "")
+        if status not in CANCELLABLE_ORDER_STATUSES:
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "SKIPPED",
+                    "order_id": order_id,
+                    "detail": f"Order status {status} is not cancellable.",
+                }
+            )
+            continue
+        try:
+            kite.cancel_order(variety=variety, order_id=order_id)
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "CANCELLED",
+                    "order_id": order_id,
+                    "detail": f"Cancelled {status} order.",
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "ERROR",
+                    "order_id": order_id,
+                    "detail": str(exc),
+                }
+            )
+    return results
+
+
+def modify_selected_orders(order_keys: list[str], form: dict[str, list[str]]) -> list[dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'Modify selected refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    selected = set(order_keys)
+    if not selected:
+        raise ValueError("Select at least one order to modify.")
+    kite = kite_orders.kite_client()
+    by_key = {
+        f"{str(order.get('variety') or 'regular')}|{str(order.get('order_id') or '')}": order
+        for order in kite.orders()
+    }
+    results: list[dict[str, Any]] = []
+    for key in selected:
+        order = by_key.get(key)
+        if not order:
+            results.append(
+                {
+                    "tradingsymbol": key,
+                    "status": "ERROR",
+                    "order_id": key.split("|")[-1],
+                    "detail": "Order not found in current Kite order book.",
+                }
+            )
+            continue
+        status = str(order.get("status") or "").upper()
+        order_id = str(order.get("order_id") or "")
+        variety = str(order.get("variety") or "regular")
+        symbol = str(order.get("tradingsymbol") or "")
+        order_type = str(order.get("order_type") or "").upper()
+        if status not in CANCELLABLE_ORDER_STATUSES:
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "SKIPPED",
+                    "order_id": order_id,
+                    "detail": f"Order status {status} is not modifiable.",
+                }
+            )
+            continue
+
+        field_key = order_form_key(key)
+        payload: dict[str, Any] = {}
+        quantity_text = first(form, f"modify_quantity_{field_key}")
+        price_text = first(form, f"modify_price_{field_key}")
+        if quantity_text:
+            quantity = int(float(quantity_text))
+            if quantity <= 0:
+                raise ValueError(f"Quantity must be positive for {symbol}.")
+            payload["quantity"] = quantity
+        if price_text and order_type in {"LIMIT", "SL"}:
+            price = float(price_text)
+            if price <= 0:
+                raise ValueError(f"Price must be positive for {symbol}.")
+            payload["price"] = price
+        if not payload:
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "SKIPPED",
+                    "order_id": order_id,
+                    "detail": "No quantity or limit price change was provided.",
+                }
+            )
+            continue
+
+        try:
+            kite.modify_order(variety=variety, order_id=order_id, **payload)
+            changed = ", ".join(f"{name}={value}" for name, value in payload.items())
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "MODIFIED",
+                    "order_id": order_id,
+                    "detail": f"Modified {changed}.",
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "ERROR",
+                    "order_id": order_id,
+                    "detail": str(exc),
+                }
+            )
+    return results
+
+
+def cancel_all_open_orders() -> list[dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'Cancel all refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    kite = kite_orders.kite_client()
+    results: list[dict[str, Any]] = []
+    for order in kite.orders():
+        status = str(order.get("status") or "").upper()
+        if status not in CANCELLABLE_ORDER_STATUSES:
+            continue
+        order_id = str(order.get("order_id") or "")
+        variety = str(order.get("variety") or "regular")
+        symbol = str(order.get("tradingsymbol") or "")
+        try:
+            kite.cancel_order(variety=variety, order_id=order_id)
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "CANCELLED",
+                    "order_id": order_id,
+                    "detail": f"Cancelled {status} order.",
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "ERROR",
+                    "order_id": order_id,
+                    "detail": str(exc),
+                }
+            )
+    if not results:
+        results.append(
+            {
+                "tradingsymbol": "ALL",
+                "status": "NO_OPEN_ORDERS",
+                "order_id": "",
+                "detail": "No open/pending orders found to cancel.",
+            }
+        )
+    return results
 
 
 def position_args_from_state(state: PageState) -> argparse.Namespace:
@@ -3015,6 +3421,91 @@ def render_results(results: list[dict[str, Any]] | None) -> str:
         "<table><thead><tr><th>Symbol</th><th>Status</th><th>Order ID</th><th>Detail</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></section>"
     )
+
+
+def render_order_book(state: PageState) -> str:
+    orders = state.order_book
+    error = state.order_book_error
+    if orders is None:
+        try:
+            orders = kite_order_book()
+        except Exception as exc:
+            orders = []
+            error = str(exc)
+    rows: list[str] = []
+    for order in orders:
+        checked_attr = " checked" if order.get("is_cancellable") else ""
+        disabled_attr = "" if order.get("is_cancellable") else " disabled"
+        key = f"{order.get('variety', 'regular')}|{order.get('order_id', '')}"
+        field_key = order_form_key(key)
+        quantity = html.escape(str(order.get("quantity", "")), quote=True)
+        price = html.escape(str(order.get("price", "")), quote=True)
+        qty_cell = (
+            f'<input class="order-edit-input" type="number" min="1" step="1" '
+            f'name="modify_quantity_{field_key}" value="{quantity}"{disabled_attr}>'
+        )
+        price_cell = (
+            f'<input class="order-edit-input" type="number" min="0" step="0.01" '
+            f'name="modify_price_{field_key}" value="{price}"{disabled_attr}>'
+        )
+        price_diff = order.get("price_diff_pct")
+        diff_class = ""
+        if price_diff is not None:
+            diff_value = float(price_diff)
+            diff_class = "pnl-positive" if diff_value >= 0 else "pnl-negative"
+        rows.append(
+            "<tr>"
+            f'<td><input type="checkbox" name="order_key" value="{html.escape(key, quote=True)}"{checked_attr}{disabled_attr}></td>'
+            f"<td>{html.escape(str(order.get('order_id', '')))}</td>"
+            f"<td>{html.escape(str(order.get('tradingsymbol', '')))}</td>"
+            f"<td>{html.escape(str(order.get('transaction_type', '')))}</td>"
+            f"<td>{qty_cell}</td>"
+            f"<td>{html.escape(str(order.get('pending_quantity', '')))}</td>"
+            f"<td>{html.escape(str(order.get('product', '')))}</td>"
+            f"<td>{html.escape(str(order.get('order_type', '')))}</td>"
+            f"<td>{price_cell}</td>"
+            f"<td>{html.escape(fmt_number(order.get('ltp')))}</td>"
+            f'<td class="{diff_class}">{html.escape(fmt_number(price_diff))}%</td>'
+            f"<td>{html.escape(str(order.get('status', '')))}</td>"
+            "</tr>"
+        )
+    body = (
+        "".join(rows)
+        if rows
+        else '<tr><td colspan="12" class="status">No Kite orders found.</td></tr>'
+    )
+    error_html = f'<div class="alert error"><pre>{html.escape(error)}</pre></div>' if error else ""
+    return (
+        '<section class="panel order-book-panel"><div class="panel-title">Kite Orders</div>'
+        '<p class="status">Select open / pending orders, edit quantity or limit price, then modify or cancel them.</p>'
+        f"{error_html}"
+        '<div class="actions"><button type="submit" formaction="/orders/modify-selected">Modify Selected Orders</button>'
+        '<button type="submit" formaction="/orders/cancel-selected" class="cancel-all-button">Cancel Selected Orders</button>'
+        '<button type="submit" formaction="/orders/refresh">Refresh Orders</button></div>'
+        '<div class="table-wrap"><table class="order-book-table"><thead><tr>'
+        '<th>Select</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Pending</th>'
+        '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>% Diff</th><th>Status</th>'
+        f"</tr></thead><tbody>{body}</tbody></table></div></section>"
+    )
+
+
+def render_order_management_panel(state: PageState) -> str:
+    panel_style = "" if state.active_tab == "order-management" else ' style="display:none"'
+    return f"""
+    <form id="order-management-panel" method="post" action="/orders/refresh"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <section class="panel cancel-all-panel">
+        <div>
+          <div class="panel-title">Modify / Cancel Kite Orders</div>
+          <p class="status">Manage open Kite orders separately from new trade execution.</p>
+        </div>
+        <button type="submit" formaction="/orders/cancel-all" class="cancel-all-button">Cancel All Orders</button>
+      </section>
+      {render_order_book(state)}
+      {render_results(state.results)}
+      {render_console(state.console_log)}
+    </form>
+    """
 
 
 def render_signal_cell(value: str) -> str:
@@ -3437,7 +3928,7 @@ def render_research_panel(state: PageState) -> str:
       {env_hidden_fields_for_render()}
       <section class="panel">
         <div class="panel-title">Research</div>
-        <p class="status">Compare every trading symbol from kite_orders.csv for SELL CALL / SELL PUT decisions using live Kite analytics.</p>
+        <p class="status">Compare every trading symbol from {html.escape(default_csv_label())} for SELL CALL / SELL PUT decisions using live Kite analytics.</p>
         <div class="actions">
           <button type="submit" formaction="/research/load">Run Research on CSV Symbols</button>
         </div>
@@ -3499,6 +3990,7 @@ def render_positions_panel(state: PageState) -> str:
       {env_hidden_fields_for_render()}
       <section class="panel">
         <div class="panel-title">Positions</div>
+        <p class="status"><strong>Analysis of current Positions</strong></p>
         <p class="status">Evaluate active Kite option trades with the same analytics and summarize current P&L / Kite margin required.</p>
         <div class="actions">
           <button type="submit" formaction="/positions-research/load">Load Active Positions</button>
@@ -3530,13 +4022,22 @@ def render_commodity_panel(state: PageState) -> str:
         f"<td class=\"{'pnl-positive' if (row.get('profit_pct') or 0) >= 0 else 'pnl-negative'}\">{html.escape(fmt_number(row.get('profit_pct')))}%</td>"
         "<td>"
         + (
-            '<form method="post" action="/commodity/sell">'
+            '<form class="commodity-confirm-form" method="post" action="/commodity/sell">'
             f"{env_hidden_fields_for_render()}"
             f'<input type="hidden" name="commodity_symbol" value="{html.escape(str(row.get("symbol", "")), quote=True)}">'
+            '<input type="hidden" name="commodity_confirmed" value="0">'
             '<button type="submit" class="book-profit-button">BOOK profit</button>'
             "</form>"
             if row.get("book_profit")
-            else '<span class="commodity-wait">Hold / wait</span>'
+            else (
+                f'<span class="commodity-wait">Hold / wait | Target {html.escape(fmt_number(row.get("profit_target_pct"), 0))}%'
+                + (
+                    f' | RSI {html.escape(fmt_number(row.get("rsi")))}'
+                    if row.get("rsi") is not None
+                    else ""
+                )
+                + "</span>"
+            )
         )
         + "</td>"
         "</tr>"
@@ -3564,7 +4065,7 @@ def render_commodity_panel(state: PageState) -> str:
         f"<td>{html.escape(str(item['threshold']))}%</td>"
         f"<td>{html.escape(format_buy_amount(commodity_yearly_base_amount() * float(item['allocation'])))}</td>"
         f"<td>{html.escape(format_buy_amount(commodity_yearly_base_amount() * float(item['allocation']) * COMMODITY_MAX_MULTIPLIER))}</td>"
-        f"<td>{int(float(item['profit_target']) * 100)}%</td>"
+        f"<td>{html.escape(str(item.get('sell_trigger') or (str(int(float(item['profit_target']) * 100)) + '%')))}</td>"
         "</tr>"
         for item in COMMODITY_ETFS
     )
@@ -3573,7 +4074,7 @@ def render_commodity_panel(state: PageState) -> str:
         '<div class="panel-title">ETF Dip-Buy Multiplier Strategy</div>'
         f'<div class="status">Yearly base for {datetime.now().year}: <strong>{html.escape(format_buy_amount(commodity_yearly_base_amount()))}</strong>. Multiplier = floor(day fall / trigger), capped at {COMMODITY_MAX_MULTIPLIER}x. Profit booking target: 25% full basket exit.</div>'
         '<div class="table-wrap"><table class="commodity-holdings-table"><thead><tr>'
-        '<th>ETF</th><th>Allocation</th><th>Dip Trigger</th><th>1x Buy Amount</th><th>2x Capped Buy</th><th>Profit Target</th>'
+        '<th>ETF</th><th>Allocation</th><th>Dip Trigger</th><th>1x Buy Amount</th><th>2x Capped Buy</th><th>Core Sell Trigger</th>'
         f'</tr></thead><tbody>{strategy_rows}</tbody></table></div></section>'
     )
     cards = "".join(
@@ -3587,9 +4088,10 @@ def render_commodity_panel(state: PageState) -> str:
           <div class="commodity-change">--</div>
           <div class="commodity-threshold">Buy trigger: down {html.escape(str(item['threshold']))}% | Allocation {int(float(item['allocation']) * 100)}% | 1x {html.escape(format_buy_amount(commodity_yearly_base_amount() * float(item['allocation'])))}</div>
           <div class="commodity-action">Wait</div>
-          <form class="commodity-buy-form" method="post" action="/commodity/buy">
+          <form class="commodity-buy-form commodity-confirm-form" method="post" action="/commodity/buy">
             {env_hidden_fields_for_render()}
             <input type="hidden" name="commodity_symbol" value="{html.escape(str(item['symbol']), quote=True)}">
+            <input type="hidden" name="commodity_confirmed" value="0">
             <button type="submit" class="commodity-buy-button">Buy on dip trigger</button>
           </form>
         </article>
@@ -3598,8 +4100,6 @@ def render_commodity_panel(state: PageState) -> str:
     )
     return f"""
     <div id="commodity-panel"{panel_style}>
-      {holdings_block}
-      {strategy_block}
       <section class="panel commodity-panel">
         <div class="panel-title">Commodity ETF Watch</div>
         <div class="status">Tracks ETF day change. Buy amount = yearly base x ETF allocation x dip multiplier, capped at {COMMODITY_MAX_MULTIPLIER}x. Current yearly base: {html.escape(format_buy_amount(commodity_yearly_base_amount()))}.</div>
@@ -3607,6 +4107,8 @@ def render_commodity_panel(state: PageState) -> str:
         <div class="commodity-grid" id="commodity-grid">{cards}</div>
       </section>
       {render_results(state.commodity_results)}
+      {holdings_block}
+      {strategy_block}
     </div>"""
 
 
@@ -3664,7 +4166,7 @@ def render_income_panel(state: PageState) -> str:
     candidate_rows = "".join(
         "<tr>"
         f"<td><strong>{html.escape(str(row.get('symbol', '')))}</strong><span>{html.escape(str(row.get('name', '')))}</span></td>"
-        f"<td>{render_symbol_value('tradingsymbol', row.get('candidate', ''))}</td>"
+        f"<td>{render_symbol_value('tradingsymbol', row.get('candidate', ''))}<small>{html.escape(str(row.get('roll_note', '')))}</small></td>"
         f"<td>{html.escape(fmt_number(row.get('spot')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('strike')))}</td>"
         f"<td>{html.escape(str(row.get('expiry', '')))}</td>"
@@ -3695,7 +4197,7 @@ def render_income_panel(state: PageState) -> str:
         f"<td>{html.escape(str(row.get('held_qty', '')))}</td>"
         f"<td class=\"{'pnl-positive' if (row.get('stock_pnl') or 0) >= 0 else 'pnl-negative'}\">{html.escape(fmt_number(row.get('stock_pnl')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('stock_return_pct')))}%</td>"
-        f"<td>{render_symbol_value('tradingsymbol', row.get('ce_candidate', ''))}</td>"
+        f"<td>{render_symbol_value('tradingsymbol', row.get('ce_candidate', ''))}<small>{html.escape(str(row.get('ce_roll_note', '')))}</small></td>"
         f"<td>{html.escape(fmt_number(row.get('ce_strike')))}</td>"
         f"<td>{html.escape(str(row.get('ce_expiry', '')))}</td>"
         f"<td>{html.escape(str(row.get('ce_lot_size', '')))}</td>"
@@ -3931,6 +4433,7 @@ def render_page(state: PageState) -> bytes:
     positions_research_tab_class = "active" if state.active_tab == "positions-research" else ""
     commodity_tab_class = "active" if state.active_tab == "commodity" else ""
     income_tab_class = "active" if state.active_tab == "income" else ""
+    order_management_tab_class = "active" if state.active_tab == "order-management" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     positions_panel_style = "" if state.active_tab == "positions" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
@@ -4809,6 +5312,60 @@ def render_page(state: PageState) -> bytes:
       border-color: #bfdbfe;
       background: #f8fbff;
     }}
+    .cancel-all-panel {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-color: #fecaca;
+      background: #fff7f7;
+      padding: 12px 16px;
+    }}
+    .cancel-all-panel .panel-title {{
+      margin: 0;
+      color: #991b1b;
+    }}
+    .cancel-all-panel .status {{
+      margin: 3px 0 0;
+    }}
+    .cancel-all-button {{
+      min-width: 180px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 0;
+      background: #b42318;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 950;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .order-book-panel {{
+      border-color: #bfdbfe;
+      background: #f8fbff;
+    }}
+    .order-book-table {{
+      min-width: 1180px;
+    }}
+    .order-book-table td,
+    .order-book-table th {{
+      white-space: normal;
+      overflow-wrap: anywhere;
+      vertical-align: top;
+    }}
+    .order-edit-input {{
+      width: 96px;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 800;
+      background: #ffffff;
+    }}
+    .order-edit-input:disabled {{
+      color: var(--muted);
+      background: #f1f5f9;
+    }}
     .validation-table {{
       min-width: 1040px;
       table-layout: fixed;
@@ -5070,6 +5627,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {research_tab_class}" type="button" data-tab="research">Research</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
+      <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Mofify / Cancel</button>
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT CSV Generator</button>
       <button class="tab-button utility-action {kite_setup_tab_class}" type="button" data-tab="kite-setup">Kite Setup</button>
     </div>
@@ -5102,6 +5660,7 @@ def render_page(state: PageState) -> bytes:
       </div>
       {render_console(state.console_log)}
     </form>
+    {render_order_management_panel(state)}
     <form id="positions-panel" method="post" action="/positions/load"{positions_panel_style}>
       {env_hidden}
       <input type="hidden" name="position_orders_payload" value="{html.escape(position_orders_payload, quote=True)}">
@@ -5170,7 +5729,7 @@ def render_page(state: PageState) -> bytes:
             <button type="submit" formaction="/gpt/save">Save to kite_orders.csv</button>
             <button type="submit" formaction="/gpt/save-preview">Save and Preview Orders</button>
           </div>
-          <div class="status">Saved CSV uses the same archive flow as Place Order, so the previous kite_orders.csv is kept as a last input order record.</div>
+          <div class="status">Saved CSV uses the same archive flow as Trading, so the previous {html.escape(DEFAULT_CSV_PATH.name)} is kept as a last input order record.</div>
         </section>
       </div>
       {orders_table}
@@ -5196,6 +5755,19 @@ def render_page(state: PageState) -> bytes:
       <div class="modal-actions">
         <button type="button" class="secondary" id="live-cancel">Cancel</button>
         <button type="button" class="danger" id="live-good" disabled>Good to go</button>
+      </div>
+    </div>
+  </div>
+  <div class="live-modal-backdrop" id="commodity-confirm-modal">
+    <div class="live-modal">
+      <h2>Validate again to the price?</h2>
+      <p>This commodity ETF order will be sent to Kite. Breathe in, breathe out, then confirm.</p>
+      <div class="breath-circle"></div>
+      <div class="breath-text" id="commodity-breath-text">Breathe in</div>
+      <div class="countdown" id="commodity-countdown">10</div>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="commodity-cancel">Cancel</button>
+        <button type="button" class="danger" id="commodity-good" disabled>Good to go</button>
       </div>
     </div>
   </div>
@@ -5231,6 +5803,7 @@ def render_page(state: PageState) -> bytes:
         document.getElementById('positions-panel').style.display = active === 'positions' ? '' : 'none';
         document.getElementById('gpt-panel').style.display = active === 'gpt' ? '' : 'none';
         document.getElementById('kite-setup-panel').style.display = active === 'kite-setup' ? '' : 'none';
+        document.getElementById('order-management-panel').style.display = active === 'order-management' ? '' : 'none';
         document.getElementById('analytics-panel').style.display = active === 'analytics' ? '' : 'none';
         document.getElementById('research-panel').style.display = active === 'research' ? '' : 'none';
         document.getElementById('positions-research-panel').style.display = active === 'positions-research' ? '' : 'none';
@@ -5250,8 +5823,15 @@ def render_page(state: PageState) -> bytes:
     const breathText = document.getElementById('breath-text');
     const liveConfirmed = document.getElementById('live-confirmed');
     const tradeNews = document.getElementById('trade-news');
+    const commodityModal = document.getElementById('commodity-confirm-modal');
+    const commodityCancel = document.getElementById('commodity-cancel');
+    const commodityGood = document.getElementById('commodity-good');
+    const commodityCountdown = document.getElementById('commodity-countdown');
+    const commodityBreathText = document.getElementById('commodity-breath-text');
     let pendingLiveSubmit = false;
     let countdownTimer = null;
+    let pendingCommodityForm = null;
+    let commodityCountdownTimer = null;
     function stopLiveCountdown() {{
       if (countdownTimer) {{
         clearInterval(countdownTimer);
@@ -5336,6 +5916,40 @@ def render_page(state: PageState) -> bytes:
       liveModal.style.display = 'none';
       stopLiveCountdown();
     }}
+    function stopCommodityCountdown() {{
+      if (commodityCountdownTimer) {{
+        clearInterval(commodityCountdownTimer);
+        commodityCountdownTimer = null;
+      }}
+    }}
+    function openCommodityModal(form) {{
+      let remaining = 10;
+      pendingCommodityForm = form;
+      commodityGood.disabled = true;
+      commodityCountdown.textContent = String(remaining);
+      commodityBreathText.textContent = 'Breathe in';
+      commodityModal.style.display = 'flex';
+      stopCommodityCountdown();
+      commodityCountdownTimer = setInterval(() => {{
+        remaining -= 1;
+        commodityCountdown.textContent = String(Math.max(remaining, 0));
+        commodityBreathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          stopCommodityCountdown();
+          commodityBreathText.textContent = 'Ready';
+          commodityGood.disabled = false;
+        }}
+      }}, 1000);
+    }}
+    function closeCommodityModal() {{
+      if (pendingCommodityForm) {{
+        const confirmed = pendingCommodityForm.querySelector('input[name="commodity_confirmed"]');
+        if (confirmed) confirmed.value = '0';
+      }}
+      pendingCommodityForm = null;
+      commodityModal.style.display = 'none';
+      stopCommodityCountdown();
+    }}
     placeForm && placeForm.addEventListener('submit', (event) => {{
       const submitter = event.submitter;
       if (!submitter || submitter.id !== 'execute-selected-button') {{
@@ -5360,6 +5974,25 @@ def render_page(state: PageState) -> bytes:
       if (liveConfirmed) liveConfirmed.value = '1';
       executeButton.setAttribute('formaction', '/execute');
       placeForm.requestSubmit(executeButton);
+    }});
+    for (const form of document.querySelectorAll('.commodity-confirm-form')) {{
+      form.addEventListener('submit', (event) => {{
+        const confirmed = form.querySelector('input[name="commodity_confirmed"]');
+        if (confirmed && confirmed.value === '1') return;
+        event.preventDefault();
+        openCommodityModal(form);
+      }});
+    }}
+    commodityCancel && commodityCancel.addEventListener('click', closeCommodityModal);
+    commodityGood && commodityGood.addEventListener('click', () => {{
+      if (commodityGood.disabled || !pendingCommodityForm) return;
+      const form = pendingCommodityForm;
+      const confirmed = form.querySelector('input[name="commodity_confirmed"]');
+      if (confirmed) confirmed.value = '1';
+      pendingCommodityForm = null;
+      commodityModal.style.display = 'none';
+      stopCommodityCountdown();
+      form.requestSubmit();
     }});
     async function refreshMmi() {{
       const value = document.getElementById('mmi-value');
@@ -5588,7 +6221,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
 
         state = PageState(
             active_tab=(
-                "positions"
+                "positions-research"
+                if self.path.startswith("/positions-research")
+                else "positions"
                 if self.path.startswith("/positions")
                 else "commodity"
                 if self.path.startswith("/commodity")
@@ -5598,12 +6233,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if self.path.startswith("/gpt")
                 else "kite-setup"
                 if self.path.startswith("/kite-setup") or self.path.startswith("/kite-token") or self.path.startswith("/kite-ip")
+                else "order-management"
+                if self.path.startswith("/orders")
                 else "analytics"
                 if self.path.startswith("/analytics")
                 else "research"
                 if self.path.startswith("/research")
-                else "positions-research"
-                if self.path.startswith("/positions-research")
                 else "place"
             ),
             csv_path=first(form, "csv_path", str(DEFAULT_CSV_PATH)),
@@ -5681,6 +6316,51 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.message = (
                         f"{persist_message} Submitted {len(state.orders)} selected order(s) to Kite."
                     ).strip()
+            elif self.path == "/orders/cancel-all":
+                state.results, state.console_log = call_with_console(cancel_all_open_orders)
+                try:
+                    state.order_book = kite_order_book()
+                except Exception as exc:
+                    state.order_book_error = str(exc)
+                cancelled = sum(1 for item in state.results if item.get("status") == "CANCELLED")
+                errors = sum(1 for item in state.results if item.get("status") == "ERROR")
+                state.message = f"Cancel all completed. Cancelled {cancelled} order(s); errors {errors}."
+            elif self.path == "/orders/cancel-selected":
+                selected_order_keys = form.get("order_key", [])
+                state.results, state.console_log = call_with_console(
+                    cancel_selected_orders,
+                    selected_order_keys,
+                )
+                try:
+                    state.order_book = kite_order_book()
+                except Exception as exc:
+                    state.order_book_error = str(exc)
+                cancelled = sum(1 for item in state.results if item.get("status") == "CANCELLED")
+                errors = sum(1 for item in state.results if item.get("status") == "ERROR")
+                skipped = sum(1 for item in state.results if item.get("status") == "SKIPPED")
+                state.message = (
+                    f"Cancel selected completed. Cancelled {cancelled}; skipped {skipped}; errors {errors}."
+                )
+            elif self.path == "/orders/modify-selected":
+                selected_order_keys = form.get("order_key", [])
+                state.results, state.console_log = call_with_console(
+                    modify_selected_orders,
+                    selected_order_keys,
+                    form,
+                )
+                try:
+                    state.order_book = kite_order_book()
+                except Exception as exc:
+                    state.order_book_error = str(exc)
+                modified = sum(1 for item in state.results if item.get("status") == "MODIFIED")
+                errors = sum(1 for item in state.results if item.get("status") == "ERROR")
+                skipped = sum(1 for item in state.results if item.get("status") == "SKIPPED")
+                state.message = (
+                    f"Modify selected completed. Modified {modified}; skipped {skipped}; errors {errors}."
+                )
+            elif self.path == "/orders/refresh":
+                state.order_book, state.console_log = call_with_console(kite_order_book)
+                state.message = f"Loaded {len(state.order_book)} Kite order(s)."
             elif self.path == "/positions/load":
                 state.position_orders, state.console_log = call_with_console(
                     build_position_buy_orders,
@@ -5811,25 +6491,57 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             elif self.path == "/commodity/buy":
                 symbol = first(form, "commodity_symbol")
-                result, state.console_log = call_with_console(place_commodity_etf_order, symbol)
-                state.commodity_results = [result]
+                try:
+                    result, state.console_log = call_with_console(
+                        place_commodity_etf_order,
+                        symbol,
+                        checked(form, "commodity_confirmed"),
+                    )
+                    state.commodity_results = [result]
+                    state.message = f"Submitted ETF BUY order for {symbol.upper()}."
+                except Exception as exc:
+                    state.commodity_results = [
+                        {
+                            "tradingsymbol": symbol.upper(),
+                            "status": "ERROR",
+                            "order_id": "",
+                            "detail": str(exc),
+                        }
+                    ]
+                    state.console_log = traceback.format_exc()
+                    state.message = "Commodity ETF BUY was not submitted. Review the execution result."
                 try:
                     state.commodity_holdings = commodity_etf_holdings()
                 except Exception as exc:
-                    state.commodity_error = f"Order submitted, but holdings refresh failed: {exc}"
-                state.message = f"Submitted ETF BUY order for {symbol.upper()}."
+                    state.commodity_error = f"Holdings refresh failed: {exc}"
             elif self.path == "/commodity/sell":
                 symbol = first(form, "commodity_symbol")
-                result, state.console_log = call_with_console(
-                    place_commodity_etf_sell_order,
-                    symbol,
-                )
-                state.commodity_results = [result]
+                try:
+                    if not checked(form, "commodity_confirmed"):
+                        raise PermissionError(
+                            "ETF SELL needs 10-second breathe confirmation before order placement."
+                        )
+                    result, state.console_log = call_with_console(
+                        place_commodity_etf_sell_order,
+                        symbol,
+                    )
+                    state.commodity_results = [result]
+                    state.message = f"Submitted ETF SELL order for full {symbol.upper()} holding."
+                except Exception as exc:
+                    state.commodity_results = [
+                        {
+                            "tradingsymbol": symbol.upper(),
+                            "status": "ERROR",
+                            "order_id": "",
+                            "detail": str(exc),
+                        }
+                    ]
+                    state.console_log = traceback.format_exc()
+                    state.message = "Commodity ETF SELL was not submitted. Review the execution result."
                 try:
                     state.commodity_holdings = commodity_etf_holdings()
                 except Exception as exc:
-                    state.commodity_error = f"Order submitted, but holdings refresh failed: {exc}"
-                state.message = f"Submitted ETF SELL order for full {symbol.upper()} holding."
+                    state.commodity_error = f"Holdings refresh failed: {exc}"
             else:
                 state.error = f"Unknown path: {self.path}"
         except Exception as exc:
