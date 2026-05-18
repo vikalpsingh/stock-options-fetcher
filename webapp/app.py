@@ -53,6 +53,8 @@ else:
 
 
 DEFAULT_CSV_PATH = PROJECT_ROOT / "src" / "script" / "kite_orders.csv"
+SETTINGS_PATH = APP_ROOT / "app_settings.json"
+DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_KITE_ENV = {
     "KITE_CONFIRM_LIVE_ORDER": "YES",
     "KITE_API_KEY": "vr6yz47r650vum8p",
@@ -115,6 +117,59 @@ TOP_WATCHLIST = [
     "NTPC",
     "WAAREEENER",
 ]
+COMMODITY_ETFS = [
+    {
+        "key": "nasdaq",
+        "label": "Motilal Oswal Nasdaq 100 ETF",
+        "symbol": "MON100",
+        "threshold": 6.0,
+        "allocation": 0.50,
+        "profit_target": 0.25,
+    },
+    {
+        "key": "gold",
+        "label": "Nippon India ETF Gold BeES",
+        "symbol": "GOLDBEES",
+        "threshold": 3.0,
+        "allocation": 0.30,
+        "profit_target": 0.25,
+    },
+    {
+        "key": "silver",
+        "label": "Nippon India Silver ETF",
+        "symbol": "SILVERBEES",
+        "threshold": 4.0,
+        "allocation": 0.20,
+        "profit_target": 0.25,
+    },
+]
+COMMODITY_YEARLY_BASE_AMOUNTS = {
+    2021: 10000.0,
+    2022: 15000.0,
+    2023: 22500.0,
+    2024: 33750.0,
+    2025: 50625.0,
+    2026: 75938.0,
+}
+COMMODITY_MAX_MULTIPLIER = 2
+INCOME_UNDERLYINGS = [
+    {
+        "symbol": "PFC",
+        "name": "Power Finance Corporation Ltd",
+        "capital": "5.2-5.5L",
+        "stress": "Moderate",
+        "annual_return": "18-22%",
+        "notes": "Excellent wheel candidate; assignment allowed, hold shares and optionally sell covered calls later.",
+    },
+    {
+        "symbol": "CAMS",
+        "name": "Computer Age Management Services Ltd",
+        "capital": "5.2-5.5L",
+        "stress": "Low",
+        "annual_return": "15-18%",
+        "notes": "Smoother volatility, lower premium, lower stress; assignment recovery is usually smoother.",
+    },
+]
 MONTH_CODES = {
     "JAN": 1,
     "FEB": 2,
@@ -132,6 +187,202 @@ MONTH_CODES = {
 
 for env_name, env_value_default in DEFAULT_KITE_ENV.items():
     os.environ[env_name] = env_value_default
+
+
+def load_app_settings() -> dict[str, Any]:
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_app_settings(settings: dict[str, Any]) -> None:
+    current = load_app_settings()
+    current.update(settings)
+    SETTINGS_PATH.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def etf_buy_amount_setting() -> float:
+    value = load_app_settings().get("etf_buy_amount", DEFAULT_ETF_BUY_AMOUNT)
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_ETF_BUY_AMOUNT
+    return amount if amount > 0 else DEFAULT_ETF_BUY_AMOUNT
+
+
+def format_buy_amount(value: Any) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        amount = DEFAULT_ETF_BUY_AMOUNT
+    if amount >= 1000 and amount % 1000 == 0:
+        return f"{int(amount / 1000)}K"
+    if amount.is_integer():
+        return f"{int(amount)}"
+    return f"{amount:.2f}"
+
+
+def etf_buy_action_text(amount: Any | None = None) -> str:
+    value = etf_buy_amount_setting() if amount is None else amount
+    return f"Buy the ETF of amount {format_buy_amount(value)} today"
+
+
+def commodity_yearly_base_amount(year: int | None = None) -> float:
+    selected_year = year or datetime.now().year
+    if selected_year in COMMODITY_YEARLY_BASE_AMOUNTS:
+        return COMMODITY_YEARLY_BASE_AMOUNTS[selected_year]
+    available_years = sorted(COMMODITY_YEARLY_BASE_AMOUNTS)
+    if selected_year < available_years[0]:
+        return COMMODITY_YEARLY_BASE_AMOUNTS[available_years[0]]
+    return COMMODITY_YEARLY_BASE_AMOUNTS[available_years[-1]]
+
+
+def commodity_daily_fall_pct(previous_close: float, current_close: float) -> float:
+    if previous_close <= 0 or current_close <= 0:
+        return 0.0
+    return max((previous_close - current_close) / previous_close * 100, 0.0)
+
+
+def commodity_dip_multiplier(
+    daily_fall_pct: float,
+    dip_trigger: float,
+    max_multiplier: int = COMMODITY_MAX_MULTIPLIER,
+) -> int:
+    if dip_trigger <= 0 or daily_fall_pct < dip_trigger:
+        return 0
+    return min(int(math.floor(daily_fall_pct / dip_trigger)), max_multiplier)
+
+
+def commodity_strategy_buy_amount(
+    etf: dict[str, Any],
+    daily_fall_pct: float,
+    year: int | None = None,
+) -> dict[str, Any]:
+    base = commodity_yearly_base_amount(year)
+    allocation = float(etf.get("allocation") or 0)
+    trigger = float(etf.get("threshold") or 0)
+    base_buy_amount = round(base * allocation)
+    multiplier = commodity_dip_multiplier(daily_fall_pct, trigger)
+    final_buy_amount = base_buy_amount * multiplier
+    return {
+        "year": year or datetime.now().year,
+        "yearly_base_amount": base,
+        "allocation": allocation,
+        "dip_trigger": trigger,
+        "daily_fall_pct": daily_fall_pct,
+        "base_buy_amount": base_buy_amount,
+        "multiplier": multiplier,
+        "final_buy_amount": final_buy_amount,
+        "buy_signal": multiplier > 0,
+        "max_multiplier": COMMODITY_MAX_MULTIPLIER,
+    }
+
+
+def commodity_action_text(amount: Any) -> str:
+    return f"Buy the ETF of amount {format_buy_amount(amount)} today"
+
+
+def commodity_backtest_engine(
+    price_history_by_symbol: dict[str, list[dict[str, Any]]],
+    profit_target: float = 0.25,
+    max_multiplier: int = COMMODITY_MAX_MULTIPLIER,
+) -> dict[str, Any]:
+    """Backtest ETF dip-buy baskets using allocation-adjusted multiplier sizing.
+
+    price_history_by_symbol rows must contain date and close. Date can be a date,
+    datetime, or ISO yyyy-mm-dd string. Results are intentionally plain dicts so
+    CSV/JSON callers can reuse this engine.
+    """
+    results: dict[str, Any] = {}
+    portfolio = {
+        "total_capital_deployed": 0.0,
+        "total_realised_profit": 0.0,
+        "total_open_mtm": 0.0,
+        "total_net_pnl": 0.0,
+        "max_active_capital": 0.0,
+        "trigger_count_by_etf": {},
+        "multiplier_trigger_count_by_etf": {},
+    }
+    for etf in COMMODITY_ETFS:
+        symbol = str(etf["symbol"])
+        rows = sorted(
+            price_history_by_symbol.get(symbol, []),
+            key=lambda row: str(row.get("date", "")),
+        )
+        units = 0.0
+        invested_amount = 0.0
+        realised_profit = 0.0
+        total_capital_deployed = 0.0
+        total_buy_triggers = 0
+        multiplier_buys = 0
+        max_active_capital = 0.0
+        peak_value = 0.0
+        max_drawdown = 0.0
+        previous_close: float | None = None
+        last_close = 0.0
+        for row in rows:
+            close = float(row.get("close") or 0)
+            if close <= 0:
+                continue
+            raw_date = row.get("date")
+            if isinstance(raw_date, datetime):
+                row_year = raw_date.year
+            elif isinstance(raw_date, date):
+                row_year = raw_date.year
+            else:
+                row_year = int(str(raw_date)[:4]) if str(raw_date)[:4].isdigit() else None
+            if previous_close is not None:
+                daily_fall = commodity_daily_fall_pct(previous_close, close)
+                sizing = commodity_strategy_buy_amount(etf, daily_fall, row_year)
+                multiplier = min(int(sizing["multiplier"]), max_multiplier)
+                if multiplier > 0:
+                    buy_amount = float(sizing["base_buy_amount"]) * multiplier
+                    units += buy_amount / close
+                    invested_amount += buy_amount
+                    total_capital_deployed += buy_amount
+                    total_buy_triggers += 1
+                    if multiplier > 1:
+                        multiplier_buys += 1
+            current_value = units * close
+            max_active_capital = max(max_active_capital, invested_amount)
+            peak_value = max(peak_value, current_value)
+            if peak_value > 0:
+                max_drawdown = min(max_drawdown, (current_value - peak_value) / peak_value * 100)
+            target = float(etf.get("profit_target") or profit_target)
+            if invested_amount > 0 and current_value >= invested_amount * (1 + target):
+                realised_profit += current_value - invested_amount
+                units = 0.0
+                invested_amount = 0.0
+                peak_value = 0.0
+            previous_close = close
+            last_close = close
+        open_market_value = units * last_close
+        open_mtm = open_market_value - invested_amount
+        total_pnl = realised_profit + open_mtm
+        results[symbol] = {
+            "total_buy_triggers": total_buy_triggers,
+            "number_of_multiplier_buys": multiplier_buys,
+            "total_capital_deployed": total_capital_deployed,
+            "realised_profit": realised_profit,
+            "open_invested_amount": invested_amount,
+            "open_market_value": open_market_value,
+            "open_mtm_profit_loss": open_mtm,
+            "total_pnl": total_pnl,
+            "max_active_capital": max_active_capital,
+            "max_drawdown": max_drawdown,
+        }
+        portfolio["total_capital_deployed"] += total_capital_deployed
+        portfolio["total_realised_profit"] += realised_profit
+        portfolio["total_open_mtm"] += open_mtm
+        portfolio["total_net_pnl"] += total_pnl
+        portfolio["max_active_capital"] += max_active_capital
+        portfolio["trigger_count_by_etf"][symbol] = total_buy_triggers
+        portfolio["multiplier_trigger_count_by_etf"][symbol] = multiplier_buys
+    return {"etfs": results, "portfolio": portfolio}
 
 
 def read_default_csv_text() -> str:
@@ -184,11 +435,20 @@ class PageState:
     openai_prompt: str = DEFAULT_OPENAI_PROMPT
     analytics_symbol: str = ""
     analytics_data: dict[str, Any] | None = None
+    trade_validations: list[dict[str, Any]] | None = None
     research_rows: list[dict[str, Any]] | None = None
     positions_rows: list[dict[str, Any]] | None = None
     positions_summary: dict[str, Any] | None = None
+    commodity_results: list[dict[str, Any]] | None = None
+    commodity_holdings: list[dict[str, Any]] | None = None
+    commodity_error: str = ""
+    income_rows: list[dict[str, Any]] | None = None
+    income_summary: dict[str, Any] | None = None
+    income_results: list[dict[str, Any]] | None = None
+    income_error: str = ""
     kite_request_token: str = ""
     kite_ip_data: list[dict[str, str]] | None = None
+    etf_buy_amount: float = field(default_factory=etf_buy_amount_setting)
 
 
 def mask_secret(value: str | None) -> str:
@@ -1214,6 +1474,524 @@ def open_option_positions() -> list[dict[str, Any]]:
     return active
 
 
+EVENT_RISK_TERMS = {
+    "board",
+    "bonus",
+    "budget",
+    "dividend",
+    "earnings",
+    "merger",
+    "policy",
+    "rbi",
+    "record",
+    "result",
+    "results",
+    "split",
+}
+
+
+def validation_status_class(status: str) -> str:
+    clean = status.lower()
+    if clean.startswith("green"):
+        return "validation-green"
+    if clean.startswith("red"):
+        return "validation-red"
+    if clean.startswith("yellow"):
+        return "validation-yellow"
+    return "validation-neutral"
+
+
+def validation_score(status: str) -> float:
+    clean = status.lower()
+    if clean.startswith("green"):
+        return 1.0
+    if clean.startswith("yellow"):
+        return 0.5
+    if clean.startswith("red"):
+        return 0.0
+    return 0.25
+
+
+def event_risk_check(symbol: str, news_cache: dict[str, list[dict[str, str]]]) -> tuple[str, str]:
+    underlying = underlying_for_symbol(symbol)
+    if not underlying:
+        return "YELLOW", "Could not detect underlying for event/news check."
+    if underlying not in news_cache:
+        try:
+            news_cache[underlying] = fetch_stock_news([symbol])
+        except Exception as exc:
+            news_cache[underlying] = [
+                {"title": f"News check failed: {exc}", "sentiment": "neutral"}
+            ]
+    titles = [str(item.get("title") or "") for item in news_cache.get(underlying, [])]
+    if not titles:
+        return "GREEN", "No recent 5-day news found by the app."
+    matched = [
+        title
+        for title in titles
+        if set(re.findall(r"[a-z]+", title.lower())) & EVENT_RISK_TERMS
+    ]
+    if matched:
+        return "RED", f"Recent event/news keyword found: {matched[0][:120]}"
+    negative = [title for title in titles if classify_news_sentiment(title) == "negative"]
+    if negative:
+        return "YELLOW", f"Recent negative headline found: {negative[0][:120]}"
+    return "GREEN", "No event-risk keyword found in recent 5-day news."
+
+
+def trade_validation_for_order(
+    order: dict[str, Any], news_cache: dict[str, list[dict[str, str]]]
+) -> dict[str, Any]:
+    symbol = str(order.get("tradingsymbol") or "").strip().upper()
+    transaction_type = str(order.get("transaction_type") or "").strip().upper()
+    quantity = abs(int(float(order.get("quantity") or 0)))
+    checks: list[dict[str, str]] = []
+    try:
+        data = option_analytics_for_symbol(symbol)
+        decision = data.get("decision", {})
+        risk_lights = decision.get("risk_lights", {})
+        option_type = str(data.get("option_type") or "").upper()
+        underlying = str(data.get("underlying") or underlying_for_symbol(symbol) or "")
+        spot = float(data.get("spot") or 0)
+        strike = float(data.get("strike") or 0)
+        option_price = float(data.get("option_price") or 0)
+        sell_pop = float(data.get("sell_pop") or 0)
+        delta_abs = abs(float(data.get("delta") or 0))
+        dte = int(data.get("dte") or 0)
+        otm_distance = decision.get("otm_distance")
+        upper_range = float(decision.get("upper_range") or 0)
+        lower_range = float(decision.get("lower_range") or 0)
+        pcr = data.get("pcr")
+        is_sell = transaction_type == "SELL"
+        side = (
+            "SELL CALL"
+            if is_sell and option_type == "CE"
+            else "SELL PUT"
+            if is_sell and option_type == "PE"
+            else f"{transaction_type} {option_type}".strip()
+        )
+        max_profit = option_price * quantity if is_sell else None
+
+        quality_status = "GREEN" if underlying in TOP_WATCHLIST else "YELLOW"
+        quality_detail = (
+            "Underlying is in the app watchlist; still confirm you are happy to hold 6-24 months."
+            if quality_status == "GREEN"
+            else "Manual quality check needed: avoid weak stock chosen only for premium."
+        )
+        checks.append(
+            {
+                "point": "Underlying quality",
+                "status": quality_status,
+                "detail": quality_detail,
+            }
+        )
+
+        event_status, event_detail = event_risk_check(symbol, news_cache)
+        checks.append({"point": "Event risk", "status": event_status, "detail": event_detail})
+
+        if option_type == "CE":
+            if pcr is not None and float(pcr) < 0.60:
+                trend_status = "GREEN"
+                trend_detail = "PCR shows call-writing/resistance setup; better for covered CALL selling."
+            elif pcr is not None and float(pcr) > 1.00:
+                trend_status = "RED"
+                trend_detail = "PCR is bullish/supportive; avoid aggressive CALL selling in possible breakout."
+            else:
+                trend_status = "YELLOW"
+                trend_detail = "Trend is neutral; use smaller size and check price action."
+        elif option_type == "PE":
+            if pcr is not None and float(pcr) > 0.80:
+                trend_status = "GREEN"
+                trend_detail = "PCR shows put-writing/support setup; better for cash-secured PUT selling."
+            elif pcr is not None and float(pcr) < 0.40:
+                trend_status = "RED"
+                trend_detail = "PCR is weak/bearish; avoid PUT selling into a falling setup."
+            else:
+                trend_status = "YELLOW"
+                trend_detail = "Trend is neutral; wait for support or reduce size."
+        else:
+            trend_status = "YELLOW"
+            trend_detail = "Trend check needs CE/PE option type."
+        checks.append({"point": "Trend structure", "status": trend_status, "detail": trend_detail})
+
+        if otm_distance is None:
+            distance_status = "YELLOW"
+            distance_detail = "Could not calculate OTM distance."
+        elif float(otm_distance) >= 10:
+            distance_status = "GREEN"
+            distance_detail = f"OTM distance {float(otm_distance):.2f}% gives buffer beyond support/resistance."
+        elif float(otm_distance) >= 7:
+            distance_status = "YELLOW"
+            distance_detail = f"OTM distance {float(otm_distance):.2f}% is acceptable but not wide."
+        else:
+            distance_status = "RED"
+            distance_detail = f"OTM distance {float(otm_distance):.2f}% is close; premium may not justify risk."
+        checks.append({"point": "Strike distance", "status": distance_status, "detail": distance_detail})
+
+        if 0.10 <= delta_abs <= 0.25 and sell_pop >= 75:
+            delta_status = "GREEN"
+        elif delta_abs <= 0.30 and sell_pop >= 70:
+            delta_status = "YELLOW"
+        else:
+            delta_status = "RED"
+        checks.append(
+            {
+                "point": "Delta / POP",
+                "status": delta_status,
+                "detail": f"Delta {delta_abs:.2f}; SELL POP {sell_pop:.2f}%. Target delta 0.10-0.25 and POP above 75-80%.",
+            }
+        )
+
+        assignment_capital = strike * quantity
+        if option_type == "CE":
+            margin_status = "YELLOW"
+            margin_detail = f"Covered CALL needs shares ready for delivery/opportunity cost. Quantity {quantity}; strike value about {assignment_capital:.0f}."
+        elif option_type == "PE":
+            margin_status = "YELLOW"
+            margin_detail = f"Cash-secured PUT needs assignment cash. Quantity {quantity}; assignment value about {assignment_capital:.0f}."
+        else:
+            margin_status = "YELLOW"
+            margin_detail = "Margin/assignment check needs option type."
+        checks.append(
+            {"point": "Margin + assignment readiness", "status": margin_status, "detail": margin_detail}
+        )
+
+        theta_yield = float(risk_lights.get("theta_yield_pct") or 0)
+        if dte <= 5:
+            exit_status = "RED"
+            exit_detail = f"{dte} DTE is close to expiry; define exit/roll before entry."
+        elif theta_yield >= 5:
+            exit_status = "GREEN"
+            exit_detail = f"Theta yield {theta_yield:.2f}%/day supports predefined 50-60% profit exit or roll-if-tested rule."
+        else:
+            exit_status = "YELLOW"
+            exit_detail = f"Theta yield {theta_yield:.2f}%/day is modest; confirm exit/roll rule before entry."
+        checks.append({"point": "Exit / roll rule before entry", "status": exit_status, "detail": exit_detail})
+
+        score = sum(validation_score(check["status"]) for check in checks)
+        overall = "GREEN" if score >= 5.5 else "YELLOW" if score >= 3.5 else "RED"
+        if option_type == "CE":
+            impact = (
+                f"Spot {spot:.2f}; strike {strike:.2f}; expected upper range {upper_range:.2f}. "
+                f"CALL risk rises if stock moves up toward/above strike; covered shares cap upside."
+            )
+        elif option_type == "PE":
+            impact = (
+                f"Spot {spot:.2f}; strike {strike:.2f}; expected lower range {lower_range:.2f}. "
+                f"PUT risk rises if stock falls toward/below strike; assignment can require cash."
+            )
+        else:
+            impact = "Could not calculate stock-price impact."
+        return {
+            "symbol": symbol,
+            "side": side,
+            "overall": overall,
+            "score": score,
+            "max_score": len(checks),
+            "max_profit": max_profit,
+            "impact": impact,
+            "checks": checks,
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "symbol": symbol,
+            "side": transaction_type,
+            "overall": "RED",
+            "score": 0,
+            "max_score": 7,
+            "max_profit": None,
+            "impact": "Validation could not calculate live impact.",
+            "checks": [],
+            "error": str(exc),
+        }
+
+
+def validate_trade_orders(orders: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    news_cache: dict[str, list[dict[str, str]]] = {}
+    return [trade_validation_for_order(order, news_cache) for order in orders or []]
+
+
+def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
+    today = datetime.now().date()
+    spot_quote = kite.quote([f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
+    spot = quote_ltp(spot_quote)
+    if spot <= 0:
+        raise ValueError(f"Could not read spot for {underlying}.")
+    instruments = [
+        item
+        for item in kite.instruments("NFO")
+        if str(item.get("name", "")).upper() == underlying
+        and str(item.get("instrument_type", "")).upper() == "PE"
+        and item.get("expiry")
+        and item.get("expiry") >= today
+    ]
+    if not instruments:
+        raise ValueError(f"No monthly PE instruments found for {underlying}.")
+    expiries = sorted({item["expiry"] for item in instruments})
+    expiry = expiries[0]
+    expiry_instruments = [item for item in instruments if item.get("expiry") == expiry]
+    target_strike = spot * 0.90
+    below_target = [
+        item for item in expiry_instruments if float(item.get("strike") or 0) <= target_strike
+    ]
+    pool = below_target or expiry_instruments
+    selected = min(
+        pool,
+        key=lambda item: abs(float(item.get("strike") or 0) - target_strike),
+    )
+    return {
+        "symbol": str(selected["tradingsymbol"]).upper(),
+        "spot": spot,
+        "strike": float(selected.get("strike") or 0),
+        "expiry": expiry,
+        "target_strike": target_strike,
+        "lot_size": int(selected.get("lot_size") or 0),
+    }
+
+
+def next_monthly_ce_candidate(kite: Any, underlying: str) -> dict[str, Any]:
+    today = datetime.now().date()
+    spot_quote = kite.quote([f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
+    spot = quote_ltp(spot_quote)
+    if spot <= 0:
+        raise ValueError(f"Could not read spot for {underlying}.")
+    instruments = [
+        item
+        for item in kite.instruments("NFO")
+        if str(item.get("name", "")).upper() == underlying
+        and str(item.get("instrument_type", "")).upper() == "CE"
+        and item.get("expiry")
+        and item.get("expiry") >= today
+    ]
+    if not instruments:
+        raise ValueError(f"No monthly CE instruments found for {underlying}.")
+    expiries = sorted({item["expiry"] for item in instruments})
+    expiry = expiries[0]
+    expiry_instruments = [item for item in instruments if item.get("expiry") == expiry]
+    target_strike = spot * 1.10
+    above_target = [
+        item for item in expiry_instruments if float(item.get("strike") or 0) >= target_strike
+    ]
+    pool = above_target or expiry_instruments
+    selected = min(
+        pool,
+        key=lambda item: abs(float(item.get("strike") or 0) - target_strike),
+    )
+    return {
+        "symbol": str(selected["tradingsymbol"]).upper(),
+        "spot": spot,
+        "strike": float(selected.get("strike") or 0),
+        "expiry": expiry,
+        "target_strike": target_strike,
+        "lot_size": int(selected.get("lot_size") or 0),
+    }
+
+
+def income_share_holdings(kite: Any) -> dict[str, dict[str, Any]]:
+    wanted = {item["symbol"] for item in INCOME_UNDERLYINGS}
+    holdings: dict[str, dict[str, Any]] = {}
+    quote_keys = [f"NSE:{symbol}" for symbol in wanted]
+    quotes = kite.quote(quote_keys)
+    for holding in kite.holdings():
+        symbol = str(holding.get("tradingsymbol") or "").upper()
+        if symbol not in wanted:
+            continue
+        quantity = int(float(holding.get("quantity") or 0))
+        average_price = float(holding.get("average_price") or 0)
+        ltp = float(
+            quotes.get(f"NSE:{symbol}", {}).get("last_price")
+            or holding.get("last_price")
+            or 0
+        )
+        investment = quantity * average_price
+        market_value = quantity * ltp
+        holdings[symbol] = {
+            "quantity": quantity,
+            "average_price": average_price,
+            "ltp": ltp,
+            "investment": investment,
+            "market_value": market_value,
+            "pnl": market_value - investment,
+            "return_pct": ((market_value - investment) / investment * 100)
+            if investment > 0
+            else None,
+        }
+    return holdings
+
+
+def income_pnl_summary(kite: Any, holdings: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    by_symbol = {
+        item["symbol"]: {
+            "stock_pnl": float(holdings.get(item["symbol"], {}).get("pnl") or 0),
+            "option_pnl": 0.0,
+            "total_pnl": float(holdings.get(item["symbol"], {}).get("pnl") or 0),
+        }
+        for item in INCOME_UNDERLYINGS
+    }
+    positions = kite.positions().get("net", [])
+    for position in positions:
+        symbol = str(position.get("tradingsymbol") or "").upper()
+        underlying = underlying_for_symbol(symbol)
+        if underlying in by_symbol:
+            pnl = float(position.get("pnl") or 0)
+            by_symbol[underlying]["option_pnl"] += pnl
+            by_symbol[underlying]["total_pnl"] += pnl
+    total = sum(row["total_pnl"] for row in by_symbol.values())
+    return {"overall_pnl": total, "by_symbol": by_symbol}
+
+
+def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'Covered CE order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    clean_underlying = underlying.strip().upper()
+    if clean_underlying not in {item["symbol"] for item in INCOME_UNDERLYINGS}:
+        raise ValueError(f"Unsupported INCOME underlying: {clean_underlying}")
+    kite = kite_orders.kite_client()
+    holdings = income_share_holdings(kite)
+    held_qty = int(holdings.get(clean_underlying, {}).get("quantity") or 0)
+    candidate = next_monthly_ce_candidate(kite, clean_underlying)
+    lot_size = int(candidate.get("lot_size") or 0)
+    if lot_size <= 0:
+        raise ValueError(f"Could not read lot size for {candidate['symbol']}.")
+    covered_qty = (held_qty // lot_size) * lot_size
+    if covered_qty <= 0:
+        raise ValueError(
+            f"Need at least {lot_size} shares of {clean_underlying} for one covered CE lot. Holding: {held_qty}."
+        )
+    quote = kite.quote([f"NFO:{candidate['symbol']}"]).get(f"NFO:{candidate['symbol']}", {})
+    price = quote_ltp(quote)
+    if price <= 0:
+        raise ValueError(f"Could not read CE premium for {candidate['symbol']}.")
+    order = {
+        "variety": "regular",
+        "exchange": "NFO",
+        "tradingsymbol": candidate["symbol"],
+        "transaction_type": "SELL",
+        "quantity": covered_qty,
+        "product": "NRML",
+        "order_type": "LIMIT",
+        "price": price,
+        "validity": "DAY",
+        "tag": "INCOME_CC",
+    }
+    order_id = kite_orders.place_order(kite, order)
+    return {
+        "tradingsymbol": candidate["symbol"],
+        "status": "LIVE_SENT",
+        "order_id": order_id,
+        "detail": (
+            f"SELL covered CE {covered_qty} qty at LIMIT {price:.2f}. "
+            f"Holding {held_qty} shares of {clean_underlying}."
+        ),
+    }
+
+
+def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    rows: list[dict[str, Any]] = []
+    news_cache: dict[str, list[dict[str, str]]] = {}
+    holdings = income_share_holdings(kite)
+    summary = income_pnl_summary(kite, holdings)
+    for config in INCOME_UNDERLYINGS:
+        underlying = config["symbol"]
+        try:
+            candidate = next_monthly_pe_candidate(kite, underlying)
+            ce_candidate = next_monthly_ce_candidate(kite, underlying)
+            data = option_analytics_for_symbol(candidate["symbol"])
+            ce_data = option_analytics_for_symbol(ce_candidate["symbol"])
+            decision = data.get("decision", {})
+            risk = decision.get("risk_lights", {})
+            expiry = candidate["expiry"]
+            trading_days = trading_days_remaining(expiry)
+            otm = decision.get("otm_distance")
+            iv_percent = data.get("iv_percent")
+            sell_pop = data.get("sell_pop")
+            pcr = data.get("pcr")
+            event_status, event_detail = event_risk_check(candidate["symbol"], news_cache)
+            entry_ok = (
+                3 <= trading_days <= 7
+                and otm is not None
+                and float(otm) >= 10
+                and sell_pop is not None
+                and float(sell_pop) >= 75
+                and event_status != "RED"
+            )
+            action = (
+                "READY TO SELL CASH-SECURED PE"
+                if entry_ok
+                else "WAIT / REVIEW FILTERS"
+            )
+            holding = holdings.get(underlying, {})
+            held_qty = int(holding.get("quantity") or 0)
+            ce_lot_size = int(ce_candidate.get("lot_size") or 0)
+            covered_lots = (held_qty // ce_lot_size) if ce_lot_size > 0 else 0
+            covered_qty = covered_lots * ce_lot_size
+            ce_otm = ce_data.get("decision", {}).get("otm_distance")
+            ce_sell_pop = ce_data.get("sell_pop")
+            ce_action = (
+                "READY TO SELL COVERED CE"
+                if covered_qty > 0
+                else "NEED SHARES FOR COVERED CE"
+            )
+            rows.append(
+                {
+                    **config,
+                    "candidate": candidate["symbol"],
+                    "spot": data.get("spot"),
+                    "strike": data.get("strike"),
+                    "expiry": expiry.strftime("%d %b %Y"),
+                    "trading_days": trading_days,
+                    "option_price": data.get("option_price"),
+                    "sell_pop": sell_pop,
+                    "delta": abs(float(data.get("delta") or 0)),
+                    "otm_distance": otm,
+                    "iv_percent": iv_percent,
+                    "pcr": pcr,
+                    "theta_yield_pct": risk.get("theta_yield_pct"),
+                    "event_status": event_status,
+                    "event_detail": event_detail,
+                    "action": action,
+                    "action_color": "green" if entry_ok else "yellow",
+                    "held_qty": held_qty,
+                    "stock_pnl": holding.get("pnl"),
+                    "stock_return_pct": holding.get("return_pct"),
+                    "ce_candidate": ce_candidate["symbol"],
+                    "ce_strike": ce_data.get("strike"),
+                    "ce_expiry": ce_candidate["expiry"].strftime("%d %b %Y"),
+                    "ce_lot_size": ce_lot_size,
+                    "covered_qty": covered_qty,
+                    "covered_lots": covered_lots,
+                    "ce_premium": ce_data.get("option_price"),
+                    "ce_otm_distance": ce_otm,
+                    "ce_sell_pop": ce_sell_pop,
+                    "ce_action": ce_action,
+                    "ce_action_color": "green" if covered_qty > 0 else "yellow",
+                    "error": "",
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    **config,
+                    "candidate": "",
+                    "ce_candidate": "",
+                    "action": "DATA ERROR",
+                    "action_color": "red",
+                    "ce_action": "DATA ERROR",
+                    "ce_action_color": "red",
+                    "error": str(exc),
+                }
+            )
+    return rows, summary
+
+
 def research_csv_symbols() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for csv_row in safe_csv_rows(read_default_csv_text()):
@@ -1465,20 +2243,35 @@ def fetch_csv_market_quotes() -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
 
-    underlyings = TOP_WATCHLIST
-    if not underlyings:
+    quote_items = [{"symbol": symbol, "threshold": None} for symbol in TOP_WATCHLIST]
+    quote_items.extend(
+        {
+            "symbol": str(item["symbol"]),
+            "threshold": float(item["threshold"]),
+            "allocation": float(item["allocation"]),
+        }
+        for item in COMMODITY_ETFS
+    )
+    if not quote_items:
         return {"ok": True, "quotes": []}
 
     kite = kite_orders.kite_client()
-    instruments = [f"NSE:{symbol}" for symbol in underlyings]
+    instruments = [f"NSE:{item['symbol']}" for item in quote_items]
     raw_quotes = kite.quote(instruments)
     quotes: list[dict[str, Any]] = []
-    for symbol in underlyings:
+    for item in quote_items:
+        symbol = str(item["symbol"])
         key = f"NSE:{symbol}"
         quote = raw_quotes.get(key, {})
         ltp = float(quote.get("last_price") or 0)
         close = float((quote.get("ohlc") or {}).get("close") or 0)
         change_percent = ((ltp - close) / close * 100) if close > 0 else None
+        threshold = item.get("threshold")
+        sizing = (
+            commodity_strategy_buy_amount(item, commodity_daily_fall_pct(close, ltp))
+            if threshold is not None
+            else None
+        )
         quotes.append(
             {
                 "symbol": symbol,
@@ -1486,9 +2279,219 @@ def fetch_csv_market_quotes() -> dict[str, Any]:
                 "change_percent": round(change_percent, 2)
                 if change_percent is not None
                 else None,
+                "threshold": threshold,
+                "buy_signal": bool(sizing and sizing["buy_signal"]),
+                "action": commodity_action_text(sizing["final_buy_amount"])
+                if sizing and sizing["buy_signal"]
+                else "",
+                "buy_amount": sizing["final_buy_amount"] if sizing else None,
+                "multiplier": sizing["multiplier"] if sizing else 0,
             }
         )
     return {"ok": True, "quotes": quotes}
+
+
+def fetch_commodity_etf_quotes() -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+
+    kite = kite_orders.kite_client()
+    instruments = [f"NSE:{item['symbol']}" for item in COMMODITY_ETFS]
+    raw_quotes = kite.quote(instruments)
+    quotes: list[dict[str, Any]] = []
+    for item in COMMODITY_ETFS:
+        key = f"NSE:{item['symbol']}"
+        quote = raw_quotes.get(key, {})
+        ltp = float(quote.get("last_price") or 0)
+        close = float((quote.get("ohlc") or {}).get("close") or 0)
+        change_percent = ((ltp - close) / close * 100) if close > 0 else None
+        daily_fall_pct = commodity_daily_fall_pct(close, ltp)
+        threshold = float(item["threshold"])
+        sizing = commodity_strategy_buy_amount(item, daily_fall_pct)
+        quotes.append(
+            {
+                "key": item["key"],
+                "label": item["label"],
+                "symbol": item["symbol"],
+                "ltp": round(ltp, 2),
+                "close": round(close, 2),
+                "change_percent": round(change_percent, 2)
+                if change_percent is not None
+                else None,
+                "threshold": threshold,
+                "allocation": item["allocation"],
+                "yearly_base_amount": sizing["yearly_base_amount"],
+                "base_buy_amount": round(sizing["base_buy_amount"], 2),
+                "daily_fall_pct": round(daily_fall_pct, 2),
+                "multiplier": sizing["multiplier"],
+                "max_multiplier": sizing["max_multiplier"],
+                "buy_signal": sizing["buy_signal"],
+                "action": commodity_action_text(sizing["final_buy_amount"])
+                if sizing["buy_signal"]
+                else "Wait",
+                "buy_amount": round(sizing["final_buy_amount"], 2),
+            }
+        )
+    return {"ok": True, "quotes": quotes}
+
+
+def commodity_etf_by_symbol(symbol: str) -> dict[str, Any]:
+    clean = symbol.strip().upper()
+    for item in COMMODITY_ETFS:
+        if str(item["symbol"]).upper() == clean:
+            return item
+    raise ValueError(f"Unknown ETF symbol: {symbol}")
+
+
+def place_commodity_etf_order(symbol: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'ETF live order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    item = commodity_etf_by_symbol(symbol)
+    clean_symbol = str(item["symbol"]).upper()
+    kite = kite_orders.kite_client()
+    quote = kite.quote([f"NSE:{clean_symbol}"]).get(f"NSE:{clean_symbol}", {})
+    ltp = float(quote.get("last_price") or 0)
+    previous_close = float((quote.get("ohlc") or {}).get("close") or 0)
+    if ltp <= 0:
+        raise ValueError(f"Could not read live LTP for {clean_symbol}.")
+    sizing = commodity_strategy_buy_amount(
+        item,
+        commodity_daily_fall_pct(previous_close, ltp),
+    )
+    if not sizing["buy_signal"]:
+        raise ValueError(
+            f"{clean_symbol} has not hit dip trigger. Fall {sizing['daily_fall_pct']:.2f}% "
+            f"is below trigger {sizing['dip_trigger']:.2f}%."
+        )
+    buy_amount = float(sizing["final_buy_amount"])
+    quantity = int(buy_amount // ltp)
+    if quantity < 1:
+        raise ValueError(
+            f"Strategy buy amount {format_buy_amount(buy_amount)} is less than one unit at LTP {ltp:.2f}."
+        )
+    order = {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": clean_symbol,
+        "transaction_type": "BUY",
+        "quantity": quantity,
+        "product": "CNC",
+        "order_type": "MARKET",
+        "validity": "DAY",
+        "tag": "ETF_BUY",
+    }
+    order_id = kite_orders.place_order(kite, order)
+    return {
+        "tradingsymbol": clean_symbol,
+        "status": "LIVE_SENT",
+        "order_id": order_id,
+        "detail": (
+            f"BUY {quantity} {clean_symbol} at MARKET for approx "
+            f"{quantity * ltp:.2f}. Strategy amount {format_buy_amount(buy_amount)} "
+            f"({sizing['multiplier']}x, fall {sizing['daily_fall_pct']:.2f}%)."
+        ),
+    }
+
+
+def commodity_etf_holdings() -> list[dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    symbols = [str(item["symbol"]).upper() for item in COMMODITY_ETFS]
+    by_symbol = {
+        str(holding.get("tradingsymbol") or "").upper(): holding
+        for holding in kite.holdings()
+    }
+    quote_keys = [f"NSE:{symbol}" for symbol in symbols]
+    quotes = kite.quote(quote_keys)
+    rows: list[dict[str, Any]] = []
+    for item in COMMODITY_ETFS:
+        symbol = str(item["symbol"]).upper()
+        holding = by_symbol.get(symbol, {})
+        quantity = int(
+            float(holding.get("quantity") or 0)
+            + float(holding.get("t1_quantity") or 0)
+        )
+        sellable_quantity = int(float(holding.get("quantity") or 0))
+        average_price = float(holding.get("average_price") or 0)
+        quote = quotes.get(f"NSE:{symbol}", {})
+        ltp = float(
+            quote.get("last_price")
+            or holding.get("last_price")
+            or holding.get("close_price")
+            or 0
+        )
+        investment = average_price * quantity
+        market_value = ltp * quantity
+        pnl = market_value - investment
+        profit_pct = (pnl / investment * 100) if investment > 0 else None
+        book_profit = profit_pct is not None and profit_pct > 25 and quantity > 0
+        rows.append(
+            {
+                "label": item["label"],
+                "symbol": symbol,
+                "quantity": quantity,
+                "sellable_quantity": sellable_quantity,
+                "average_price": average_price,
+                "ltp": ltp,
+                "investment": investment,
+                "market_value": market_value,
+                "pnl": pnl,
+                "profit_pct": profit_pct,
+                "book_profit": book_profit,
+            }
+        )
+    return rows
+
+
+def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'ETF sell order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    item = commodity_etf_by_symbol(symbol)
+    clean_symbol = str(item["symbol"]).upper()
+    holding = next(
+        (row for row in commodity_etf_holdings() if row["symbol"] == clean_symbol),
+        None,
+    )
+    if not holding or int(holding.get("quantity") or 0) <= 0:
+        raise ValueError(f"No ETF holding quantity found for {clean_symbol}.")
+    if not holding.get("book_profit"):
+        raise ValueError(
+            f"{clean_symbol} profit is {fmt_number(holding.get('profit_pct'))}%, below BOOK profit threshold 25%."
+        )
+    quantity = int(holding.get("sellable_quantity") or 0)
+    if quantity <= 0:
+        raise ValueError(f"No sellable ETF holding quantity found for {clean_symbol}.")
+    order = {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": clean_symbol,
+        "transaction_type": "SELL",
+        "quantity": quantity,
+        "product": "CNC",
+        "order_type": "MARKET",
+        "validity": "DAY",
+        "tag": "ETF_BOOK",
+    }
+    kite = kite_orders.kite_client()
+    order_id = kite_orders.place_order(kite, order)
+    return {
+        "tradingsymbol": clean_symbol,
+        "status": "LIVE_SENT",
+        "order_id": order_id,
+        "detail": (
+            f"SELL full holding {quantity} {clean_symbol} at MARKET. "
+            f"Current profit {fmt_number(holding.get('profit_pct'))}%."
+        ),
+    }
 
 
 def compact_text(value: str) -> str:
@@ -1916,6 +2919,54 @@ def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] 
         '<section class="panel"><div class="panel-title">Orders</div>'
         '<div class="table-wrap"><table><thead><tr><th>Select</th>'
         f"{header}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
+    )
+
+
+def render_trade_validation_table(validations: list[dict[str, Any]] | None) -> str:
+    if not validations:
+        return ""
+    rows: list[str] = []
+    for item in validations:
+        overall_class = validation_status_class(str(item.get("overall") or ""))
+        score = fmt_number(item.get("score"), 1)
+        max_score = fmt_number(item.get("max_score"), 0)
+        max_profit = item.get("max_profit")
+        profit_text = fmt_number(max_profit) if max_profit is not None else "N/A"
+        if item.get("error"):
+            rows.append(
+                "<tr>"
+                f'<td class="validation-symbol">{render_symbol_value("tradingsymbol", item.get("symbol", ""))}<span>{html.escape(str(item.get("side", "")))}</span></td>'
+                f'<td class="validation-overall {overall_class}"><strong>{html.escape(str(item.get("overall", "RED")))}</strong><small>{score}/{max_score}</small></td>'
+                f'<td class="validation-profit">{html.escape(profit_text)}</td>'
+                f'<td class="validation-checks validation-red">{html.escape(str(item.get("error")))}</td>'
+                f'<td class="validation-impact">{html.escape(str(item.get("impact", "")))}</td>'
+                "</tr>"
+            )
+            continue
+        checks = item.get("checks") or []
+        check_html = "".join(
+            f'<div class="validation-check {validation_status_class(str(check.get("status", "")))}">'
+            f'<strong>{html.escape(str(check.get("point", "")))}: {html.escape(str(check.get("status", "")))}</strong>'
+            f'<span>{html.escape(str(check.get("detail", "")))}</span>'
+            "</div>"
+            for check in checks
+        )
+        rows.append(
+            "<tr>"
+            f'<td class="validation-symbol">{render_symbol_value("tradingsymbol", item.get("symbol", ""))}<span>{html.escape(str(item.get("side", "")))}</span></td>'
+            f'<td class="validation-overall {overall_class}"><strong>{html.escape(str(item.get("overall", "")))}</strong><small>{score}/{max_score}</small></td>'
+            f'<td class="validation-profit">{html.escape(profit_text)}</td>'
+            f'<td class="validation-checks">{check_html}</td>'
+            f'<td class="validation-impact">{html.escape(str(item.get("impact", "")))}</td>'
+            "</tr>"
+        )
+    return (
+        '<section class="panel validation-panel">'
+        '<div class="panel-title">Pre-Trade Wheel Validation Engine</div>'
+        '<div class="status">Top 7 checks before selling CALL / PUT. Use this to judge stock-price impact and CE/PE assignment risk before live order placement.</div>'
+        '<div class="table-wrap"><table class="validation-table"><thead><tr>'
+        '<th>Symbol</th><th>Overall</th><th>Max Profit</th><th>7 Checks</th><th>Stock Price Impact / CE-PE Risk</th>'
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
     )
 
 
@@ -2459,6 +3510,264 @@ def render_positions_panel(state: PageState) -> str:
     </form>"""
 
 
+def render_commodity_panel(state: PageState) -> str:
+    panel_style = "" if state.active_tab == "commodity" else ' style="display:none"'
+    holdings = state.commodity_holdings
+    holdings_error = state.commodity_error
+    if holdings is None and state.active_tab == "commodity":
+        try:
+            holdings = commodity_etf_holdings()
+        except Exception as exc:
+            holdings = []
+            holdings_error = str(exc)
+    holding_rows = "".join(
+        "<tr>"
+        f"<td><strong>{html.escape(str(row.get('symbol', '')))}</strong><span>{html.escape(str(row.get('label', '')))}</span></td>"
+        f"<td>{html.escape(str(row.get('quantity', 0)))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('investment')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('market_value')))}</td>"
+        f"<td class=\"{'pnl-positive' if float(row.get('pnl') or 0) >= 0 else 'pnl-negative'}\">{html.escape(fmt_number(row.get('pnl')))}</td>"
+        f"<td class=\"{'pnl-positive' if (row.get('profit_pct') or 0) >= 0 else 'pnl-negative'}\">{html.escape(fmt_number(row.get('profit_pct')))}%</td>"
+        "<td>"
+        + (
+            '<form method="post" action="/commodity/sell">'
+            f"{env_hidden_fields_for_render()}"
+            f'<input type="hidden" name="commodity_symbol" value="{html.escape(str(row.get("symbol", "")), quote=True)}">'
+            '<button type="submit" class="book-profit-button">BOOK profit</button>'
+            "</form>"
+            if row.get("book_profit")
+            else '<span class="commodity-wait">Hold / wait</span>'
+        )
+        + "</td>"
+        "</tr>"
+        for row in holdings or []
+    )
+    holdings_error_html = f'<div class="status">{html.escape(holdings_error)}</div>' if holdings_error else ""
+    holdings_empty_html = (
+        '<tr><td colspan="7" class="status">No commodity ETF holdings found.</td></tr>'
+        if not holding_rows and not holdings_error
+        else ""
+    )
+    holdings_block = (
+        '<section class="panel commodity-holdings-panel">'
+        '<div class="panel-title">Current ETF Holdings</div>'
+        '<div class="table-wrap"><table class="commodity-holdings-table"><thead><tr>'
+        '<th>ETF</th><th>Unit</th><th>Investment Amount</th><th>Market Value</th><th>Profit</th><th>% Profit</th><th>Action</th>'
+        f'</tr></thead><tbody>{holding_rows}{holdings_empty_html}</tbody></table></div>'
+        f"{holdings_error_html}"
+        "</section>"
+    )
+    strategy_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(item['label']))}<strong>{html.escape(str(item['symbol']))}</strong></td>"
+        f"<td>{int(float(item['allocation']) * 100)}%</td>"
+        f"<td>{html.escape(str(item['threshold']))}%</td>"
+        f"<td>{html.escape(format_buy_amount(commodity_yearly_base_amount() * float(item['allocation'])))}</td>"
+        f"<td>{html.escape(format_buy_amount(commodity_yearly_base_amount() * float(item['allocation']) * COMMODITY_MAX_MULTIPLIER))}</td>"
+        f"<td>{int(float(item['profit_target']) * 100)}%</td>"
+        "</tr>"
+        for item in COMMODITY_ETFS
+    )
+    strategy_block = (
+        '<section class="panel commodity-strategy-panel">'
+        '<div class="panel-title">ETF Dip-Buy Multiplier Strategy</div>'
+        f'<div class="status">Yearly base for {datetime.now().year}: <strong>{html.escape(format_buy_amount(commodity_yearly_base_amount()))}</strong>. Multiplier = floor(day fall / trigger), capped at {COMMODITY_MAX_MULTIPLIER}x. Profit booking target: 25% full basket exit.</div>'
+        '<div class="table-wrap"><table class="commodity-holdings-table"><thead><tr>'
+        '<th>ETF</th><th>Allocation</th><th>Dip Trigger</th><th>1x Buy Amount</th><th>2x Capped Buy</th><th>Profit Target</th>'
+        f'</tr></thead><tbody>{strategy_rows}</tbody></table></div></section>'
+    )
+    cards = "".join(
+        f"""
+        <article class="commodity-card" data-symbol="{html.escape(str(item['symbol']), quote=True)}" data-threshold="{html.escape(str(item['threshold']), quote=True)}">
+          <div class="commodity-meta">
+            <span class="commodity-label">{html.escape(str(item['label']))}</span>
+            <strong>{html.escape(str(item['symbol']))}</strong>
+          </div>
+          <div class="commodity-price">...</div>
+          <div class="commodity-change">--</div>
+          <div class="commodity-threshold">Buy trigger: down {html.escape(str(item['threshold']))}% | Allocation {int(float(item['allocation']) * 100)}% | 1x {html.escape(format_buy_amount(commodity_yearly_base_amount() * float(item['allocation'])))}</div>
+          <div class="commodity-action">Wait</div>
+          <form class="commodity-buy-form" method="post" action="/commodity/buy">
+            {env_hidden_fields_for_render()}
+            <input type="hidden" name="commodity_symbol" value="{html.escape(str(item['symbol']), quote=True)}">
+            <button type="submit" class="commodity-buy-button">Buy on dip trigger</button>
+          </form>
+        </article>
+        """
+        for item in COMMODITY_ETFS
+    )
+    return f"""
+    <div id="commodity-panel"{panel_style}>
+      {holdings_block}
+      {strategy_block}
+      <section class="panel commodity-panel">
+        <div class="panel-title">Commodity ETF Watch</div>
+        <div class="status">Tracks ETF day change. Buy amount = yearly base x ETF allocation x dip multiplier, capped at {COMMODITY_MAX_MULTIPLIER}x. Current yearly base: {html.escape(format_buy_amount(commodity_yearly_base_amount()))}.</div>
+        <div class="quote-error" id="commodity-error"></div>
+        <div class="commodity-grid" id="commodity-grid">{cards}</div>
+      </section>
+      {render_results(state.commodity_results)}
+    </div>"""
+
+
+def render_income_panel(state: PageState) -> str:
+    rows = state.income_rows or []
+    summary = state.income_summary or {"overall_pnl": 0, "by_symbol": {}}
+    panel_style = "" if state.active_tab == "income" else ' style="display:none"'
+    pnl_cards = [
+        (
+            "Overall monthly P&L",
+            fmt_number(summary.get("overall_pnl")),
+            "pnl-positive" if float(summary.get("overall_pnl") or 0) >= 0 else "pnl-negative",
+        )
+    ]
+    for item in INCOME_UNDERLYINGS:
+        symbol = item["symbol"]
+        symbol_summary = (summary.get("by_symbol") or {}).get(symbol, {})
+        total_pnl = float(symbol_summary.get("total_pnl") or 0)
+        pnl_cards.append(
+            (
+                f"{symbol} monthly P&L",
+                fmt_number(total_pnl),
+                "pnl-positive" if total_pnl >= 0 else "pnl-negative",
+            )
+        )
+    pnl_summary_html = "".join(
+        f'<div class="income-pnl-card"><span>{html.escape(label)}</span><strong class="{css_class}">{html.escape(value)}</strong></div>'
+        for label, value, css_class in pnl_cards
+    )
+    rule_cards = "".join(
+        f'<div class="income-rule"><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>'
+        for label, value in [
+            ("Strategy", "Sell monthly 10% OTM PUT"),
+            ("Entry", "~5 trading days before monthly expiry"),
+            ("Exit", "50-70% premium decay OR roll 5 days before next expiry"),
+            ("Position", "Cash-secured, assignment allowed"),
+            ("Capital", "Start 15L conservative, 20L comfortable, 25L+ scaling"),
+            ("Risk", "Active deployed <=60%, emergency reserve >=40%"),
+        ]
+    )
+    stock_cards = "".join(
+        f"""
+        <article class="income-stock">
+          <div><span>{html.escape(item['symbol'])}</span><strong>{html.escape(item['name'])}</strong></div>
+          <p>{html.escape(item['notes'])}</p>
+          <div class="income-stock-metrics">
+            <span>Capital {html.escape(item['capital'])}</span>
+            <span>Return {html.escape(item['annual_return'])}</span>
+            <span>Stress {html.escape(item['stress'])}</span>
+          </div>
+        </article>
+        """
+        for item in INCOME_UNDERLYINGS
+    )
+    candidate_rows = "".join(
+        "<tr>"
+        f"<td><strong>{html.escape(str(row.get('symbol', '')))}</strong><span>{html.escape(str(row.get('name', '')))}</span></td>"
+        f"<td>{render_symbol_value('tradingsymbol', row.get('candidate', ''))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('spot')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('strike')))}</td>"
+        f"<td>{html.escape(str(row.get('expiry', '')))}</td>"
+        f"<td>{html.escape(str(row.get('trading_days', '')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('option_price')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('otm_distance')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('sell_pop')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('delta')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('iv_percent')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('pcr')))}</td>"
+        f"<td>{html.escape(str(row.get('event_status', '')))}<small>{html.escape(str(row.get('event_detail', '')))}</small></td>"
+        f'<td class="{strength_class(row.get("action_color"))}"><strong>{html.escape(str(row.get("action", "")))}</strong><small>{html.escape(str(row.get("error", "")))}</small></td>'
+        "</tr>"
+        for row in rows
+    )
+    candidate_table = (
+        '<section class="panel income-candidates"><div class="panel-title">PFC / CAMS Monthly PE Candidates</div>'
+        '<div class="table-wrap"><table><thead><tr>'
+        '<th>Stock</th><th>Candidate PE</th><th>Spot</th><th>Strike</th><th>Expiry</th><th>Trading Days</th>'
+        '<th>Premium</th><th>OTM</th><th>SELL POP</th><th>Delta</th><th>IV</th><th>PCR</th><th>Event Risk</th><th>Action</th>'
+        f'</tr></thead><tbody>{candidate_rows}</tbody></table></div></section>'
+        if rows
+        else ""
+    )
+    ce_rows = "".join(
+        "<tr>"
+        f"<td><strong>{html.escape(str(row.get('symbol', '')))}</strong><span>{html.escape(str(row.get('name', '')))}</span></td>"
+        f"<td>{html.escape(str(row.get('held_qty', '')))}</td>"
+        f"<td class=\"{'pnl-positive' if (row.get('stock_pnl') or 0) >= 0 else 'pnl-negative'}\">{html.escape(fmt_number(row.get('stock_pnl')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('stock_return_pct')))}%</td>"
+        f"<td>{render_symbol_value('tradingsymbol', row.get('ce_candidate', ''))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('ce_strike')))}</td>"
+        f"<td>{html.escape(str(row.get('ce_expiry', '')))}</td>"
+        f"<td>{html.escape(str(row.get('ce_lot_size', '')))}</td>"
+        f"<td>{html.escape(str(row.get('covered_qty', '')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('ce_premium')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('ce_otm_distance')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('ce_sell_pop')))}%</td>"
+        f'<td class="{strength_class(row.get("ce_action_color"))}"><strong>{html.escape(str(row.get("ce_action", "")))}</strong></td>'
+        "<td>"
+        + (
+            f'<button type="submit" class="book-profit-button" formaction="/income/sell-ce" name="income_underlying" value="{html.escape(str(row.get("symbol", "")), quote=True)}">SELL CE</button>'
+            if int(row.get("covered_qty") or 0) > 0
+            else '<span class="commodity-wait">Need shares</span>'
+        )
+        + "</td>"
+        "</tr>"
+        for row in rows
+    )
+    ce_table = (
+        '<section class="panel income-candidates"><div class="panel-title">Covered CALL Candidates From Current Holdings</div>'
+        '<div class="status">SELL CE only when actual share holding covers the full option quantity.</div>'
+        '<div class="table-wrap"><table><thead><tr>'
+        '<th>Stock</th><th>Held Shares</th><th>Stock P&L</th><th>Stock Return</th><th>Candidate CE</th><th>Strike</th><th>Expiry</th>'
+        '<th>Lot Size</th><th>Covered Qty</th><th>Premium</th><th>OTM</th><th>SELL POP</th><th>Status</th><th>Action</th>'
+        f'</tr></thead><tbody>{ce_rows}</tbody></table></div></section>'
+        if rows
+        else ""
+    )
+    filters = [
+        ("OTM distance", ">=10%", "Do not chase premium at close strikes."),
+        ("Timing", "Around 5 trading days before expiry", "Avoid weekly expiry and high gamma pressure."),
+        ("Event risk", "No results/dividend/split/news in next 5 days", "Mandatory gap-risk filter."),
+        ("Structure", "Neutral/bullish, above 200 DMA preferred", "Avoid vertical breakdown and macro panic."),
+        ("Exit", "Close at 50-70% premium decay", "Roll 5 trading days before next expiry if tested."),
+        ("Assignment", "Allowed, cash secured", "If assigned, hold shares; later covered calls are allowed."),
+    ]
+    filter_html = "".join(
+        f'<div class="income-filter"><strong>{html.escape(name)}</strong><span>{html.escape(rule)}</span><small>{html.escape(note)}</small></div>'
+        for name, rule, note in filters
+    )
+    return f"""
+    <form id="income-panel" method="post" action="/income/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <section class="panel income-hero">
+        <div>
+          <div class="panel-title">INCOME - Monthly PE Sell Strategy</div>
+          <p class="status">Low-stress cash-secured monthly PUT selling for PFC and CAMS. Built for disciplined theta income, assignment readiness, and monthly review.</p>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/income/load">Refresh PFC / CAMS Candidates</button>
+        </div>
+      </section>
+      <section class="panel"><div class="panel-title">Monthly P&L Summary</div><div class="income-pnl-grid">{pnl_summary_html}</div></section>
+      <section class="panel"><div class="income-rule-grid">{rule_cards}</div></section>
+      <section class="panel"><div class="panel-title">Strategy Stocks</div><div class="income-stock-grid">{stock_cards}</div></section>
+      {ce_table}
+      {candidate_table}
+      <section class="panel"><div class="panel-title">Entry / Exit Validation</div><div class="income-filter-grid">{filter_html}</div></section>
+      <section class="panel"><div class="panel-title">Expected Portfolio Behavior</div>
+        <div class="income-rule-grid">
+          <div class="income-rule"><span>PFC</span><strong>18-22% annualized, moderate stress</strong></div>
+          <div class="income-rule"><span>CAMS</span><strong>15-18% annualized, low stress</strong></div>
+          <div class="income-rule"><span>Combined</span><strong>~16-20% CAGR, ~1.3-1.7% monthly average</strong></div>
+          <div class="income-rule"><span>Best setups</span><strong>After 5-8% correction, IV spike, sideways market, panic week</strong></div>
+        </div>
+      </section>
+      {('<section class="panel"><div class="alert error"><pre>' + html.escape(state.income_error) + '</pre></div></section>') if state.income_error else ''}
+      {render_results(state.income_results)}
+      {render_console(state.console_log)}
+    </form>"""
+
+
 def env_hidden_fields_for_render() -> str:
     return (
         f'<input type="hidden" name="api_key" value="{html.escape(env_value("KITE_API_KEY"), quote=True)}">'
@@ -2499,7 +3808,7 @@ def render_market_topper(state: PageState) -> str:
     csv_text = state.csv_text or read_default_csv_text()
     order_symbols = csv_trading_symbols(csv_text)
     underlyings = TOP_WATCHLIST
-    quote_cards = "".join(
+    stock_quote_cards = "".join(
         '<div class="quote-card" data-symbol="'
         f'{html.escape(underlying, quote=True)}">'
         f'<span class="quote-symbol">{html.escape(underlying)}</span>'
@@ -2508,6 +3817,16 @@ def render_market_topper(state: PageState) -> str:
         "</div>"
         for underlying in underlyings
     )
+    etf_quote_cards = "".join(
+        '<div class="quote-card etf-quote-card" data-symbol="'
+        f'{html.escape(str(item["symbol"]), quote=True)}" data-threshold="{html.escape(str(item["threshold"]), quote=True)}">'
+        f'<span class="quote-symbol">{html.escape(str(item["symbol"]))}</span>'
+        '<span class="quote-ltp">...</span>'
+        '<span class="quote-change">--</span>'
+        "</div>"
+        for item in COMMODITY_ETFS
+    )
+    quote_cards = stock_quote_cards + etf_quote_cards
     if not quote_cards:
         quote_cards = (
             '<div class="quote-card"><div class="quote-symbol">No tickers</div>'
@@ -2580,6 +3899,8 @@ def render_page(state: PageState) -> bytes:
         f"KITE_ACCESS_TOKEN {mask_secret(env_value('KITE_ACCESS_TOKEN'))} | "
         f"KITE_CONFIRM_LIVE_ORDER {html.escape(env_value('KITE_CONFIRM_LIVE_ORDER') or '<not set>')}"
     )
+    etf_buy_amount = state.etf_buy_amount or etf_buy_amount_setting()
+    etf_buy_action = etf_buy_action_text(etf_buy_amount)
     alert = ""
     if state.message:
         alert += f'<div class="alert ok">{html.escape(state.message)}</div>'
@@ -2587,6 +3908,7 @@ def render_page(state: PageState) -> bytes:
         alert += f'<div class="alert error"><pre>{html.escape(state.error)}</pre></div>'
 
     orders_table = render_orders_table(state.orders, state.selected_indexes)
+    trade_validation_table = render_trade_validation_table(state.trade_validations)
     position_orders_table = render_position_orders_table(
         state.position_orders, state.position_selected_indexes
     )
@@ -2607,6 +3929,8 @@ def render_page(state: PageState) -> bytes:
     analytics_tab_class = "active" if state.active_tab == "analytics" else ""
     research_tab_class = "active" if state.active_tab == "research" else ""
     positions_research_tab_class = "active" if state.active_tab == "positions-research" else ""
+    commodity_tab_class = "active" if state.active_tab == "commodity" else ""
+    income_tab_class = "active" if state.active_tab == "income" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     positions_panel_style = "" if state.active_tab == "positions" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
@@ -2620,6 +3944,9 @@ def render_page(state: PageState) -> bytes:
           {render_input("confirm_live_order", "KITE_CONFIRM_LIVE_ORDER", state.confirm_live_order or env_value("KITE_CONFIRM_LIVE_ORDER"))}
           {render_checkbox("show_credentials", "Show credential values", True, "Reveals KITE_API_SECRET and KITE_ACCESS_TOKEN in this local browser page.")}
           <div class="status">{status}</div>
+          <div class="panel-title token-title">ETF Buy Setup</div>
+          {render_number_input("etf_buy_amount", "ETF buy amount", etf_buy_amount, "100")}
+          <div class="status">Current ETF action text: <strong>{html.escape(etf_buy_action)}</strong>. This value is saved in <code>{html.escape(str(SETTINGS_PATH.name))}</code>.</div>
           <div class="panel-title token-title">Generate Kite Access Token</div>
           <div class="actions">
             <a class="button-link" href="{html.escape(kite_login_url(), quote=True)}" target="_blank" rel="noopener">Open Kite Login</a>
@@ -2842,6 +4169,15 @@ def render_page(state: PageState) -> bytes:
       background: #fee2e2;
       border-color: #fca5a5;
     }}
+    .quote-card.etf-quote-card {{
+      border-color: #bae6fd;
+      background: #f0f9ff;
+    }}
+    .quote-card.etf-buy {{
+      background: #fee2e2;
+      border-color: #ef4444;
+      box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
+    }}
     .quote-symbol {{
       color: var(--muted);
       font-size: 9px;
@@ -2858,6 +4194,253 @@ def render_page(state: PageState) -> bytes:
     }}
     .quote-change.up {{ color: #047857; }}
     .quote-change.down {{ color: #b42318; }}
+    .commodity-panel {{
+      border-color: #bfdbfe;
+      background: #f8fbff;
+    }}
+    .commodity-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }}
+    .commodity-card {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #ffffff;
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
+    }}
+    .commodity-card.buy-now {{
+      background: #fee2e2;
+      border-color: #f87171;
+      box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.22), 0 16px 36px rgba(185, 28, 28, 0.16);
+    }}
+    .commodity-meta {{
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: flex-start;
+      min-height: 44px;
+    }}
+    .commodity-label {{
+      color: #475569;
+      font-size: 12px;
+      font-weight: 800;
+      line-height: 1.25;
+    }}
+    .commodity-meta strong {{
+      color: #075985;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    .commodity-price {{
+      margin-top: 10px;
+      font-size: 28px;
+      line-height: 1;
+      font-weight: 950;
+      color: #0f172a;
+    }}
+    .commodity-change {{
+      margin-top: 5px;
+      font-size: 14px;
+      font-weight: 900;
+    }}
+    .commodity-change.up {{ color: #047857; }}
+    .commodity-change.down {{ color: #b91c1c; }}
+    .commodity-threshold {{
+      margin-top: 8px;
+      color: #64748b;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+    .commodity-action {{
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: #f1f5f9;
+      color: #475569;
+      font-weight: 900;
+      text-align: center;
+    }}
+    .commodity-card.buy-now .commodity-action {{
+      background: #b91c1c;
+      color: #ffffff;
+      font-size: 16px;
+      text-transform: uppercase;
+    }}
+    .commodity-buy-form {{
+      margin-top: 8px;
+    }}
+    .commodity-buy-button {{
+      width: 100%;
+      border: 0;
+      border-radius: 8px;
+      padding: 9px 10px;
+      background: linear-gradient(135deg, #1769aa, #0f766e);
+      color: #ffffff;
+      font-weight: 950;
+      cursor: pointer;
+    }}
+    .commodity-card.buy-now .commodity-buy-button {{
+      background: linear-gradient(135deg, #b91c1c, #ef4444);
+      box-shadow: 0 8px 22px rgba(185, 28, 28, 0.2);
+    }}
+    .commodity-holdings-panel {{
+      border-color: #bbf7d0;
+      background: #f7fef9;
+    }}
+    .commodity-strategy-panel {{
+      border-color: #bae6fd;
+      background: #f8fbff;
+    }}
+    .commodity-holdings-table {{
+      min-width: 980px;
+    }}
+    .commodity-holdings-table td:first-child strong,
+    .commodity-holdings-table td:first-child span {{
+      display: block;
+    }}
+    .commodity-holdings-table td:first-child span {{
+      margin-top: 2px;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 700;
+    }}
+    .commodity-holdings-table td:first-child strong {{
+      margin-top: 2px;
+      color: #075985;
+    }}
+    .book-profit-button {{
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: linear-gradient(135deg, #047857, #16a34a);
+      color: #ffffff;
+      font-weight: 950;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .commodity-wait {{
+      display: inline-block;
+      border-radius: 999px;
+      padding: 5px 8px;
+      background: #f1f5f9;
+      color: #64748b;
+      font-size: 12px;
+      font-weight: 900;
+    }}
+    .income-hero {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-color: #bbf7d0;
+      background: linear-gradient(135deg, #f0fdf4, #ffffff);
+    }}
+    .income-rule-grid,
+    .income-stock-grid,
+    .income-filter-grid,
+    .income-pnl-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 10px;
+    }}
+    .income-rule,
+    .income-stock,
+    .income-filter {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #ffffff;
+    }}
+    .income-rule span,
+    .income-stock span {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 900;
+      text-transform: uppercase;
+      margin-bottom: 5px;
+    }}
+    .income-rule strong,
+    .income-stock strong {{
+      display: block;
+      color: #0f172a;
+      font-size: 14px;
+      line-height: 1.3;
+    }}
+    .income-stock p {{
+      color: #334155;
+      font-size: 12px;
+      line-height: 1.4;
+      margin: 8px 0;
+    }}
+    .income-stock-metrics {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }}
+    .income-stock-metrics span {{
+      border-radius: 999px;
+      background: #ecfdf5;
+      color: #047857;
+      padding: 4px 7px;
+      font-size: 11px;
+      margin: 0;
+      text-transform: none;
+    }}
+    .income-candidates table {{
+      min-width: 1380px;
+    }}
+    .income-candidates td:first-child span,
+    .income-candidates small {{
+      display: block;
+      margin-top: 3px;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 700;
+      max-width: 260px;
+      white-space: normal;
+    }}
+    .income-filter strong,
+    .income-filter span,
+    .income-filter small {{
+      display: block;
+    }}
+    .income-filter strong {{
+      color: #075985;
+      margin-bottom: 5px;
+    }}
+    .income-filter span {{
+      color: #0f172a;
+      font-weight: 900;
+      margin-bottom: 4px;
+    }}
+    .income-filter small {{
+      color: #64748b;
+      line-height: 1.35;
+    }}
+    .income-pnl-card {{
+      border: 1px solid #bbf7d0;
+      border-radius: 8px;
+      padding: 12px;
+      background: #ffffff;
+    }}
+    .income-pnl-card span {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 900;
+      text-transform: uppercase;
+      margin-bottom: 5px;
+    }}
+    .income-pnl-card strong {{
+      display: block;
+      font-size: 22px;
+      line-height: 1;
+      font-weight: 950;
+    }}
     .expiry-strip {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -3222,6 +4805,99 @@ def render_page(state: PageState) -> bytes:
       font-size: 10px;
       opacity: 0.9;
     }}
+    .validation-panel {{
+      border-color: #bfdbfe;
+      background: #f8fbff;
+    }}
+    .validation-table {{
+      min-width: 1040px;
+      table-layout: fixed;
+    }}
+    .validation-table th:nth-child(1) {{ width: 160px; }}
+    .validation-table th:nth-child(2) {{ width: 90px; }}
+    .validation-table th:nth-child(3) {{ width: 95px; }}
+    .validation-table th:nth-child(4) {{ width: 52%; }}
+    .validation-table th:nth-child(5) {{ width: 28%; }}
+    .validation-table th,
+    .validation-table td {{
+      vertical-align: top;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }}
+    .validation-table small {{
+      font-size: 11px;
+      color: #475569;
+    }}
+    .validation-symbol a {{
+      display: block;
+      font-weight: 900;
+      line-height: 1.2;
+    }}
+    .validation-symbol span {{
+      display: inline-block;
+      margin-top: 5px;
+      padding: 3px 6px;
+      border-radius: 999px;
+      background: #e0f2fe;
+      color: #075985;
+      font-size: 11px;
+      font-weight: 900;
+    }}
+    .validation-overall {{
+      text-align: center;
+      border-radius: 0;
+    }}
+    .validation-overall strong,
+    .validation-overall small {{
+      display: block;
+    }}
+    .validation-profit {{
+      font-weight: 900;
+    }}
+    .validation-impact {{
+      line-height: 1.45;
+      color: #334155;
+      font-weight: 700;
+    }}
+    .validation-checks {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 6px;
+    }}
+    .validation-green {{
+      background: #dcfce7;
+      color: #047857;
+    }}
+    .validation-yellow {{
+      background: #fef9c3;
+      color: #a16207;
+    }}
+    .validation-red {{
+      background: #fee2e2;
+      color: #b91c1c;
+    }}
+    .validation-neutral {{
+      background: #f1f5f9;
+      color: #475569;
+    }}
+    .validation-check {{
+      border: 1px solid rgba(100, 116, 139, 0.24);
+      border-radius: 7px;
+      padding: 6px 8px;
+      min-height: 58px;
+    }}
+    .validation-check strong {{
+      display: block;
+      font-size: 12px;
+    }}
+    .validation-check span {{
+      display: block;
+      margin-top: 2px;
+      color: #1f2937;
+      font-size: 12px;
+      line-height: 1.3;
+    }}
     .compact-indicator {{
       text-align: center;
       min-width: 76px;
@@ -3392,6 +5068,8 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {positions_research_tab_class}" type="button" data-tab="positions-research">Positions</button>
       <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
       <button class="tab-button utility-action {research_tab_class}" type="button" data-tab="research">Research</button>
+      <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
+      <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT CSV Generator</button>
       <button class="tab-button utility-action {kite_setup_tab_class}" type="button" data-tab="kite-setup">Kite Setup</button>
     </div>
@@ -3402,10 +5080,12 @@ def render_page(state: PageState) -> bytes:
       <section class="panel trading-actions-panel">
         <div class="panel-title">Execution Options</div>
         {orders_table}
+        {trade_validation_table}
         <div class="actions">
           <button type="submit" formaction="/load">Load / Preview CSV</button>
           {execute_button}
         </div>
+        {render_results(state.results)}
         <div class="execution-checks">
           {render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}
           {render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}
@@ -3420,7 +5100,6 @@ def render_page(state: PageState) -> bytes:
           <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
         </section>
       </div>
-      {render_results(state.results)}
       {render_console(state.console_log)}
     </form>
     <form id="positions-panel" method="post" action="/positions/load"{positions_panel_style}>
@@ -3500,6 +5179,8 @@ def render_page(state: PageState) -> bytes:
     {render_analytics_panel(state)}
     {render_research_panel(state)}
     {render_positions_panel(state)}
+    {render_income_panel(state)}
+    {render_commodity_panel(state)}
   </main>
   <div class="live-modal-backdrop" id="live-confirm-modal">
     <div class="live-modal">
@@ -3553,6 +5234,8 @@ def render_page(state: PageState) -> bytes:
         document.getElementById('analytics-panel').style.display = active === 'analytics' ? '' : 'none';
         document.getElementById('research-panel').style.display = active === 'research' ? '' : 'none';
         document.getElementById('positions-research-panel').style.display = active === 'positions-research' ? '' : 'none';
+        document.getElementById('income-panel').style.display = active === 'income' ? '' : 'none';
+        document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
         for (const item of document.querySelectorAll('.tab-button')) {{
           item.classList.toggle('active', item.dataset.tab === active);
         }}
@@ -3742,8 +5425,12 @@ def render_page(state: PageState) -> bytes:
             const sign = pct > 0 ? '+' : '';
             change.textContent = `${{sign}}${{pct.toFixed(2)}}%`;
             change.className = `quote-change ${{pct >= 0 ? 'up' : 'down'}}`;
-            card.classList.toggle('strong-up', pct > 2);
-            card.classList.toggle('strong-down', pct < -2);
+            const threshold = card.dataset.threshold ? Number(card.dataset.threshold) : null;
+            const etfBuy = threshold !== null && pct <= -threshold;
+            card.classList.toggle('etf-buy', etfBuy);
+            card.title = etfBuy ? (quote.action || 'Action: buy the ETF today') : '';
+            card.classList.toggle('strong-up', !threshold && pct > 2);
+            card.classList.toggle('strong-down', threshold ? etfBuy : pct < -2);
           }}
         }}
       }} catch (error) {{
@@ -3761,6 +5448,66 @@ def render_page(state: PageState) -> bytes:
     }}
     refreshQuotes();
     setInterval(refreshQuotes, 10000);
+    async function refreshCommodityQuotes() {{
+      const cards = Array.from(document.querySelectorAll('.commodity-card[data-symbol]'));
+      if (!cards.length) return;
+      const errorBox = document.getElementById('commodity-error');
+      try {{
+        const response = await fetch('/commodity-quotes', {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load commodity ETF quotes');
+        if (errorBox) {{
+          errorBox.style.display = 'none';
+          errorBox.textContent = '';
+        }}
+        const bySymbol = new Map((data.quotes || []).map((quote) => [quote.symbol, quote]));
+        for (const card of cards) {{
+          const symbol = card.dataset.symbol;
+          const quote = bySymbol.get(symbol);
+          const price = card.querySelector('.commodity-price');
+          const change = card.querySelector('.commodity-change');
+          const action = card.querySelector('.commodity-action');
+          const buyButton = card.querySelector('.commodity-buy-button');
+          if (!quote || !quote.ltp) {{
+            price.textContent = 'N/A';
+            change.textContent = 'Quote unavailable';
+            change.className = 'commodity-change';
+            action.textContent = 'Wait';
+            if (buyButton) buyButton.textContent = 'Buy on dip trigger';
+            card.classList.remove('buy-now');
+            continue;
+          }}
+          price.textContent = Number(quote.ltp).toFixed(2);
+          const pct = quote.change_percent === null || quote.change_percent === undefined
+            ? null
+            : Number(quote.change_percent);
+          if (pct === null) {{
+            change.textContent = '--';
+            change.className = 'commodity-change';
+          }} else {{
+            const sign = pct > 0 ? '+' : '';
+            change.textContent = `${{sign}}${{pct.toFixed(2)}}%`;
+            change.className = `commodity-change ${{pct >= 0 ? 'up' : 'down'}}`;
+          }}
+          card.classList.toggle('buy-now', Boolean(quote.buy_signal));
+          action.innerHTML = quote.buy_signal
+            ? `<strong>Action: ${{escapeHtml(quote.action || 'buy the ETF today')}} (${{quote.multiplier}}x)</strong>`
+            : `Wait | fall ${{Number(quote.daily_fall_pct || 0).toFixed(2)}}%`;
+          if (buyButton) {{
+            buyButton.textContent = quote.buy_signal
+              ? `Buy ${{escapeHtml(quote.buy_amount ? String(Math.round(Number(quote.buy_amount))) : '')}}`
+              : 'Buy on dip trigger';
+          }}
+        }}
+      }} catch (error) {{
+        if (errorBox) {{
+          errorBox.style.display = 'block';
+          errorBox.textContent = `ETF quote error: ${{error.message}}`;
+        }}
+      }}
+    }}
+    refreshCommodityQuotes();
+    setInterval(refreshCommodityQuotes, 10000);
   </script>
 </body>
 </html>"""
@@ -3819,6 +5566,18 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     }
                 )
             return
+        if self.path == "/commodity-quotes":
+            try:
+                self.send_json(fetch_commodity_etf_quotes())
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "quotes": [],
+                    }
+                )
+            return
         self.send_page(PageState())
 
     def do_POST(self) -> None:
@@ -3831,6 +5590,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             active_tab=(
                 "positions"
                 if self.path.startswith("/positions")
+                else "commodity"
+                if self.path.startswith("/commodity")
+                else "income"
+                if self.path.startswith("/income")
                 else "gpt"
                 if self.path.startswith("/gpt")
                 else "kite-setup"
@@ -3874,6 +5637,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             openai_prompt=first(form, "openai_prompt", DEFAULT_OPENAI_PROMPT),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
+            etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
         )
 
         try:
@@ -3886,6 +5650,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.no_ltp_price,
                     state.keep_existing_orders,
                 )
+                state.trade_validations = validate_trade_orders(state.orders)
                 state.selected_indexes = set(range(len(state.orders)))
                 state.message = f"{persist_message} Loaded {len(state.orders)} order(s).".strip()
             elif self.path == "/execute":
@@ -3905,6 +5670,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.no_ltp_price,
                     state.keep_existing_orders,
                 )
+                state.trade_validations = validate_trade_orders(state.orders)
                 state.selected_indexes = set(range(len(state.orders)))
                 if state.dry_run:
                     state.message = (
@@ -3988,7 +5754,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 else:
                     state.message = persist_message
             elif self.path == "/kite-setup":
-                state.message = "Kite setup saved for this running web app session."
+                save_app_settings({"etf_buy_amount": state.etf_buy_amount})
+                state.message = (
+                    f"Kite setup saved. ETF buy amount saved as {format_buy_amount(state.etf_buy_amount)}."
+                )
             elif self.path == "/kite-token/generate":
                 access_token, state.console_log = call_with_console(
                     generate_kite_access_token,
@@ -4013,6 +5782,25 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             elif self.path == "/research/load":
                 state.research_rows, state.console_log = call_with_console(research_csv_symbols)
                 state.message = f"Research completed for {len(state.research_rows)} CSV symbol(s)."
+            elif self.path == "/income/load":
+                (
+                    state.income_rows,
+                    state.income_summary,
+                ), state.console_log = call_with_console(income_strategy_candidates)
+                state.message = f"Income strategy refreshed for {len(state.income_rows)} stock(s)."
+            elif self.path == "/income/sell-ce":
+                underlying = first(form, "income_underlying")
+                result, state.console_log = call_with_console(
+                    place_income_covered_call_order,
+                    underlying,
+                )
+                state.income_results = [result]
+                (
+                    state.income_rows,
+                    state.income_summary,
+                ), refresh_log = call_with_console(income_strategy_candidates)
+                state.console_log = f"{state.console_log}{refresh_log}"
+                state.message = f"Submitted covered CE order for {underlying.upper()}."
             elif self.path == "/positions-research/load":
                 (
                     state.positions_rows,
@@ -4021,6 +5809,27 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = (
                     f"Loaded analytics for {len(state.positions_rows)} active option position(s)."
                 )
+            elif self.path == "/commodity/buy":
+                symbol = first(form, "commodity_symbol")
+                result, state.console_log = call_with_console(place_commodity_etf_order, symbol)
+                state.commodity_results = [result]
+                try:
+                    state.commodity_holdings = commodity_etf_holdings()
+                except Exception as exc:
+                    state.commodity_error = f"Order submitted, but holdings refresh failed: {exc}"
+                state.message = f"Submitted ETF BUY order for {symbol.upper()}."
+            elif self.path == "/commodity/sell":
+                symbol = first(form, "commodity_symbol")
+                result, state.console_log = call_with_console(
+                    place_commodity_etf_sell_order,
+                    symbol,
+                )
+                state.commodity_results = [result]
+                try:
+                    state.commodity_holdings = commodity_etf_holdings()
+                except Exception as exc:
+                    state.commodity_error = f"Order submitted, but holdings refresh failed: {exc}"
+                state.message = f"Submitted ETF SELL order for full {symbol.upper()} holding."
             else:
                 state.error = f"Unknown path: {self.path}"
         except Exception as exc:
