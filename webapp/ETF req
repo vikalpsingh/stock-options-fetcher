@@ -1,0 +1,207 @@
+For your ETF framework, the **sell trigger** should not be emotional or news-based.
+
+It should be:
+
+* rules-based,
+* volatility-aware,
+* trend-aware.
+
+That is what makes the system scalable.
+
+---
+
+# Your Current Sell Rule
+
+You already defined:
+
+| Market Type        |       Sell Trigger |
+| ------------------ | -----------------: |
+| Normal market      | +25% basket profit |
+| Euphoric/parabolic | +20% basket profit |
+
+Meaning:
+
+If accumulated ETF basket value becomes:
+
+Current\ Value \ge Invested\ Amount \times 1.25
+
+then:
+
+* sell full basket,
+* book profit,
+* restart cycle.
+
+This is already a strong framework.
+
+---
+
+# But Professionals Usually Add More Exit Logic
+
+Because markets behave differently in:
+
+* panic,
+* trends,
+* melt-ups,
+* crashes.
+
+---
+
+# Best Sell Triggers for Your ETF Strategy
+
+# 1. Primary Profit Sell Trigger (Core Rule)
+
+## Recommended
+
+| ETF        | Standard Sell |
+| ---------- | ------------: |
+| Nasdaq ETF |        25–30% |
+| Gold ETF   |        20–25% |
+| Silver ETF |        18–25% |
+
+Reason:
+
+* Silver moves fastest,
+* Gold moves slowest,
+* Nasdaq trends longer.
+
+---
+
+# 2. Parabolic Move Exit
+
+If ETF moves vertically too fast:
+
+| Condition                       | Action                   |
+| ------------------------------- | ------------------------ |
+| ETF up >15% in <20 trading days | Book partial/full profit |
+| RSI > 80 weekly                 | Tighten exit             |
+| Massive retail euphoria         | Reduce aggressively      |
+
+Especially important for:
+
+* Silver,
+* Nasdaq AI rallies.
+
+---
+
+# 3. Trend Breakdown Exit
+
+Professionals often use:
+
+## 50 DMA / 200 DMA logic
+
+Example:
+
+| Condition                | Action            |
+| ------------------------ | ----------------- |
+| Close below 50 DMA       | Stop fresh buying |
+| Close below 200 DMA      | Reduce exposure   |
+| Lower highs + lower lows | Tighten targets   |
+
+This avoids holding through secular breakdowns.
+
+---
+
+# 4. Time-Based Exit (Very Important)
+
+Sometimes:
+ETF stays dead money for months.
+
+So use:
+
+| Rule                          | Action         |
+| ----------------------------- | -------------- |
+| No recovery after 9–12 months | Exit partial   |
+| Opportunity cost high         | Rotate capital |
+
+Professionals always consider:
+
+> opportunity cost.
+
+---
+
+# 5. Macro Sell Trigger
+
+Especially relevant for your portfolio.
+
+## Nasdaq
+
+Sell/reduce when:
+
+* Fed tightening aggressively,
+* yields exploding higher,
+* AI capex cycle slowing.
+
+## Gold/Silver
+
+Sell/reduce when:
+
+* real yields rising strongly,
+* DXY surging,
+* inflation collapsing.
+
+---
+
+# What I Think Is BEST For Your Actual System
+
+# Recommended Final Sell Framework
+
+| ETF        | Core Sell Trigger |
+| ---------- | ----------------: |
+| Nasdaq ETF |     25% OR RSI>78 |
+| Gold ETF   |               22% |
+| Silver ETF |               20% |
+
+AND:
+
+| Condition            | Additional Rule         |
+| -------------------- | ----------------------- |
+| ETF below 200 DMA    | Pause fresh buys        |
+| ETF parabolic        | Book faster             |
+| Macro panic resolved | Reduce metals gradually |
+
+---
+
+# Best Practical Version (Simple)
+
+If you want simplicity:
+
+## Keep only 3 rules
+
+### BUY
+
+* Nasdaq down 6%
+* Gold down 3%
+* Silver down 4%
+
+### SELL
+
+* Basket +25%
+
+### RISK CONTROL
+
+* No new buys below 200 DMA
+
+That alone is already a very strong system.
+
+---
+
+# Important Insight
+
+The sell rule is actually MORE important than buy rule.
+
+Why?
+
+Most investors:
+
+* know how to buy,
+* don’t know when to exit.
+
+Without exits:
+
+* volatility harvesting becomes permanent holding,
+* capital rotation slows,
+* CAGR falls.
+
+Your sell trigger is what converts:
+
+> volatility into compounding.

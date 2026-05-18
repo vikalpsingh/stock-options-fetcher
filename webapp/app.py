@@ -52,15 +52,15 @@ else:
     IMPORT_ERROR = None
 
 
-INCOME_CSV_DIR = Path(r"C:\income")
+DATA_CSV_PATH = PROJECT_ROOT / "data.csv"
 
 
 def dated_income_csv_path(day: date | None = None) -> Path:
     day = day or datetime.now().date()
-    return INCOME_CSV_DIR / f"{day.day}{day.strftime('%b')}{day.year}.csv"
+    return PROJECT_ROOT / f"{day.day}{day.strftime('%b')}{day.year}.csv"
 
 
-DEFAULT_CSV_PATH = dated_income_csv_path()
+DEFAULT_CSV_PATH = Path(os.getenv("KITE_DEFAULT_CSV_PATH", str(dated_income_csv_path())))
 LEGACY_CSV_PATH = PROJECT_ROOT / "src" / "script" / "kite_orders.csv"
 SETTINGS_PATH = APP_ROOT / "app_settings.json"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
@@ -403,9 +403,10 @@ def commodity_backtest_engine(
 
 
 def read_default_csv_text() -> str:
-    if not DEFAULT_CSV_PATH.exists():
-        return ""
-    return DEFAULT_CSV_PATH.read_text(encoding="utf-8-sig")
+    for path in [DEFAULT_CSV_PATH, DATA_CSV_PATH, LEGACY_CSV_PATH]:
+        if path.exists():
+            return path.read_text(encoding="utf-8-sig")
+    return ""
 
 
 def default_csv_label() -> str:
@@ -2211,6 +2212,10 @@ def load_rows(csv_path: str, csv_text: str) -> tuple[list[dict[str, str]], str]:
     path = Path(csv_path.strip() or DEFAULT_CSV_PATH)
     if not path.is_absolute():
         path = PROJECT_ROOT / path
+    if not path.exists() and path == DEFAULT_CSV_PATH and DATA_CSV_PATH.exists():
+        path = DATA_CSV_PATH
+    if not path.exists() and path == DEFAULT_CSV_PATH and LEGACY_CSV_PATH.exists():
+        path = LEGACY_CSV_PATH
     if not path.exists():
         raise FileNotFoundError(f"CSV file not found: {path}")
     text = path.read_text(encoding="utf-8-sig")
