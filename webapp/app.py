@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Small local web UI for previewing and placing Zerodha Kite CSV orders.
 
@@ -154,6 +154,7 @@ COMMODITY_ETFS = [
         "key": "nasdaq",
         "label": "Motilal Oswal Nasdaq 100 ETF",
         "symbol": "MON100",
+        "aliases": ["MON100"],
         "threshold": 6.0,
         "allocation": 0.50,
         "profit_target": 0.25,
@@ -163,6 +164,7 @@ COMMODITY_ETFS = [
         "key": "gold",
         "label": "Nippon India ETF Gold BeES",
         "symbol": "GOLDBEES",
+        "aliases": ["GOLDBEES"],
         "threshold": 3.0,
         "allocation": 0.30,
         "profit_target": 0.22,
@@ -172,6 +174,7 @@ COMMODITY_ETFS = [
         "key": "silver",
         "label": "Nippon India Silver ETF",
         "symbol": "SILVERBEES",
+        "aliases": ["SILVERBEES"],
         "threshold": 4.0,
         "allocation": 0.20,
         "profit_target": 0.20,
@@ -501,6 +504,8 @@ class PageState:
     gpt_url: str = DEFAULT_GPT_SHARE_URL
     gpt_conversation: str = ""
     gpt_csv_text: str = ""
+    gpt_api_output: str = ""
+    gpt_api_response_id: str = ""
     openai_api_key: str = ""
     openai_model: str = DEFAULT_OPENAI_MODEL
     openai_system_prompt: str = field(default_factory=read_openai_csv_system_prompt)
@@ -765,6 +770,39 @@ def safe_csv_rows(csv_text: str) -> list[dict[str, str]]:
         return parse_csv_text(csv_text)
     except Exception:
         return []
+
+
+def is_web_csv_source(value: str) -> bool:
+    return value.strip().lower().startswith(("http://", "https://"))
+
+
+def google_sheet_csv_export_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    if parsed.netloc not in {"docs.google.com", "www.docs.google.com"}:
+        return url.strip()
+    match = re.search(r"/spreadsheets/d/([^/]+)", parsed.path)
+    if not match:
+        return url.strip()
+    sheet_id = match.group(1)
+    gid = parse_qs(parsed.query).get("gid", ["0"])[0]
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
+def fetch_csv_text_from_url(url: str) -> str:
+    csv_url = google_sheet_csv_export_url(url)
+    request = Request(csv_url, headers={"User-Agent": "KiteTraderLocalApp/1.0"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            text = response.read().decode("utf-8-sig", errors="ignore")
+    except HTTPError as exc:
+        raise RuntimeError(
+            f"Could not load CSV from URL. HTTP {exc.code}. "
+            "For Google Sheets, set sharing to anyone with the link can view."
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not load CSV from URL: {exc}") from exc
+    parse_csv_text(text)
+    return text
 
 
 def csv_trading_symbols(csv_text: str) -> list[str]:
@@ -2254,6 +2292,10 @@ def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 
 def load_rows(csv_path: str, csv_text: str) -> tuple[list[dict[str, str]], str]:
+    if is_web_csv_source(csv_path):
+        text = fetch_csv_text_from_url(csv_path)
+        return parse_csv_text(text), text
+
     if csv_text.strip():
         return parse_csv_text(csv_text), csv_text
 
@@ -2597,29 +2639,60 @@ def commodity_etf_holdings() -> list[dict[str, Any]]:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     kite = kite_orders.kite_client()
     symbols = [str(item["symbol"]).upper() for item in COMMODITY_ETFS]
+    all_symbols = sorted(
+        {
+            alias.upper()
+            for item in COMMODITY_ETFS
+            for alias in [str(item["symbol"])] + [str(value) for value in item.get("aliases", [])]
+        }
+    )
     by_symbol = {
         str(holding.get("tradingsymbol") or "").upper(): holding
         for holding in kite.holdings()
     }
+    positions_by_symbol: dict[str, dict[str, Any]] = {}
+    try:
+        for position in kite.positions().get("net", []):
+            symbol = str(position.get("tradingsymbol") or "").upper()
+            if symbol in all_symbols and str(position.get("exchange") or "").upper() == "NSE":
+                positions_by_symbol[symbol] = position
+    except Exception:
+        positions_by_symbol = {}
     quote_keys = [f"NSE:{symbol}" for symbol in symbols]
     quotes = kite.quote(quote_keys)
     rows: list[dict[str, Any]] = []
     for item in COMMODITY_ETFS:
         symbol = str(item["symbol"]).upper()
-        holding = by_symbol.get(symbol, {})
-        quantity = int(
+        aliases = [symbol] + [str(value).upper() for value in item.get("aliases", [])]
+        holding = next((by_symbol.get(alias) for alias in aliases if by_symbol.get(alias)), {})
+        position = next(
+            (positions_by_symbol.get(alias) for alias in aliases if positions_by_symbol.get(alias)),
+            {},
+        )
+        holding_quantity = (
             float(holding.get("quantity") or 0)
             + float(holding.get("t1_quantity") or 0)
         )
-        sellable_quantity = int(float(holding.get("quantity") or 0))
-        average_price = float(holding.get("average_price") or 0)
+        position_quantity = max(float(position.get("quantity") or 0), 0)
+        quantity = int(
+            max(holding_quantity, position_quantity)
+        )
+        sellable_quantity = int(max(float(holding.get("quantity") or 0), position_quantity))
+        average_price = float(
+            holding.get("average_price")
+            or position.get("average_price")
+            or 0
+        )
         quote = quotes.get(f"NSE:{symbol}", {})
         ltp = float(
             quote.get("last_price")
+            or position.get("last_price")
             or holding.get("last_price")
             or holding.get("close_price")
             or 0
         )
+        if average_price <= 0 and quantity > 0:
+            average_price = ltp
         investment = average_price * quantity
         market_value = ltp * quantity
         pnl = market_value - investment
@@ -2644,6 +2717,7 @@ def commodity_etf_holdings() -> list[dict[str, Any]]:
                 "rsi_book_profit": rsi_book_profit,
                 "quantity": quantity,
                 "sellable_quantity": sellable_quantity,
+                "source": "holding" if holding else ("position" if position else ""),
                 "average_price": average_price,
                 "ltp": ltp,
                 "investment": investment,
@@ -2902,7 +2976,7 @@ def call_openai_responses_api(
     model: str,
     system_prompt: str,
     prompt: str,
-) -> str:
+) -> tuple[str, str]:
     body = {
         "model": model.strip() or DEFAULT_OPENAI_MODEL,
         "input": [
@@ -2935,17 +3009,17 @@ def call_openai_responses_api(
     output = response_output_text(payload)
     if not output:
         raise RuntimeError("OpenAI returned an empty response.")
-    return output
+    return output, str(payload.get("id") or "")
 
 
-def generate_csv_with_openai(prompt: str, model: str, system_prompt: str) -> str:
+def generate_csv_with_openai(prompt: str, model: str, system_prompt: str) -> tuple[str, str, str]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Missing OPENAI_API_KEY. Enter it in the GPT CSV Generator tab.")
 
-    output = call_openai_responses_api(api_key, model, system_prompt, prompt)
+    output, response_id = call_openai_responses_api(api_key, model, system_prompt, prompt)
     try:
-        return extract_csv_from_text(output)
+        return extract_csv_from_text(output), output, response_id
     except ValueError as first_error:
         repair_prompt = (
             "Convert the previous response into valid Kite CSV only. "
@@ -2954,14 +3028,14 @@ def generate_csv_with_openai(prompt: str, model: str, system_prompt: str) -> str
             "No explanation, no markdown, no notes. If price is unknown, use 0.\n\n"
             f"Previous response:\n{output}"
         )
-        repaired = call_openai_responses_api(
+        repaired, repair_response_id = call_openai_responses_api(
             api_key,
             model,
             DEFAULT_OPENAI_SYSTEM_PROMPT,
             repair_prompt,
         )
         try:
-            return extract_csv_from_text(repaired)
+            return extract_csv_from_text(repaired), repaired, repair_response_id or response_id
         except ValueError as second_error:
             raise ValueError(
                 f"{first_error}\n\nOpenAI raw output preview:\n{output[:1200]}\n\n"
@@ -3932,38 +4006,100 @@ def render_analytics_panel(state: PageState) -> str:
             f"<tr><th>{html.escape(str(label))}</th><td>{html.escape(str(value))}</td></tr>"
             for label, value in rows
         )
+        final_sell = risk_lights.get("final_sell", "N/A")
+        final_sell_color = risk_lights.get("final_sell_color", "neutral")
+        buy_signal = risk_lights.get("buy_signal", "N/A")
+        buy_signal_color = risk_lights.get("buy_signal_color", "neutral")
+        final_strength = strength_lights.get("final", "N/A")
+        final_strength_color = strength_lights.get("color", "neutral")
+        headline_action = (
+            final_strength
+            if str(final_strength).upper() not in {"N/A", "NONE", ""}
+            else final_sell
+        )
+        support_resistance = (
+            f'{fmt_number(data.get("support"))} / {fmt_number(data.get("resistance"))}'
+        )
+        analytics_metric_cards = "".join(
+            '<div class="analytics-metric">'
+            f'<span>{html.escape(label)}</span>'
+            f'<strong class="{html.escape(css_class)}">{html.escape(str(value))}</strong>'
+            f'<small>{html.escape(note)}</small>'
+            "</div>"
+            for label, value, css_class, note in [
+                ("Spot", fmt_number(data["spot"]), "", f'Underlying {data["underlying"]}'),
+                ("Strike", fmt_number(data["strike"]), "", f'{option_type} contract'),
+                ("SELL POP", f'{fmt_number(data["sell_pop"])}%', "pnl-positive", "Income probability"),
+                ("OTM", f'{fmt_number(decision.get("otm_distance"))}%', "pnl-positive", "Distance from spot"),
+                ("IV", f'{fmt_number(data["iv_percent"])}%', "", "Premium quality"),
+                ("PCR", fmt_number(data["pcr"]), "", "OI pressure"),
+                ("DTE", str(data["dte"]), "", f'Expiry {data["expiry"]}'),
+                ("Support / Resistance", support_resistance, "", "OI levels"),
+            ]
+        )
+        primary_action_cards = "".join(
+            '<div class="analytics-action-card">'
+            f'<span>{html.escape(label)}</span>'
+            f'<strong class="signal-{html.escape(color)}">{html.escape(str(value))}</strong>'
+            "</div>"
+            for label, value, color in [
+                ("SELL decision", final_sell, final_sell_color),
+                ("BUY decision", buy_signal, buy_signal_color),
+                ("Strategy strength", final_strength, final_strength_color),
+            ]
+        )
         detail = (
-            f'<section class="panel"><div class="panel-title">{html.escape(decision_title)}</div>'
-            f'<div class="decision-grid">{decision_cards}</div></section>'
-            '<section class="panel"><div class="panel-title">Greek Risk Lights</div>'
-            f'<div class="decision-grid">{risk_cards}</div>'
-            '<div class="table-wrap"><table class="analytics-table">'
+            '<section class="panel analytics-command-panel">'
+            '<div class="analytics-command-head">'
+            '<div>'
+            '<div class="panel-title">Option Analytics</div>'
+            f'<h2>{html.escape(str(data.get("symbol", "")))}</h2>'
+            f'<p>{html.escape(sell_recommendation)} review for wheel/income decision making.</p>'
+            '</div>'
+            f'<div class="analytics-verdict strength-{html.escape(final_strength_color)}">'
+            '<span>Primary read</span>'
+            f'<strong>{html.escape(str(headline_action))}</strong>'
+            '</div>'
+            '</div>'
+            f'<div class="analytics-action-row">{primary_action_cards}</div>'
+            f'<div class="analytics-metric-grid">{analytics_metric_cards}</div>'
+            '</section>'
+            '<section class="analytics-two-column">'
+            '<div class="panel analytics-compact-panel">'
+            '<div class="panel-title">Decision Labels</div>'
+            f'<div class="decision-grid compact-decisions">{decision_cards}</div>'
+            '</div>'
+            '<div class="panel analytics-compact-panel">'
+            '<div class="panel-title">Risk Summary</div>'
+            f'<div class="decision-grid compact-decisions">{risk_cards}</div>'
+            '</div>'
+            '</section>'
+            '<section class="panel analytics-review-panel"><div class="panel-title">Risk Lights</div>'
+            '<div class="table-wrap"><table class="analytics-table analytics-review-table">'
             "<tr><th>Indicator</th><th>Value</th><th>Strength</th><th>Meaning</th></tr>"
             f"{risk_rows}</table></div></section>"
-            '<section class="panel"><div class="panel-title">Strategy Strength Indicators</div>'
-            '<div class="decision-grid">'
-            f'<div class="decision-card strength-{html.escape(strength_lights["color"])}">'
-            '<div class="decision-label">Final Strategy Strength</div>'
-            f'<div class="decision-value">{html.escape(strength_lights["final"])}</div></div></div>'
-            '<div class="table-wrap"><table class="analytics-table">'
+            '<section class="panel analytics-review-panel"><div class="panel-title">Strategy Strength</div>'
+            '<div class="table-wrap"><table class="analytics-table analytics-review-table">'
             "<tr><th>Indicator</th><th>Value</th><th>Strength</th><th>Rule</th></tr>"
             f"{strength_rows}</table></div></section>"
-            '<section class="panel"><div class="panel-title">Seller View Greeks</div>'
-            '<div class="table-wrap"><table class="analytics-table">'
-            f"{seller_rows}</table></div></section>"
-            '<section class="panel"><div class="panel-title">Analytics Details</div>'
-            '<div class="table-wrap"><table class="analytics-table">'
-            f"{cells}</table></div></section>"
-            '<section class="panel"><div class="panel-title">Decision Signal Matrix</div>'
-            '<div class="table-wrap"><table class="analytics-table">'
+            '<section class="analytics-two-column">'
+            '<div class="panel analytics-compact-panel"><div class="panel-title">Seller Greeks</div>'
+            '<div class="table-wrap"><table class="analytics-table analytics-mini-table">'
+            f"{seller_rows}</table></div></div>"
+            '<div class="panel analytics-compact-panel"><div class="panel-title">Decision Matrix</div>'
+            '<div class="table-wrap"><table class="analytics-table analytics-mini-table">'
             f"<tr>{matrix_headers}</tr>"
-            f"{signal_rows}</table></div></section>"
+            f"{signal_rows}</table></div></div>"
+            '</section>'
+            '<section class="panel analytics-review-panel"><div class="panel-title">Full Contract Details</div>'
+            '<div class="table-wrap"><table class="analytics-table analytics-details-table">'
+            f"{cells}</table></div></section>"
         )
 
     return f"""
     <form id="analytics-panel" method="post" action="/analytics/load"{'' if state.active_tab == 'analytics' else ' style="display:none"'}>
-      <section class="panel">
-        <div class="panel-title">Option Analytics</div>
+      <section class="panel analytics-picker-panel">
+        <div class="panel-title">Load Option Analytics</div>
         <div class="analytics-links">{links or '<span class="status">No CSV symbols found.</span>'}</div>
         <div class="analytics-form">
           {render_input("analytics_symbol", "Trading symbol", selected)}
@@ -3971,8 +4107,8 @@ def render_analytics_panel(state: PageState) -> str:
           <button type="submit" formaction="/analytics/load">Load Analytics</button>
         </div>
       </section>
-      {active_section}
       {detail}
+      {active_section}
       {render_console(state.console_log)}
     </form>"""
 
@@ -4132,8 +4268,9 @@ def render_research_panel(state: PageState) -> str:
         for row in rows
     )
     table = (
-        '<section class="panel"><div class="panel-title">CSV Symbol Research Comparison</div>'
-        '<div class="table-wrap"><table class="research-table"><thead><tr>'
+        '<section class="panel research-scorecard-panel"><div class="panel-title">CSV Symbol Research Comparison</div>'
+        '<div class="research-table-hint">Color guide: green is preferred, yellow means reduce size / wait, red means avoid or review.</div>'
+        '<div class="table-wrap research-table-wrap"><table class="research-table"><thead><tr>'
         '<th>Symbol</th><th>Score /26</th><th>Type</th><th>SELL Decision</th><th>BUY Decision</th>'
         '<th>Strategy Strength</th><th>Delta</th><th>Maximum Profit</th><th>SELL POP</th><th>Gamma 1%</th>'
         '<th>Theta/Premium</th><th>Vega/Premium</th><th>OTM</th><th>IV</th><th>PCR</th>'
@@ -4161,7 +4298,12 @@ def render_research_panel(state: PageState) -> str:
     </form>"""
 
 
-def render_positions_panel(state: PageState) -> str:
+def render_positions_panel(
+    state: PageState,
+    position_orders_payload: str = "",
+    position_orders_table: str = "",
+    position_execute_button: str = "",
+) -> str:
     rows = state.positions_rows or []
     summary = state.positions_summary or {}
     summary_cards = "".join(
@@ -4209,18 +4351,35 @@ def render_positions_panel(state: PageState) -> str:
         else ""
     )
     return f"""
-    <form id="positions-research-panel" method="post" action="/positions-research/load"{'' if state.active_tab == 'positions-research' else ' style="display:none"'}>
+    <form id="positions-panel" method="post" action="/positions-research/load"{'' if state.active_tab == 'positions' else ' style="display:none"'}>
       {env_hidden_fields_for_render()}
-      <section class="panel">
-        <div class="panel-title">Positions</div>
+      <input type="hidden" name="position_orders_payload" value="{html.escape(position_orders_payload, quote=True)}">
+      <section class="panel calm-hero-panel">
+        <p class="calm-quote">"Small drops makes the ocean"</p>
         <p class="status"><strong>Analysis of current Positions</strong></p>
         <p class="status">Evaluate active Kite option trades with the same analytics and summarize current P&L / Kite margin required.</p>
         <div class="actions">
           <button type="submit" formaction="/positions-research/load">Load Active Positions</button>
+          <button type="submit" formaction="/positions/load">Get Current Position / Preview BUY</button>
+          {position_execute_button}
         </div>
       </section>
       <section class="panel"><div class="panel-title">Positions Summary</div><div class="decision-grid">{summary_cards}</div></section>
       {table}
+      {position_orders_table}
+      {render_results(state.position_results)}
+      <section class="panel calm-options-panel">
+        <div class="panel-title">Position BUY Options</div>
+        {render_number_input("position_discount_percent", "Discount percent", state.position_discount_percent, "0.05")}
+        {render_input("position_exchange", "Exchange", state.position_exchange)}
+        {render_input("position_product", "Product filter", state.position_product)}
+        {render_input("position_symbols", "Symbol filter, comma-separated", state.position_symbols)}
+        {render_input("position_variety", "Variety", state.position_variety)}
+        {render_input("position_validity", "Validity", state.position_validity)}
+        {render_input("position_tag", "Tag", state.position_tag)}
+        {render_number_input("position_tick_size", "Tick size", state.position_tick_size, "0.01")}
+        {render_input("position_max_orders", "Max orders", state.position_max_orders)}
+      </section>
       {render_console(state.console_log)}
     </form>"""
 
@@ -4239,6 +4398,7 @@ def render_commodity_panel(state: PageState) -> str:
         "<tr>"
         f"<td><strong>{html.escape(str(row.get('symbol', '')))}</strong><span>{html.escape(str(row.get('label', '')))}</span></td>"
         f"<td>{html.escape(str(row.get('quantity', 0)))}</td>"
+        f"<td>{html.escape(str(row.get('source', '')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('investment')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('market_value')))}</td>"
         f"<td class=\"{'pnl-positive' if float(row.get('pnl') or 0) >= 0 else 'pnl-negative'}\">{html.escape(fmt_number(row.get('pnl')))}</td>"
@@ -4268,15 +4428,19 @@ def render_commodity_panel(state: PageState) -> str:
     )
     holdings_error_html = f'<div class="status">{html.escape(holdings_error)}</div>' if holdings_error else ""
     holdings_empty_html = (
-        '<tr><td colspan="7" class="status">No commodity ETF holdings found.</td></tr>'
+        '<tr><td colspan="8" class="status">No commodity ETF holdings found.</td></tr>'
         if not holding_rows and not holdings_error
         else ""
     )
     holdings_block = (
         '<section class="panel commodity-holdings-panel">'
         '<div class="panel-title">Current ETF Holdings</div>'
+        '<form method="post" action="/commodity/refresh">'
+        f"{env_hidden_fields_for_render()}"
+        '<div class="actions"><button type="submit">Refresh Current Holdings</button></div>'
+        '</form>'
         '<div class="table-wrap"><table class="commodity-holdings-table"><thead><tr>'
-        '<th>ETF</th><th>Unit</th><th>Investment Amount</th><th>Market Value</th><th>Profit</th><th>% Profit</th><th>Action</th>'
+        '<th>ETF</th><th>Unit</th><th>Source</th><th>Investment Amount</th><th>Market Value</th><th>Profit</th><th>% Profit</th><th>Action</th>'
         f'</tr></thead><tbody>{holding_rows}{holdings_empty_html}</tbody></table></div>'
         f"{holdings_error_html}"
         "</section>"
@@ -4300,9 +4464,14 @@ def render_commodity_panel(state: PageState) -> str:
         '<th>ETF</th><th>Allocation</th><th>Dip Trigger</th><th>1x Buy Amount</th><th>2x Capped Buy</th><th>Core Sell Trigger</th>'
         f'</tr></thead><tbody>{strategy_rows}</tbody></table></div></section>'
     )
+    commodity_action_names = {
+        "nasdaq": "NASDAQ",
+        "gold": "GOLD",
+        "silver": "Silver",
+    }
     cards = "".join(
         f"""
-        <article class="commodity-card" data-symbol="{html.escape(str(item['symbol']), quote=True)}" data-threshold="{html.escape(str(item['threshold']), quote=True)}">
+        <article class="commodity-card" data-symbol="{html.escape(str(item['symbol']), quote=True)}" data-asset-name="{html.escape(commodity_action_names.get(str(item.get('key')), str(item['symbol'])), quote=True)}" data-threshold="{html.escape(str(item['threshold']), quote=True)}">
           <div class="commodity-meta">
             <span class="commodity-label">{html.escape(str(item['label']))}</span>
             <strong>{html.escape(str(item['symbol']))}</strong>
@@ -4315,7 +4484,7 @@ def render_commodity_panel(state: PageState) -> str:
             {env_hidden_fields_for_render()}
             <input type="hidden" name="commodity_symbol" value="{html.escape(str(item['symbol']), quote=True)}">
             <input type="hidden" name="commodity_confirmed" value="0">
-            <button type="submit" class="commodity-buy-button">Buy on dip trigger</button>
+            <button type="submit" class="commodity-buy-button">Add more {html.escape(commodity_action_names.get(str(item.get('key')), str(item['symbol'])))}</button>
           </form>
         </article>
         """
@@ -4642,54 +4811,78 @@ def render_page(state: PageState) -> bytes:
         if state.rows
         else ""
     )
+    execute_after_orders = (
+        f'<div class="actions order-execute-actions">{execute_button}</div>'
+        if execute_button
+        else ""
+    )
     position_execute_button = (
         '<button type="submit" formaction="/positions/execute" class="danger">Execute Selected BUY</button>'
         if state.position_orders
         else ""
     )
     place_tab_class = "active" if state.active_tab == "place" else ""
-    positions_tab_class = "active" if state.active_tab == "positions" else ""
+    positions_tab_class = "active" if state.active_tab in {"positions", "positions-research"} else ""
     gpt_tab_class = "active" if state.active_tab == "gpt" else ""
     kite_setup_tab_class = "active" if state.active_tab == "kite-setup" else ""
     analytics_tab_class = "active" if state.active_tab == "analytics" else ""
     research_tab_class = "active" if state.active_tab == "research" else ""
-    positions_research_tab_class = "active" if state.active_tab == "positions-research" else ""
     commodity_tab_class = "active" if state.active_tab == "commodity" else ""
     income_tab_class = "active" if state.active_tab == "income" else ""
     order_management_tab_class = "active" if state.active_tab == "order-management" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
-    positions_panel_style = "" if state.active_tab == "positions" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
     kite_setup_panel_style = "" if state.active_tab == "kite-setup" else ' style="display:none"'
     env_panel = f"""
-        <section class="panel">
-          <div class="panel-title">Kite Environment</div>
-          {render_input("api_key", "KITE_API_KEY", state.api_key or env_value("KITE_API_KEY"))}
-          {render_input("api_secret", "KITE_API_SECRET", state.api_secret or env_value("KITE_API_SECRET"), "password")}
-          {render_input("access_token", "KITE_ACCESS_TOKEN", state.access_token or env_value("KITE_ACCESS_TOKEN"), "password")}
-          {render_input("confirm_live_order", "KITE_CONFIRM_LIVE_ORDER", state.confirm_live_order or env_value("KITE_CONFIRM_LIVE_ORDER"))}
-          {render_checkbox("show_credentials", "Show credential values", True, "Reveals KITE_API_SECRET and KITE_ACCESS_TOKEN in this local browser page.")}
-          <div class="status">{status}</div>
-          <div class="panel-title token-title">ETF Buy Setup</div>
-          {render_number_input("etf_buy_amount", "ETF buy amount", etf_buy_amount, "100")}
-          <div class="status">Current ETF action text: <strong>{html.escape(etf_buy_action)}</strong>. This value is saved in <code>{html.escape(str(SETTINGS_PATH.name))}</code>.</div>
-          <div class="panel-title token-title">Generate Kite Access Token</div>
-          <div class="actions">
-            <a class="button-link" href="{html.escape(kite_login_url(), quote=True)}" target="_blank" rel="noopener">Open Kite Login</a>
+        <section class="panel kite-setup-hero">
+          <div>
+            <div class="panel-title">Kite Setup</div>
+            <p class="status">A calm control room for credentials, access token, ETF amount, and allowed IP checks.</p>
           </div>
-          <div class="status">After login, copy <code>request_token</code> from the redirected URL and paste it below.</div>
-          {render_input("kite_request_token", "Manual request_token fallback", state.kite_request_token)}
-          <div class="actions">
-            <button type="submit" formaction="/kite-token/generate">Generate Access Token</button>
-          </div>
-          <div class="panel-title token-title">Allowed IP for Kite Orders</div>
-          <div class="status">If Kite says your IP is not allowed, add the matching public IP below in the Kite developer console allowed IP list.</div>
-          <div class="actions">
-            <button type="submit" formaction="/kite-ip/check">Check Current Public IP</button>
-            <a class="inline-link" href="https://developers.kite.trade" target="_blank" rel="noopener">Open Kite Developer Console</a>
-          </div>
-          {render_kite_ip_data(state.kite_ip_data)}
-        </section>"""
+          <div class="kite-status-pill">{status}</div>
+        </section>
+        <div class="kite-setup-grid">
+          <section class="panel kite-setup-card credential-card">
+            <div class="setup-card-kicker">01</div>
+            <div class="panel-title">Environment</div>
+            <div class="compact-grid">
+              {render_input("api_key", "KITE_API_KEY", state.api_key or env_value("KITE_API_KEY"))}
+              {render_input("confirm_live_order", "KITE_CONFIRM_LIVE_ORDER", state.confirm_live_order or env_value("KITE_CONFIRM_LIVE_ORDER"))}
+              {render_input("api_secret", "KITE_API_SECRET", state.api_secret or env_value("KITE_API_SECRET"), "password")}
+              {render_input("access_token", "KITE_ACCESS_TOKEN", state.access_token or env_value("KITE_ACCESS_TOKEN"), "password")}
+            </div>
+            {render_checkbox("show_credentials", "Show credential values", False, "Reveals KITE_API_SECRET and KITE_ACCESS_TOKEN in this local browser page.")}
+          </section>
+          <section class="panel kite-setup-card token-card">
+            <div class="setup-card-kicker">02</div>
+            <div class="panel-title">Access Token</div>
+            <p class="status">Open Kite login, copy <code>request_token</code> from redirected URL, then generate the session token.</p>
+            <div class="actions">
+              <a class="button-link" href="{html.escape(kite_login_url(), quote=True)}" target="_blank" rel="noopener">Open Kite Login</a>
+            </div>
+            {render_input("kite_request_token", "Manual request_token fallback", state.kite_request_token)}
+            <div class="actions">
+              <button type="submit" formaction="/kite-token/generate">Generate Access Token</button>
+            </div>
+          </section>
+          <section class="panel kite-setup-card etf-card">
+            <div class="setup-card-kicker">03</div>
+            <div class="panel-title">ETF Buy Setup</div>
+            {render_number_input("etf_buy_amount", "ETF buy amount", etf_buy_amount, "100")}
+            <div class="kite-action-preview">{html.escape(etf_buy_action)}</div>
+            <p class="status">Saved in <code>{html.escape(str(SETTINGS_PATH.name))}</code>.</p>
+          </section>
+          <section class="panel kite-setup-card ip-card">
+            <div class="setup-card-kicker">04</div>
+            <div class="panel-title">Allowed IP</div>
+            <p class="status">If Kite blocks orders by IP, add your current public IP in the Kite developer console.</p>
+            <div class="actions">
+              <button type="submit" formaction="/kite-ip/check">Check Current Public IP</button>
+              <a class="inline-link" href="https://developers.kite.trade" target="_blank" rel="noopener">Open Kite Developer Console</a>
+            </div>
+            {render_kite_ip_data(state.kite_ip_data)}
+          </section>
+        </div>"""
     env_hidden = env_hidden_fields_for_render()
     html_doc = f"""<!doctype html>
 <html lang="en">
@@ -4700,51 +4893,85 @@ def render_page(state: PageState) -> bytes:
   <style>
     :root {{
       color-scheme: light;
-      --bg: #eef3f7;
+      --bg: #eef7f6;
       --ink: #17202a;
       --muted: #627084;
-      --line: #d8dee8;
+      --line: #d6e6e3;
       --panel: #ffffff;
-      --accent: #1769aa;
+      --panel-soft: #f8fdfc;
+      --accent: #0f766e;
+      --accent-blue: #1769aa;
+      --accent-soft: #ccfbf1;
       --danger: #b42318;
       --ok: #0f766e;
+      --warn: #a16207;
+      --shadow: 0 14px 34px rgba(15, 23, 42, 0.08);
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       font-family: Arial, Helvetica, sans-serif;
       background:
-        radial-gradient(circle at 14% -8%, rgba(23, 105, 170, 0.22), transparent 28%),
-        linear-gradient(180deg, #eef6fb 0%, #f6f7f9 44%, #eef3f7 100%);
+        linear-gradient(135deg, #eef7f6 0%, #f7fbff 42%, #f2fbf4 100%);
       color: var(--ink);
     }}
     header {{
-      background: linear-gradient(135deg, #0f172a 0%, #164e63 54%, #0f766e 100%);
-      border-bottom: 1px solid var(--line);
-      padding: 10px 18px;
+      background:
+        linear-gradient(120deg, #0b1220 0%, #123b52 48%, #0f766e 100%);
+      border-bottom: 1px solid rgba(153, 246, 228, 0.28);
+      padding: 12px 18px;
       color: #ffffff;
-      display: grid;
-      grid-template-columns: 1fr auto 1fr;
-      align-items: center;
-      gap: 18px;
+      box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18);
     }}
-    header h1 {{ margin: 0 0 3px; font-size: 22px; letter-spacing: 0; }}
+    .header-inner {{
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(220px, 0.85fr) minmax(300px, 1fr) minmax(280px, 0.95fr);
+      align-items: center;
+      gap: 14px;
+    }}
+    .brand-block {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }}
+    .brand-mark {{
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #38bdf8, #14b8a6);
+      color: #ecfeff;
+      font-size: 21px;
+      font-weight: 950;
+      box-shadow: 0 12px 24px rgba(20, 184, 166, 0.24);
+    }}
+    header h1 {{ margin: 0 0 3px; font-size: 23px; letter-spacing: 0; }}
     header p {{ margin: 0; color: #d5eef3; font-size: 12px; }}
     .naval-quote {{
       margin: 0;
-      color: #d1fae5;
-      font-size: 13px;
-      font-weight: 700;
+      color: #e0f2fe;
+      font-size: 12px;
+      font-weight: 800;
       text-align: right;
-      max-width: 520px;
       line-height: 1.25;
+      padding: 8px 10px;
+      border: 1px solid rgba(186, 230, 253, 0.2);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.08);
     }}
     .blessing {{
       color: #fef3c7;
-      font-size: 17px;
+      font-size: 15px;
       font-weight: 900;
       text-align: center;
       white-space: nowrap;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(254, 243, 199, 0.18);
     }}
     main {{
       width: min(1180px, calc(100vw - 32px));
@@ -4752,6 +4979,13 @@ def render_page(state: PageState) -> bytes:
     }}
     .market-shell {{
       margin-bottom: 18px;
+      padding: 12px;
+      border: 1px solid #bde8e3;
+      border-radius: 18px;
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.92), rgba(236, 254, 255, 0.78)),
+        #ffffff;
+      box-shadow: 0 22px 54px rgba(15, 23, 42, 0.10);
     }}
     .rule-strip {{
       display: grid;
@@ -4760,11 +4994,11 @@ def render_page(state: PageState) -> bytes:
       margin-bottom: 10px;
     }}
     .rule-card, .mmi-card {{
-      border-radius: 8px;
-      padding: 6px 12px;
+      border-radius: 14px;
+      padding: 10px 14px;
       color: #ffffff;
-      min-height: 42px;
-      box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
+      min-height: 78px;
+      box-shadow: 0 14px 30px rgba(15, 23, 42, 0.10);
       border: 1px solid rgba(255, 255, 255, 0.18);
     }}
     .sell-stock {{
@@ -4788,9 +5022,9 @@ def render_page(state: PageState) -> bytes:
       margin-bottom: 3px;
     }}
     .rule-title {{
-      font-size: 16px;
-      line-height: 1;
-      font-weight: 800;
+      font-size: 17px;
+      line-height: 1.04;
+      font-weight: 950;
     }}
     .mmi-value {{
       font-size: 18px;
@@ -4825,12 +5059,12 @@ def render_page(state: PageState) -> bytes:
       font-weight: 700;
     }}
     .ticker-panel {{
-      background: #ffffff;
+      background: rgba(255, 255, 255, 0.94);
       color: var(--ink);
-      border-radius: 8px;
+      border-radius: 14px;
       border: 1px solid var(--line);
       overflow: hidden;
-      box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
     }}
     .ticker-title {{
       padding: 8px 10px 0;
@@ -4921,8 +5155,8 @@ def render_page(state: PageState) -> bytes:
     .quote-change.up {{ color: #047857; }}
     .quote-change.down {{ color: #b42318; }}
     .commodity-panel {{
-      border-color: #bfdbfe;
-      background: #f8fbff;
+      border-color: #fed7aa;
+      background: linear-gradient(135deg, #ffffff 0%, #fff7ed 44%, #f0fdfa 100%);
     }}
     .commodity-grid {{
       display: grid;
@@ -4932,10 +5166,13 @@ def render_page(state: PageState) -> bytes:
     }}
     .commodity-card {{
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 12px;
       padding: 14px;
-      background: #ffffff;
-      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
+      background: rgba(255, 255, 255, 0.95);
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+      display: flex;
+      flex-direction: column;
+      min-height: 270px;
     }}
     .commodity-card.buy-now {{
       background: #fee2e2;
@@ -4979,9 +5216,10 @@ def render_page(state: PageState) -> bytes:
       color: #64748b;
       font-size: 12px;
       font-weight: 800;
+      min-height: 34px;
     }}
     .commodity-action {{
-      margin-top: 10px;
+      margin-top: auto;
       padding: 8px 10px;
       border-radius: 8px;
       background: #f1f5f9;
@@ -4997,6 +5235,7 @@ def render_page(state: PageState) -> bytes:
     }}
     .commodity-buy-form {{
       margin-top: 8px;
+      width: 100%;
     }}
     .commodity-buy-button {{
       width: 100%;
@@ -5014,11 +5253,11 @@ def render_page(state: PageState) -> bytes:
     }}
     .commodity-holdings-panel {{
       border-color: #bbf7d0;
-      background: #f7fef9;
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdf4 100%);
     }}
     .commodity-strategy-panel {{
       border-color: #bae6fd;
-      background: #f8fbff;
+      background: linear-gradient(135deg, #ffffff 0%, #eff6ff 100%);
     }}
     .commodity-holdings-table {{
       min-width: 980px;
@@ -5076,9 +5315,10 @@ def render_page(state: PageState) -> bytes:
     .income-stock,
     .income-filter {{
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 12px;
       padding: 12px;
-      background: #ffffff;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.04);
     }}
     .income-rule span,
     .income-stock span {{
@@ -5149,9 +5389,10 @@ def render_page(state: PageState) -> bytes:
     }}
     .income-pnl-card {{
       border: 1px solid #bbf7d0;
-      border-radius: 8px;
+      border-radius: 12px;
       padding: 12px;
-      background: #ffffff;
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdf4 100%);
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.04);
     }}
     .income-pnl-card span {{
       display: block;
@@ -5178,11 +5419,11 @@ def render_page(state: PageState) -> bytes:
       flex-wrap: wrap;
       align-items: baseline;
       gap: 7px;
-      background: #ffffff;
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 14px;
       padding: 10px 14px;
-      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
     }}
     .expiry-month {{
       color: var(--accent);
@@ -5236,16 +5477,17 @@ def render_page(state: PageState) -> bytes:
       align-items: start;
     }}
     .panel {{
-      background: var(--panel);
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.98), rgba(248, 253, 252, 0.96));
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 12px;
       padding: 16px;
       margin-bottom: 16px;
-      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+      box-shadow: var(--shadow);
     }}
     .trading-actions-panel {{
-      border-color: #bfdbfe;
-      background: #f8fbff;
+      border-color: #bae6fd;
+      background: linear-gradient(135deg, #ffffff 0%, #eff6ff 46%, #f0fdfa 100%);
     }}
     .trading-actions-panel .panel {{
       box-shadow: none;
@@ -5255,47 +5497,187 @@ def render_page(state: PageState) -> bytes:
       font-weight: 700;
       margin-bottom: 14px;
       font-size: 16px;
+      color: #0f3b65;
     }}
     .tabs {{
       display: flex;
       gap: 8px;
       margin-bottom: 16px;
-      border-bottom: 1px solid var(--line);
+      padding: 10px;
+      border: 1px solid #bde8e3;
+      border-radius: 16px;
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.9), rgba(236, 254, 255, 0.84)),
+        #ffffff;
+      box-shadow: 0 16px 38px rgba(15, 23, 42, 0.08);
+      overflow-x: auto;
     }}
     .tab-button {{
-      border: 1px solid var(--line);
-      border-bottom: 0;
-      border-radius: 8px 8px 0 0;
-      background: #eef2f7;
+      --tab-a: #e2e8f0;
+      --tab-b: #f8fafc;
+      --tab-ink: #0f172a;
+      --tab-shadow: rgba(15, 23, 42, 0.08);
+      border: 1px solid rgba(148, 163, 184, 0.34);
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--tab-a), var(--tab-b));
       color: var(--ink);
       padding: 10px 14px;
+      box-shadow: 0 8px 18px var(--tab-shadow);
+      transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
+    }}
+    .tab-button:hover {{
+      transform: translateY(-1px);
+      filter: saturate(1.08);
+    }}
+    .tab-button[data-tab="place"] {{
+      --tab-a: #dbeafe;
+      --tab-b: #ecfeff;
+      --tab-ink: #075985;
+      --tab-shadow: rgba(14, 165, 233, 0.14);
+    }}
+    .tab-button[data-tab="positions"] {{
+      --tab-a: #dcfce7;
+      --tab-b: #f0fdf4;
+      --tab-ink: #166534;
+      --tab-shadow: rgba(34, 197, 94, 0.14);
+    }}
+    .tab-button[data-tab="analytics"] {{
+      --tab-a: #ede9fe;
+      --tab-b: #eff6ff;
+      --tab-ink: #4338ca;
+      --tab-shadow: rgba(99, 102, 241, 0.14);
+    }}
+    .tab-button[data-tab="research"] {{
+      --tab-a: #e0f2fe;
+      --tab-b: #f0f9ff;
+      --tab-ink: #0369a1;
+      --tab-shadow: rgba(2, 132, 199, 0.14);
+    }}
+    .tab-button[data-tab="income"] {{
+      --tab-a: #bbf7d0;
+      --tab-b: #fef9c3;
+      --tab-ink: #047857;
+      --tab-shadow: rgba(22, 163, 74, 0.16);
+    }}
+    .tab-button[data-tab="commodity"] {{
+      --tab-a: #fed7aa;
+      --tab-b: #fef3c7;
+      --tab-ink: #92400e;
+      --tab-shadow: rgba(245, 158, 11, 0.18);
+    }}
+    .tab-button[data-tab="order-management"] {{
+      --tab-a: #fee2e2;
+      --tab-b: #fff1f2;
+      --tab-ink: #991b1b;
+      --tab-shadow: rgba(239, 68, 68, 0.16);
+    }}
+    .tab-button[data-tab="gpt"] {{
+      --tab-a: #ccfbf1;
+      --tab-b: #e0f2fe;
+      --tab-ink: #0f766e;
+      --tab-shadow: rgba(20, 184, 166, 0.16);
+    }}
+    .tab-button[data-tab="kite-setup"] {{
+      --tab-a: #cffafe;
+      --tab-b: #ecfeff;
+      --tab-ink: #155e75;
+      --tab-shadow: rgba(6, 182, 212, 0.16);
     }}
     .tab-button.primary-action {{
       padding: 14px 24px;
       font-size: 16px;
       font-weight: 900;
-      background: #ffffff;
-      color: #0f3b65;
+      color: var(--tab-ink);
     }}
     .tab-button.utility-action {{
       padding: 10px 14px;
       font-size: 13px;
     }}
     .tab-button.active {{
-      background: #ffffff;
-      color: var(--accent);
-      box-shadow: inset 0 3px 0 var(--accent);
+      color: var(--tab-ink);
+      border-color: rgba(15, 23, 42, 0.12);
+      box-shadow:
+        inset 0 0 0 2px rgba(255, 255, 255, 0.58),
+        inset 0 -4px 0 rgba(15, 23, 42, 0.12),
+        0 12px 26px var(--tab-shadow);
+      transform: translateY(-1px);
+    }}
+    .tab-button.active::after {{
+      content: "";
+      display: block;
+      height: 3px;
+      margin-top: 7px;
+      border-radius: 999px;
+      background: currentColor;
+      opacity: 0.72;
+    }}
+    #place-panel,
+    #positions-panel,
+    #analytics-panel,
+    #research-panel,
+    #income-panel,
+    #commodity-panel,
+    #order-management-panel,
+    #gpt-panel,
+    #kite-setup-panel {{
+      padding: 12px;
+      border: 1px solid #d7f2ee;
+      border-radius: 16px;
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.72), rgba(240, 253, 250, 0.72));
+      box-shadow: 0 18px 46px rgba(15, 23, 42, 0.06);
+      margin-bottom: 18px;
+    }}
+    #place-panel {{ border-left: 5px solid #38bdf8; }}
+    #positions-panel {{ border-left: 5px solid #0f766e; }}
+    #analytics-panel, #research-panel {{ border-left: 5px solid #2563eb; }}
+    #income-panel {{ border-left: 5px solid #22c55e; }}
+    #commodity-panel {{ border-left: 5px solid #f59e0b; }}
+    #order-management-panel {{ border-left: 5px solid #ef4444; }}
+    #gpt-panel {{ border-left: 5px solid #14b8a6; }}
+    #kite-setup-panel {{ border-left: 5px solid #06b6d4; }}
+    #place-panel {{
+      background: linear-gradient(135deg, rgba(239, 246, 255, 0.9), rgba(236, 254, 255, 0.82));
+    }}
+    #positions-panel {{
+      background: linear-gradient(135deg, rgba(240, 253, 244, 0.92), rgba(236, 254, 255, 0.82));
+    }}
+    #analytics-panel {{
+      background: linear-gradient(135deg, rgba(245, 243, 255, 0.92), rgba(239, 246, 255, 0.84));
+    }}
+    #research-panel {{
+      background: linear-gradient(135deg, rgba(240, 249, 255, 0.92), rgba(236, 254, 255, 0.84));
+    }}
+    #income-panel {{
+      background: linear-gradient(135deg, rgba(240, 253, 244, 0.92), rgba(254, 252, 232, 0.86));
+    }}
+    #commodity-panel {{
+      background: linear-gradient(135deg, rgba(255, 247, 237, 0.94), rgba(254, 243, 199, 0.76));
+    }}
+    #order-management-panel {{
+      background: linear-gradient(135deg, rgba(255, 241, 242, 0.92), rgba(255, 255, 255, 0.82));
+    }}
+    #gpt-panel {{
+      background: linear-gradient(135deg, rgba(240, 253, 250, 0.94), rgba(236, 254, 255, 0.82));
+    }}
+    #kite-setup-panel {{
+      background: linear-gradient(135deg, rgba(236, 254, 255, 0.94), rgba(240, 249, 255, 0.84));
     }}
     label {{ display: block; margin-bottom: 12px; }}
     label span {{ display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }}
     input[type="text"], input[type="password"], textarea {{
       width: 100%;
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 9px;
       padding: 9px 10px;
       font-size: 14px;
-      background: #ffffff;
+      background: rgba(255, 255, 255, 0.94);
       color: var(--ink);
+      box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.04);
+    }}
+    input[type="text"]:focus, input[type="password"]:focus, textarea:focus {{
+      outline: 2px solid rgba(20, 184, 166, 0.18);
+      border-color: #5eead4;
     }}
     textarea {{
       min-height: 150px;
@@ -5321,6 +5703,12 @@ def render_page(state: PageState) -> bytes:
       gap: 10px;
       margin-top: 10px;
     }}
+    .order-execute-actions {{
+      justify-content: flex-end;
+      padding-top: 8px;
+      margin: 4px 0 12px;
+      border-top: 1px solid rgba(15, 118, 110, 0.14);
+    }}
     .execution-checks {{
       margin-top: 12px;
       padding-top: 10px;
@@ -5328,27 +5716,114 @@ def render_page(state: PageState) -> bytes:
     }}
     button {{
       border: 0;
-      border-radius: 6px;
+      border-radius: 9px;
       padding: 10px 14px;
       background: linear-gradient(135deg, #1769aa 0%, #0f766e 100%);
       color: #ffffff;
       cursor: pointer;
       font-weight: 700;
+      box-shadow: 0 10px 22px rgba(15, 118, 110, 0.18);
     }}
     button.secondary {{ background: #4b5563; }}
     button.danger {{ background: linear-gradient(135deg, #b42318 0%, #7f1d1d 100%); }}
+    button:hover, .button-link:hover {{
+      transform: translateY(-1px);
+      filter: saturate(1.05);
+    }}
     .button-link {{
       display: inline-block;
-      border-radius: 6px;
+      border-radius: 9px;
       padding: 10px 14px;
       background: linear-gradient(135deg, #1769aa 0%, #0f766e 100%);
       color: #ffffff;
       cursor: pointer;
       font-weight: 700;
       text-decoration: none;
+      box-shadow: 0 10px 22px rgba(15, 118, 110, 0.18);
     }}
     .token-title {{
       margin-top: 18px;
+    }}
+    .kite-setup-hero {{
+      display: grid;
+      grid-template-columns: 1fr minmax(260px, 0.8fr);
+      gap: 14px;
+      align-items: center;
+      border-color: #a7f3d0;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(191, 219, 254, 0.86), transparent 34%),
+        radial-gradient(circle at 90% 20%, rgba(187, 247, 208, 0.84), transparent 30%),
+        linear-gradient(135deg, #f8fafc 0%, #ecfeff 46%, #f0fdf4 100%);
+    }}
+    .kite-setup-hero .panel-title {{
+      color: #064e3b;
+      font-size: 22px;
+    }}
+    .kite-status-pill {{
+      padding: 12px;
+      border: 1px solid #99f6e4;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.88);
+      color: #0f766e;
+      font-size: 12px;
+      font-weight: 850;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }}
+    .kite-setup-grid {{
+      display: grid;
+      grid-template-columns: minmax(340px, 1.1fr) minmax(320px, 0.9fr);
+      gap: 12px;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid #ccfbf1;
+      background:
+        linear-gradient(135deg, rgba(240, 253, 250, 0.96), rgba(239, 246, 255, 0.96)),
+        #f8fafc;
+      margin-bottom: 14px;
+    }}
+    .kite-setup-card {{
+      position: relative;
+      margin: 0;
+      overflow: hidden;
+      border-color: #bae6fd;
+      background: rgba(255, 255, 255, 0.94);
+    }}
+    .kite-setup-card::after {{
+      content: "";
+      position: absolute;
+      width: 110px;
+      height: 110px;
+      right: -42px;
+      top: -46px;
+      border-radius: 50%;
+      background: rgba(167, 243, 208, 0.42);
+      pointer-events: none;
+    }}
+    .setup-card-kicker {{
+      display: inline-grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      margin-bottom: 8px;
+      background: #ccfbf1;
+      color: #0f766e;
+      font-weight: 950;
+      font-size: 12px;
+    }}
+    .credential-card {{ grid-row: span 2; }}
+    .token-card {{ border-color: #bfdbfe; }}
+    .etf-card {{ border-color: #bbf7d0; }}
+    .ip-card {{ border-color: #fde68a; }}
+    .kite-action-preview {{
+      margin-top: 8px;
+      padding: 12px;
+      border-radius: 10px;
+      border: 1px solid #86efac;
+      background: #f0fdf4;
+      color: #065f46;
+      font-weight: 950;
     }}
     .alert {{
       position: relative;
@@ -5571,8 +6046,215 @@ def render_page(state: PageState) -> bytes:
     .analytics-table th {{
       width: 260px;
     }}
+    .analytics-picker-panel {{
+      border-color: #bfdbfe;
+      background: linear-gradient(135deg, #ffffff 0%, #eff6ff 100%);
+    }}
+    .analytics-command-panel {{
+      border-color: #c4b5fd;
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.98) 0%, rgba(245, 243, 255, 0.95) 48%, rgba(236, 254, 255, 0.92) 100%);
+    }}
+    .analytics-command-head {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 0.42fr);
+      gap: 16px;
+      align-items: stretch;
+      margin-bottom: 12px;
+    }}
+    .analytics-command-head h2 {{
+      margin: 0 0 4px;
+      font-size: 28px;
+      color: #0f172a;
+      letter-spacing: 0;
+    }}
+    .analytics-command-head p {{
+      margin: 0;
+      color: #526173;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    .analytics-verdict {{
+      border-radius: 14px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      border: 1px solid rgba(15, 23, 42, 0.08);
+    }}
+    .analytics-verdict span,
+    .analytics-action-card span,
+    .analytics-metric span {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 950;
+      text-transform: uppercase;
+      margin-bottom: 5px;
+    }}
+    .analytics-verdict strong {{
+      display: block;
+      font-size: 22px;
+      line-height: 1.08;
+      overflow-wrap: anywhere;
+    }}
+    .analytics-action-row,
+    .analytics-metric-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .analytics-action-card,
+    .analytics-metric {{
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 11px 12px;
+      background: rgba(255, 255, 255, 0.88);
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.04);
+      min-height: 76px;
+    }}
+    .analytics-action-card strong {{
+      display: block;
+      font-size: 15px;
+      line-height: 1.18;
+      overflow-wrap: anywhere;
+    }}
+    .analytics-metric strong {{
+      display: block;
+      color: #0f172a;
+      font-size: 19px;
+      line-height: 1.05;
+      font-weight: 950;
+    }}
+    .analytics-metric small {{
+      display: block;
+      margin-top: 5px;
+      color: #64748b;
+      font-size: 11px;
+      line-height: 1.25;
+      font-weight: 700;
+    }}
+    .analytics-two-column {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }}
+    .analytics-compact-panel,
+    .analytics-review-panel {{
+      border-color: #c7d2fe;
+      background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
+    }}
+    .compact-decisions {{
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }}
+    .compact-decisions .decision-card {{
+      min-height: 88px;
+    }}
+    .analytics-review-table th,
+    .analytics-review-table td,
+    .analytics-mini-table th,
+    .analytics-mini-table td,
+    .analytics-details-table th,
+    .analytics-details-table td {{
+      white-space: normal;
+      vertical-align: top;
+    }}
+    .analytics-review-table th:first-child,
+    .analytics-details-table th:first-child {{
+      width: 220px;
+    }}
+    .analytics-mini-table {{
+      min-width: 520px;
+    }}
+    .signal-lightgreen {{
+      color: #047857;
+      font-weight: 900;
+      background: #dcfce7;
+      border-radius: 4px;
+      padding: 2px 4px;
+    }}
+    .signal-lightcoral {{
+      color: #b42318;
+      font-weight: 900;
+      background: #fee2e2;
+      border-radius: 4px;
+      padding: 2px 4px;
+    }}
+    .signal-orange {{
+      color: #c2410c;
+      font-weight: 900;
+      background: #ffedd5;
+      border-radius: 4px;
+      padding: 2px 4px;
+    }}
     .research-table {{
       min-width: 2600px;
+      border-collapse: separate;
+      border-spacing: 0;
+      background: #ffffff;
+      box-shadow: none;
+    }}
+    .research-scorecard-panel {{
+      border-color: #a7f3d0;
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
+    }}
+    .research-table-hint {{
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      margin: -4px 0 10px;
+      border-radius: 999px;
+      background: #ecfeff;
+      color: #155e75;
+      border: 1px solid #a5f3fc;
+      font-size: 12px;
+      font-weight: 850;
+    }}
+    .research-table-wrap {{
+      border: 1px solid #cde7e2;
+      border-radius: 12px;
+      background: #ffffff;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+    }}
+    .research-table th {{
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: linear-gradient(135deg, #0f3b65 0%, #0f766e 100%);
+      color: #ffffff;
+      border-bottom: 0;
+      font-size: 12px;
+      line-height: 1.15;
+      letter-spacing: 0.01em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      padding: 11px 9px;
+    }}
+    .research-table th:first-child {{
+      border-top-left-radius: 10px;
+    }}
+    .research-table th:last-child {{
+      border-top-right-radius: 10px;
+    }}
+    .research-table td {{
+      border-bottom: 1px solid #dbece8;
+      border-right: 1px solid rgba(219, 236, 232, 0.72);
+      color: #0f172a;
+      font-size: 13px;
+      font-weight: 750;
+      padding: 10px 9px;
+    }}
+    .research-table td:first-child {{
+      font-weight: 950;
+      color: #075985;
+    }}
+    .research-table tbody tr:nth-child(even) td:not(.signal-green):not(.signal-yellow):not(.signal-red):not(.signal-neutral):not(.strength-lightgreen):not(.strength-yellow):not(.strength-orange):not(.strength-lightcoral):not(.strength-neutral) {{
+      background: #fbfefd;
+    }}
+    .research-table tbody tr:hover td {{
+      background-color: #e0f2fe;
     }}
     .research-table small {{
       font-size: 10px;
@@ -5729,6 +6411,7 @@ def render_page(state: PageState) -> bytes:
       text-align: center;
       min-width: 76px;
       font-weight: 900;
+      letter-spacing: 0.02em;
     }}
     .ip-table th {{
       width: 190px;
@@ -5796,29 +6479,112 @@ def render_page(state: PageState) -> bytes:
       font-weight: 900;
       overflow-wrap: anywhere;
     }}
+    .calm-hero-panel {{
+      border-color: #bfdbfe;
+      background:
+        linear-gradient(135deg, #f8fafc 0%, #ecfeff 46%, #f0fdf4 100%);
+    }}
+    .calm-quote {{
+      margin: 2px 0 8px;
+      color: #0f766e;
+      font-size: 18px;
+      font-weight: 950;
+    }}
+    .calm-options-panel {{
+      border-color: #ccfbf1;
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
+    }}
+    .gpt-hero-panel {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-color: #a7f3d0;
+      background:
+        linear-gradient(135deg, #ecfeff 0%, #f0fdf4 52%, #fff7ed 100%);
+    }}
+    .gpt-hero-panel .panel-title {{
+      color: #065f46;
+      font-size: 21px;
+    }}
+    .gpt-hero-chip {{
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid #99f6e4;
+      background: #ffffff;
+      color: #0f766e;
+      font-size: 12px;
+      font-weight: 950;
+      white-space: nowrap;
+    }}
+    .gpt-workspace {{
+      display: grid;
+      grid-template-columns: minmax(300px, 0.92fr) minmax(360px, 1.08fr);
+      gap: 12px;
+      padding: 12px;
+      border-radius: 12px;
+      background:
+        linear-gradient(135deg, rgba(240, 253, 244, 0.95), rgba(239, 246, 255, 0.95)),
+        #f8fafc;
+      border: 1px solid #ccfbf1;
+      margin-bottom: 14px;
+    }}
+    .gpt-card {{
+      margin: 0;
+      border-color: #bae6fd;
+      background: rgba(255, 255, 255, 0.94);
+    }}
+    .gpt-result-card {{
+      border-color: #86efac;
+      background: #f0fdf4;
+    }}
+    .compact-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+    }}
+    .gpt-prompt-box {{ min-height: 160px; }}
+    .gpt-system-box {{ min-height: 260px; }}
+    .gpt-api-output {{ min-height: 190px; background: #f8fafc; }}
+    .gpt-fallback-box {{ min-height: 130px; }}
+    .gpt-response-meta {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 4px 0 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #bbf7d0;
+      background: #f0fdf4;
+      color: #166534;
+      font-size: 12px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }}
     .signal-good {{
       color: #047857;
       font-weight: 900;
       background: #ecfdf5;
     }}
     .signal-green {{
-      color: #047857;
+      color: #006b4f;
       font-weight: 900;
-      background: #ecfdf5;
+      background: #d9fbe7;
       border-radius: 4px;
       padding: 2px 4px;
     }}
     .signal-yellow {{
-      color: #a16207;
+      color: #8a5200;
       font-weight: 900;
-      background: #fef9c3;
+      background: #fff7b8;
       border-radius: 4px;
       padding: 2px 4px;
     }}
     .signal-red {{
-      color: #b42318;
+      color: #a51212;
       font-weight: 900;
-      background: #fee2e2;
+      background: #ffe0de;
       border-radius: 4px;
       padding: 2px 4px;
     }}
@@ -5827,13 +6593,13 @@ def render_page(state: PageState) -> bytes:
       font-weight: 800;
     }}
     .strength-lightgreen {{
-      background: #dcfce7;
-      color: #047857;
+      background: #d7fbe5;
+      color: #006b4f;
       font-weight: 900;
     }}
     .strength-yellow {{
-      background: #fef9c3;
-      color: #a16207;
+      background: #fff7b8;
+      color: #8a5200;
       font-weight: 900;
     }}
     .strength-orange {{
@@ -5842,8 +6608,8 @@ def render_page(state: PageState) -> bytes:
       font-weight: 900;
     }}
     .strength-lightcoral {{
-      background: #fee2e2;
-      color: #b42318;
+      background: #ffe0de;
+      color: #a51212;
       font-weight: 900;
     }}
     .strength-neutral {{
@@ -5856,6 +6622,9 @@ def render_page(state: PageState) -> bytes:
       width: 100%;
       border-collapse: collapse;
       font-size: 13px;
+      background: rgba(255, 255, 255, 0.9);
+      border-radius: 10px;
+      overflow: hidden;
     }}
     th, td {{
       border-bottom: 1px solid var(--line);
@@ -5863,14 +6632,28 @@ def render_page(state: PageState) -> bytes:
       text-align: left;
       white-space: nowrap;
     }}
-    th {{ color: var(--muted); font-weight: 700; background: #f9fafb; }}
+    th {{
+      color: #49627d;
+      font-weight: 800;
+      background: linear-gradient(135deg, #f8fafc, #eef7f6);
+    }}
+    tbody tr:hover td {{
+      background: rgba(236, 254, 255, 0.46);
+    }}
     @media (max-width: 820px) {{
       .rule-strip {{ grid-template-columns: 1fr; }}
       .expiry-strip {{ grid-template-columns: 1fr; }}
       .expiry-warning {{ max-width: none; }}
       .grid {{ grid-template-columns: 1fr; }}
+      .gpt-workspace {{ grid-template-columns: 1fr; }}
+      .gpt-hero-panel {{ align-items: flex-start; flex-direction: column; }}
+      .kite-setup-hero {{ grid-template-columns: 1fr; }}
+      .kite-setup-grid {{ grid-template-columns: 1fr; }}
       .analytics-form {{ grid-template-columns: 1fr; }}
-      header {{ padding: 10px 12px; grid-template-columns: 1fr; align-items: flex-start; }}
+      .analytics-command-head {{ grid-template-columns: 1fr; }}
+      .analytics-two-column {{ grid-template-columns: 1fr; }}
+      header {{ padding: 10px 12px; }}
+      .header-inner {{ width: 100%; grid-template-columns: 1fr; align-items: flex-start; }}
       .blessing {{ text-align: left; white-space: normal; }}
       .naval-quote {{ text-align: left; max-width: none; }}
       main {{ width: calc(100vw - 20px); }}
@@ -5879,26 +6662,30 @@ def render_page(state: PageState) -> bytes:
 </head>
 <body>
   <header>
-    <div>
-      <h1>Kite Trader</h1>
-      <p>Place CSV orders or build BUY orders from existing Kite positions.</p>
+    <div class="header-inner">
+    <div class="brand-block">
+      <div class="brand-mark">KT</div>
+      <div>
+        <h1>Kite Trader</h1>
+        <p>CSV orders, positions, income strategy, and ETF actions.</p>
+      </div>
     </div>
-    <div class="blessing">ॐ | Jai Sri Ram | Jai Laxmi Mata</div>
-    <p class="naval-quote">"Trade money for time, not time for money. You're going to run out of time first." - Naval</p>
+    <div class="blessing">&#2384; | Jai Sri Ram | Jai Laxmi Mata</div>
+    <p class="naval-quote">"Trade money for time, not time for money. You're going to run out of time first." <strong>- Naval</strong></p>
+    </div>
   </header>
   <main>
     {render_market_topper(state)}
     {alert}
     <div class="tabs">
       <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
-      <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">CLOSE Positions</button>
-      <button class="tab-button utility-action {positions_research_tab_class}" type="button" data-tab="positions-research">Positions</button>
+      <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">Positions</button>
       <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
       <button class="tab-button utility-action {research_tab_class}" type="button" data-tab="research">Research</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
       <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Mofify / Cancel</button>
-      <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT CSV Generator</button>
+      <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT</button>
       <button class="tab-button utility-action {kite_setup_tab_class}" type="button" data-tab="kite-setup">Kite Setup</button>
     </div>
     <form id="place-panel" method="post" action="/load"{place_panel_style}>
@@ -5908,10 +6695,10 @@ def render_page(state: PageState) -> bytes:
       <section class="panel trading-actions-panel">
         <div class="panel-title">Execution Options</div>
         {orders_table}
+        {execute_after_orders}
         {trade_validation_table}
         <div class="actions">
           <button type="submit" formaction="/load">Load / Preview CSV</button>
-          {execute_button}
         </div>
         {render_results(state.results)}
         <div class="execution-checks">
@@ -5924,6 +6711,7 @@ def render_page(state: PageState) -> bytes:
         <section class="panel">
           <div class="panel-title">CSV Source</div>
           {render_input("csv_path", "CSV path", state.csv_path)}
+          <div class="status">CSV path can be a local file or a public Google Sheets link. Google Sheets must be shared as viewable by anyone with the link.</div>
           <label><span>Upload CSV</span><input id="csv-file" type="file" accept=".csv,text/csv"></label>
           <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
           <div class="actions">
@@ -5935,37 +6723,7 @@ def render_page(state: PageState) -> bytes:
       {render_console(state.console_log)}
     </form>
     {render_order_management_panel(state)}
-    <form id="positions-panel" method="post" action="/positions/load"{positions_panel_style}>
-      {env_hidden}
-      <input type="hidden" name="position_orders_payload" value="{html.escape(position_orders_payload, quote=True)}">
-      <section class="panel">
-        <div class="panel-title">Execution Options</div>
-        {render_checkbox("position_dry_run", "Dry run", state.position_dry_run, "Build BUY orders and show what would happen without sending anything to Kite.")}
-        {render_checkbox("position_include_long", "Include long positions", state.position_include_long, "Default only creates BUY orders for short positions.")}
-        {render_checkbox("position_profit_only", "Profit-only positions", state.position_profit_only)}
-        {render_checkbox("position_autoslice", "Autoslice", state.position_autoslice)}
-        {render_checkbox("position_keep_existing_orders", "Place new order instead of modifying similar open order", state.position_keep_existing_orders)}
-        <div class="actions">
-          <button type="submit" formaction="/positions/load">Get Current Position / Preview BUY</button>
-          {position_execute_button}
-        </div>
-      </section>
-      {position_orders_table}
-      {render_results(state.position_results)}
-      {render_console(state.console_log)}
-      <section class="panel">
-        <div class="panel-title">Position BUY Options</div>
-        {render_number_input("position_discount_percent", "Discount percent", state.position_discount_percent, "0.05")}
-        {render_input("position_exchange", "Exchange", state.position_exchange)}
-        {render_input("position_product", "Product filter", state.position_product)}
-        {render_input("position_symbols", "Symbol filter, comma-separated", state.position_symbols)}
-        {render_input("position_variety", "Variety", state.position_variety)}
-        {render_input("position_validity", "Validity", state.position_validity)}
-        {render_input("position_tag", "Tag", state.position_tag)}
-        {render_number_input("position_tick_size", "Tick size", state.position_tick_size, "0.01")}
-        {render_input("position_max_orders", "Max orders", state.position_max_orders)}
-      </section>
-    </form>
+    {render_positions_panel(state, position_orders_payload, position_orders_table, position_execute_button)}
     <form id="kite-setup-panel" method="post" action="/kite-setup"{kite_setup_panel_style}>
       {env_panel}
       <div class="actions">
@@ -5974,37 +6732,59 @@ def render_page(state: PageState) -> bytes:
     </form>
     <form id="gpt-panel" method="post" action="/gpt/load"{gpt_panel_style}>
       {env_hidden}
-      <div class="grid">
-        <section class="panel">
-          <div class="panel-title">OpenAI CSV Generator</div>
-          {render_input("openai_api_key", "OPENAI_API_KEY", state.openai_api_key or env_value("OPENAI_API_KEY"), "password")}
-          {render_input("openai_model", "Model", state.openai_model)}
-          <label><span>System prompt / GPT instructions used by API</span><textarea class="conversation" name="openai_system_prompt" placeholder="System instructions for CSV generation">{html.escape(state.openai_system_prompt)}</textarea></label>
-          <label><span>User prompt for CSV generation</span><textarea class="conversation" name="openai_prompt" placeholder="Describe holdings, cash, expiry, symbols, strikes, lots, prices, and risk preference">{html.escape(state.openai_prompt)}</textarea></label>
+      <section class="panel gpt-hero-panel">
+        <div>
+          <div class="panel-title">GPT CSV Generator</div>
+          <p class="status">OpenAI API turns your strategy prompt into Kite-ready CSV. Review every row before saving or trading.</p>
+        </div>
+        <div class="gpt-hero-chip">Prompt file: {html.escape(OPENAI_CSV_PROMPT_PATH.name)}</div>
+      </section>
+      <div class="gpt-workspace">
+        <section class="panel gpt-card gpt-setup-card">
+          <div class="panel-title">API Setup</div>
+          <div class="compact-grid">
+            {render_input("openai_api_key", "OPENAI_API_KEY", state.openai_api_key or env_value("OPENAI_API_KEY"), "password")}
+            {render_input("openai_model", "Model", state.openai_model)}
+          </div>
           <div class="actions">
             <button type="submit" formaction="/gpt/generate">Generate CSV with OpenAI</button>
           </div>
         </section>
-        <section class="panel">
-          <div class="panel-title">Manual Paste Fallback</div>
-          <div class="status">Custom GPT share URLs cannot be called as an app API. Use OpenAI API above, or paste CSV/GPT output here manually.</div>
-          {render_input("gpt_url", "GPT share URL", state.gpt_url)}
-          <a class="inline-link" href="{html.escape(state.gpt_url, quote=True)}" target="_blank" rel="noopener">Open GPT Share</a>
-          <label><span>Conversation / GPT output</span><textarea class="conversation" name="gpt_conversation" placeholder="Fetch the share link, or paste GPT output here">{html.escape(state.gpt_conversation)}</textarea></label>
-          <div class="actions">
-            <button type="submit" formaction="/gpt/extract">Extract CSV</button>
-          </div>
+        <section class="panel gpt-card">
+          <div class="panel-title">User Request</div>
+          <label><span>Ask GPT what CSV to build</span><textarea class="conversation gpt-prompt-box" name="openai_prompt" placeholder="Describe holdings, cash, expiry, symbols, strikes, lots, prices, and risk preference">{html.escape(state.openai_prompt)}</textarea></label>
         </section>
-      </div>
-      <div class="grid">
-        <section class="panel">
+        <section class="panel gpt-card">
+          <div class="panel-title">System Prompt</div>
+          <label><span>Loaded from openai_csv_prompt.md</span><textarea class="conversation gpt-system-box" name="openai_system_prompt" placeholder="System instructions for CSV generation">{html.escape(state.openai_system_prompt)}</textarea></label>
+        </section>
+        <section class="panel gpt-card">
+          <div class="panel-title">API Returned Output</div>
+          <input type="hidden" name="gpt_api_response_id" value="{html.escape(state.gpt_api_response_id, quote=True)}">
+          <div class="gpt-response-meta">
+            <span>Response ID: <strong>{html.escape(state.gpt_api_response_id or 'Not generated yet')}</strong></span>
+            <a class="inline-link" href="https://platform.openai.com/logs" target="_blank" rel="noopener">Open OpenAI API logs</a>
+          </div>
+          <label><span>Raw / repaired OpenAI response</span><textarea class="conversation gpt-api-output" name="gpt_api_output" readonly placeholder="OpenAI API output appears here">{html.escape(state.gpt_api_output)}</textarea></label>
+        </section>
+        <section class="panel gpt-card gpt-result-card">
           <div class="panel-title">CSV To Save</div>
-          <label><span>Extracted CSV</span><textarea class="csv-output" name="gpt_csv_text" placeholder="CSV generated from GPT appears here">{html.escape(state.gpt_csv_text)}</textarea></label>
+          <label><span>Validated Kite CSV</span><textarea class="csv-output" name="gpt_csv_text" placeholder="CSV generated from GPT appears here">{html.escape(state.gpt_csv_text)}</textarea></label>
           <div class="actions">
             <button type="submit" formaction="/gpt/save">Save to kite_orders.csv</button>
             <button type="submit" formaction="/gpt/save-preview">Save and Preview Orders</button>
           </div>
           <div class="status">Saved CSV uses the same archive flow as Trading, so the previous {html.escape(DEFAULT_CSV_PATH.name)} is kept as a last input order record.</div>
+        </section>
+        <section class="panel gpt-card">
+          <div class="panel-title">Manual Paste Fallback</div>
+          <div class="status">Custom GPT share URLs cannot be called as an app API. Use OpenAI API above, or paste CSV/GPT output here manually.</div>
+          {render_input("gpt_url", "GPT share URL", state.gpt_url)}
+          <a class="inline-link" href="{html.escape(state.gpt_url, quote=True)}" target="_blank" rel="noopener">Open GPT Share</a>
+          <label><span>Conversation / GPT output</span><textarea class="conversation gpt-fallback-box" name="gpt_conversation" placeholder="Paste GPT output here">{html.escape(state.gpt_conversation)}</textarea></label>
+          <div class="actions">
+            <button type="submit" formaction="/gpt/extract">Extract CSV</button>
+          </div>
         </section>
       </div>
       {orders_table}
@@ -6012,7 +6792,6 @@ def render_page(state: PageState) -> bytes:
     </form>
     {render_analytics_panel(state)}
     {render_research_panel(state)}
-    {render_positions_panel(state)}
     {render_income_panel(state)}
     {render_commodity_panel(state)}
   </main>
@@ -6074,6 +6853,10 @@ def render_page(state: PageState) -> bytes:
     for (const button of document.querySelectorAll('.tab-button')) {{
       button.addEventListener('click', () => {{
         const active = button.dataset.tab;
+        if (active === 'commodity' && window.location.pathname !== '/commodity') {{
+          window.location.href = '/commodity';
+          return;
+        }}
         document.getElementById('place-panel').style.display = active === 'place' ? '' : 'none';
         document.getElementById('positions-panel').style.display = active === 'positions' ? '' : 'none';
         document.getElementById('gpt-panel').style.display = active === 'gpt' ? '' : 'none';
@@ -6081,7 +6864,6 @@ def render_page(state: PageState) -> bytes:
         document.getElementById('order-management-panel').style.display = active === 'order-management' ? '' : 'none';
         document.getElementById('analytics-panel').style.display = active === 'analytics' ? '' : 'none';
         document.getElementById('research-panel').style.display = active === 'research' ? '' : 'none';
-        document.getElementById('positions-research-panel').style.display = active === 'positions-research' ? '' : 'none';
         document.getElementById('income-panel').style.display = active === 'income' ? '' : 'none';
         document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
         for (const item of document.querySelectorAll('.tab-button')) {{
@@ -6315,6 +7097,7 @@ def render_page(state: PageState) -> bytes:
         const bySymbol = new Map((data.quotes || []).map((quote) => [quote.symbol, quote]));
         for (const card of cards) {{
           const symbol = card.dataset.symbol;
+          const assetName = card.dataset.assetName || symbol;
           const quote = bySymbol.get(symbol);
           const ltp = card.querySelector('.quote-ltp');
           const change = card.querySelector('.quote-change');
@@ -6371,6 +7154,7 @@ def render_page(state: PageState) -> bytes:
         const bySymbol = new Map((data.quotes || []).map((quote) => [quote.symbol, quote]));
         for (const card of cards) {{
           const symbol = card.dataset.symbol;
+          const assetName = card.dataset.assetName || symbol;
           const quote = bySymbol.get(symbol);
           const price = card.querySelector('.commodity-price');
           const change = card.querySelector('.commodity-change');
@@ -6381,7 +7165,7 @@ def render_page(state: PageState) -> bytes:
             change.textContent = 'Quote unavailable';
             change.className = 'commodity-change';
             action.textContent = 'Wait';
-            if (buyButton) buyButton.textContent = 'Buy on dip trigger';
+            if (buyButton) buyButton.textContent = `Add more ${{assetName}}`;
             card.classList.remove('buy-now');
             continue;
           }}
@@ -6402,9 +7186,7 @@ def render_page(state: PageState) -> bytes:
             ? `<strong>Action: ${{escapeHtml(quote.action || 'buy the ETF today')}} (${{quote.multiplier}}x)</strong>`
             : `Wait | fall ${{Number(quote.daily_fall_pct || 0).toFixed(2)}}%`;
           if (buyButton) {{
-            buyButton.textContent = quote.buy_signal
-              ? `Buy ${{escapeHtml(quote.buy_amount ? String(Math.round(Number(quote.buy_amount))) : '')}}`
-              : 'Buy on dip trigger';
+            buyButton.textContent = `Add more ${{assetName}}`;
           }}
         }}
       }} catch (error) {{
@@ -6440,6 +7222,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     state.error = f"{exc}\n\n{traceback.format_exc()}"
             self.send_page(state)
+            return
+        if parsed_url.path == "/commodity":
+            self.send_page(PageState(active_tab="commodity"))
             return
         if parsed_url.path == "/trade-news":
             query = parse_qs(parsed_url.query, keep_blank_values=True)
@@ -6496,9 +7281,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
 
         state = PageState(
             active_tab=(
-                "positions-research"
-                if self.path.startswith("/positions-research")
-                else "positions"
+                "positions"
                 if self.path.startswith("/positions")
                 else "place"
                 if self.path.startswith("/csv")
@@ -6544,6 +7327,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             gpt_url=first(form, "gpt_url", DEFAULT_GPT_SHARE_URL),
             gpt_conversation=first(form, "gpt_conversation"),
             gpt_csv_text=first(form, "gpt_csv_text"),
+            gpt_api_output=first(form, "gpt_api_output"),
+            gpt_api_response_id=first(form, "gpt_api_response_id"),
             openai_api_key=first(form, "openai_api_key"),
             openai_model=first(form, "openai_model", DEFAULT_OPENAI_MODEL),
             openai_system_prompt=first(form, "openai_system_prompt", read_openai_csv_system_prompt()),
@@ -6688,7 +7473,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.gpt_csv_text = extract_csv_from_text(state.gpt_conversation)
                 state.message = "Extracted CSV from GPT conversation."
             elif self.path == "/gpt/generate":
-                state.gpt_csv_text, state.console_log = call_with_console(
+                (
+                    state.gpt_csv_text,
+                    state.gpt_api_output,
+                    state.gpt_api_response_id,
+                ), state.console_log = call_with_console(
                     generate_csv_with_openai,
                     state.openai_prompt,
                     state.openai_model,
@@ -6771,6 +7560,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = (
                     f"Loaded analytics for {len(state.positions_rows)} active option position(s)."
                 )
+            elif self.path == "/commodity/refresh":
+                state.commodity_holdings, state.console_log = call_with_console(
+                    commodity_etf_holdings
+                )
+                non_zero = sum(1 for item in state.commodity_holdings if item.get("quantity"))
+                state.message = f"Refreshed commodity ETF holdings. Found {non_zero} holding(s)."
             elif self.path == "/commodity/buy":
                 symbol = first(form, "commodity_symbol")
                 try:
