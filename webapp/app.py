@@ -63,6 +63,7 @@ def dated_income_csv_path(day: date | None = None) -> Path:
 DEFAULT_CSV_PATH = Path(os.getenv("KITE_DEFAULT_CSV_PATH", str(dated_income_csv_path())))
 LEGACY_CSV_PATH = PROJECT_ROOT / "src" / "script" / "kite_orders.csv"
 SETTINGS_PATH = APP_ROOT / "app_settings.json"
+OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_KITE_ENV = {
     "KITE_CONFIRM_LIVE_ORDER": "YES",
@@ -96,7 +97,7 @@ DISPLAY_FIELDS = [
 ]
 MMI_URL = "https://www.tickertape.in/market-mood-index"
 DEFAULT_GPT_SHARE_URL = "https://chatgpt.com/share/6a058d56-7558-83a4-ac3d-d4ea9058b663"
-DEFAULT_OPENAI_MODEL = "gpt-5.2"
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
 KITE_CALLBACK_HOST = "127.0.0.1"
 KITE_CALLBACK_PORT = 8000
 PUBLIC_IP_ENDPOINTS = [
@@ -104,10 +105,32 @@ PUBLIC_IP_ENDPOINTS = [
     ("IPv4 public IP", "https://api.ipify.org?format=json"),
     ("IPv6 public IP", "https://api6.ipify.org?format=json"),
 ]
+DEFAULT_OPENAI_SYSTEM_PROMPT = """You are Monthly Income by Trading GPT.
+
+Generate only Kite-compatible CSV output.
+
+CSV columns must be:
+exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity
+
+Rules:
+- No explanation.
+- No markdown.
+- No extra text.
+- Return valid CSV only.
+- Use NSE/NFO symbols.
+- Use exchange NFO for options unless the user explicitly says otherwise.
+- transaction_type must be BUY or SELL.
+- product should usually be NRML for options.
+- order_type should usually be LIMIT.
+- validity should usually be DAY.
+- Strategy is conservative monthly income using covered call or cash-secured put.
+- SELL CALL only when actual share holding covers the full option quantity.
+- SELL PUT only when cash is available to buy all lots if assigned.
+- Avoid new positions when expiry is too close; prefer next monthly expiry when needed.
+- User must verify live premium, lot size, margin, liquidity, and event risk before order placement.
+"""
 DEFAULT_OPENAI_PROMPT = (
-    "Generate a Kite order CSV for a conservative income options basket. "
-    "Return only CSV with header: exchange,tradingsymbol,quantity,"
-    "transaction_type,product,order_type,price,validity."
+    "generate csv file on basis of current market scenario and mentioned prompts"
 )
 TOP_WATCHLIST = [
     "BAJFINANCE",
@@ -197,6 +220,24 @@ MONTH_CODES = {
     "NOV": 11,
     "DEC": 12,
 }
+
+
+def load_local_env_files() -> None:
+    for env_path in [PROJECT_ROOT / ".env", APP_ROOT / ".env"]:
+        if not env_path.exists():
+            continue
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.lstrip("\ufeff").strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+load_local_env_files()
 
 for env_name, env_value_default in DEFAULT_KITE_ENV.items():
     os.environ[env_name] = env_value_default
@@ -409,6 +450,12 @@ def read_default_csv_text() -> str:
     return ""
 
 
+def read_openai_csv_system_prompt() -> str:
+    if OPENAI_CSV_PROMPT_PATH.exists():
+        return OPENAI_CSV_PROMPT_PATH.read_text(encoding="utf-8-sig").strip()
+    return DEFAULT_OPENAI_SYSTEM_PROMPT
+
+
 def default_csv_label() -> str:
     return str(DEFAULT_CSV_PATH)
 
@@ -456,6 +503,7 @@ class PageState:
     gpt_csv_text: str = ""
     openai_api_key: str = ""
     openai_model: str = DEFAULT_OPENAI_MODEL
+    openai_system_prompt: str = field(default_factory=read_openai_csv_system_prompt)
     openai_prompt: str = DEFAULT_OPENAI_PROMPT
     analytics_symbol: str = ""
     analytics_data: dict[str, Any] | None = None
@@ -2246,6 +2294,29 @@ def persist_default_csv_text(csv_text: str) -> str:
     return f"{archive_message}Updated {DEFAULT_CSV_PATH.name} from the input box."
 
 
+def save_today_csv_text(csv_text: str) -> tuple[str, str]:
+    text = csv_text.strip()
+    if not text:
+        raise ValueError("CSV text is empty. Paste or upload CSV before saving.")
+    parse_csv_text(text)
+    today_path = dated_income_csv_path()
+    normalized_new = text.rstrip() + "\n"
+    archive_message = ""
+    if today_path.exists() and today_path.read_text(encoding="utf-8-sig").strip():
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        archive_path = today_path.with_name(f"{today_path.stem}_last_input_order_{stamp}.csv")
+        today_path.replace(archive_path)
+        archive_message = f"Archived previous CSV to {archive_path.name}. "
+    try:
+        today_path.parent.mkdir(parents=True, exist_ok=True)
+        today_path.write_text(normalized_new, encoding="utf-8")
+    except PermissionError:
+        today_path = APP_ROOT / today_path.name
+        today_path.write_text(normalized_new, encoding="utf-8")
+        archive_message += "Repo root was not writable, saved in webapp folder. "
+    return str(today_path), f"{archive_message}Saved CSV text to {today_path.name}."
+
+
 def mmi_zone(value: float) -> str:
     if value >= 71:
         return "Extreme Greed"
@@ -2690,9 +2761,101 @@ def normalize_csv_candidate(candidate: str) -> str:
     return "\n".join(lines).strip()
 
 
+KITE_CSV_REQUIRED_FIELDS = [
+    "exchange",
+    "tradingsymbol",
+    "quantity",
+    "transaction_type",
+    "product",
+    "order_type",
+    "price",
+    "validity",
+]
+KITE_CSV_HEADER_ALIASES = {
+    "symbol": "tradingsymbol",
+    "trading_symbol": "tradingsymbol",
+    "qty": "quantity",
+    "transaction": "transaction_type",
+    "side": "transaction_type",
+    "type": "transaction_type",
+    "ordertype": "order_type",
+    "order type": "order_type",
+    "limit_price": "price",
+    "limit price": "price",
+}
+
+
+def markdown_table_to_csv(text: str) -> str:
+    table_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("|") and line.strip().endswith("|")
+    ]
+    if len(table_lines) < 2:
+        return ""
+    rows: list[list[str]] = []
+    for line in table_lines:
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells):
+            continue
+        rows.append(cells)
+    if len(rows) < 2:
+        return ""
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerows(rows)
+    return output.getvalue().strip()
+
+
+def canonical_field_name(name: str) -> str:
+    clean = re.sub(r"[_\s-]+", "_", name.strip().lower())
+    return KITE_CSV_HEADER_ALIASES.get(clean, clean)
+
+
+def canonicalize_kite_csv(candidate: str) -> str:
+    reader = csv.DictReader(io.StringIO(candidate.lstrip("\ufeff")))
+    if not reader.fieldnames:
+        raise ValueError("CSV is missing a header row.")
+    canonical_headers = [canonical_field_name(name or "") for name in reader.fieldnames]
+    row_count = 0
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=KITE_CSV_REQUIRED_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    for raw_row in reader:
+        normalized = {
+            canonical_field_name(key or ""): (value or "").strip()
+            for key, value in raw_row.items()
+        }
+        if not any(normalized.values()):
+            continue
+        row = {field: normalized.get(field, "") for field in KITE_CSV_REQUIRED_FIELDS}
+        if not row["exchange"]:
+            row["exchange"] = "NFO"
+        if not row["product"]:
+            row["product"] = "NRML"
+        if not row["order_type"]:
+            row["order_type"] = "LIMIT"
+        if not row["validity"]:
+            row["validity"] = "DAY"
+        if not row["price"]:
+            row["price"] = "0"
+        if not {"tradingsymbol", "quantity", "transaction_type"}.issubset(
+            {field for field, value in row.items() if value}
+        ):
+            raise ValueError("CSV is missing tradingsymbol, quantity, or transaction_type.")
+        writer.writerow(row)
+        row_count += 1
+    if row_count == 0:
+        raise ValueError("CSV has no order rows.")
+    return output.getvalue()
+
+
 def extract_csv_from_text(text: str) -> str:
     fenced_blocks = re.findall(r"```(?:csv)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
     candidates = [normalize_csv_candidate(block) for block in fenced_blocks]
+    markdown_csv = markdown_table_to_csv(text)
+    if markdown_csv:
+        candidates.append(normalize_csv_candidate(markdown_csv))
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     required_headers = {"tradingsymbol", "quantity", "transaction_type"}
@@ -2713,8 +2876,9 @@ def extract_csv_from_text(text: str) -> str:
         if not candidate:
             continue
         try:
-            parse_csv_text(candidate)
-            return candidate.rstrip() + "\n"
+            canonical = canonicalize_kite_csv(candidate)
+            parse_csv_text(canonical)
+            return canonical.rstrip() + "\n"
         except Exception:
             continue
     raise ValueError(
@@ -2733,26 +2897,21 @@ def response_output_text(payload: dict[str, Any]) -> str:
     return "\n".join(chunks).strip()
 
 
-def generate_csv_with_openai(prompt: str, model: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("Missing OPENAI_API_KEY. Enter it in the GPT CSV Generator tab.")
-
-    instructions = (
-        "You generate Zerodha Kite order CSV only. "
-        "Output must be plain CSV text, no markdown, no explanation. "
-        "Required header exactly: exchange,tradingsymbol,quantity,transaction_type,"
-        "product,order_type,price,validity. "
-        "Use exchange NFO for options unless the user explicitly says otherwise. "
-        "transaction_type must be BUY or SELL. product should usually be NRML. "
-        "order_type should usually be LIMIT. validity should usually be DAY. "
-        "Follow these risk rules: SELL only when the user says stock is held; "
-        "SELL PUT only when the user says cash is available."
-    )
+def call_openai_responses_api(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    prompt: str,
+) -> str:
     body = {
         "model": model.strip() or DEFAULT_OPENAI_MODEL,
-        "instructions": instructions,
-        "input": prompt,
+        "input": [
+            {
+                "role": "system",
+                "content": system_prompt.strip() or DEFAULT_OPENAI_SYSTEM_PROMPT,
+            },
+            {"role": "user", "content": prompt},
+        ],
         "max_output_tokens": 2500,
     }
     request = Request(
@@ -2776,7 +2935,39 @@ def generate_csv_with_openai(prompt: str, model: str) -> str:
     output = response_output_text(payload)
     if not output:
         raise RuntimeError("OpenAI returned an empty response.")
-    return extract_csv_from_text(output)
+    return output
+
+
+def generate_csv_with_openai(prompt: str, model: str, system_prompt: str) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Missing OPENAI_API_KEY. Enter it in the GPT CSV Generator tab.")
+
+    output = call_openai_responses_api(api_key, model, system_prompt, prompt)
+    try:
+        return extract_csv_from_text(output)
+    except ValueError as first_error:
+        repair_prompt = (
+            "Convert the previous response into valid Kite CSV only. "
+            "Use exactly this header: "
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "No explanation, no markdown, no notes. If price is unknown, use 0.\n\n"
+            f"Previous response:\n{output}"
+        )
+        repaired = call_openai_responses_api(
+            api_key,
+            model,
+            DEFAULT_OPENAI_SYSTEM_PROMPT,
+            repair_prompt,
+        )
+        try:
+            return extract_csv_from_text(repaired)
+        except ValueError as second_error:
+            raise ValueError(
+                f"{first_error}\n\nOpenAI raw output preview:\n{output[:1200]}\n\n"
+                f"Repair attempt also failed:\n{second_error}\n\n"
+                f"Repair raw output preview:\n{repaired[:1200]}"
+            ) from second_error
 
 
 def default_args(no_ltp_price: bool, keep_existing_orders: bool) -> argparse.Namespace:
@@ -3428,6 +3619,33 @@ def render_results(results: list[dict[str, Any]] | None) -> str:
     )
 
 
+def render_graceful_error(error: str, title: str = "Error") -> str:
+    if not error:
+        return ""
+    lines = str(error).strip().splitlines()
+    top_lines = "\n".join(lines[:4]).strip()
+    remaining = "\n".join(lines[4:]).strip()
+    if not remaining:
+        return (
+            '<div class="alert error graceful-error">'
+            '<button type="button" class="alert-close" aria-label="Close error" onclick="this.parentElement.style.display=\'none\'">x</button>'
+            f"<strong>{html.escape(title)}</strong>"
+            f"<pre>{html.escape(top_lines)}</pre>"
+            "</div>"
+        )
+    return (
+        '<div class="alert error graceful-error">'
+        '<button type="button" class="alert-close" aria-label="Close error" onclick="this.parentElement.style.display=\'none\'">x</button>'
+        f"<strong>{html.escape(title)}</strong>"
+        f"<pre>{html.escape(top_lines)}</pre>"
+        "<details>"
+        "<summary>Show full details</summary>"
+        f'<textarea class="error-details" readonly>{html.escape(str(error))}</textarea>'
+        "</details>"
+        "</div>"
+    )
+
+
 def render_order_book(state: PageState) -> str:
     orders = state.order_book
     error = state.order_book_error
@@ -3479,7 +3697,7 @@ def render_order_book(state: PageState) -> str:
         if rows
         else '<tr><td colspan="12" class="status">No Kite orders found.</td></tr>'
     )
-    error_html = f'<div class="alert error"><pre>{html.escape(error)}</pre></div>' if error else ""
+    error_html = render_graceful_error(error, "Kite Orders Error")
     return (
         '<section class="panel order-book-panel"><div class="panel-title">Kite Orders</div>'
         '<p class="status">Select open / pending orders, edit quantity or limit price, then modify or cancel them.</p>'
@@ -4269,7 +4487,7 @@ def render_income_panel(state: PageState) -> str:
           <div class="income-rule"><span>Best setups</span><strong>After 5-8% correction, IV spike, sideways market, panic week</strong></div>
         </div>
       </section>
-      {('<section class="panel"><div class="alert error"><pre>' + html.escape(state.income_error) + '</pre></div></section>') if state.income_error else ''}
+      {('<section class="panel">' + render_graceful_error(state.income_error, "INCOME Error") + '</section>') if state.income_error else ''}
       {render_results(state.income_results)}
       {render_console(state.console_log)}
     </form>"""
@@ -4412,7 +4630,7 @@ def render_page(state: PageState) -> bytes:
     if state.message:
         alert += f'<div class="alert ok">{html.escape(state.message)}</div>'
     if state.error:
-        alert += f'<div class="alert error"><pre>{html.escape(state.error)}</pre></div>'
+        alert += render_graceful_error(state.error)
 
     orders_table = render_orders_table(state.orders, state.selected_indexes)
     trade_validation_table = render_trade_validation_table(state.trade_validations)
@@ -5133,6 +5351,7 @@ def render_page(state: PageState) -> bytes:
       margin-top: 18px;
     }}
     .alert {{
+      position: relative;
       border-radius: 8px;
       padding: 12px 14px;
       margin-bottom: 16px;
@@ -5141,6 +5360,52 @@ def render_page(state: PageState) -> bytes:
     .alert.ok {{ color: var(--ok); background: #ecfdf5; border-color: #99f6e4; }}
     .alert.error {{ color: var(--danger); background: #fff1f2; border-color: #fecdd3; }}
     .alert pre {{ margin: 0; white-space: pre-wrap; font-family: Consolas, "Courier New", monospace; }}
+    .alert-close {{
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 26px;
+      height: 26px;
+      padding: 0;
+      border-radius: 50%;
+      background: #fee2e2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+      font-size: 14px;
+      font-weight: 950;
+      line-height: 1;
+    }}
+    .alert-close:hover {{
+      background: #fecaca;
+    }}
+    .graceful-error strong {{
+      display: block;
+      margin-bottom: 6px;
+      padding-right: 34px;
+    }}
+    .graceful-error details {{
+      margin-top: 10px;
+      color: var(--text);
+    }}
+    .graceful-error summary {{
+      cursor: pointer;
+      font-weight: 900;
+      color: #991b1b;
+      margin-bottom: 8px;
+    }}
+    .error-details {{
+      width: 100%;
+      min-height: 190px;
+      resize: vertical;
+      padding: 10px;
+      border: 1px solid #fecdd3;
+      border-radius: 6px;
+      background: #fff7f7;
+      color: #7f1d1d;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      white-space: pre;
+    }}
     .live-modal-backdrop {{
       position: fixed;
       inset: 0;
@@ -5661,6 +5926,10 @@ def render_page(state: PageState) -> bytes:
           {render_input("csv_path", "CSV path", state.csv_path)}
           <label><span>Upload CSV</span><input id="csv-file" type="file" accept=".csv,text/csv"></label>
           <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
+          <div class="actions">
+            <button type="submit" formaction="/csv/save-today">Save as Today CSV</button>
+          </div>
+          <div class="status">Saves CSV text to {html.escape(str(dated_income_csv_path()))} and updates CSV path.</div>
         </section>
       </div>
       {render_console(state.console_log)}
@@ -5710,18 +5979,19 @@ def render_page(state: PageState) -> bytes:
           <div class="panel-title">OpenAI CSV Generator</div>
           {render_input("openai_api_key", "OPENAI_API_KEY", state.openai_api_key or env_value("OPENAI_API_KEY"), "password")}
           {render_input("openai_model", "Model", state.openai_model)}
-          <label><span>Prompt for CSV generation</span><textarea class="conversation" name="openai_prompt" placeholder="Describe holdings, cash, expiry, symbols, strikes, lots, prices, and risk preference">{html.escape(state.openai_prompt)}</textarea></label>
+          <label><span>System prompt / GPT instructions used by API</span><textarea class="conversation" name="openai_system_prompt" placeholder="System instructions for CSV generation">{html.escape(state.openai_system_prompt)}</textarea></label>
+          <label><span>User prompt for CSV generation</span><textarea class="conversation" name="openai_prompt" placeholder="Describe holdings, cash, expiry, symbols, strikes, lots, prices, and risk preference">{html.escape(state.openai_prompt)}</textarea></label>
           <div class="actions">
             <button type="submit" formaction="/gpt/generate">Generate CSV with OpenAI</button>
           </div>
         </section>
         <section class="panel">
-          <div class="panel-title">GPT Share / Paste Fallback</div>
+          <div class="panel-title">Manual Paste Fallback</div>
+          <div class="status">Custom GPT share URLs cannot be called as an app API. Use OpenAI API above, or paste CSV/GPT output here manually.</div>
           {render_input("gpt_url", "GPT share URL", state.gpt_url)}
           <a class="inline-link" href="{html.escape(state.gpt_url, quote=True)}" target="_blank" rel="noopener">Open GPT Share</a>
           <label><span>Conversation / GPT output</span><textarea class="conversation" name="gpt_conversation" placeholder="Fetch the share link, or paste GPT output here">{html.escape(state.gpt_conversation)}</textarea></label>
           <div class="actions">
-            <button type="submit" formaction="/gpt/load">Fetch GPT Share</button>
             <button type="submit" formaction="/gpt/extract">Extract CSV</button>
           </div>
         </section>
@@ -6230,6 +6500,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if self.path.startswith("/positions-research")
                 else "positions"
                 if self.path.startswith("/positions")
+                else "place"
+                if self.path.startswith("/csv")
                 else "commodity"
                 if self.path.startswith("/commodity")
                 else "income"
@@ -6274,6 +6546,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             gpt_csv_text=first(form, "gpt_csv_text"),
             openai_api_key=first(form, "openai_api_key"),
             openai_model=first(form, "openai_model", DEFAULT_OPENAI_MODEL),
+            openai_system_prompt=first(form, "openai_system_prompt", read_openai_csv_system_prompt()),
             openai_prompt=first(form, "openai_prompt", DEFAULT_OPENAI_PROMPT),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
@@ -6293,6 +6566,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.trade_validations = validate_trade_orders(state.orders)
                 state.selected_indexes = set(range(len(state.orders)))
                 state.message = f"{persist_message} Loaded {len(state.orders)} order(s).".strip()
+            elif self.path == "/csv/save-today":
+                state.csv_path, state.message = save_today_csv_text(state.csv_text)
+                state.csv_text = Path(state.csv_path).read_text(encoding="utf-8-sig")
             elif self.path == "/execute":
                 rows_payload = first(form, "rows_payload")
                 state.rows = decode_rows(rows_payload) if rows_payload else None
@@ -6416,6 +6692,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     generate_csv_with_openai,
                     state.openai_prompt,
                     state.openai_model,
+                    state.openai_system_prompt,
                 )
                 state.message = "Generated Kite order CSV with OpenAI. Review before saving or placing orders."
             elif self.path in {"/gpt/save", "/gpt/save-preview"}:
