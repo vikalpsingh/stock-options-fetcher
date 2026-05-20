@@ -5296,11 +5296,11 @@ def render_income_panel(state: PageState) -> str:
           <button type="submit" formaction="/income/load">Refresh PFC / CAMS Candidates</button>
         </div>
       </section>
+      <section class="panel income-pnl-panel"><div class="panel-title">Monthly P&L Summary</div><div class="income-pnl-grid">{pnl_summary_html}</div></section>
       {candidate_table}
       {render_results(state.income_results)}
-      <section class="panel"><div class="panel-title">Monthly P&L Summary</div><div class="income-pnl-grid">{pnl_summary_html}</div></section>
-      <section class="panel"><div class="income-rule-grid">{rule_cards}</div></section>
-      <section class="panel"><div class="panel-title">Strategy Stocks</div><div class="income-stock-grid">{stock_cards}</div></section>
+      <section class="panel income-guideline-panel"><div class="income-rule-grid">{rule_cards}</div></section>
+      <section class="panel income-stock-panel"><div class="panel-title">Strategy Stocks</div><div class="income-stock-grid">{stock_cards}</div></section>
       {ce_table}
       <section class="panel"><div class="panel-title">Entry / Exit Validation</div><div class="income-filter-grid">{filter_html}</div></section>
       <section class="panel"><div class="panel-title">Expected Portfolio Behavior</div>
@@ -5529,6 +5529,13 @@ def render_page(state: PageState) -> bytes:
           </section>
           <section class="panel kite-setup-card ip-card">
             <div class="setup-card-kicker">04</div>
+            <div class="panel-title">OpenAI Setup</div>
+            <p class="status">Used by the GPT tab to generate Kite-ready CSV from your strategy prompt.</p>
+            {render_input("openai_api_key", "OPENAI_API_KEY", state.openai_api_key or env_value("OPENAI_API_KEY"), "password")}
+            <p class="status">Saved to <code>.env</code> when you click Save Kite Setup.</p>
+          </section>
+          <section class="panel kite-setup-card ip-card">
+            <div class="setup-card-kicker">05</div>
             <div class="panel-title">Allowed IP</div>
             <p class="status">If Kite blocks orders by IP, add your current public IP in the Kite developer console.</p>
             <div class="actions">
@@ -6064,7 +6071,22 @@ def render_page(state: PageState) -> bytes:
       justify-content: space-between;
       gap: 14px;
       border-color: #bbf7d0;
-      background: linear-gradient(135deg, #f0fdf4, #ffffff);
+      background:
+        radial-gradient(circle at top right, rgba(34, 197, 94, 0.15), transparent 26%),
+        linear-gradient(135deg, #f0fdf4, #ffffff);
+      margin-bottom: 10px;
+    }}
+    .income-hero .panel-title {{
+      color: #064e3b;
+      font-size: 18px;
+      margin-bottom: 7px;
+    }}
+    .income-pnl-panel {{
+      border-color: #86efac;
+      background:
+        radial-gradient(circle at top left, rgba(187, 247, 208, 0.45), transparent 32%),
+        linear-gradient(135deg, #ffffff 0%, #f0fdf4 100%);
+      margin-bottom: 10px;
     }}
     .income-rule-grid,
     .income-stock-grid,
@@ -6122,6 +6144,29 @@ def render_page(state: PageState) -> bytes:
     .income-candidates table {{
       min-width: 1380px;
     }}
+    .income-candidates {{
+      border-color: #a7f3d0;
+      background:
+        linear-gradient(135deg, #ffffff 0%, #f8fffd 100%);
+      box-shadow: 0 16px 38px rgba(15, 118, 110, 0.08);
+    }}
+    .income-candidates .panel-title {{
+      color: #0f3b65;
+      font-size: 17px;
+      margin-bottom: 10px;
+    }}
+    .income-candidates th {{
+      background: linear-gradient(135deg, #0f3b65 0%, #0f766e 100%);
+      color: #ffffff;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }}
+    .income-candidates td {{
+      font-size: 12px;
+      font-weight: 780;
+      vertical-align: middle;
+    }}
     .income-candidates td:first-child span,
     .income-candidates small {{
       display: block;
@@ -6157,6 +6202,10 @@ def render_page(state: PageState) -> bytes:
       background: linear-gradient(135deg, #ffffff 0%, #f0fdf4 100%);
       box-shadow: 0 8px 20px rgba(15, 23, 42, 0.04);
     }}
+    .income-pnl-card:first-child {{
+      background: linear-gradient(135deg, #ecfdf5 0%, #ccfbf1 100%);
+      border-color: #86efac;
+    }}
     .income-pnl-card span {{
       display: block;
       color: #64748b;
@@ -6170,6 +6219,11 @@ def render_page(state: PageState) -> bytes:
       font-size: 22px;
       line-height: 1;
       font-weight: 950;
+    }}
+    .income-guideline-panel,
+    .income-stock-panel {{
+      background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+      box-shadow: 0 8px 22px rgba(15, 23, 42, 0.04);
     }}
     .expiry-strip {{
       display: grid;
@@ -7517,6 +7571,12 @@ def render_page(state: PageState) -> bytes:
       border-color: #86efac;
       background: #f0fdf4;
     }}
+    .gpt-api-response-card {{
+      border-color: #a7f3d0;
+      background:
+        radial-gradient(circle at top left, rgba(20, 184, 166, 0.12), transparent 32%),
+        #ffffff;
+    }}
     .compact-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -7524,7 +7584,7 @@ def render_page(state: PageState) -> bytes:
     }}
     .gpt-prompt-box {{ min-height: 160px; }}
     .gpt-system-box {{ min-height: 260px; }}
-    .gpt-api-output {{ min-height: 190px; background: #f8fafc; }}
+    .gpt-api-output {{ min-height: 240px; background: #f8fafc; }}
     .gpt-fallback-box {{ min-height: 130px; }}
     .gpt-response-meta {{
       display: flex;
@@ -7743,14 +7803,15 @@ def render_page(state: PageState) -> bytes:
           <div class="panel-title">System Prompt</div>
           <label><span>Loaded from openai_csv_prompt.md</span><textarea class="conversation gpt-system-box" name="openai_system_prompt" placeholder="System instructions for CSV generation">{html.escape(state.openai_system_prompt)}</textarea></label>
         </section>
-        <section class="panel gpt-card">
-          <div class="panel-title">API Returned Output</div>
+        <section class="panel gpt-card gpt-api-response-card">
+          <div class="panel-title">OpenAI Prompt Response</div>
+          <p class="status">This is the direct text returned by the OpenAI API before the app extracts and validates Kite CSV.</p>
           <input type="hidden" name="gpt_api_response_id" value="{html.escape(state.gpt_api_response_id, quote=True)}">
           <div class="gpt-response-meta">
             <span>Response ID: <strong>{html.escape(state.gpt_api_response_id or 'Not generated yet')}</strong></span>
             <a class="inline-link" href="https://platform.openai.com/logs" target="_blank" rel="noopener">Open OpenAI API logs</a>
           </div>
-          <label><span>Raw / repaired OpenAI response</span><textarea class="conversation gpt-api-output" name="gpt_api_output" readonly placeholder="OpenAI API output appears here">{html.escape(state.gpt_api_output)}</textarea></label>
+          <label><span>Prompt response from OpenAI API</span><textarea class="conversation gpt-api-output" name="gpt_api_output" readonly placeholder="Generate CSV with OpenAI to see the full prompt response here.">{html.escape(state.gpt_api_output)}</textarea></label>
         </section>
         <section class="panel gpt-card gpt-result-card">
           <div class="panel-title">CSV To Save</div>
@@ -7844,6 +7905,10 @@ def render_page(state: PageState) -> bytes:
         const active = button.dataset.tab;
         if (active === 'commodity' && window.location.pathname !== '/commodity') {{
           window.location.href = '/commodity';
+          return;
+        }}
+        if (active === 'positions' && window.location.pathname !== '/positions') {{
+          window.location.href = '/positions';
           return;
         }}
         document.getElementById('place-panel').style.display = active === 'place' ? '' : 'none';
@@ -8651,6 +8716,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         "KITE_API_KEY": state.api_key or env_value("KITE_API_KEY"),
                         "KITE_API_SECRET": state.api_secret or env_value("KITE_API_SECRET"),
                         "KITE_ACCESS_TOKEN": state.access_token or env_value("KITE_ACCESS_TOKEN"),
+                        "OPENAI_API_KEY": state.openai_api_key or env_value("OPENAI_API_KEY"),
                     }
                 )
                 save_app_settings({"etf_buy_amount": state.etf_buy_amount})
