@@ -71,6 +71,7 @@ DEFAULT_KITE_ENV = {
     "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
     "KITE_ACCESS_TOKEN": "TqL81HKQXjdi6KQ9jxsYUz5AIUgrrwxB",
 }
+BAD_KITE_API_KEYS = {"wg21s30mtedr53q0"}
 ORDER_FIELDS = [
     "variety",
     "exchange",
@@ -149,6 +150,40 @@ TOP_WATCHLIST = [
     "NTPC",
     "WAAREEENER",
 ]
+STOCK_NEWS_NAMES = {
+    "BAJFINANCE": "Bajaj Finance",
+    "TATACONSUM": "Tata Consumer Products",
+    "PGEL": "PG Electroplast",
+    "TITAN": "Titan Company",
+    "ETERNAL": "Eternal Zomato",
+    "UNITDSPR": "United Spirits",
+    "HAVELLS": "Havells India",
+    "NAUKRI": "Info Edge Naukri",
+    "PFC": "Power Finance Corporation",
+    "CAMS": "Computer Age Management Services",
+    "CDSL": "Central Depository Services",
+    "MAZDOCK": "Mazagon Dock Shipbuilders",
+    "NUVAMA": "Nuvama Wealth Management",
+    "NTPC": "NTPC",
+    "WAAREEENER": "Waaree Energies",
+}
+STOCK_SECTORS = {
+    "BAJFINANCE": "Financials",
+    "PFC": "Financials",
+    "CAMS": "Financials",
+    "CDSL": "Financials",
+    "NUVAMA": "Financials",
+    "TATACONSUM": "Consumer",
+    "TITAN": "Consumer",
+    "ETERNAL": "Consumer",
+    "UNITDSPR": "Consumer",
+    "HAVELLS": "Consumer Durables",
+    "PGEL": "Electronics",
+    "NAUKRI": "Internet",
+    "MAZDOCK": "Defence",
+    "NTPC": "Power",
+    "WAAREEENER": "Energy",
+}
 COMMODITY_ETFS = [
     {
         "key": "nasdaq",
@@ -243,7 +278,9 @@ def load_local_env_files() -> None:
 load_local_env_files()
 
 for env_name, env_value_default in DEFAULT_KITE_ENV.items():
-    os.environ[env_name] = env_value_default
+    os.environ.setdefault(env_name, env_value_default)
+if os.environ.get("KITE_API_KEY") in BAD_KITE_API_KEYS:
+    os.environ["KITE_API_KEY"] = DEFAULT_KITE_ENV["KITE_API_KEY"]
 
 
 def load_app_settings() -> dict[str, Any]:
@@ -260,6 +297,30 @@ def save_app_settings(settings: dict[str, Any]) -> None:
     current = load_app_settings()
     current.update(settings)
     SETTINGS_PATH.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def save_env_values(values: dict[str, str], env_path: Path = APP_ROOT / ".env") -> None:
+    existing: dict[str, str] = {}
+    order: list[str] = []
+    if env_path.exists():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.lstrip("\ufeff").strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key:
+                existing[key] = value.strip().strip('"').strip("'")
+                order.append(key)
+    for key, value in values.items():
+        clean = str(value or "").strip()
+        if not clean:
+            continue
+        existing[key] = clean
+        if key not in order:
+            order.append(key)
+    env_text = "\n".join(f'{key}="{existing[key]}"' for key in order if key in existing)
+    env_path.write_text(env_text + ("\n" if env_text else ""), encoding="utf-8")
 
 
 def etf_buy_amount_setting() -> float:
@@ -540,6 +601,28 @@ def env_value(name: str) -> str:
     return os.getenv(name, "")
 
 
+def kite_setup_issue() -> str:
+    if kite_orders is None:
+        return f"Could not import kite_place_order.py: {IMPORT_ERROR}"
+    missing = [
+        name
+        for name in (
+            "KITE_API_KEY",
+            "KITE_API_SECRET",
+            "KITE_ACCESS_TOKEN",
+            "KITE_CONFIRM_LIVE_ORDER",
+        )
+        if not env_value(name)
+    ]
+    if missing:
+        return f"Missing Kite setup value(s): {', '.join(missing)}"
+    return ""
+
+
+def default_active_tab() -> str:
+    return "kite-setup" if kite_setup_issue() else "place"
+
+
 def set_kite_env(form: dict[str, list[str]]) -> None:
     env_names = {
         "api_key": "KITE_API_KEY",
@@ -550,7 +633,10 @@ def set_kite_env(form: dict[str, list[str]]) -> None:
     for field, env_name in env_names.items():
         value = first(form, field)
         if value != "":
-            os.environ[env_name] = value.strip()
+            clean_value = value.strip()
+            if env_name == "KITE_API_KEY" and clean_value in BAD_KITE_API_KEYS:
+                clean_value = DEFAULT_KITE_ENV["KITE_API_KEY"]
+            os.environ[env_name] = clean_value
     openai_api_key = first(form, "openai_api_key")
     if openai_api_key:
         os.environ["OPENAI_API_KEY"] = openai_api_key.strip()
@@ -561,12 +647,28 @@ def kite_login_url() -> str:
     return f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
 
 
+def extract_kite_request_token(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.query:
+        token = first(parse_qs(parsed.query, keep_blank_values=True), "request_token")
+        if token:
+            return token.strip()
+    if "request_token=" in text:
+        token = first(parse_qs(text.split("?", 1)[-1], keep_blank_values=True), "request_token")
+        if token:
+            return token.strip()
+    return text
+
+
 def generate_kite_access_token(request_token: str) -> str:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
-    token = request_token.strip()
+    token = extract_kite_request_token(request_token)
     if not token:
-        raise ValueError("request_token cannot be empty.")
+        raise ValueError("Paste the redirected URL or request_token before generating access token.")
     api_key = env_value("KITE_API_KEY")
     api_secret = env_value("KITE_API_SECRET")
     if not api_key or not api_secret:
@@ -577,6 +679,14 @@ def generate_kite_access_token(request_token: str) -> str:
     access_token = data["access_token"]
     os.environ["KITE_ACCESS_TOKEN"] = access_token
     DEFAULT_KITE_ENV["KITE_ACCESS_TOKEN"] = access_token
+    save_env_values(
+        {
+            "KITE_CONFIRM_LIVE_ORDER": env_value("KITE_CONFIRM_LIVE_ORDER") or "YES",
+            "KITE_API_KEY": api_key,
+            "KITE_API_SECRET": api_secret,
+            "KITE_ACCESS_TOKEN": access_token,
+        }
+    )
     return access_token
 
 
@@ -688,14 +798,16 @@ def fetch_stock_news(symbols: list[str]) -> list[dict[str, str]]:
 
     news: list[dict[str, str]] = []
     min_published_at = datetime.now().astimezone() - timedelta(days=5)
-    for underlying in underlyings[:5]:
-        query = quote_plus(f"{underlying} NSE stock")
+    for underlying in underlyings[:8]:
+        search_name = STOCK_NEWS_NAMES.get(underlying, underlying)
+        query = quote_plus(f"{search_name} NSE stock")
         url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
         try:
             request = Request(url, headers={"User-Agent": "KiteTraderLocalApp/1.0"})
             with urlopen(request, timeout=8) as response:
                 xml_text = response.read().decode("utf-8", errors="ignore")
             root = ElementTree.fromstring(xml_text)
+            stock_count = 0
             for item in root.findall(".//item"):
                 title = item.findtext("title") or ""
                 link = item.findtext("link") or ""
@@ -714,8 +826,9 @@ def fetch_stock_news(symbols: list[str]) -> list[dict[str, str]]:
                             "sentiment": classify_news_sentiment(title),
                         }
                     )
-                if len(news) >= 3:
-                    return news
+                    stock_count += 1
+                if stock_count >= 3:
+                    break
         except Exception as exc:
             news.append(
                 {
@@ -726,7 +839,7 @@ def fetch_stock_news(symbols: list[str]) -> list[dict[str, str]]:
                     "sentiment": "neutral",
                 }
             )
-    return news[:3]
+    return news
 
 
 def first(form: dict[str, list[str]], name: str, default: str = "") -> str:
@@ -1584,6 +1697,32 @@ def open_option_positions() -> list[dict[str, Any]]:
     return active
 
 
+def active_position_underlyings() -> set[str]:
+    if kite_orders is None:
+        return set()
+    try:
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            kite = kite_orders.kite_client()
+            positions = kite.positions().get("net", [])
+    except Exception:
+        return set()
+    active: set[str] = set()
+    for position in positions:
+        try:
+            quantity = int(float(position.get("quantity") or 0))
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity == 0:
+            continue
+        symbol = str(position.get("tradingsymbol") or "").strip().upper()
+        if not symbol:
+            continue
+        active.add(symbol)
+        active.add(underlying_for_symbol(symbol))
+    return {item for item in active if item}
+
+
 EVENT_RISK_TERMS = {
     "board",
     "bonus",
@@ -1822,6 +1961,97 @@ def validate_trade_orders(orders: list[dict[str, Any]] | None) -> list[dict[str,
     return [trade_validation_for_order(order, news_cache) for order in orders or []]
 
 
+def selected_trade_guardrails(orders: list[dict[str, Any]]) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    sell_orders = [
+        order
+        for order in orders
+        if str(order.get("transaction_type") or "").upper() == "SELL"
+        and option_symbol_parts(str(order.get("tradingsymbol") or "").upper())
+    ]
+    margin_orders = []
+    for order in sell_orders:
+        quantity = int(float(order.get("quantity") or 0))
+        if quantity <= 0:
+            continue
+        margin_orders.append(
+            {
+                "exchange": order.get("exchange") or "NFO",
+                "tradingsymbol": order.get("tradingsymbol"),
+                "transaction_type": "SELL",
+                "variety": order.get("variety") or "regular",
+                "product": order.get("product") or "NRML",
+                "order_type": order.get("order_type") or "LIMIT",
+                "quantity": quantity,
+                "price": float(order.get("price") or 0),
+            }
+        )
+    selected_margin = 0.0
+    if margin_orders:
+        try:
+            selected_margin = sum(
+                float(
+                    item.get("total")
+                    or item.get("final", {}).get("total")
+                    or item.get("initial", {}).get("total")
+                    or 0
+                )
+                for item in kite.order_margins(margin_orders)
+            )
+        except Exception:
+            selected_margin = sum(
+                float(order.get("price") or 0) * int(float(order.get("quantity") or 0))
+                for order in sell_orders
+            )
+    existing_margin = 0.0
+    sector_amounts: dict[str, float] = {}
+    stock_amounts: dict[str, float] = {}
+    for position in open_option_positions():
+        symbol = str(position.get("tradingsymbol") or "").upper()
+        underlying = underlying_for_symbol(symbol)
+        deployed = margin_required_for_position(kite, position)
+        existing_margin += deployed
+        sector = STOCK_SECTORS.get(underlying, "Other")
+        sector_amounts[sector] = sector_amounts.get(sector, 0.0) + deployed
+        stock_amounts[underlying] = stock_amounts.get(underlying, 0.0) + deployed
+    cash_reserved = 0.0
+    for order in sell_orders:
+        symbol = str(order.get("tradingsymbol") or "").upper()
+        parts = option_symbol_parts(symbol)
+        if not parts:
+            continue
+        quantity = abs(int(float(order.get("quantity") or 0)))
+        strike = float(parts.get("strike") or 0)
+        underlying = str(parts.get("underlying") or underlying_for_symbol(symbol))
+        amount = selected_margin / max(len(sell_orders), 1)
+        if parts.get("option_type") == "PE":
+            amount = strike * quantity * 0.90
+            cash_reserved += amount
+        sector = STOCK_SECTORS.get(underlying, "Other")
+        sector_amounts[sector] = sector_amounts.get(sector, 0.0) + amount
+        stock_amounts[underlying] = stock_amounts.get(underlying, 0.0) + amount
+    capital_used = existing_margin + selected_margin + cash_reserved
+    denominator = capital_used if capital_used > 0 else 1.0
+    top_sector, top_sector_value = max(
+        sector_amounts.items(), key=lambda item: item[1], default=("N/A", 0.0)
+    )
+    top_stock, top_stock_value = max(
+        stock_amounts.items(), key=lambda item: item[1], default=("N/A", 0.0)
+    )
+    return {
+        "ok": True,
+        "sell_count": len(sell_orders),
+        "capital_used": fmt_number(capital_used),
+        "cash_reserved": fmt_number(cash_reserved),
+        "margin_used": fmt_number(existing_margin + selected_margin),
+        "selected_margin": fmt_number(selected_margin),
+        "sector_exposure": f"{top_sector} {top_sector_value / denominator * 100:.1f}%",
+        "single_stock_exposure": f"{top_stock} {top_stock_value / denominator * 100:.1f}%",
+    }
+
+
 def income_selected_expiry(expiries: list[date], today: date) -> tuple[date, date | None, int | None]:
     front_expiry = expiries[0]
     front_trading_days = trading_days_remaining(front_expiry, today)
@@ -2019,6 +2249,52 @@ def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
     }
 
 
+def place_income_cash_secured_put_order(underlying: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'Cash-secured PE order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    clean_underlying = underlying.strip().upper()
+    if clean_underlying not in {item["symbol"] for item in INCOME_UNDERLYINGS}:
+        raise ValueError(f"Unsupported INCOME underlying: {clean_underlying}")
+    kite = kite_orders.kite_client()
+    candidate = next_monthly_pe_candidate(kite, clean_underlying)
+    lot_size = int(candidate.get("lot_size") or 0)
+    if lot_size <= 0:
+        raise ValueError(f"Could not read lot size for {candidate['symbol']}.")
+    quote = kite.quote([f"NFO:{candidate['symbol']}"]).get(f"NFO:{candidate['symbol']}", {})
+    current_price = quote_ltp(quote)
+    if current_price <= 0:
+        raise ValueError(f"Could not read PE premium for {candidate['symbol']}.")
+    price = ceil_to_tick(current_price * 1.20, 0.05)
+    order = {
+        "variety": "regular",
+        "exchange": "NFO",
+        "tradingsymbol": candidate["symbol"],
+        "transaction_type": "SELL",
+        "quantity": lot_size,
+        "product": "NRML",
+        "order_type": "LIMIT",
+        "price": price,
+        "validity": "DAY",
+        "tag": "INCOME_CSP",
+    }
+    order_id = kite_orders.place_order(kite, order)
+    assignment_value = float(candidate.get("strike") or 0) * lot_size
+    return {
+        "tradingsymbol": candidate["symbol"],
+        "status": "LIVE_SENT",
+        "order_id": order_id,
+        "detail": (
+            f"SELL cash-secured PE {lot_size} qty at LIMIT {price:.2f}, "
+            f"20% above CMP {current_price:.2f}. "
+            f"Assignment value about {assignment_value:.0f}."
+        ),
+    }
+
+
 def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -2075,6 +2351,7 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             holding = holdings.get(underlying, {})
             held_qty = int(holding.get("quantity") or 0)
             ce_lot_size = int(ce_candidate.get("lot_size") or 0)
+            pe_lot_size = int(candidate.get("lot_size") or 0)
             covered_lots = (held_qty // ce_lot_size) if ce_lot_size > 0 else 0
             covered_qty = covered_lots * ce_lot_size
             ce_otm = ce_data.get("decision", {}).get("otm_distance")
@@ -2094,6 +2371,17 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "expiry": expiry.strftime("%d %b %Y"),
                     "trading_days": trading_days,
                     "option_price": data.get("option_price"),
+                    "sell_limit_price": (
+                        ceil_to_tick(float(data.get("option_price") or 0) * 1.20, 0.05)
+                        if float(data.get("option_price") or 0) > 0
+                        else None
+                    ),
+                    "lot_size": pe_lot_size,
+                    "max_profit": (
+                        float(data.get("option_price") or 0) * pe_lot_size
+                        if pe_lot_size > 0
+                        else None
+                    ),
                     "sell_pop": sell_pop,
                     "delta": abs(float(data.get("delta") or 0)),
                     "otm_distance": otm,
@@ -2115,6 +2403,12 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "covered_qty": covered_qty,
                     "covered_lots": covered_lots,
                     "ce_premium": ce_data.get("option_price"),
+                    "ce_max_profit": (
+                        float(ce_data.get("option_price") or 0)
+                        * (covered_qty if covered_qty > 0 else ce_lot_size)
+                        if ce_lot_size > 0
+                        else None
+                    ),
                     "ce_otm_distance": ce_otm,
                     "ce_sell_pop": ce_sell_pop,
                     "ce_action": ce_action,
@@ -2224,6 +2518,114 @@ def margin_required_for_position(kite: Any, position: dict[str, Any]) -> float:
     )
 
 
+def premium_capture_for_position(position: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    quantity = int(position.get("quantity") or 0)
+    average_price = float(position.get("average_price") or 0)
+    ltp = float(position.get("ltp") or data.get("option_price") or 0)
+    if quantity >= 0 or average_price <= 0:
+        return {
+            "captured_pct": None,
+            "remaining_premium": None,
+            "remaining_pct": None,
+            "capture_action": "N/A",
+            "capture_color": "neutral",
+            "capture_detail": "Premium capture applies to sold option positions.",
+        }
+    captured_pct = ((average_price - ltp) / average_price) * 100
+    remaining_pct = (ltp / average_price) * 100
+    remaining_premium = ltp * abs(quantity)
+    dte = int(data.get("dte") or 0)
+    if captured_pct >= 70:
+        action = "Close now"
+        color = "green"
+        detail = "70%+ premium captured; book profit cleanly."
+    elif captured_pct >= 50:
+        action = "Close 50%"
+        color = "green"
+        detail = "50%+ premium captured; regular income booking zone."
+    elif dte <= 5:
+        action = "Roll"
+        color = "yellow"
+        detail = f"{dte} DTE; roll or close before gamma risk rises."
+    elif captured_pct < 0:
+        action = "Review"
+        color = "red"
+        detail = "Premium expanded; check strike breach, trend and roll plan."
+    else:
+        action = "Hold"
+        color = "neutral"
+        detail = "Premium capture below 50%; continue monitoring."
+    return {
+        "captured_pct": captured_pct,
+        "remaining_premium": remaining_premium,
+        "remaining_pct": remaining_pct,
+        "capture_action": action,
+        "capture_color": color,
+        "capture_detail": detail,
+    }
+
+
+def build_position_close_buy_order(symbol: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    clean_symbol = symbol.strip().upper()
+    if not clean_symbol:
+        raise ValueError("Missing position symbol.")
+    kite = kite_orders.kite_client()
+    matches = [
+        position
+        for position in open_option_positions()
+        if str(position.get("tradingsymbol") or "").upper() == clean_symbol
+        and int(position.get("quantity") or 0) < 0
+    ]
+    if not matches:
+        raise ValueError(f"No open sold option position found for {clean_symbol}.")
+    position = matches[0]
+    quantity = abs(int(position.get("quantity") or 0))
+    ltp = float(position.get("ltp") or 0)
+    if ltp <= 0:
+        quote = kite.quote([f"{position.get('exchange') or 'NFO'}:{clean_symbol}"]).get(
+            f"{position.get('exchange') or 'NFO'}:{clean_symbol}",
+            {},
+        )
+        ltp = quote_ltp(quote)
+    if ltp <= 0:
+        raise ValueError(f"Could not read LTP for {clean_symbol}.")
+    limit_price = floor_to_tick(ltp * 0.90, 0.05)
+    return {
+        "variety": "regular",
+        "exchange": position.get("exchange") or "NFO",
+        "tradingsymbol": clean_symbol,
+        "transaction_type": "BUY",
+        "quantity": quantity,
+        "product": position.get("product") or "NRML",
+        "order_type": "LIMIT",
+        "price": limit_price,
+        "validity": "DAY",
+        "tag": "CAPTURE_EXIT",
+        "ltp": ltp,
+    }
+
+
+def place_position_close_buy_order(symbol: str) -> dict[str, Any]:
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'Live placement refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    order = build_position_close_buy_order(symbol)
+    kite = kite_orders.kite_client()
+    order_id = kite_orders.place_order(kite, order)
+    return {
+        "tradingsymbol": order["tradingsymbol"],
+        "status": "LIVE_SENT",
+        "order_id": order_id,
+        "detail": (
+            f"BUY close order {order['quantity']} qty at LIMIT {order['price']:.2f}, "
+            f"10% below LTP {order['ltp']:.2f}."
+        ),
+    }
+
+
 def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -2239,6 +2641,7 @@ def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             decision = data.get("decision", {})
             risk = decision.get("risk_lights", {})
             strength = strategy_strength_lights(data, decision)
+            capture = premium_capture_for_position(position, data)
             deployed = margin_required_for_position(kite, position)
             pnl = float(position.get("pnl") or 0)
             total_pnl += pnl
@@ -2253,6 +2656,7 @@ def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "pnl": pnl,
                     "deployed": deployed,
                     "return_pct": (pnl / deployed * 100) if deployed > 0 else None,
+                    **capture,
                     "sell_signal": risk.get("final_sell"),
                     "sell_color": risk.get("final_sell_color"),
                     "buy_signal": risk.get("buy_signal"),
@@ -3086,6 +3490,40 @@ def build_orders(
     return [kite_orders.build_order(item, kite) for item in row_args]
 
 
+def should_fallback_to_new_order(error: Exception) -> bool:
+    text = str(error).lower()
+    fallback_terms = [
+        "not found",
+        "not modifiable",
+        "cannot be modified",
+        "order not open",
+        "completed",
+        "cancelled",
+        "rejected",
+        "no pending quantity",
+    ]
+    return any(term in text for term in fallback_terms)
+
+
+def modify_or_place_order_with_new_fallback(kite: Any, order: dict[str, Any]) -> tuple[str, str]:
+    similar_orders = kite_orders.find_similar_open_orders(kite, order)
+    if not similar_orders:
+        order_id = kite_orders.place_order(kite, order)
+        return order_id, "placed_new_no_similar_open_order"
+    try:
+        order_id = kite_orders.modify_order(kite, similar_orders[-1], order)
+        return order_id, "modified_similar_open_order"
+    except Exception as exc:
+        if not should_fallback_to_new_order(exc):
+            raise
+        print(
+            "Similar order could not be modified; placing a new order instead. "
+            f"Reason: {exc}"
+        )
+        order_id = kite_orders.place_order(kite, order)
+        return order_id, "placed_new_after_modify_failed"
+
+
 def encode_rows(rows: list[dict[str, str]]) -> str:
     payload = json.dumps(rows, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii")
@@ -3130,10 +3568,9 @@ def execute_orders(
         try:
             if keep_existing_orders:
                 order_id = kite_orders.place_order(kite, order)
-                action = "placed"
+                action = "placed_new_requested"
             else:
-                order_id = kite_orders.modify_or_place_order(kite, order)
-                action = "placed_or_modified"
+                order_id, action = modify_or_place_order_with_new_fallback(kite, order)
             results.append(
                 {
                     "tradingsymbol": order["tradingsymbol"],
@@ -3578,21 +4015,34 @@ def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] 
     if not orders:
         return ""
     selected = selected or set(range(len(orders)))
+    active_underlyings = active_position_underlyings()
     header = "".join(f"<th>{html.escape(field)}</th>" for field in DISPLAY_FIELDS)
     rows = []
     for index, order in enumerate(orders):
         checked_attr = " checked" if index in selected else ""
+        symbol = str(order.get("tradingsymbol") or "").strip().upper()
+        underlying = underlying_for_symbol(symbol) if symbol else ""
+        has_active_position = bool(
+            symbol and (symbol in active_underlyings or underlying in active_underlyings)
+        )
+        row_class = ' class="order-existing-position"' if has_active_position else ""
+        row_title = (
+            f' title="Existing Kite position found for {html.escape(underlying or symbol, quote=True)}"'
+            if has_active_position
+            else ""
+        )
         cells = "".join(
             f"<td>{render_symbol_value(field, order.get(field, ''))}</td>"
             for field in DISPLAY_FIELDS
         )
         rows.append(
-            "<tr>"
+            f"<tr{row_class}{row_title}>"
             f'<td><input type="checkbox" name="selected" value="{index}"{checked_attr}></td>'
             f"{cells}</tr>"
         )
     return (
         '<section class="panel"><div class="panel-title">Orders</div>'
+        '<div class="status order-position-note">Rows in light red already have an active Kite position for the same underlying.</div>'
         '<div class="table-wrap"><table><thead><tr><th>Select</th>'
         f"{header}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
     )
@@ -3819,6 +4269,18 @@ def fmt_number(value: Any, decimals: int = 2) -> str:
         return f"{float(value):.{decimals}f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def ceil_to_tick(value: float, tick_size: float = 0.05) -> float:
+    if tick_size <= 0:
+        return round(value, 2)
+    return round(math.ceil(value / tick_size) * tick_size, 2)
+
+
+def floor_to_tick(value: float, tick_size: float = 0.05) -> float:
+    if tick_size <= 0:
+        return round(value, 2)
+    return round(math.floor(value / tick_size) * tick_size, 2)
 
 
 def render_analytics_panel(state: PageState) -> str:
@@ -4304,8 +4766,31 @@ def render_positions_panel(
     position_orders_table: str = "",
     position_execute_button: str = "",
 ) -> str:
+    if state.active_tab == "positions" and state.positions_rows is None:
+        try:
+            state.positions_rows, state.positions_summary = positions_research()
+        except Exception as exc:
+            state.error = f"{exc}\n\n{traceback.format_exc()}"
     rows = state.positions_rows or []
     summary = state.positions_summary or {}
+    def compact_signal(value: Any) -> str:
+        text = str(value or "").upper()
+        if "GREEN" in text:
+            return "GREEN"
+        if "YELLOW" in text:
+            return "YELLOW"
+        if "RED" in text:
+            return "RED"
+        if "AVOID" in text:
+            return "AVOID"
+        return text or "N/A"
+
+    def metric_class(value: Any) -> str:
+        try:
+            return "pnl-positive" if float(value or 0) >= 0 else "pnl-negative"
+        except (TypeError, ValueError):
+            return ""
+
     summary_cards = "".join(
         f'<div class="decision-card"><div class="decision-label">{html.escape(label)}</div>'
         f'<div class="decision-value">{html.escape(value)}</div></div>'
@@ -4317,35 +4802,47 @@ def render_positions_panel(
         ]
     )
     table_rows = "".join(
+        (
         "<tr>"
-        f"<td>{render_symbol_value('tradingsymbol', row.get('symbol', ''))}</td>"
-        f"<td>{html.escape(str(row.get('quantity', '')))}</td>"
-        f"<td>{html.escape(str(row.get('product', '')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('average_price')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('ltp')))}</td>"
-        f"<td>{html.escape(display_cell('pnl', row.get('pnl', '')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('deployed')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('return_pct')))}%</td>"
-        f'<td class="{strength_class(row.get("buy_color"))}">{html.escape(str(row.get("buy_signal", "")))}</td>'
-        f"<td>{html.escape(fmt_number(row.get('sell_pop')))}%</td>"
-        f"<td>{html.escape(fmt_number(row.get('otm_distance')))}%</td>"
-        f'<td class="{strength_class(row.get("sell_color"))}">{html.escape(str(row.get("sell_signal", "")))}</td>'
-        f'<td class="{strength_class(row.get("strategy_color"))}">{html.escape(str(row.get("strategy_strength", "")))}</td>'
-        f"<td>{html.escape(fmt_number(row.get('delta')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('iv_percent')))}%</td>"
-        f"<td>{html.escape(fmt_number(row.get('pcr')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('support')))} / {html.escape(fmt_number(row.get('resistance')))}</td>"
+        f"<td class=\"position-symbol-cell\">{render_symbol_value('tradingsymbol', row.get('symbol', ''))}<span>{html.escape(str(row.get('product', '')))} | Qty {html.escape(str(row.get('quantity', '')))}</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('ltp')))}</strong><span>Avg {html.escape(fmt_number(row.get('average_price')))}</span></td>"
+        f'<td class="{metric_class(row.get("pnl"))}"><strong>{html.escape(display_cell("pnl", row.get("pnl", "")))}</strong><span>{html.escape(fmt_number(row.get("return_pct")))}% on margin</span></td>'
+        f'<td class="{strength_class("green" if (row.get("captured_pct") is not None and float(row.get("captured_pct") or 0) >= 50) else row.get("capture_color"))}"><strong>{html.escape(fmt_number(row.get("captured_pct")))}%</strong><span>Captured</span></td>'
+        f"<td><strong>{html.escape(fmt_number(row.get('remaining_premium')))}</strong><span>{html.escape(fmt_number(row.get('remaining_pct')))}% remaining</span></td>"
+        f'<td class="{strength_class(row.get("capture_color"))}"><strong>{html.escape(str(row.get("capture_action", "")))}</strong><span>{html.escape(str(row.get("capture_detail", "")))}</span></td>'
+        "<td>"
+        + (
+            f'<button type="submit" class="book-profit-button compact-action-button" formaction="/positions/close-buy" name="close_symbol" value="{html.escape(str(row.get("symbol", "")), quote=True)}">BUY -10%</button>'
+            if int(row.get("quantity") or 0) < 0
+            and (
+                (row.get("captured_pct") is not None and abs(float(row.get("captured_pct") or 0)) >= 50)
+                or float(row.get("return_pct") or 0) <= -40
+            )
+            else '<span class="commodity-wait">Wait</span>'
+        )
+        + "</td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('deployed')))}</strong><span>Required</span></td>"
+        f'<td class="{strength_class(row.get("buy_color"))}"><strong>{html.escape(compact_signal(row.get("buy_signal")))}</strong><span>{html.escape(str(row.get("buy_signal", "")))}</span></td>'
+        f'<td><strong>{html.escape(fmt_number(row.get("sell_pop")))}%</strong><span>SELL POP</span></td>'
+        f'<td><strong>{html.escape(fmt_number(row.get("otm_distance")))}%</strong><span>OTM</span></td>'
+        f'<td class="{strength_class(row.get("sell_color"))}"><strong>{html.escape(compact_signal(row.get("sell_signal")))}</strong><span>{html.escape(str(row.get("sell_signal", "")))}</span></td>'
+        f'<td class="{strength_class(row.get("strategy_color"))}"><strong>{html.escape(compact_signal(row.get("strategy_strength")))}</strong><span>{html.escape(str(row.get("strategy_strength", "")))}</span></td>'
+        f"<td><strong>{html.escape(fmt_number(row.get('delta')))}</strong><span>Delta</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('iv_percent')))}%</strong><span>IV</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('pcr')))}</strong><span>PCR</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('support')))} / {html.escape(fmt_number(row.get('resistance')))}</strong><span>Support / resistance</span></td>"
         f"<td>{html.escape(str(row.get('error', '')))}</td>"
         "</tr>"
+        )
         for row in rows
     )
     table = (
-        '<section class="panel"><div class="panel-title">Active Position Analytics</div>'
-        '<div class="table-wrap"><table class="research-table"><thead><tr>'
-        '<th>Symbol</th><th>Qty</th><th>Product</th><th>Avg</th><th>LTP</th><th>P&L</th>'
-        '<th>Margin required</th><th>Return %</th><th>BUY Decision</th><th>SELL POP</th><th>OTM</th>'
-        '<th>SELL Decision</th><th>Strategy Strength</th><th>Delta</th><th>IV</th>'
-        '<th>PCR</th><th>Support / Resistance</th><th>Error</th></tr></thead>'
+        '<section class="panel positions-analytics-panel"><div class="panel-title">Active Position Analytics</div>'
+        '<div class="research-table-hint">Premium capture: book sold options at 50-70% decay; roll near expiry if capture is not enough.</div>'
+        '<div class="table-wrap positions-table-wrap"><table class="positions-table"><thead><tr>'
+        '<th>Position</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>Buy</th>'
+        '<th>POP</th><th>OTM</th><th>Sell</th><th>Strength</th><th>Delta</th>'
+        '<th>IV</th><th>PCR</th><th>S / R</th><th>Error</th></tr></thead>'
         f"<tbody>{table_rows}</tbody></table></div></section>"
         if rows
         else ""
@@ -4355,9 +4852,10 @@ def render_positions_panel(
       {env_hidden_fields_for_render()}
       <input type="hidden" name="position_orders_payload" value="{html.escape(position_orders_payload, quote=True)}">
       <section class="panel calm-hero-panel">
-        <p class="calm-quote">"Small drops makes the ocean"</p>
-        <p class="status"><strong>Analysis of current Positions</strong></p>
-        <p class="status">Evaluate active Kite option trades with the same analytics and summarize current P&L / Kite margin required.</p>
+        <div>
+          <p class="calm-quote">"Small drops makes the ocean"</p>
+          <p class="status">Analysis of current Positions | P&L, margin, premium capture and roll signals.</p>
+        </div>
         <div class="actions">
           <button type="submit" formaction="/positions-research/load">Load Active Positions</button>
           <button type="submit" formaction="/positions/load">Get Current Position / Preview BUY</button>
@@ -4564,21 +5062,31 @@ def render_income_panel(state: PageState) -> str:
         f"<td>{html.escape(str(row.get('expiry', '')))}</td>"
         f"<td>{html.escape(str(row.get('trading_days', '')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('option_price')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('sell_limit_price')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('max_profit')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('otm_distance')))}%</td>"
         f"<td>{html.escape(fmt_number(row.get('sell_pop')))}%</td>"
         f"<td>{html.escape(fmt_number(row.get('delta')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('iv_percent')))}%</td>"
         f"<td>{html.escape(fmt_number(row.get('pcr')))}</td>"
         f"<td>{html.escape(str(row.get('event_status', '')))}<small>{html.escape(str(row.get('event_detail', '')))}</small></td>"
-        f'<td class="{strength_class(row.get("action_color"))}"><strong>{html.escape(str(row.get("action", "")))}</strong><small>{html.escape(str(row.get("error", "")))}</small></td>'
+        "<td>"
+        + (
+            f'<button type="submit" class="book-profit-button" formaction="/income/sell-pe" name="income_underlying" value="{html.escape(str(row.get("symbol", "")), quote=True)}">SELL PE</button>'
+            if not row.get("error")
+            else '<span class="commodity-wait">Review error</span>'
+        )
+        + f'<small>{html.escape(str(row.get("action", "")))}</small>'
+        + f'<small>{html.escape(str(row.get("error", "")))}</small>'
+        + "</td>"
         "</tr>"
         for row in rows
     )
     candidate_table = (
         '<section class="panel income-candidates"><div class="panel-title">PFC / CAMS Monthly PE Candidates</div>'
         '<div class="table-wrap"><table><thead><tr>'
-        '<th>Stock</th><th>Candidate PE</th><th>Spot</th><th>Strike</th><th>Expiry</th><th>Trading Days</th>'
-        '<th>Premium</th><th>OTM</th><th>SELL POP</th><th>Delta</th><th>IV</th><th>PCR</th><th>Event Risk</th><th>Action</th>'
+        '<th>Stock</th><th>Candidate PE</th><th>CMP</th><th>Strike</th><th>Expiry</th><th>Trading Days</th>'
+        '<th>Premium</th><th>Sell Limit +20%</th><th>Maximum Profit</th><th>OTM</th><th>SELL POP</th><th>Delta</th><th>IV</th><th>PCR</th><th>Event Risk</th><th>Action</th>'
         f'</tr></thead><tbody>{candidate_rows}</tbody></table></div></section>'
         if rows
         else ""
@@ -4586,6 +5094,7 @@ def render_income_panel(state: PageState) -> str:
     ce_rows = "".join(
         "<tr>"
         f"<td><strong>{html.escape(str(row.get('symbol', '')))}</strong><span>{html.escape(str(row.get('name', '')))}</span></td>"
+        f"<td>{html.escape(fmt_number(row.get('spot')))}</td>"
         f"<td>{html.escape(str(row.get('held_qty', '')))}</td>"
         f"<td class=\"{'pnl-positive' if (row.get('stock_pnl') or 0) >= 0 else 'pnl-negative'}\">{html.escape(fmt_number(row.get('stock_pnl')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('stock_return_pct')))}%</td>"
@@ -4595,6 +5104,7 @@ def render_income_panel(state: PageState) -> str:
         f"<td>{html.escape(str(row.get('ce_lot_size', '')))}</td>"
         f"<td>{html.escape(str(row.get('covered_qty', '')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('ce_premium')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('ce_max_profit')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('ce_otm_distance')))}%</td>"
         f"<td>{html.escape(fmt_number(row.get('ce_sell_pop')))}%</td>"
         f'<td class="{strength_class(row.get("ce_action_color"))}"><strong>{html.escape(str(row.get("ce_action", "")))}</strong></td>'
@@ -4612,8 +5122,8 @@ def render_income_panel(state: PageState) -> str:
         '<section class="panel income-candidates"><div class="panel-title">Covered CALL Candidates From Current Holdings</div>'
         '<div class="status">SELL CE only when actual share holding covers the full option quantity.</div>'
         '<div class="table-wrap"><table><thead><tr>'
-        '<th>Stock</th><th>Held Shares</th><th>Stock P&L</th><th>Stock Return</th><th>Candidate CE</th><th>Strike</th><th>Expiry</th>'
-        '<th>Lot Size</th><th>Covered Qty</th><th>Premium</th><th>OTM</th><th>SELL POP</th><th>Status</th><th>Action</th>'
+        '<th>Stock</th><th>CMP</th><th>Held Shares</th><th>Stock P&L</th><th>Stock Return</th><th>Candidate CE</th><th>Strike</th><th>Expiry</th>'
+        '<th>Lot Size</th><th>Covered Qty</th><th>Premium</th><th>Maximum Profit</th><th>OTM</th><th>SELL POP</th><th>Status</th><th>Action</th>'
         f'</tr></thead><tbody>{ce_rows}</tbody></table></div></section>'
         if rows
         else ""
@@ -4642,11 +5152,12 @@ def render_income_panel(state: PageState) -> str:
           <button type="submit" formaction="/income/load">Refresh PFC / CAMS Candidates</button>
         </div>
       </section>
+      {candidate_table}
+      {render_results(state.income_results)}
       <section class="panel"><div class="panel-title">Monthly P&L Summary</div><div class="income-pnl-grid">{pnl_summary_html}</div></section>
       <section class="panel"><div class="income-rule-grid">{rule_cards}</div></section>
       <section class="panel"><div class="panel-title">Strategy Stocks</div><div class="income-stock-grid">{stock_cards}</div></section>
       {ce_table}
-      {candidate_table}
       <section class="panel"><div class="panel-title">Entry / Exit Validation</div><div class="income-filter-grid">{filter_html}</div></section>
       <section class="panel"><div class="panel-title">Expected Portfolio Behavior</div>
         <div class="income-rule-grid">
@@ -4657,7 +5168,6 @@ def render_income_panel(state: PageState) -> str:
         </div>
       </section>
       {('<section class="panel">' + render_graceful_error(state.income_error, "INCOME Error") + '</section>') if state.income_error else ''}
-      {render_results(state.income_results)}
       {render_console(state.console_log)}
     </form>"""
 
@@ -4755,7 +5265,7 @@ def render_market_topper(state: PageState) -> str:
     )
     quote_date = datetime.now().strftime("%d %b %Y")
     return f"""
-    <section class="market-shell">
+    <section class="market-shell top-command-center">
       <div class="rule-strip">
         <div class="rule-card sell-stock">
           <div class="rule-kicker">Rule 1</div>
@@ -4856,14 +5366,15 @@ def render_page(state: PageState) -> bytes:
           <section class="panel kite-setup-card token-card">
             <div class="setup-card-kicker">02</div>
             <div class="panel-title">Access Token</div>
-            <p class="status">Open Kite login, copy <code>request_token</code> from redirected URL, then generate the session token.</p>
+            <p class="status">Open Kite login, paste the full redirected URL or only <code>request_token</code>, then generate and save today's token.</p>
             <div class="actions">
               <a class="button-link" href="{html.escape(kite_login_url(), quote=True)}" target="_blank" rel="noopener">Open Kite Login</a>
             </div>
-            {render_input("kite_request_token", "Manual request_token fallback", state.kite_request_token)}
+            {render_input("kite_request_token", "Redirected URL or request_token", state.kite_request_token)}
             <div class="actions">
-              <button type="submit" formaction="/kite-token/generate">Generate Access Token</button>
+              <button type="submit" formaction="/kite-token/generate">Generate and Save Access Token</button>
             </div>
+            <p class="status">Saved to <code>.env</code> and applied immediately to this running app.</p>
           </section>
           <section class="panel kite-setup-card etf-card">
             <div class="setup-card-kicker">03</div>
@@ -4917,11 +5428,12 @@ def render_page(state: PageState) -> bytes:
     }}
     header {{
       background:
+        radial-gradient(circle at 16% 12%, rgba(45, 212, 191, 0.20), transparent 26%),
         linear-gradient(120deg, #0b1220 0%, #123b52 48%, #0f766e 100%);
-      border-bottom: 1px solid rgba(153, 246, 228, 0.28);
-      padding: 12px 18px;
+      border-bottom: 1px solid rgba(153, 246, 228, 0.34);
+      padding: 7px 18px;
       color: #ffffff;
-      box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18);
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
     }}
     .header-inner {{
       width: min(1180px, calc(100vw - 32px));
@@ -4939,8 +5451,8 @@ def render_page(state: PageState) -> bytes:
     .brand-mark {{
       display: grid;
       place-items: center;
-      width: 42px;
-      height: 42px;
+      width: 92px;
+      height: 38px;
       border-radius: 12px;
       background: linear-gradient(135deg, #38bdf8, #14b8a6);
       color: #ecfeff;
@@ -4948,8 +5460,8 @@ def render_page(state: PageState) -> bytes:
       font-weight: 950;
       box-shadow: 0 12px 24px rgba(20, 184, 166, 0.24);
     }}
-    header h1 {{ margin: 0 0 3px; font-size: 23px; letter-spacing: 0; }}
-    header p {{ margin: 0; color: #d5eef3; font-size: 12px; }}
+    header h1 {{ margin: 0 0 2px; font-size: 22px; letter-spacing: 0; }}
+    header p {{ margin: 0; color: #d5eef3; font-size: 11.5px; }}
     .naval-quote {{
       margin: 0;
       color: #e0f2fe;
@@ -5147,13 +5659,120 @@ def render_page(state: PageState) -> bytes:
       font-size: 12px;
       font-weight: 900;
     }}
-    .quote-change {{
+    .quote-change {{ 
       font-size: 10px;
       font-weight: 800;
       color: var(--muted);
     }}
     .quote-change.up {{ color: #047857; }}
     .quote-change.down {{ color: #b42318; }}
+    header {{
+      padding: 7px 18px;
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
+    }}
+    .brand-mark {{
+      width: 38px;
+      height: 38px;
+      border-radius: 11px;
+      font-size: 17px;
+      letter-spacing: 0.02em;
+    }}
+    header h1 {{ font-size: 22px; margin-bottom: 2px; }}
+    header p {{ font-size: 11.5px; }}
+    .naval-quote {{
+      font-size: 11.5px;
+      padding: 6px 10px;
+      border-color: rgba(186, 230, 253, 0.28);
+    }}
+    .blessing {{
+      font-size: 14px;
+      padding: 7px 12px;
+    }}
+    main {{
+      margin-top: 16px;
+    }}
+    .top-command-center {{
+      padding: 10px;
+      margin-bottom: 14px;
+      border-radius: 16px;
+      background:
+        radial-gradient(circle at top left, rgba(34, 211, 238, 0.12), transparent 28%),
+        linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(236, 254, 255, 0.82)),
+        #ffffff;
+      box-shadow: 0 18px 42px rgba(15, 23, 42, 0.09);
+    }}
+    .top-command-center .rule-strip {{
+      grid-template-columns: minmax(230px, 1fr) minmax(260px, 1.05fr) minmax(230px, 0.86fr);
+      gap: 10px;
+      margin-bottom: 8px;
+    }}
+    .top-command-center .rule-card,
+    .top-command-center .mmi-card {{
+      min-height: 58px;
+      padding: 8px 12px;
+      border-radius: 13px;
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+    }}
+    .top-command-center .rule-kicker {{
+      margin-bottom: 2px;
+      font-size: 9.5px;
+      letter-spacing: 0.03em;
+    }}
+    .top-command-center .rule-title {{
+      max-width: 420px;
+      font-size: 15px;
+      line-height: 1.02;
+    }}
+    .top-command-center .mmi-value {{
+      font-size: 19px;
+    }}
+    .top-command-center .mmi-line {{
+      margin: 0 0 1px;
+    }}
+    .top-command-center .mmi-card a {{
+      font-size: 10.5px;
+    }}
+    .top-command-center .expiry-strip {{
+      margin-bottom: 8px;
+    }}
+    .top-command-center .expiry-card {{
+      padding: 8px 12px;
+      border-radius: 12px;
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04);
+    }}
+    .top-command-center .expiry-month {{
+      font-size: 13px;
+    }}
+    .top-command-center .expiry-day,
+    .top-command-center .expiry-days {{
+      font-size: 16px;
+    }}
+    .top-command-center .ticker-panel {{
+      border-radius: 13px;
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+    }}
+    .top-command-center .ticker-title {{
+      padding: 6px 10px 0;
+      font-size: 10.5px;
+    }}
+    .top-command-center .quote-grid {{
+      gap: 3px;
+      padding: 4px 8px 7px;
+    }}
+    .top-command-center .quote-card {{
+      min-height: 22px;
+      gap: 4px;
+      padding: 2px 6px;
+    }}
+    .top-command-center .quote-symbol {{
+      font-size: 8.5px;
+    }}
+    .top-command-center .quote-ltp {{
+      font-size: 11.5px;
+    }}
+    .top-command-center .quote-change {{
+      font-size: 9.5px;
+    }}
     .commodity-panel {{
       border-color: #fed7aa;
       background: linear-gradient(135deg, #ffffff 0%, #fff7ed 44%, #f0fdfa 100%);
@@ -5611,6 +6230,43 @@ def render_page(state: PageState) -> bytes:
       background: currentColor;
       opacity: 0.72;
     }}
+    .tabs {{
+      display: grid;
+      grid-template-columns: repeat(9, minmax(0, 1fr));
+      gap: 6px;
+      padding: 8px;
+      align-items: stretch;
+    }}
+    .tab-button,
+    .tab-button.primary-action,
+    .tab-button.utility-action {{
+      --tab-a: #e0f2fe;
+      --tab-b: #ecfeff;
+      --tab-ink: #0f3b65;
+      --tab-shadow: rgba(6, 182, 212, 0.12);
+      width: 100%;
+      min-height: 46px;
+      padding: 9px 8px;
+      color: var(--tab-ink);
+      font-size: 13px;
+      font-weight: 800;
+      text-align: center;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .tab-button.primary-action {{
+      font-size: 13px;
+      font-weight: 800;
+    }}
+    .tab-button.active {{
+      transform: none;
+      filter: saturate(1.08);
+    }}
+    .tab-button.active::after {{
+      margin-top: 5px;
+    }}
     #place-panel,
     #positions-panel,
     #analytics-panel,
@@ -5708,6 +6364,23 @@ def render_page(state: PageState) -> bytes:
       padding-top: 8px;
       margin: 4px 0 12px;
       border-top: 1px solid rgba(15, 118, 110, 0.14);
+    }}
+    .order-position-note {{
+      display: inline-block;
+      margin: -4px 0 10px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #fff1f2;
+      color: #991b1b;
+      border: 1px solid #fecdd3;
+      font-weight: 850;
+    }}
+    tr.order-existing-position td {{
+      background: #ffe4e6 !important;
+      color: #7f1d1d;
+    }}
+    tr.order-existing-position td a {{
+      color: #9f1239;
     }}
     .execution-checks {{
       margin-top: 12px;
@@ -5987,6 +6660,35 @@ def render_page(state: PageState) -> bytes:
       text-transform: uppercase;
       color: #475569;
     }}
+    .guardrail-box {{
+      border-color: #bae6fd;
+      background: #f8fbff;
+      max-height: none;
+    }}
+    .guardrail-grid {{
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 7px;
+    }}
+    .guardrail-grid div {{
+      border: 1px solid #cde7e2;
+      border-radius: 8px;
+      padding: 7px 8px;
+      background: #ffffff;
+    }}
+    .guardrail-grid span {{
+      display: block;
+      color: #64748b;
+      font-size: 10px;
+      font-weight: 850;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+    }}
+    .guardrail-grid strong {{
+      color: #0f3b65;
+      font-size: 13px;
+      font-weight: 950;
+    }}
     .console {{
       margin: 0;
       padding: 12px;
@@ -6108,7 +6810,7 @@ def render_page(state: PageState) -> bytes:
     .analytics-action-card,
     .analytics-metric {{
       border: 1px solid var(--line);
-      border-radius: 12px;
+      border-radius: 11px;
       padding: 11px 12px;
       background: rgba(255, 255, 255, 0.88);
       box-shadow: 0 8px 20px rgba(15, 23, 42, 0.04);
@@ -6138,7 +6840,7 @@ def render_page(state: PageState) -> bytes:
     .analytics-two-column {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
+      gap: 12px;
       margin-bottom: 16px;
     }}
     .analytics-compact-panel,
@@ -6209,7 +6911,7 @@ def render_page(state: PageState) -> bytes:
       background: #ecfeff;
       color: #155e75;
       border: 1px solid #a5f3fc;
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 850;
     }}
     .research-table-wrap {{
@@ -6259,6 +6961,113 @@ def render_page(state: PageState) -> bytes:
     .research-table small {{
       font-size: 10px;
       opacity: 0.9;
+    }}
+    .positions-analytics-panel {{
+      border-color: #a7f3d0;
+      background:
+        radial-gradient(circle at top left, rgba(204, 251, 241, 0.55), transparent 34%),
+        linear-gradient(135deg, #ffffff 0%, #f8fffd 100%);
+    }}
+    .positions-table-wrap {{
+      border: 1px solid #b7e4da;
+      border-radius: 14px;
+      background: #ffffff;
+      box-shadow: 0 14px 30px rgba(15, 118, 110, 0.08);
+    }}
+    .positions-table {{
+      min-width: 1180px;
+      border-collapse: separate;
+      border-spacing: 0;
+      background: #ffffff;
+      table-layout: auto;
+    }}
+    .positions-table th {{
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 7px 8px;
+      background: linear-gradient(135deg, #12395b 0%, #0f766e 100%);
+      color: #f8fafc;
+      border-bottom: 0;
+      font-size: 10px;
+      line-height: 1.1;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }}
+    .positions-table th:first-child {{
+      border-top-left-radius: 12px;
+    }}
+    .positions-table th:last-child {{
+      border-top-right-radius: 12px;
+    }}
+    .positions-table td {{
+      padding: 6px 8px;
+      border-bottom: 1px solid #d8ebe7;
+      border-right: 1px solid rgba(216, 235, 231, 0.75);
+      color: #0f172a;
+      font-size: 12px;
+      font-weight: 850;
+      vertical-align: middle;
+      white-space: nowrap;
+    }}
+    .positions-table tbody tr:nth-child(even) td:not(.strength-lightgreen):not(.strength-yellow):not(.strength-orange):not(.strength-lightcoral) {{
+      background: #fbfefd;
+    }}
+    .positions-table tbody tr:hover td {{
+      background-color: #ecfeff;
+    }}
+    .positions-table td span,
+    .position-symbol-cell span {{
+      display: block;
+      margin-top: 1px;
+      color: #64748b;
+      font-size: 9.5px;
+      font-weight: 750;
+      white-space: normal;
+      line-height: 1.15;
+    }}
+    .positions-table td strong {{
+      display: inline-block;
+      font-size: 12.5px;
+      font-weight: 950;
+    }}
+    .position-symbol-cell {{
+      min-width: 190px;
+      max-width: 230px;
+    }}
+    .position-symbol-cell a,
+    .position-symbol-cell strong {{
+      color: #006c67;
+      font-size: 12.5px;
+      font-weight: 950;
+      overflow-wrap: anywhere;
+    }}
+    .positions-table .pnl-positive {{
+      background: #ecfdf5;
+      color: #047857;
+    }}
+    .positions-table .pnl-negative {{
+      background: #fef2f2;
+      color: #b91c1c;
+    }}
+    .positions-table .strength-lightgreen,
+    .positions-table .strength-green {{
+      background: #dcfce7;
+      color: #047857;
+    }}
+    .positions-table .strength-yellow {{
+      background: #fef9c3;
+      color: #a16207;
+    }}
+    .positions-table .strength-orange {{
+      background: #ffedd5;
+      color: #c2410c;
+    }}
+    .positions-table .strength-lightcoral,
+    .positions-table .strength-red {{
+      background: #fee2e2;
+      color: #b91c1c;
     }}
     .validation-panel {{
       border-color: #bfdbfe;
@@ -6480,15 +7289,41 @@ def render_page(state: PageState) -> bytes:
       overflow-wrap: anywhere;
     }}
     .calm-hero-panel {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
       border-color: #bfdbfe;
       background:
         linear-gradient(135deg, #f8fafc 0%, #ecfeff 46%, #f0fdf4 100%);
+      padding: 10px 14px;
+      margin-bottom: 10px;
     }}
     .calm-quote {{
-      margin: 2px 0 8px;
+      margin: 0 0 3px;
       color: #0f766e;
-      font-size: 18px;
+      font-size: 15px;
       font-weight: 950;
+    }}
+    .calm-hero-panel .status {{
+      margin: 0;
+      font-size: 12px;
+    }}
+    .calm-hero-panel .actions {{
+      margin: 0;
+      flex-wrap: nowrap;
+      justify-content: flex-end;
+    }}
+    .calm-hero-panel button {{
+      min-height: 34px;
+      padding: 8px 12px;
+      font-size: 12px;
+    }}
+    .compact-action-button {{
+      min-height: 28px;
+      padding: 6px 9px;
+      font-size: 11px;
+      white-space: nowrap;
     }}
     .calm-options-panel {{
       border-color: #ccfbf1;
@@ -6505,10 +7340,10 @@ def render_page(state: PageState) -> bytes:
     }}
     .gpt-hero-panel .panel-title {{
       color: #065f46;
-      font-size: 21px;
+      font-size: 19px;
     }}
     .gpt-hero-chip {{
-      padding: 8px 10px;
+      padding: 6px 10px;
       border-radius: 999px;
       border: 1px solid #99f6e4;
       background: #ffffff;
@@ -6652,6 +7487,12 @@ def render_page(state: PageState) -> bytes:
       .analytics-form {{ grid-template-columns: 1fr; }}
       .analytics-command-head {{ grid-template-columns: 1fr; }}
       .analytics-two-column {{ grid-template-columns: 1fr; }}
+      .tabs {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+      .tab-button,
+      .tab-button.primary-action,
+      .tab-button.utility-action {{ white-space: normal; }}
+      .calm-hero-panel {{ align-items: flex-start; flex-direction: column; }}
+      .calm-hero-panel .actions {{ flex-wrap: wrap; justify-content: flex-start; }}
       header {{ padding: 10px 12px; }}
       .header-inner {{ width: 100%; grid-template-columns: 1fr; align-items: flex-start; }}
       .blessing {{ text-align: left; white-space: normal; }}
@@ -6664,10 +7505,10 @@ def render_page(state: PageState) -> bytes:
   <header>
     <div class="header-inner">
     <div class="brand-block">
-      <div class="brand-mark">KT</div>
+      <div class="brand-mark">विकल्प</div>
       <div>
-        <h1>Kite Trader</h1>
-        <p>CSV orders, positions, income strategy, and ETF actions.</p>
+        <h1>Income Desk</h1>
+        <p>Wheel income, positions, ETF actions, and calm execution.</p>
       </div>
     </div>
     <div class="blessing">&#2384; | Jai Sri Ram | Jai Laxmi Mata</div>
@@ -6704,7 +7545,7 @@ def render_page(state: PageState) -> bytes:
         <div class="execution-checks">
           {render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}
           {render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}
-          {render_checkbox("keep_existing_orders", "Place new order instead of modifying similar open order", state.keep_existing_orders)}
+          {render_checkbox("keep_existing_orders", "Always place new order", state.keep_existing_orders, "Turn off to modify a similar open order when found; if no modifiable order exists, the app places a new order.")}
         </div>
       </section>
       <div>
@@ -6802,6 +7643,10 @@ def render_page(state: PageState) -> bytes:
       <div class="breath-circle"></div>
       <div class="breath-text" id="breath-text">Breathe in</div>
       <div class="countdown" id="live-countdown">20</div>
+      <div class="news-box guardrail-box">
+        <h3>Capital Allocation Guardrail</h3>
+        <div id="trade-guardrails">Loading capital guardrails...</div>
+      </div>
       <div class="news-box">
         <h3>Top Stock News Before Trade - Last 5 Days</h3>
         <div id="trade-news">Loading selected stock news...</div>
@@ -6871,6 +7716,22 @@ def render_page(state: PageState) -> bytes:
         }}
       }});
     }}
+    function isKiteSetupError(message) {{
+      const text = String(message || '').toLowerCase();
+      return text.includes('api_key')
+        || text.includes('access_token')
+        || text.includes('api secret')
+        || text.includes('token')
+        || text.includes('kite setup')
+        || text.includes('invalid session')
+        || text.includes('permission')
+        || text.includes('could not import kite_place_order');
+    }}
+    function openKiteSetupForError(message) {{
+      if (!isKiteSetupError(message)) return;
+      const setupTab = document.querySelector('.tab-button[data-tab="kite-setup"]');
+      if (setupTab) setupTab.click();
+    }}
     const executeButton = document.getElementById('execute-selected-button');
     const placeForm = document.getElementById('place-panel');
     const liveModal = document.getElementById('live-confirm-modal');
@@ -6880,6 +7741,7 @@ def render_page(state: PageState) -> bytes:
     const breathText = document.getElementById('breath-text');
     const liveConfirmed = document.getElementById('live-confirmed');
     const tradeNews = document.getElementById('trade-news');
+    const tradeGuardrails = document.getElementById('trade-guardrails');
     const commodityModal = document.getElementById('commodity-confirm-modal');
     const commodityCancel = document.getElementById('commodity-cancel');
     const commodityGood = document.getElementById('commodity-good');
@@ -6896,13 +7758,15 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     function openLiveModal() {{
-      let remaining = 20;
+      const stocks = selectedTradingStocks();
+      let remaining = Math.min(40, Math.max(10, stocks.length * 5));
       pendingLiveSubmit = true;
       liveGood.disabled = true;
       liveCountdown.textContent = String(remaining);
       breathText.textContent = 'Breathe in';
       liveModal.style.display = 'flex';
-      loadTradeNews();
+      loadTradeNews(stocks);
+      loadTradeGuardrails();
       stopLiveCountdown();
       countdownTimer = setInterval(() => {{
         remaining -= 1;
@@ -6915,27 +7779,81 @@ def render_page(state: PageState) -> bytes:
         }}
       }}, 1000);
     }}
-    function selectedTradingSymbols() {{
-      const symbols = [];
+    function optionUnderlying(symbol) {{
+      const clean = String(symbol || '').trim().toUpperCase();
+      const match = clean.match(/^(.+?)(\\d{{2}})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\\d+(?:\\.\\d+)?)(CE|PE)$/);
+      return match ? match[1] : clean;
+    }}
+    function selectedTradingStocks() {{
+      const stocks = [];
+      const seen = new Set();
       const rows = placeForm.querySelectorAll('table tbody tr');
       for (const row of rows) {{
         const checkbox = row.querySelector('input[name="selected"]');
         if (checkbox && checkbox.checked && row.cells.length > 2) {{
-          symbols.push(row.cells[2].innerText.trim());
+          const stock = optionUnderlying(row.cells[2].innerText);
+          if (stock && !seen.has(stock)) {{
+            stocks.push(stock);
+            seen.add(stock);
+          }}
         }}
       }}
-      return symbols;
+      return stocks;
     }}
-    async function loadTradeNews() {{
-      if (!tradeNews) return;
-      const symbols = selectedTradingSymbols();
-      if (!symbols.length) {{
-        tradeNews.textContent = 'No selected symbols found.';
+    function selectedTradingOrders() {{
+      const orders = [];
+      const rows = placeForm.querySelectorAll('table tbody tr');
+      for (const row of rows) {{
+        const checkbox = row.querySelector('input[name="selected"]');
+        if (!checkbox || !checkbox.checked || row.cells.length < 10) continue;
+        orders.push({{
+          exchange: row.cells[1].innerText.trim(),
+          tradingsymbol: row.cells[2].innerText.trim(),
+          transaction_type: row.cells[3].innerText.trim(),
+          quantity: row.cells[4].innerText.trim(),
+          product: row.cells[5].innerText.trim(),
+          order_type: row.cells[6].innerText.trim(),
+          price: row.cells[7].innerText.trim(),
+          validity: row.cells[8].innerText.trim(),
+          tag: row.cells[9].innerText.trim()
+        }});
+      }}
+      return orders;
+    }}
+    async function loadTradeGuardrails() {{
+      if (!tradeGuardrails) return;
+      const orders = selectedTradingOrders();
+      if (!orders.length) {{
+        tradeGuardrails.textContent = 'No selected SELL CALL / PUT orders found.';
         return;
       }}
-      tradeNews.textContent = 'Loading selected stock news...';
+      tradeGuardrails.textContent = 'Calculating capital, cash and exposure...';
       try {{
-        const response = await fetch(`/trade-news?symbols=${{encodeURIComponent(symbols.join(','))}}`, {{ cache: 'no-store' }});
+        const response = await fetch(`/trade-guardrails?orders=${{encodeURIComponent(JSON.stringify(orders))}}`, {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load guardrails');
+        tradeGuardrails.innerHTML = `
+          <div class="guardrail-grid">
+            <div><span>Capital used</span><strong>${{escapeHtml(data.capital_used)}}</strong></div>
+            <div><span>Cash reserved</span><strong>${{escapeHtml(data.cash_reserved)}}</strong></div>
+            <div><span>Margin used</span><strong>${{escapeHtml(data.margin_used)}}</strong></div>
+            <div><span>Sector exposure</span><strong>${{escapeHtml(data.sector_exposure)}}</strong></div>
+            <div><span>Single stock exposure</span><strong>${{escapeHtml(data.single_stock_exposure)}}</strong></div>
+          </div>`;
+      }} catch (error) {{
+        tradeGuardrails.textContent = `Guardrail error: ${{error.message}}`;
+      }}
+    }}
+    async function loadTradeNews(stocks) {{
+      if (!tradeNews) return;
+      const selectedStocks = stocks && stocks.length ? stocks : selectedTradingStocks();
+      if (!selectedStocks.length) {{
+        tradeNews.textContent = 'No selected stocks found.';
+        return;
+      }}
+      tradeNews.textContent = `Loading latest news for ${{selectedStocks.join(', ')}}...`;
+      try {{
+        const response = await fetch(`/trade-news?stocks=${{encodeURIComponent(selectedStocks.join(','))}}`, {{ cache: 'no-store' }});
         const data = await response.json();
         if (!data.ok) throw new Error(data.error || 'Could not load news');
         if (!data.news || !data.news.length) {{
@@ -7125,6 +8043,7 @@ def render_page(state: PageState) -> bytes:
           }}
         }}
       }} catch (error) {{
+        openKiteSetupForError(error.message);
         if (quoteError) {{
           quoteError.style.display = 'block';
           quoteError.textContent = `Kite quote error: ${{error.message}}`;
@@ -7138,7 +8057,7 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     refreshQuotes();
-    setInterval(refreshQuotes, 10000);
+    setInterval(refreshQuotes, 30000);
     async function refreshCommodityQuotes() {{
       const cards = Array.from(document.querySelectorAll('.commodity-card[data-symbol]'));
       if (!cards.length) return;
@@ -7190,6 +8109,7 @@ def render_page(state: PageState) -> bytes:
           }}
         }}
       }} catch (error) {{
+        openKiteSetupForError(error.message);
         if (errorBox) {{
           errorBox.style.display = 'block';
           errorBox.textContent = `ETF quote error: ${{error.message}}`;
@@ -7197,7 +8117,7 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     refreshCommodityQuotes();
-    setInterval(refreshCommodityQuotes, 10000);
+    setInterval(refreshCommodityQuotes, 30000);
   </script>
 </body>
 </html>"""
@@ -7226,14 +8146,25 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/commodity":
             self.send_page(PageState(active_tab="commodity"))
             return
+        if parsed_url.path == "/positions":
+            self.send_page(PageState(active_tab="positions"))
+            return
         if parsed_url.path == "/trade-news":
             query = parse_qs(parsed_url.query, keep_blank_values=True)
-            symbols_text = first(query, "symbols")
+            symbols_text = first(query, "stocks") or first(query, "symbols")
             symbols = [item for item in symbols_text.split(",") if item.strip()]
             try:
                 self.send_json({"ok": True, "news": fetch_stock_news(symbols)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc), "news": []})
+            return
+        if parsed_url.path == "/trade-guardrails":
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            try:
+                orders = json.loads(first(query, "orders") or "[]")
+                self.send_json(selected_trade_guardrails(orders))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)})
             return
         if self.path == "/market-mmi":
             try:
@@ -7271,7 +8202,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     }
                 )
             return
-        self.send_page(PageState())
+        setup_issue = kite_setup_issue()
+        self.send_page(
+            PageState(
+                active_tab=default_active_tab(),
+                error=setup_issue,
+            )
+        )
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -7299,7 +8236,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if self.path.startswith("/analytics")
                 else "research"
                 if self.path.startswith("/research")
-                else "place"
+                else default_active_tab()
             ),
             csv_path=first(form, "csv_path", str(DEFAULT_CSV_PATH)),
             csv_text=first(form, "csv_text"),
@@ -7463,6 +8400,19 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.message = (
                         f"Submitted {len(state.position_orders)} selected BUY order(s) to Kite."
                     )
+            elif self.path == "/positions/close-buy":
+                close_symbol = first(form, "close_symbol")
+                result, state.console_log = call_with_console(
+                    place_position_close_buy_order,
+                    close_symbol,
+                )
+                state.position_results = [result]
+                (
+                    state.positions_rows,
+                    state.positions_summary,
+                ), refresh_log = call_with_console(positions_research)
+                state.console_log = f"{state.console_log}{refresh_log}"
+                state.message = f"Submitted BUY close order for {close_symbol.upper()}."
             elif self.path == "/gpt/load":
                 state.gpt_conversation, state.console_log = call_with_console(
                     fetch_gpt_conversation,
@@ -7505,9 +8455,17 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 else:
                     state.message = persist_message
             elif self.path == "/kite-setup":
+                save_env_values(
+                    {
+                        "KITE_CONFIRM_LIVE_ORDER": state.confirm_live_order or env_value("KITE_CONFIRM_LIVE_ORDER"),
+                        "KITE_API_KEY": state.api_key or env_value("KITE_API_KEY"),
+                        "KITE_API_SECRET": state.api_secret or env_value("KITE_API_SECRET"),
+                        "KITE_ACCESS_TOKEN": state.access_token or env_value("KITE_ACCESS_TOKEN"),
+                    }
+                )
                 save_app_settings({"etf_buy_amount": state.etf_buy_amount})
                 state.message = (
-                    f"Kite setup saved. ETF buy amount saved as {format_buy_amount(state.etf_buy_amount)}."
+                    f"Kite setup saved to .env. ETF buy amount saved as {format_buy_amount(state.etf_buy_amount)}."
                 )
             elif self.path == "/kite-token/generate":
                 access_token, state.console_log = call_with_console(
@@ -7515,7 +8473,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.kite_request_token,
                 )
                 state.access_token = access_token
-                state.message = "Generated and saved KITE_ACCESS_TOKEN for this running web app session."
+                state.message = "Generated today's KITE_ACCESS_TOKEN, saved it to .env, and applied it to this running app."
             elif self.path == "/kite-ip/check":
                 state.kite_ip_data, state.console_log = call_with_console(fetch_public_ip_data)
                 ips = [item["ip"] for item in state.kite_ip_data if item.get("ip")]
@@ -7552,6 +8510,19 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 ), refresh_log = call_with_console(income_strategy_candidates)
                 state.console_log = f"{state.console_log}{refresh_log}"
                 state.message = f"Submitted covered CE order for {underlying.upper()}."
+            elif self.path == "/income/sell-pe":
+                underlying = first(form, "income_underlying")
+                result, state.console_log = call_with_console(
+                    place_income_cash_secured_put_order,
+                    underlying,
+                )
+                state.income_results = [result]
+                (
+                    state.income_rows,
+                    state.income_summary,
+                ), refresh_log = call_with_console(income_strategy_candidates)
+                state.console_log = f"{state.console_log}{refresh_log}"
+                state.message = f"Submitted cash-secured PE order for {underlying.upper()}."
             elif self.path == "/positions-research/load":
                 (
                     state.positions_rows,

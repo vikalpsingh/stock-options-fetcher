@@ -24,6 +24,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from typing import Any
 
 
@@ -172,15 +173,18 @@ def generate_access_token() -> int:
     kite = KiteConnect(api_key=api_key)
     print("Open this URL in your browser and login:")
     print(kite.login_url())
-    print("\nAfter login, copy request_token from the redirected URL.")
+    print(
+        "\nAfter login, copy the full redirected URL or only the request_token value."
+    )
     try:
-        request_token = input("Paste request_token: ").strip()
+        request_token_input = input("Paste redirected URL or request_token: ").strip()
     except EOFError as exc:
         raise SystemExit(
             "Could not read request_token. Run this command in an interactive terminal, "
             "open the login URL, then paste the request_token from the redirected URL."
         ) from exc
 
+    request_token = extract_request_token(request_token_input)
     if not request_token:
         raise SystemExit("request_token cannot be empty.")
 
@@ -188,6 +192,24 @@ def generate_access_token() -> int:
     print("\nDaily access token generated. Run this in PowerShell:")
     print(f'$env:KITE_ACCESS_TOKEN="{data["access_token"]}"')
     return 0
+
+
+def extract_request_token(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.query:
+        token = parse_qs(parsed.query, keep_blank_values=True).get("request_token", [""])[0]
+        if token:
+            return token.strip()
+    if "request_token=" in text:
+        token = parse_qs(text.split("?", 1)[-1], keep_blank_values=True).get(
+            "request_token", [""]
+        )[0]
+        if token:
+            return token.strip()
+    return text
 
 
 def parse_optional_float(value: str | None) -> float | None:
