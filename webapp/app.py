@@ -15,6 +15,8 @@ import argparse
 import base64
 import contextlib
 import csv
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -22,6 +24,7 @@ import math
 import os
 import re
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -72,6 +75,12 @@ DEFAULT_KITE_ENV = {
     "KITE_ACCESS_TOKEN": "TqL81HKQXjdi6KQ9jxsYUz5AIUgrrwxB",
 }
 BAD_KITE_API_KEYS = {"wg21s30mtedr53q0"}
+AUTH_USERNAME = "vikalpsingh"
+AUTH_PASSWORD_SALT = b"vikalp-income-desk-v1"
+AUTH_PASSWORD_HASH = "77e7696df3cb9025e5e9261f76d258208844447c8af89f4c47353c0d04512a76"
+AUTH_COOKIE_NAME = "vikalp_income_session"
+AUTH_SESSION_SECONDS = 12 * 60 * 60
+AUTH_SESSION_SECRET = os.getenv("VIKALP_AUTH_SECRET") or AUTH_PASSWORD_HASH
 ORDER_FIELDS = [
     "variety",
     "exchange",
@@ -595,6 +604,141 @@ def mask_secret(value: str | None) -> str:
     if len(value) <= 8:
         return "*" * len(value)
     return f"{value[:4]}...{value[-4:]}"
+
+
+def hash_login_password(password: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        AUTH_PASSWORD_SALT,
+        200_000,
+    ).hex()
+
+
+def verify_login(username: str, password: str) -> bool:
+    return username.strip() == AUTH_USERNAME and hmac.compare_digest(
+        hash_login_password(password),
+        AUTH_PASSWORD_HASH,
+    )
+
+
+def make_auth_token(username: str) -> str:
+    expires = int(time.time()) + AUTH_SESSION_SECONDS
+    payload = f"{username}:{expires}"
+    signature = hmac.new(
+        AUTH_SESSION_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode("utf-8")).decode("ascii")
+
+
+def valid_auth_token(token: str) -> bool:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        username, expires_text, signature = decoded.rsplit(":", 2)
+        if username != AUTH_USERNAME or int(expires_text) < int(time.time()):
+            return False
+        payload = f"{username}:{expires_text}"
+        expected = hmac.new(
+            AUTH_SESSION_SECRET.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(signature, expected)
+    except Exception:
+        return False
+
+
+def render_login_page(error: str = "") -> bytes:
+    error_html = f'<div class="login-error">{html.escape(error)}</div>' if error else ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Income Desk Login</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: Arial, Helvetica, sans-serif;
+      color: #0f172a;
+      background:
+        radial-gradient(circle at top left, rgba(45, 212, 191, 0.30), transparent 30%),
+        linear-gradient(135deg, #eef7f6 0%, #f8fafc 48%, #ecfeff 100%);
+    }}
+    .login-card {{
+      width: min(420px, calc(100vw - 28px));
+      border: 1px solid #bde8e3;
+      border-radius: 20px;
+      padding: 26px;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 24px 70px rgba(15, 23, 42, 0.14);
+    }}
+    .brand {{
+      display: inline-grid;
+      place-items: center;
+      min-width: 92px;
+      height: 42px;
+      padding: 0 14px;
+      border-radius: 14px;
+      color: #ecfeff;
+      background: linear-gradient(135deg, #38bdf8, #14b8a6);
+      font-size: 18px;
+      font-weight: 950;
+      margin-bottom: 14px;
+    }}
+    h1 {{ margin: 0 0 6px; color: #0f3b65; font-size: 26px; }}
+    p {{ margin: 0 0 18px; color: #64748b; line-height: 1.4; }}
+    label {{ display: block; margin-bottom: 12px; color: #334155; font-size: 13px; font-weight: 850; }}
+    input {{
+      width: 100%;
+      margin-top: 6px;
+      border: 1px solid #cde7e2;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 15px;
+      font-weight: 700;
+      background: #f8fafc;
+    }}
+    button {{
+      width: 100%;
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: #ffffff;
+      background: linear-gradient(135deg, #1769aa, #0f766e);
+      font-size: 15px;
+      font-weight: 950;
+      cursor: pointer;
+    }}
+    .login-error {{
+      margin-bottom: 12px;
+      border: 1px solid #fecaca;
+      border-radius: 10px;
+      padding: 10px;
+      color: #991b1b;
+      background: #fee2e2;
+      font-weight: 800;
+    }}
+  </style>
+</head>
+<body>
+  <form class="login-card" method="post" action="/login">
+    <div class="brand">विकल्प</div>
+    <h1>Income Desk</h1>
+    <p>Sign in to access trading, positions, income strategy, ETF actions, and Kite setup.</p>
+    {error_html}
+    <label>Username<input name="username" autocomplete="username" autofocus></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password"></label>
+    <button type="submit">Log in</button>
+  </form>
+</body>
+</html>""".encode("utf-8")
 
 
 def env_value(name: str) -> str:
@@ -8127,8 +8271,36 @@ def render_page(state: PageState) -> bytes:
 class KiteWebHandler(BaseHTTPRequestHandler):
     server_version = "KiteCSVTrader/1.0"
 
+    def auth_cookie_value(self) -> str:
+        raw_cookie = self.headers.get("Cookie", "")
+        for part in raw_cookie.split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.strip().split("=", 1)
+            if key == AUTH_COOKIE_NAME:
+                return value.strip()
+        return ""
+
+    def is_authenticated(self) -> bool:
+        return valid_auth_token(self.auth_cookie_value())
+
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
+        if parsed_url.path == "/login":
+            self.send_login()
+            return
+        if parsed_url.path == "/logout":
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header(
+                "Set-Cookie",
+                f"{AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+            )
+            self.end_headers()
+            return
+        if not self.is_authenticated():
+            self.send_login()
+            return
         if parsed_url.path == "/analytics":
             query = parse_qs(parsed_url.query, keep_blank_values=True)
             symbol = first(query, "symbol")
@@ -8214,6 +8386,24 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         form = parse_qs(body, keep_blank_values=True)
+        if self.path == "/login":
+            username = first(form, "username")
+            password = first(form, "password")
+            if verify_login(username, password):
+                token = make_auth_token(username)
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.send_header(
+                    "Set-Cookie",
+                    f"{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={AUTH_SESSION_SECONDS}; HttpOnly; SameSite=Lax",
+                )
+                self.end_headers()
+            else:
+                self.send_login("Invalid username or password.")
+            return
+        if not self.is_authenticated():
+            self.send_login()
+            return
         set_kite_env(form)
 
         state = PageState(
@@ -8601,6 +8791,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         content = render_page(state)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def send_login(self, error: str = "") -> None:
+        content = render_login_page(error)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
