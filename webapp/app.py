@@ -2842,10 +2842,12 @@ def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 def load_rows(csv_path: str, csv_text: str) -> tuple[list[dict[str, str]], str]:
     if is_web_csv_source(csv_path):
         text = fetch_csv_text_from_url(csv_path)
+        text = normalize_kite_csv_input(text)
         return parse_csv_text(text), text
 
     if csv_text.strip():
-        return parse_csv_text(csv_text), csv_text
+        text = normalize_kite_csv_input(csv_text)
+        return parse_csv_text(text), text
 
     path = Path(csv_path.strip() or DEFAULT_CSV_PATH)
     if not path.is_absolute():
@@ -2857,11 +2859,12 @@ def load_rows(csv_path: str, csv_text: str) -> tuple[list[dict[str, str]], str]:
     if not path.exists():
         raise FileNotFoundError(f"CSV file not found: {path}")
     text = path.read_text(encoding="utf-8-sig")
+    text = normalize_kite_csv_input(text)
     return parse_csv_text(text), text
 
 
 def persist_default_csv_text(csv_text: str) -> str:
-    text = csv_text.strip()
+    text = normalize_kite_csv_input(csv_text).strip()
     if not text:
         return ""
 
@@ -2885,7 +2888,7 @@ def persist_default_csv_text(csv_text: str) -> str:
 
 
 def save_today_csv_text(csv_text: str) -> tuple[str, str]:
-    text = csv_text.strip()
+    text = normalize_kite_csv_input(csv_text).strip()
     if not text:
         raise ValueError("CSV text is empty. Paste or upload CSV before saving.")
     parse_csv_text(text)
@@ -3438,7 +3441,6 @@ def canonicalize_kite_csv(candidate: str) -> str:
     reader = csv.DictReader(io.StringIO(candidate.lstrip("\ufeff")))
     if not reader.fieldnames:
         raise ValueError("CSV is missing a header row.")
-    canonical_headers = [canonical_field_name(name or "") for name in reader.fieldnames]
     row_count = 0
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=KITE_CSV_REQUIRED_FIELDS, lineterminator="\n")
@@ -3451,6 +3453,14 @@ def canonicalize_kite_csv(candidate: str) -> str:
         if not any(normalized.values()):
             continue
         row = {field: normalized.get(field, "") for field in KITE_CSV_REQUIRED_FIELDS}
+        if not row["quantity"]:
+            lots_text = normalized.get("lots", "")
+            lot_size_text = normalized.get("lot_size", "")
+            if lots_text and lot_size_text:
+                try:
+                    row["quantity"] = str(int(float(lots_text) * float(lot_size_text)))
+                except ValueError:
+                    raise ValueError("CSV lots and lot_size must be numeric.") from None
         if not row["exchange"]:
             row["exchange"] = "NFO"
         if not row["product"]:
@@ -3480,12 +3490,13 @@ def extract_csv_from_text(text: str) -> str:
         candidates.append(normalize_csv_candidate(markdown_csv))
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    required_headers = {"tradingsymbol", "quantity", "transaction_type"}
+    required_headers = {"tradingsymbol", "transaction_type"}
     for index, line in enumerate(lines):
         if "," not in line:
             continue
-        header = {item.strip().lower() for item in line.split(",")}
-        if not required_headers.issubset(header):
+        header = {canonical_field_name(item) for item in line.split(",")}
+        has_quantity = "quantity" in header or {"lots", "lot_size"}.issubset(header)
+        if not required_headers.issubset(header) or not has_quantity:
             continue
         csv_lines = [line]
         for next_line in lines[index + 1 :]:
@@ -3506,6 +3517,17 @@ def extract_csv_from_text(text: str) -> str:
     raise ValueError(
         "Could not find a valid Kite order CSV. Paste the GPT CSV output into the text box and try again."
     )
+
+
+def normalize_kite_csv_input(text: str) -> str:
+    """Accept a plain CSV or GPT text that contains a Kite CSV block."""
+    clean = text.strip()
+    if not clean:
+        return ""
+    try:
+        return canonicalize_kite_csv(clean).rstrip() + "\n"
+    except Exception:
+        return extract_csv_from_text(clean)
 
 
 def response_output_text(payload: dict[str, Any]) -> str:
@@ -4155,20 +4177,42 @@ def render_symbol_value(field: str, value: Any) -> str:
     return html.escape(text)
 
 
+def order_has_active_position(order: dict[str, Any], active_underlyings: set[str]) -> bool:
+    symbol = str(order.get("tradingsymbol") or "").strip().upper()
+    if not symbol:
+        return False
+    underlying = underlying_for_symbol(symbol)
+    return symbol in active_underlyings or bool(underlying and underlying in active_underlyings)
+
+
+def default_selected_order_indexes(orders: list[dict[str, Any]]) -> set[int]:
+    try:
+        active_underlyings = active_position_underlyings()
+    except Exception:
+        active_underlyings = set()
+    return {
+        index
+        for index, order in enumerate(orders)
+        if not order_has_active_position(order, active_underlyings)
+    }
+
+
 def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] | None = None) -> str:
     if not orders:
         return ""
-    selected = selected or set(range(len(orders)))
-    active_underlyings = active_position_underlyings()
+    if selected is None:
+        selected = default_selected_order_indexes(orders)
+    try:
+        active_underlyings = active_position_underlyings()
+    except Exception:
+        active_underlyings = set()
     header = "".join(f"<th>{html.escape(field)}</th>" for field in DISPLAY_FIELDS)
     rows = []
     for index, order in enumerate(orders):
         checked_attr = " checked" if index in selected else ""
         symbol = str(order.get("tradingsymbol") or "").strip().upper()
         underlying = underlying_for_symbol(symbol) if symbol else ""
-        has_active_position = bool(
-            symbol and (symbol in active_underlyings or underlying in active_underlyings)
-        )
+        has_active_position = order_has_active_position(order, active_underlyings)
         row_class = ' class="order-existing-position"' if has_active_position else ""
         row_title = (
             f' title="Existing Kite position found for {html.escape(underlying or symbol, quote=True)}"'
@@ -5465,8 +5509,15 @@ def render_page(state: PageState) -> bytes:
         if state.rows
         else ""
     )
+    execution_checks = (
+        '<div class="execution-checks">'
+        f'{render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}'
+        f'{render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}'
+        f'{render_checkbox("keep_existing_orders", "Always place new order", state.keep_existing_orders, "Turn off to modify a similar open order when found; if no modifiable order exists, the app places a new order.")}'
+        "</div>"
+    )
     execute_after_orders = (
-        f'<div class="actions order-execute-actions">{execute_button}</div>'
+        f'<div class="actions order-execute-actions">{execute_button}</div>{execution_checks}'
         if execute_button
         else ""
     )
@@ -7746,11 +7797,6 @@ def render_page(state: PageState) -> bytes:
           <button type="submit" formaction="/load">Load / Preview CSV</button>
         </div>
         {render_results(state.results)}
-        <div class="execution-checks">
-          {render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}
-          {render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}
-          {render_checkbox("keep_existing_orders", "Always place new order", state.keep_existing_orders, "Turn off to modify a similar open order when found; if no modifiable order exists, the app places a new order.")}
-        </div>
       </section>
       <div>
         <section class="panel">
@@ -8333,8 +8379,52 @@ def render_page(state: PageState) -> bytes:
     return html_doc.encode("utf-8")
 
 
+def render_fallback_error_page(error: str) -> bytes:
+    body = render_graceful_error(error, "Page render error")
+    html_doc = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vikalp Income Desk - Error</title>
+  <style>
+    body {{ margin: 0; font-family: Arial, sans-serif; background: #eef7f5; color: #07152b; }}
+    main {{ max-width: 980px; margin: 40px auto; padding: 0 18px; }}
+    .alert {{ border: 1px solid #fecaca; background: #fee2e2; color: #7f1d1d; border-radius: 12px; padding: 16px; }}
+    .alert-close {{ float: right; }}
+    pre {{ white-space: pre-wrap; font-family: Consolas, monospace; }}
+    textarea {{ width: 100%; min-height: 220px; }}
+    a {{ color: #006b5f; font-weight: 700; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Vikalp Income Desk</h1>
+    {body}
+    <p><a href="/">Back to app</a></p>
+  </main>
+</body>
+</html>"""
+    return html_doc.encode("utf-8")
+
+
 class KiteWebHandler(BaseHTTPRequestHandler):
     server_version = "KiteCSVTrader/1.0"
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except Exception as exc:
+            try:
+                content = render_fallback_error_page(f"{exc}\n\n{traceback.format_exc()}")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+            except Exception:
+                raise
 
     def auth_cookie_value(self) -> str:
         raw_cookie = self.headers.get("Cookie", "")
@@ -8541,7 +8631,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.keep_existing_orders,
                 )
                 state.trade_validations = validate_trade_orders(state.orders)
-                state.selected_indexes = set(range(len(state.orders)))
+                state.selected_indexes = default_selected_order_indexes(state.orders)
                 state.message = f"{persist_message} Loaded {len(state.orders)} order(s).".strip()
             elif self.path == "/csv/save-today":
                 state.csv_path, state.message = save_today_csv_text(state.csv_text)
@@ -8564,7 +8654,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.keep_existing_orders,
                 )
                 state.trade_validations = validate_trade_orders(state.orders)
-                state.selected_indexes = set(range(len(state.orders)))
+                state.selected_indexes = selected
                 if state.dry_run:
                     state.message = (
                         f"{persist_message} Dry run completed for "
@@ -8692,7 +8782,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             elif self.path in {"/gpt/save", "/gpt/save-preview"}:
                 if not state.gpt_csv_text.strip():
                     state.gpt_csv_text = extract_csv_from_text(state.gpt_conversation)
-                parse_csv_text(state.gpt_csv_text)
+                state.gpt_csv_text = normalize_kite_csv_input(state.gpt_csv_text)
                 persist_message = persist_default_csv_text(state.gpt_csv_text)
                 state.csv_text = state.gpt_csv_text
                 if self.path == "/gpt/save-preview":
@@ -8703,7 +8793,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         True,
                         state.keep_existing_orders,
                     )
-                    state.selected_indexes = set(range(len(state.orders)))
+                    state.selected_indexes = default_selected_order_indexes(state.orders)
                     state.message = (
                         f"{persist_message} Previewed {len(state.orders)} order(s)."
                     ).strip()
@@ -8854,7 +8944,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         self.send_page(state)
 
     def send_page(self, state: PageState) -> None:
-        content = render_page(state)
+        try:
+            content = render_page(state)
+        except Exception as exc:
+            content = render_fallback_error_page(f"{exc}\n\n{traceback.format_exc()}")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
