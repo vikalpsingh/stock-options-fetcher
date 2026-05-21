@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import copy
 import csv
 import hashlib
 import hmac
@@ -159,6 +160,21 @@ TOP_WATCHLIST = [
     "NTPC",
     "WAAREEENER",
 ]
+GLOBAL_MARKET_WATCHLIST = [
+    {"label": "Nifty Fut", "symbol": "^NSEI"},
+    {"label": "Nasdaq", "symbol": "^IXIC"},
+    {"label": "FTSE", "symbol": "^FTSE"},
+    {"label": "Hang Seng", "symbol": "^HSI"},
+    {"label": "Nikkei", "symbol": "^N225"},
+    {"label": "Gold", "symbol": "GC=F"},
+    {"label": "Crude", "symbol": "CL=F"},
+]
+TOP_QUOTE_REFRESH_MS = 300000
+TOP_QUOTE_CACHE_SECONDS = 300
+APP_CACHE: dict[str, tuple[float, Any]] = {}
+KITE_READ_CACHE_SECONDS = 60
+KITE_QUOTE_CACHE_SECONDS = 30
+KITE_INSTRUMENT_CACHE_SECONDS = 3600
 STOCK_NEWS_NAMES = {
     "BAJFINANCE": "Bajaj Finance",
     "TATACONSUM": "Tata Consumer Products",
@@ -854,6 +870,8 @@ def fetch_public_ip_data() -> list[dict[str, str]]:
             results.append({"label": label, "ip": ip_value, "error": ""})
         except Exception as exc:
             results.append({"label": label, "ip": "", "error": str(exc)})
+    if any(item.get("status") == "CANCELLED" for item in results):
+        invalidate_kite_trade_cache()
     return results
 
 
@@ -1243,7 +1261,7 @@ def option_analytics_for_symbol(symbol: str) -> dict[str, Any]:
     strike = float(parts["strike"])
     option_key = f"NFO:{symbol}"
     spot_key = f"NSE:{parts['underlying']}"
-    quotes = kite.quote([option_key, spot_key])
+    quotes = cached_kite_quote(kite, [option_key, spot_key])
     option_quote = quotes.get(option_key, {})
     spot_quote = quotes.get(spot_key, {})
     option_price = quote_ltp(option_quote)
@@ -1770,7 +1788,7 @@ def option_risk_lights(data: dict[str, Any]) -> dict[str, Any]:
 def option_chain_analytics(kite: Any, parts: dict[str, Any], spot: float) -> dict[str, Any]:
     instruments = [
         item
-        for item in kite.instruments("NFO")
+        for item in cached_kite_instruments(kite, "NFO")
         if str(item.get("name", "")).upper() == parts["underlying"]
         and str(item.get("instrument_type", "")).upper() in {"CE", "PE"}
         and item.get("expiry") == expiry_date_for_parts(parts)
@@ -1781,7 +1799,7 @@ def option_chain_analytics(kite: Any, parts: dict[str, Any], spot: float) -> dic
     keys = [f"NFO:{item['tradingsymbol']}" for item in instruments]
     quotes: dict[str, Any] = {}
     for index in range(0, len(keys), 400):
-        quotes.update(kite.quote(keys[index : index + 400]))
+        quotes.update(cached_kite_quote(kite, keys[index : index + 400]))
 
     by_strike: dict[float, dict[str, int]] = {}
     for item in instruments:
@@ -1820,7 +1838,7 @@ def open_option_positions() -> list[dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     kite = kite_orders.kite_client()
-    positions = kite.positions().get("net", [])
+    positions = cached_kite_positions(kite)
     active: list[dict[str, Any]] = []
     for position in positions:
         quantity = int(position.get("quantity") or 0)
@@ -1848,7 +1866,7 @@ def active_position_underlyings() -> set[str]:
         stream = io.StringIO()
         with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
             kite = kite_orders.kite_client()
-            positions = kite.positions().get("net", [])
+            positions = cached_kite_positions(kite)
     except Exception:
         return set()
     active: set[str] = set()
@@ -2142,7 +2160,11 @@ def selected_trade_guardrails(orders: list[dict[str, Any]]) -> dict[str, Any]:
                     or item.get("initial", {}).get("total")
                     or 0
                 )
-                for item in kite.order_margins(margin_orders)
+                for item in cached_value(
+                    "kite:margin:selected:" + json.dumps(margin_orders, sort_keys=True, default=str),
+                    lambda: kite.order_margins(margin_orders),
+                    KITE_READ_CACHE_SECONDS,
+                )
             )
         except Exception:
             selected_margin = sum(
@@ -2206,13 +2228,13 @@ def income_selected_expiry(expiries: list[date], today: date) -> tuple[date, dat
 
 def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
     today = datetime.now().date()
-    spot_quote = kite.quote([f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
+    spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
     spot = quote_ltp(spot_quote)
     if spot <= 0:
         raise ValueError(f"Could not read spot for {underlying}.")
     instruments = [
         item
-        for item in kite.instruments("NFO")
+        for item in cached_kite_instruments(kite, "NFO")
         if str(item.get("name", "")).upper() == underlying
         and str(item.get("instrument_type", "")).upper() == "PE"
         and item.get("expiry")
@@ -2249,13 +2271,13 @@ def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
 
 def next_monthly_ce_candidate(kite: Any, underlying: str) -> dict[str, Any]:
     today = datetime.now().date()
-    spot_quote = kite.quote([f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
+    spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
     spot = quote_ltp(spot_quote)
     if spot <= 0:
         raise ValueError(f"Could not read spot for {underlying}.")
     instruments = [
         item
-        for item in kite.instruments("NFO")
+        for item in cached_kite_instruments(kite, "NFO")
         if str(item.get("name", "")).upper() == underlying
         and str(item.get("instrument_type", "")).upper() == "CE"
         and item.get("expiry")
@@ -2294,8 +2316,8 @@ def income_share_holdings(kite: Any) -> dict[str, dict[str, Any]]:
     wanted = {item["symbol"] for item in INCOME_UNDERLYINGS}
     holdings: dict[str, dict[str, Any]] = {}
     quote_keys = [f"NSE:{symbol}" for symbol in wanted]
-    quotes = kite.quote(quote_keys)
-    for holding in kite.holdings():
+    quotes = cached_kite_quote(kite, quote_keys)
+    for holding in cached_value("kite:holdings", kite.holdings, KITE_READ_CACHE_SECONDS):
         symbol = str(holding.get("tradingsymbol") or "").upper()
         if symbol not in wanted:
             continue
@@ -2331,7 +2353,7 @@ def income_pnl_summary(kite: Any, holdings: dict[str, dict[str, Any]]) -> dict[s
         }
         for item in INCOME_UNDERLYINGS
     }
-    positions = kite.positions().get("net", [])
+    positions = cached_kite_positions(kite)
     for position in positions:
         symbol = str(position.get("tradingsymbol") or "").upper()
         underlying = underlying_for_symbol(symbol)
@@ -2365,7 +2387,8 @@ def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
         raise ValueError(
             f"Need at least {lot_size} shares of {clean_underlying} for one covered CE lot. Holding: {held_qty}."
         )
-    quote = kite.quote([f"NFO:{candidate['symbol']}"]).get(f"NFO:{candidate['symbol']}", {})
+    quote_key = f"NFO:{candidate['symbol']}"
+    quote = cached_kite_quote(kite, [quote_key]).get(quote_key, {})
     price = quote_ltp(quote)
     if price <= 0:
         raise ValueError(f"Could not read CE premium for {candidate['symbol']}.")
@@ -2408,7 +2431,8 @@ def place_income_cash_secured_put_order(underlying: str) -> dict[str, Any]:
     lot_size = int(candidate.get("lot_size") or 0)
     if lot_size <= 0:
         raise ValueError(f"Could not read lot size for {candidate['symbol']}.")
-    quote = kite.quote([f"NFO:{candidate['symbol']}"]).get(f"NFO:{candidate['symbol']}", {})
+    quote_key = f"NFO:{candidate['symbol']}"
+    quote = cached_kite_quote(kite, [quote_key]).get(quote_key, {})
     current_price = quote_ltp(quote)
     if current_price <= 0:
         raise ValueError(f"Could not read PE premium for {candidate['symbol']}.")
@@ -2426,6 +2450,7 @@ def place_income_cash_secured_put_order(underlying: str) -> dict[str, Any]:
         "tag": "INCOME_CSP",
     }
     order_id = kite_orders.place_order(kite, order)
+    invalidate_kite_trade_cache()
     assignment_value = float(candidate.get("strike") or 0) * lot_size
     return {
         "tradingsymbol": candidate["symbol"],
@@ -2650,7 +2675,15 @@ def margin_required_for_position(kite: Any, position: dict[str, Any]) -> float:
         "order_type": "MARKET",
         "quantity": abs(quantity),
     }
-    margin_rows = kite.order_margins([order])
+    cache_key = (
+        f"kite:margin:{order['exchange']}:{order['tradingsymbol']}:"
+        f"{order['transaction_type']}:{order['product']}:{order['quantity']}"
+    )
+    margin_rows = cached_value(
+        cache_key,
+        lambda: kite.order_margins([order]),
+        KITE_READ_CACHE_SECONDS,
+    )
     if not margin_rows:
         return 0.0
     margin = margin_rows[0]
@@ -2728,8 +2761,9 @@ def build_position_close_buy_order(symbol: str) -> dict[str, Any]:
     quantity = abs(int(position.get("quantity") or 0))
     ltp = float(position.get("ltp") or 0)
     if ltp <= 0:
-        quote = kite.quote([f"{position.get('exchange') or 'NFO'}:{clean_symbol}"]).get(
-            f"{position.get('exchange') or 'NFO'}:{clean_symbol}",
+        quote_key = f"{position.get('exchange') or 'NFO'}:{clean_symbol}"
+        quote = cached_kite_quote(kite, [quote_key]).get(
+            quote_key,
             {},
         )
         ltp = quote_ltp(quote)
@@ -2759,6 +2793,7 @@ def place_position_close_buy_order(symbol: str) -> dict[str, Any]:
     order = build_position_close_buy_order(symbol)
     kite = kite_orders.kite_client()
     order_id = kite_orders.place_order(kite, order)
+    invalidate_kite_trade_cache()
     return {
         "tradingsymbol": order["tradingsymbol"],
         "status": "LIVE_SENT",
@@ -2773,6 +2808,10 @@ def place_position_close_buy_order(symbol: str) -> dict[str, Any]:
 def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    cached = APP_CACHE.get("positions-research")
+    now = time.time()
+    if cached and now - cached[0] < KITE_READ_CACHE_SECONDS:
+        return copy.deepcopy(cached[1])
     kite = kite_orders.kite_client()
     positions = open_option_positions()
     rows: list[dict[str, Any]] = []
@@ -2836,7 +2875,9 @@ def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "total_deployed": total_deployed,
         "return_pct": (total_pnl / total_deployed * 100) if total_deployed > 0 else None,
     }
-    return rows, summary
+    result = (rows, summary)
+    APP_CACHE["positions-research"] = (now, copy.deepcopy(result))
+    return result
 
 
 def load_rows(csv_path: str, csv_text: str) -> tuple[list[dict[str, str]], str]:
@@ -2922,7 +2963,77 @@ def mmi_zone(value: float) -> str:
     return "Extreme Fear"
 
 
-def fetch_mmi_snapshot() -> dict[str, Any]:
+def cached_value(cache_key: str, fetcher: Any, ttl_seconds: int) -> Any:
+    now = time.time()
+    cached = APP_CACHE.get(cache_key)
+    if cached and now - cached[0] < ttl_seconds:
+        return copy.deepcopy(cached[1])
+    value = fetcher()
+    APP_CACHE[cache_key] = (now, copy.deepcopy(value))
+    return value
+
+
+def cached_payload(cache_key: str, fetcher: Any, ttl_seconds: int = TOP_QUOTE_CACHE_SECONDS) -> dict[str, Any]:
+    now = time.time()
+    cached = APP_CACHE.get(cache_key)
+    if cached and now - cached[0] < ttl_seconds:
+        payload = copy.deepcopy(cached[1])
+        payload["cached"] = True
+        payload["cache_age_seconds"] = int(now - cached[0])
+        return payload
+    payload = fetcher()
+    payload["cached"] = False
+    payload["cache_age_seconds"] = 0
+    APP_CACHE[cache_key] = (now, copy.deepcopy(payload))
+    return payload
+
+
+def clear_app_cache(prefixes: tuple[str, ...] = ()) -> None:
+    if not prefixes:
+        APP_CACHE.clear()
+        return
+    for key in list(APP_CACHE):
+        if key.startswith(prefixes):
+            APP_CACHE.pop(key, None)
+
+
+def cached_kite_quote(kite: Any, keys: list[str] | tuple[str, ...], ttl_seconds: int = KITE_QUOTE_CACHE_SECONDS) -> dict[str, Any]:
+    clean_keys = tuple(sorted(str(key) for key in keys if key))
+    if not clean_keys:
+        return {}
+    return cached_value(
+        "kite:quote:" + "|".join(clean_keys),
+        lambda: kite.quote(list(clean_keys)),
+        ttl_seconds,
+    )
+
+
+def cached_kite_positions(kite: Any) -> list[dict[str, Any]]:
+    return cached_value(
+        "kite:positions",
+        lambda: kite.positions().get("net", []),
+        KITE_READ_CACHE_SECONDS,
+    )
+
+
+def cached_kite_orders(kite: Any) -> list[dict[str, Any]]:
+    return cached_value("kite:orders", kite.orders, KITE_READ_CACHE_SECONDS)
+
+
+def cached_kite_instruments(kite: Any, exchange: str) -> list[dict[str, Any]]:
+    clean_exchange = exchange.strip().upper()
+    return cached_value(
+        f"kite:instruments:{clean_exchange}",
+        lambda: kite.instruments(clean_exchange),
+        KITE_INSTRUMENT_CACHE_SECONDS,
+    )
+
+
+def invalidate_kite_trade_cache() -> None:
+    clear_app_cache(("kite:orders", "kite:positions", "kite:holdings", "kite:margin", "kite:quote", "positions-research"))
+
+
+def fetch_mmi_snapshot_uncached() -> dict[str, Any]:
     request = Request(
         MMI_URL,
         headers={
@@ -2958,6 +3069,10 @@ def fetch_mmi_snapshot() -> dict[str, Any]:
     }
 
 
+def fetch_mmi_snapshot() -> dict[str, Any]:
+    return cached_payload("mmi", fetch_mmi_snapshot_uncached)
+
+
 def csv_underlyings(csv_text: str) -> list[str]:
     underlyings: list[str] = []
     seen: set[str] = set()
@@ -2969,7 +3084,7 @@ def csv_underlyings(csv_text: str) -> list[str]:
     return underlyings
 
 
-def fetch_csv_market_quotes() -> dict[str, Any]:
+def fetch_csv_market_quotes_uncached() -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
 
@@ -2987,7 +3102,7 @@ def fetch_csv_market_quotes() -> dict[str, Any]:
 
     kite = kite_orders.kite_client()
     instruments = [f"NSE:{item['symbol']}" for item in quote_items]
-    raw_quotes = kite.quote(instruments)
+    raw_quotes = cached_kite_quote(kite, instruments)
     quotes: list[dict[str, Any]] = []
     for item in quote_items:
         symbol = str(item["symbol"])
@@ -3021,13 +3136,84 @@ def fetch_csv_market_quotes() -> dict[str, Any]:
     return {"ok": True, "quotes": quotes}
 
 
-def fetch_commodity_etf_quotes() -> dict[str, Any]:
+def fetch_csv_market_quotes() -> dict[str, Any]:
+    return cached_payload("market-quotes", fetch_csv_market_quotes_uncached)
+
+
+def fetch_yahoo_quote(symbol: str, label: str) -> dict[str, Any]:
+    encoded_symbol = quote_plus(symbol)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}?range=5d&interval=1d"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+            )
+        },
+    )
+    with urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    result = ((payload.get("chart") or {}).get("result") or [{}])[0]
+    meta = result.get("meta") or {}
+    current = float(
+        meta.get("regularMarketPrice")
+        or meta.get("previousClose")
+        or meta.get("chartPreviousClose")
+        or 0
+    )
+    previous = float(meta.get("chartPreviousClose") or meta.get("previousClose") or 0)
+    close_values = (
+        ((result.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+    )
+    valid_closes = [float(value) for value in close_values if value is not None]
+    if current <= 0 and valid_closes:
+        current = valid_closes[-1]
+    if previous <= 0 and len(valid_closes) >= 2:
+        previous = valid_closes[-2]
+    change_percent = ((current - previous) / previous * 100) if previous > 0 else None
+    return {
+        "label": label,
+        "symbol": symbol,
+        "ltp": round(current, 2) if current > 0 else None,
+        "change_percent": round(change_percent, 2) if change_percent is not None else None,
+    }
+
+
+def fetch_global_market_quotes_uncached() -> dict[str, Any]:
+    quotes: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for item in GLOBAL_MARKET_WATCHLIST:
+        try:
+            quotes.append(fetch_yahoo_quote(str(item["symbol"]), str(item["label"])))
+        except Exception as exc:
+            errors.append(f"{item['label']}: {exc}")
+            quotes.append(
+                {
+                    "label": str(item["label"]),
+                    "symbol": str(item["symbol"]),
+                    "ltp": None,
+                    "change_percent": None,
+                }
+            )
+    return {
+        "ok": not errors,
+        "quotes": quotes,
+        "error": "; ".join(errors),
+    }
+
+
+def fetch_global_market_quotes() -> dict[str, Any]:
+    return cached_payload("global-quotes", fetch_global_market_quotes_uncached)
+
+
+def fetch_commodity_etf_quotes_uncached() -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
 
     kite = kite_orders.kite_client()
     instruments = [f"NSE:{item['symbol']}" for item in COMMODITY_ETFS]
-    raw_quotes = kite.quote(instruments)
+    raw_quotes = cached_kite_quote(kite, instruments)
     quotes: list[dict[str, Any]] = []
     for item in COMMODITY_ETFS:
         key = f"NSE:{item['symbol']}"
@@ -3063,6 +3249,10 @@ def fetch_commodity_etf_quotes() -> dict[str, Any]:
             }
         )
     return {"ok": True, "quotes": quotes}
+
+
+def fetch_commodity_etf_quotes() -> dict[str, Any]:
+    return cached_payload("commodity-quotes", fetch_commodity_etf_quotes_uncached)
 
 
 def commodity_etf_by_symbol(symbol: str) -> dict[str, Any]:
@@ -3103,7 +3293,7 @@ def commodity_etf_rsi(kite: Any, symbol: str) -> float | None:
         instrument = next(
             (
                 item
-                for item in kite.instruments("NSE")
+                for item in cached_kite_instruments(kite, "NSE")
                 if str(item.get("tradingsymbol") or "").upper() == clean_symbol
             ),
             None,
@@ -3134,7 +3324,7 @@ def place_commodity_etf_order(symbol: str, allow_manual_override: bool = False) 
     item = commodity_etf_by_symbol(symbol)
     clean_symbol = str(item["symbol"]).upper()
     kite = kite_orders.kite_client()
-    quote = kite.quote([f"NSE:{clean_symbol}"]).get(f"NSE:{clean_symbol}", {})
+    quote = cached_kite_quote(kite, [f"NSE:{clean_symbol}"]).get(f"NSE:{clean_symbol}", {})
     ltp = float(quote.get("last_price") or 0)
     previous_close = float((quote.get("ohlc") or {}).get("close") or 0)
     if ltp <= 0:
@@ -3173,6 +3363,7 @@ def place_commodity_etf_order(symbol: str, allow_manual_override: bool = False) 
         "tag": "ETF_BUY",
     }
     order_id = kite_orders.place_order(kite, order)
+    invalidate_kite_trade_cache()
     return {
         "tradingsymbol": clean_symbol,
         "status": "LIVE_SENT",
@@ -3199,18 +3390,18 @@ def commodity_etf_holdings() -> list[dict[str, Any]]:
     )
     by_symbol = {
         str(holding.get("tradingsymbol") or "").upper(): holding
-        for holding in kite.holdings()
+        for holding in cached_value("kite:holdings", kite.holdings, KITE_READ_CACHE_SECONDS)
     }
     positions_by_symbol: dict[str, dict[str, Any]] = {}
     try:
-        for position in kite.positions().get("net", []):
+        for position in cached_kite_positions(kite):
             symbol = str(position.get("tradingsymbol") or "").upper()
             if symbol in all_symbols and str(position.get("exchange") or "").upper() == "NSE":
                 positions_by_symbol[symbol] = position
     except Exception:
         positions_by_symbol = {}
     quote_keys = [f"NSE:{symbol}" for symbol in symbols]
-    quotes = kite.quote(quote_keys)
+    quotes = cached_kite_quote(kite, quote_keys)
     rows: list[dict[str, Any]] = []
     for item in COMMODITY_ETFS:
         symbol = str(item["symbol"]).upper()
@@ -3305,7 +3496,7 @@ def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
     if quantity <= 0:
         raise ValueError(f"No sellable ETF holding quantity found for {clean_symbol}.")
     kite = kite_orders.kite_client()
-    quote = kite.quote([f"NSE:{clean_symbol}"]).get(f"NSE:{clean_symbol}", {})
+    quote = cached_kite_quote(kite, [f"NSE:{clean_symbol}"]).get(f"NSE:{clean_symbol}", {})
     ltp = float(quote.get("last_price") or holding.get("ltp") or 0)
     if ltp <= 0:
         raise ValueError(f"Could not read live LTP for {clean_symbol}.")
@@ -3323,6 +3514,7 @@ def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
         "tag": "ETF_BOOK",
     }
     order_id = kite_orders.place_order(kite, order)
+    invalidate_kite_trade_cache()
     return {
         "tradingsymbol": clean_symbol,
         "status": "LIVE_SENT",
@@ -3753,6 +3945,8 @@ def execute_orders(
                     "detail": str(exc),
                 }
             )
+    if any(item.get("status") == "LIVE_SENT" for item in results):
+        invalidate_kite_trade_cache()
     return orders, results
 
 
@@ -3769,7 +3963,7 @@ def kite_order_book() -> list[dict[str, Any]]:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     kite = kite_orders.kite_client()
     rows: list[dict[str, Any]] = []
-    orders = list(reversed(kite.orders()))
+    orders = list(reversed(cached_kite_orders(kite)))
     quote_keys = sorted(
         {
             f"{str(order.get('exchange') or '').upper()}:{str(order.get('tradingsymbol') or '').upper()}"
@@ -3777,7 +3971,7 @@ def kite_order_book() -> list[dict[str, Any]]:
             if order.get("exchange") and order.get("tradingsymbol")
         }
     )
-    quotes = kite.quote(quote_keys) if quote_keys else {}
+    quotes = cached_kite_quote(kite, quote_keys) if quote_keys else {}
     for order in orders:
         status = str(order.get("status") or "").upper()
         exchange = str(order.get("exchange") or "")
@@ -3880,6 +4074,8 @@ def cancel_selected_orders(order_keys: list[str]) -> list[dict[str, Any]]:
                     "detail": str(exc),
                 }
             )
+    if any(item.get("status") == "MODIFIED" for item in results):
+        invalidate_kite_trade_cache()
     return results
 
 
@@ -3972,6 +4168,8 @@ def modify_selected_orders(order_keys: list[str], form: dict[str, list[str]]) ->
                     "detail": str(exc),
                 }
             )
+    if any(item.get("status") == "CANCELLED" for item in results):
+        invalidate_kite_trade_cache()
     return results
 
 
@@ -4426,6 +4624,17 @@ def render_order_book(state: PageState) -> str:
 
 def render_order_management_panel(state: PageState) -> str:
     panel_style = "" if state.active_tab == "order-management" else ' style="display:none"'
+    if state.active_tab != "order-management":
+        order_book_html = ""
+    elif state.order_book is not None or state.order_book_error:
+        order_book_html = render_order_book(state)
+    else:
+        order_book_html = (
+            '<section class="panel order-book-panel"><div class="panel-title">Kite Orders</div>'
+            '<p class="status">Click Refresh Orders to load open Kite orders. No Kite order API is called until you click.</p>'
+            '<div class="actions"><button type="submit" formaction="/orders/refresh">Refresh Orders</button></div>'
+            "</section>"
+        )
     return f"""
     <form id="order-management-panel" method="post" action="/orders/refresh"{panel_style}>
       {env_hidden_fields_for_render()}
@@ -4436,7 +4645,7 @@ def render_order_management_panel(state: PageState) -> str:
         </div>
         <button type="submit" formaction="/orders/cancel-all" class="cancel-all-button">Cancel All Orders</button>
       </section>
-      {render_order_book(state)}
+      {order_book_html}
       {render_results(state.results)}
       {render_console(state.console_log)}
     </form>
@@ -4954,11 +5163,6 @@ def render_positions_panel(
     position_orders_table: str = "",
     position_execute_button: str = "",
 ) -> str:
-    if state.active_tab == "positions" and state.positions_rows is None:
-        try:
-            state.positions_rows, state.positions_summary = positions_research()
-        except Exception as exc:
-            state.error = f"{exc}\n\n{traceback.format_exc()}"
     rows = state.positions_rows or []
     summary = state.positions_summary or {}
     def compact_signal(value: Any) -> str:
@@ -5424,6 +5628,15 @@ def render_market_topper(state: PageState) -> str:
             '<div class="quote-card"><div class="quote-symbol">No tickers</div>'
             '<div class="quote-ltp">Load CSV</div><div class="quote-change">--</div></div>'
         )
+    global_quote_cards = "".join(
+        '<div class="global-card" data-global-symbol="'
+        f'{html.escape(str(item["symbol"]), quote=True)}">'
+        f'<span class="global-label">{html.escape(str(item["label"]))}</span>'
+        '<span class="global-ltp">...</span>'
+        '<span class="global-change">--</span>'
+        "</div>"
+        for item in GLOBAL_MARKET_WATCHLIST
+    )
     summaries = expiry_summaries(order_symbols)
     if summaries:
         expiry_cards = "".join(
@@ -5469,6 +5682,11 @@ def render_market_topper(state: PageState) -> str:
           <div class="mmi-line"><span id="mmi-zone">Tickertape MMI</span><span id="mmi-action">| Signal: <strong>Checking...</strong></span></div>
           <a href="{MMI_URL}" target="_blank" rel="noopener">Open MMI</a>
         </div>
+      </div>
+      <div class="global-market-strip">
+        <div class="global-market-title">Global cues</div>
+        <div class="global-error" id="global-error"></div>
+        <div class="global-grid" id="global-grid">{global_quote_cards}</div>
       </div>
       <div class="expiry-strip">
         {expiry_cards}
@@ -5868,6 +6086,73 @@ def render_page(state: PageState) -> bytes:
     }}
     .quote-change.up {{ color: #047857; }}
     .quote-change.down {{ color: #b42318; }}
+    .global-market-strip {{
+      margin: 0 0 8px;
+      padding: 7px 10px;
+      border: 1px solid rgba(15, 118, 110, 0.16);
+      border-radius: 12px;
+      background: linear-gradient(135deg, rgba(240, 253, 250, 0.92), rgba(239, 246, 255, 0.92));
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px;
+      align-items: center;
+    }}
+    .global-market-title {{
+      color: #0f766e;
+      font-size: 10px;
+      font-weight: 900;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }}
+    .global-grid {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-items: center;
+    }}
+    .global-card {{
+      display: inline-flex;
+      align-items: baseline;
+      gap: 5px;
+      min-height: 22px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid #c7d2fe;
+      background: #f8fafc;
+    }}
+    .global-card.up {{
+      border-color: #86efac;
+      background: #ecfdf5;
+    }}
+    .global-card.down {{
+      border-color: #fca5a5;
+      background: #fff1f2;
+    }}
+    .global-label {{
+      color: #334155;
+      font-size: 9px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }}
+    .global-ltp {{
+      font-size: 11px;
+      font-weight: 950;
+      color: #07152b;
+    }}
+    .global-change {{
+      font-size: 9.5px;
+      font-weight: 900;
+      color: #64748b;
+    }}
+    .global-change.up {{ color: #047857; }}
+    .global-change.down {{ color: #b42318; }}
+    .global-error {{
+      display: none;
+      grid-column: 1 / -1;
+      color: #991b1b;
+      font-size: 11px;
+      font-weight: 800;
+    }}
     header {{
       padding: 7px 18px;
       box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
@@ -7949,12 +8234,20 @@ def render_page(state: PageState) -> bytes:
     for (const button of document.querySelectorAll('.tab-button')) {{
       button.addEventListener('click', () => {{
         const active = button.dataset.tab;
-        if (active === 'commodity' && window.location.pathname !== '/commodity') {{
-          window.location.href = '/commodity';
-          return;
-        }}
-        if (active === 'positions' && window.location.pathname !== '/positions') {{
-          window.location.href = '/positions';
+        const routes = {{
+          place: '/',
+          positions: '/positions',
+          analytics: '/analytics',
+          research: '/research',
+          income: '/income',
+          commodity: '/commodity',
+          'order-management': '/orders',
+          gpt: '/gpt',
+          'kite-setup': '/kite-setup'
+        }};
+        const route = routes[active] || '/';
+        if (window.location.pathname !== route) {{
+          window.location.href = route;
           return;
         }}
         document.getElementById('place-panel').style.display = active === 'place' ? '' : 'none';
@@ -8255,6 +8548,54 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     refreshMmi();
+    setInterval(refreshMmi, {TOP_QUOTE_REFRESH_MS});
+    async function refreshGlobalQuotes() {{
+      const cards = Array.from(document.querySelectorAll('.global-card[data-global-symbol]'));
+      if (!cards.length) return;
+      const errorBox = document.getElementById('global-error');
+      try {{
+        const response = await fetch('/global-quotes', {{ cache: 'no-store' }});
+        const data = await response.json();
+        const bySymbol = new Map((data.quotes || []).map((quote) => [quote.symbol, quote]));
+        if (errorBox) {{
+          errorBox.style.display = data.ok ? 'none' : 'block';
+          errorBox.textContent = data.ok ? '' : (data.error || 'Some global quotes unavailable');
+        }}
+        for (const card of cards) {{
+          const symbol = card.dataset.globalSymbol;
+          const quote = bySymbol.get(symbol);
+          const ltp = card.querySelector('.global-ltp');
+          const change = card.querySelector('.global-change');
+          if (!quote || quote.ltp === null || quote.ltp === undefined) {{
+            ltp.textContent = 'N/A';
+            change.textContent = '--';
+            change.className = 'global-change';
+            card.classList.remove('up', 'down');
+            continue;
+          }}
+          ltp.textContent = Number(quote.ltp).toFixed(2);
+          if (quote.change_percent === null || quote.change_percent === undefined) {{
+            change.textContent = '--';
+            change.className = 'global-change';
+            card.classList.remove('up', 'down');
+          }} else {{
+            const pct = Number(quote.change_percent);
+            const sign = pct > 0 ? '+' : '';
+            change.textContent = `${{sign}}${{pct.toFixed(2)}}%`;
+            change.className = `global-change ${{pct >= 0 ? 'up' : 'down'}}`;
+            card.classList.toggle('up', pct >= 0);
+            card.classList.toggle('down', pct < 0);
+          }}
+        }}
+      }} catch (error) {{
+        if (errorBox) {{
+          errorBox.style.display = 'block';
+          errorBox.textContent = `Global quote error: ${{error.message}}`;
+        }}
+      }}
+    }}
+    refreshGlobalQuotes();
+    setInterval(refreshGlobalQuotes, {TOP_QUOTE_REFRESH_MS});
     async function refreshQuotes() {{
       const cards = Array.from(document.querySelectorAll('.quote-card[data-symbol]'));
       if (!cards.length) return;
@@ -8312,7 +8653,7 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     refreshQuotes();
-    setInterval(refreshQuotes, 30000);
+    setInterval(refreshQuotes, {TOP_QUOTE_REFRESH_MS});
     async function refreshCommodityQuotes() {{
       const cards = Array.from(document.querySelectorAll('.commodity-card[data-symbol]'));
       if (!cards.length) return;
@@ -8372,7 +8713,7 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     refreshCommodityQuotes();
-    setInterval(refreshCommodityQuotes, 30000);
+    setInterval(refreshCommodityQuotes, {TOP_QUOTE_REFRESH_MS});
   </script>
 </body>
 </html>"""
@@ -8476,6 +8817,21 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/positions":
             self.send_page(PageState(active_tab="positions"))
             return
+        if parsed_url.path == "/orders":
+            self.send_page(PageState(active_tab="order-management"))
+            return
+        if parsed_url.path == "/income":
+            self.send_page(PageState(active_tab="income"))
+            return
+        if parsed_url.path == "/research":
+            self.send_page(PageState(active_tab="research"))
+            return
+        if parsed_url.path == "/gpt":
+            self.send_page(PageState(active_tab="gpt"))
+            return
+        if parsed_url.path == "/kite-setup":
+            self.send_page(PageState(active_tab="kite-setup"))
+            return
         if parsed_url.path == "/trade-news":
             query = parse_qs(parsed_url.query, keep_blank_values=True)
             symbols_text = first(query, "stocks") or first(query, "symbols")
@@ -8508,6 +8864,18 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if self.path == "/market-quotes":
             try:
                 self.send_json(fetch_csv_market_quotes())
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "quotes": [],
+                    }
+                )
+            return
+        if self.path == "/global-quotes":
+            try:
+                self.send_json(fetch_global_market_quotes())
             except Exception as exc:
                 self.send_json(
                     {
