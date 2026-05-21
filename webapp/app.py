@@ -2866,6 +2866,7 @@ def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "product": position.get("product"),
                     "average_price": position.get("average_price"),
                     "ltp": position.get("ltp"),
+                    "stock_cmp": data.get("spot"),
                     "pnl": pnl,
                     "deployed": deployed,
                     "return_pct": (pnl / deployed * 100) if deployed > 0 else None,
@@ -5227,6 +5228,7 @@ def render_positions_panel(
         (
         "<tr>"
         f"<td class=\"position-symbol-cell\">{render_symbol_value('tradingsymbol', row.get('symbol', ''))}<span>{html.escape(str(row.get('product', '')))} | Qty {html.escape(str(row.get('quantity', '')))}</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('stock_cmp')))}</strong><span>Stock CMP</span></td>"
         f"<td><strong>{html.escape(fmt_number(row.get('ltp')))}</strong><span>Avg {html.escape(fmt_number(row.get('average_price')))}</span></td>"
         f'<td class="{metric_class(row.get("pnl"))}"><strong>{html.escape(display_cell("pnl", row.get("pnl", "")))}</strong><span>{html.escape(fmt_number(row.get("return_pct")))}% on margin</span></td>'
         f'<td class="{strength_class("green" if (row.get("captured_pct") is not None and float(row.get("captured_pct") or 0) >= 50) else row.get("capture_color"))}"><strong>{html.escape(fmt_number(row.get("captured_pct")))}%</strong><span>Captured</span></td>'
@@ -5262,7 +5264,7 @@ def render_positions_panel(
         '<section class="panel positions-analytics-panel"><div class="panel-title">Active Position Analytics</div>'
         '<div class="research-table-hint">Premium capture: book sold options at 50-70% decay; roll near expiry if capture is not enough.</div>'
         '<div class="table-wrap positions-table-wrap"><table class="positions-table"><thead><tr>'
-        '<th>Position</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>Buy</th>'
+        '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>Buy</th>'
         '<th>POP</th><th>OTM</th><th>Sell</th><th>Strength</th><th>Delta</th>'
         '<th>IV</th><th>PCR</th><th>S / R</th><th>Error</th></tr></thead>'
         f"<tbody>{table_rows}</tbody></table></div></section>"
@@ -5836,7 +5838,7 @@ def render_page(state: PageState) -> bytes:
               {render_input("api_secret", "KITE_API_SECRET", state.api_secret or env_value("KITE_API_SECRET"), "password")}
               {render_input("access_token", "KITE_ACCESS_TOKEN", state.access_token or env_value("KITE_ACCESS_TOKEN"), "password")}
             </div>
-            {render_checkbox("show_credentials", "Show credential values", False, "Reveals KITE_API_SECRET and KITE_ACCESS_TOKEN in this local browser page.")}
+            {render_checkbox("show_credentials", "Show credential values", False, "Reveals KITE_API_SECRET, KITE_ACCESS_TOKEN, and OPENAI_API_KEY in this local browser page.")}
           </section>
           <section class="panel kite-setup-card token-card">
             <div class="setup-card-kicker">02</div>
@@ -5869,6 +5871,7 @@ def render_page(state: PageState) -> bytes:
             <div class="panel-title">OpenAI Setup</div>
             <p class="status">Used by the GPT tab to generate Kite-ready CSV from your strategy prompt.</p>
             {render_input("openai_api_key", "OPENAI_API_KEY", state.openai_api_key or env_value("OPENAI_API_KEY"), "password")}
+            {render_checkbox("show_credentials", "Show OPENAI_API_KEY", False, "Temporarily reveals the OpenAI key in this browser.")}
             <p class="status">Saved to <code>.env</code> when you click Save Kite Setup.</p>
           </section>
           <section class="panel kite-setup-card ip-card">
