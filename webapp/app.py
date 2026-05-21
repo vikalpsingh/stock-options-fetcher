@@ -357,6 +357,35 @@ def etf_buy_amount_setting() -> float:
     return amount if amount > 0 else DEFAULT_ETF_BUY_AMOUNT
 
 
+def normalize_home_tickers(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_items = re.split(r"[\s,]+", value)
+    elif isinstance(value, list):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = []
+    tickers: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        clean = item.strip().upper()
+        if not clean:
+            continue
+        clean = clean.removeprefix("NSE:")
+        if clean not in seen:
+            tickers.append(clean)
+            seen.add(clean)
+    return tickers
+
+
+def home_tickers_setting() -> list[str]:
+    saved = normalize_home_tickers(load_app_settings().get("home_tickers", []))
+    return saved or TOP_WATCHLIST
+
+
+def home_tickers_text() -> str:
+    return "\n".join(home_tickers_setting())
+
+
 def format_buy_amount(value: Any) -> str:
     try:
         amount = float(value)
@@ -612,6 +641,7 @@ class PageState:
     kite_request_token: str = ""
     kite_ip_data: list[dict[str, str]] | None = None
     etf_buy_amount: float = field(default_factory=etf_buy_amount_setting)
+    home_tickers: str = field(default_factory=home_tickers_text)
 
 
 def mask_secret(value: str | None) -> str:
@@ -3088,7 +3118,7 @@ def fetch_csv_market_quotes_uncached() -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
 
-    quote_items = [{"symbol": symbol, "threshold": None} for symbol in TOP_WATCHLIST]
+    quote_items = [{"symbol": symbol, "threshold": None} for symbol in home_tickers_setting()]
     quote_items.extend(
         {
             "symbol": str(item["symbol"]),
@@ -5603,7 +5633,7 @@ def render_kite_ip_data(ip_data: list[dict[str, str]] | None) -> str:
 def render_market_topper(state: PageState) -> str:
     csv_text = state.csv_text or read_default_csv_text()
     order_symbols = csv_trading_symbols(csv_text)
-    underlyings = TOP_WATCHLIST
+    underlyings = home_tickers_setting()
     stock_quote_cards = "".join(
         '<div class="quote-card" data-symbol="'
         f'{html.escape(underlying, quote=True)}">'
@@ -5667,7 +5697,38 @@ def render_market_topper(state: PageState) -> str:
     quote_date = datetime.now().strftime("%d %b %Y")
     return f"""
     <section class="market-shell top-command-center">
-      <div class="rule-strip">
+      <div class="home-hero">
+        <div>
+          <div class="home-kicker">Today decision cockpit</div>
+          <h2>Should I sell premium today, close risk, or wait?</h2>
+          <p>Use this screen first. It combines mood, expiry distance, global cues, and your watchlist movement into one calm pre-trade view.</p>
+        </div>
+        <div class="home-hero-date">{quote_date}</div>
+      </div>
+      <div class="home-decision-grid">
+        <div class="decision-tile decision-primary" id="home-bias-card">
+          <span>Market bias</span>
+          <strong id="home-bias">Checking...</strong>
+          <small id="home-bias-detail">Waiting for MMI and global cues.</small>
+        </div>
+        <div class="decision-tile" id="home-new-position-card">
+          <span>New position gate</span>
+          <strong id="home-new-position">Wait for data</strong>
+          <small id="home-new-position-detail">Avoid entries near expiry or when global risk is red.</small>
+        </div>
+        <div class="decision-tile" id="home-close-card">
+          <span>Close / roll focus</span>
+          <strong id="home-close-focus">Review positions</strong>
+          <small>Book sold options at 50-70% capture. Roll before gamma risk rises.</small>
+        </div>
+        <div class="decision-tile mmi-card">
+          <span>Market Mood Index</span>
+          <strong id="mmi-value">Loading...</strong>
+          <small><span id="mmi-zone">Tickertape MMI</span><span id="mmi-action"> | Signal: <strong>Checking...</strong></span></small>
+          <a href="{MMI_URL}" target="_blank" rel="noopener">Open MMI</a>
+        </div>
+      </div>
+      <div class="rule-strip compact-rules">
         <div class="rule-card sell-stock">
           <div class="rule-kicker">Rule 1</div>
           <div class="rule-title">SELL CALL only when you hold the stock with lot size</div>
@@ -5675,12 +5736,6 @@ def render_market_topper(state: PageState) -> str:
         <div class="rule-card sell-put">
           <div class="rule-kicker">Rule 2</div>
           <div class="rule-title">SELL PUT only when you have cash to buy all lots</div>
-        </div>
-        <div class="mmi-card">
-          <div class="rule-kicker">Market Mood Index</div>
-          <div class="mmi-value" id="mmi-value">Loading...</div>
-          <div class="mmi-line"><span id="mmi-zone">Tickertape MMI</span><span id="mmi-action">| Signal: <strong>Checking...</strong></span></div>
-          <a href="{MMI_URL}" target="_blank" rel="noopener">Open MMI</a>
         </div>
       </div>
       <div class="global-market-strip">
@@ -5696,6 +5751,11 @@ def render_market_topper(state: PageState) -> str:
         <div class="ticker-title live-title">Kite LTP and Day Change | {quote_date}</div>
         <div class="quote-error" id="quote-error"></div>
         <div class="quote-grid" id="quote-grid">{quote_cards}</div>
+      </div>
+      <div class="home-action-grid">
+        <a class="home-action-card" href="/research"><strong>Research new CSV trades</strong><span>Compare SELL CALL / SELL PUT scores before entry.</span></a>
+        <a class="home-action-card" href="/positions"><strong>Check active positions</strong><span>Review P&L, capture %, remaining premium, and roll signals.</span></a>
+        <a class="home-action-card" href="/income"><strong>PFC / CAMS income</strong><span>Use monthly PE/CE candidates with cash and coverage rules.</span></a>
       </div>
     </section>"""
 
@@ -5744,6 +5804,7 @@ def render_page(state: PageState) -> bytes:
         if state.position_orders
         else ""
     )
+    home_tab_class = "active" if state.active_tab == "home" else ""
     place_tab_class = "active" if state.active_tab == "place" else ""
     positions_tab_class = "active" if state.active_tab in {"positions", "positions-research"} else ""
     gpt_tab_class = "active" if state.active_tab == "gpt" else ""
@@ -5756,6 +5817,7 @@ def render_page(state: PageState) -> bytes:
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
     kite_setup_panel_style = "" if state.active_tab == "kite-setup" else ' style="display:none"'
+    home_market_html = render_market_topper(state) if state.active_tab == "home" else ""
     env_panel = f"""
         <section class="panel kite-setup-hero">
           <div>
@@ -5796,15 +5858,21 @@ def render_page(state: PageState) -> bytes:
             <div class="kite-action-preview">{html.escape(etf_buy_action)}</div>
             <p class="status">Saved in <code>{html.escape(str(SETTINGS_PATH.name))}</code>.</p>
           </section>
-          <section class="panel kite-setup-card ip-card">
+          <section class="panel kite-setup-card watchlist-card">
             <div class="setup-card-kicker">04</div>
+            <div class="panel-title">Home Watchlist</div>
+            <p class="status">One ticker per line or comma-separated. These decide which Kite LTP cards appear on Home.</p>
+            <label><span>Home tickers</span><textarea class="watchlist-box" name="home_tickers">{html.escape(state.home_tickers)}</textarea></label>
+          </section>
+          <section class="panel kite-setup-card ip-card">
+            <div class="setup-card-kicker">05</div>
             <div class="panel-title">OpenAI Setup</div>
             <p class="status">Used by the GPT tab to generate Kite-ready CSV from your strategy prompt.</p>
             {render_input("openai_api_key", "OPENAI_API_KEY", state.openai_api_key or env_value("OPENAI_API_KEY"), "password")}
             <p class="status">Saved to <code>.env</code> when you click Save Kite Setup.</p>
           </section>
           <section class="panel kite-setup-card ip-card">
-            <div class="setup-card-kicker">05</div>
+            <div class="setup-card-kicker">06</div>
             <div class="panel-title">Allowed IP</div>
             <p class="status">If Kite blocks orders by IP, add your current public IP in the Kite developer console.</p>
             <div class="actions">
@@ -5911,19 +5979,155 @@ def render_page(state: PageState) -> bytes:
     }}
     .market-shell {{
       margin-bottom: 18px;
-      padding: 12px;
+      padding: 16px;
       border: 1px solid #bde8e3;
-      border-radius: 18px;
+      border-radius: 22px;
       background:
-        linear-gradient(135deg, rgba(255, 255, 255, 0.92), rgba(236, 254, 255, 0.78)),
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.18), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(34, 197, 94, 0.14), transparent 30%),
+        linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(236, 254, 255, 0.84)),
         #ffffff;
       box-shadow: 0 22px 54px rgba(15, 23, 42, 0.10);
+    }}
+    .home-hero {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      margin-bottom: 12px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #0f172a 0%, #134e4a 58%, #0f766e 100%);
+      color: #ffffff;
+      box-shadow: 0 18px 38px rgba(15, 23, 42, 0.16);
+    }}
+    .home-kicker {{
+      color: #99f6e4;
+      font-size: 10px;
+      font-weight: 950;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }}
+    .home-hero h2 {{
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.08;
+      letter-spacing: 0;
+    }}
+    .home-hero p {{
+      margin: 6px 0 0;
+      color: #d1fae5;
+      font-size: 12.5px;
+      max-width: 760px;
+      line-height: 1.35;
+    }}
+    .home-hero-date {{
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.12);
+      color: #ecfeff;
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+    .home-decision-grid {{
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr 0.95fr;
+      gap: 10px;
+      margin-bottom: 10px;
+    }}
+    .decision-tile {{
+      min-height: 116px;
+      padding: 14px;
+      border: 1px solid #cde9e5;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 12px 28px rgba(15, 23, 42, 0.07);
+    }}
+    .decision-tile span {{
+      display: block;
+      color: #64748b;
+      font-size: 10px;
+      font-weight: 950;
+      text-transform: uppercase;
+      margin-bottom: 7px;
+    }}
+    .decision-tile strong {{
+      display: block;
+      color: #07152b;
+      font-size: 20px;
+      line-height: 1.05;
+      margin-bottom: 8px;
+    }}
+    .decision-tile small {{
+      display: block;
+      color: #475569;
+      font-size: 12px;
+      line-height: 1.3;
+    }}
+    .decision-tile.mmi-card span,
+    .decision-tile.mmi-card strong,
+    .decision-tile.mmi-card small {{
+      color: #4c1d95;
+    }}
+    .decision-tile.mmi-card a {{
+      display: inline-block;
+      margin-top: 6px;
+      color: #5b21b6;
+      font-size: 11px;
+      font-weight: 900;
+    }}
+    .decision-primary {{
+      background: linear-gradient(135deg, #ecfeff 0%, #dcfce7 100%);
+      border-color: #99f6e4;
+    }}
+    .decision-green {{
+      background: #ecfdf5;
+      border-color: #86efac;
+    }}
+    .decision-yellow {{
+      background: #fffbeb;
+      border-color: #fde68a;
+    }}
+    .decision-red {{
+      background: #fff1f2;
+      border-color: #fda4af;
+    }}
+    .home-action-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .home-action-card {{
+      display: block;
+      text-decoration: none;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid #bae6fd;
+      background: linear-gradient(135deg, #ffffff 0%, #f0f9ff 100%);
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+    }}
+    .home-action-card strong {{
+      display: block;
+      color: #075985;
+      margin-bottom: 5px;
+      font-size: 13px;
+    }}
+    .home-action-card span {{
+      display: block;
+      color: #475569;
+      font-size: 12px;
+      line-height: 1.35;
     }}
     .rule-strip {{
       display: grid;
       grid-template-columns: 1.1fr 1.1fr 0.9fr;
       gap: 12px;
       margin-bottom: 10px;
+    }}
+    .compact-rules {{
+      grid-template-columns: 1fr 1fr;
     }}
     .rule-card, .mmi-card {{
       border-radius: 14px;
@@ -6688,6 +6892,12 @@ def render_page(state: PageState) -> bytes:
       --tab-ink: #075985;
       --tab-shadow: rgba(14, 165, 233, 0.14);
     }}
+    .tab-button[data-tab="home"] {{
+      --tab-a: #ccfbf1;
+      --tab-b: #ecfeff;
+      --tab-ink: #0f766e;
+      --tab-shadow: rgba(20, 184, 166, 0.14);
+    }}
     .tab-button[data-tab="positions"] {{
       --tab-a: #dcfce7;
       --tab-b: #f0fdf4;
@@ -6766,9 +6976,9 @@ def render_page(state: PageState) -> bytes:
     }}
     .tabs {{
       display: grid;
-      grid-template-columns: repeat(9, minmax(0, 1fr));
+      grid-template-columns: repeat(10, minmax(0, 1fr));
       gap: 6px;
-      padding: 8px;
+      padding: 7px;
       align-items: stretch;
     }}
     .tab-button,
@@ -6779,10 +6989,10 @@ def render_page(state: PageState) -> bytes:
       --tab-ink: #0f3b65;
       --tab-shadow: rgba(6, 182, 212, 0.12);
       width: 100%;
-      min-height: 46px;
-      padding: 9px 8px;
+      min-height: 38px;
+      padding: 7px 5px;
       color: var(--tab-ink);
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 800;
       text-align: center;
       white-space: nowrap;
@@ -6791,7 +7001,7 @@ def render_page(state: PageState) -> bytes:
       justify-content: center;
     }}
     .tab-button.primary-action {{
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 800;
     }}
     .tab-button.active {{
@@ -7922,6 +8132,11 @@ def render_page(state: PageState) -> bytes:
     .gpt-system-box {{ min-height: 260px; }}
     .gpt-api-output {{ min-height: 240px; background: #f8fafc; }}
     .gpt-fallback-box {{ min-height: 130px; }}
+    .watchlist-box {{
+      min-height: 160px;
+      font-family: Consolas, monospace;
+      text-transform: uppercase;
+    }}
     .gpt-response-meta {{
       display: flex;
       align-items: center;
@@ -8027,6 +8242,13 @@ def render_page(state: PageState) -> bytes:
       .analytics-form {{ grid-template-columns: 1fr; }}
       .analytics-command-head {{ grid-template-columns: 1fr; }}
       .analytics-two-column {{ grid-template-columns: 1fr; }}
+      .home-hero {{ grid-template-columns: 1fr; }}
+      .home-hero h2 {{ font-size: 20px; }}
+      .home-decision-grid {{ grid-template-columns: 1fr; }}
+      .home-action-grid {{ grid-template-columns: 1fr; }}
+      .compact-rules {{ grid-template-columns: 1fr; }}
+      .decision-tile {{ min-height: auto; }}
+      .tab-button[data-tab="home"] {{ display: inline-flex; }}
       .tabs {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
       .tab-button,
       .tab-button.primary-action,
@@ -8041,7 +8263,7 @@ def render_page(state: PageState) -> bytes:
     }}
   </style>
 </head>
-<body>
+<body class="tab-{html.escape(state.active_tab, quote=True)}">
   <header>
     <div class="header-inner">
     <div class="brand-block">
@@ -8056,9 +8278,9 @@ def render_page(state: PageState) -> bytes:
     </div>
   </header>
   <main>
-    {render_market_topper(state)}
     {alert}
     <div class="tabs">
+      <button class="tab-button utility-action home-tab {home_tab_class}" type="button" data-tab="home">Home</button>
       <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
       <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">Positions</button>
       <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
@@ -8069,6 +8291,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT</button>
       <button class="tab-button utility-action {kite_setup_tab_class}" type="button" data-tab="kite-setup">Kite Setup</button>
     </div>
+    {home_market_html}
     <form id="place-panel" method="post" action="/load"{place_panel_style}>
       {env_hidden}
       <input type="hidden" name="live_confirmed" id="live-confirmed" value="0">
@@ -8235,6 +8458,7 @@ def render_page(state: PageState) -> bytes:
       button.addEventListener('click', () => {{
         const active = button.dataset.tab;
         const routes = {{
+          home: '/home',
           place: '/',
           positions: '/positions',
           analytics: '/analytics',
@@ -8517,6 +8741,55 @@ def render_page(state: PageState) -> bytes:
       stopCommodityCountdown();
       form.requestSubmit();
     }});
+    let homeMmiValue = null;
+    let homeGlobalRedCount = 0;
+    function setDecisionClass(element, className) {{
+      if (!element) return;
+      element.classList.remove('decision-green', 'decision-yellow', 'decision-red');
+      if (className) element.classList.add(className);
+    }}
+    function updateHomeDecision() {{
+      const biasCard = document.getElementById('home-bias-card');
+      const bias = document.getElementById('home-bias');
+      const biasDetail = document.getElementById('home-bias-detail');
+      const gateCard = document.getElementById('home-new-position-card');
+      const gate = document.getElementById('home-new-position');
+      const gateDetail = document.getElementById('home-new-position-detail');
+      const closeCard = document.getElementById('home-close-card');
+      if (!bias || !gate) return;
+      const mmi = Number(homeMmiValue || 0);
+      const globalRisk = homeGlobalRedCount >= 3;
+      if (globalRisk) {{
+        bias.textContent = 'Risk-off / protect';
+        biasDetail.textContent = 'Several global cues are red. Prefer smaller size, covered calls, or wait.';
+        gate.textContent = 'Avoid fresh aggressive trades';
+        gateDetail.textContent = 'Only high-score covered CALL/CSP setups after checking news and liquidity.';
+        setDecisionClass(biasCard, 'decision-red');
+        setDecisionClass(gateCard, 'decision-red');
+      }} else if (mmi > 60) {{
+        bias.textContent = 'SELL CALL bias';
+        biasDetail.textContent = 'Greed zone. Prefer covered CALLs, avoid naked CE, be careful with fresh PUT selling.';
+        gate.textContent = 'Only covered CALL / high-score CSP';
+        gateDetail.textContent = 'Enter only if score, POP, OTM and capital guardrails are green/yellow.';
+        setDecisionClass(biasCard, 'decision-yellow');
+        setDecisionClass(gateCard, 'decision-yellow');
+      }} else if (mmi && mmi < 40) {{
+        bias.textContent = 'SELL PUT watchlist';
+        biasDetail.textContent = 'Fear zone. Consider cash-secured PUT only near support and with full assignment cash.';
+        gate.textContent = 'CSP only after support holds';
+        gateDetail.textContent = 'Wait for stabilization; do not catch falling knives.';
+        setDecisionClass(biasCard, 'decision-yellow');
+        setDecisionClass(gateCard, 'decision-yellow');
+      }} else {{
+        bias.textContent = 'Neutral / wait for edge';
+        biasDetail.textContent = 'No strong mood signal. Let Research and Positions decide.';
+        gate.textContent = 'Trade only best scores';
+        gateDetail.textContent = 'Prefer 3+ green indicators and no event risk.';
+        setDecisionClass(biasCard, 'decision-green');
+        setDecisionClass(gateCard, 'decision-green');
+      }}
+      setDecisionClass(closeCard, 'decision-green');
+    }}
     async function refreshMmi() {{
       const value = document.getElementById('mmi-value');
       const zone = document.getElementById('mmi-zone');
@@ -8529,6 +8802,7 @@ def render_page(state: PageState) -> bytes:
           value.textContent = data.value;
           zone.textContent = data.zone;
           const mmi = Number(data.value);
+          homeMmiValue = mmi;
           if (mmi > 60) {{
             action.innerHTML = '| Signal: <strong>SELL CALL</strong>';
           }} else if (mmi < 40) {{
@@ -8536,6 +8810,7 @@ def render_page(state: PageState) -> bytes:
           }} else {{
             action.innerHTML = '| Signal: <strong>WAIT / NEUTRAL</strong>';
           }}
+          updateHomeDecision();
         }} else {{
           value.textContent = 'Open';
           zone.textContent = 'Tickertape live MMI';
@@ -8561,6 +8836,7 @@ def render_page(state: PageState) -> bytes:
           errorBox.style.display = data.ok ? 'none' : 'block';
           errorBox.textContent = data.ok ? '' : (data.error || 'Some global quotes unavailable');
         }}
+        let redCount = 0;
         for (const card of cards) {{
           const symbol = card.dataset.globalSymbol;
           const quote = bySymbol.get(symbol);
@@ -8585,8 +8861,11 @@ def render_page(state: PageState) -> bytes:
             change.className = `global-change ${{pct >= 0 ? 'up' : 'down'}}`;
             card.classList.toggle('up', pct >= 0);
             card.classList.toggle('down', pct < 0);
+            if (pct < -0.5) redCount += 1;
           }}
         }}
+        homeGlobalRedCount = redCount;
+        updateHomeDecision();
       }} catch (error) {{
         if (errorBox) {{
           errorBox.style.display = 'block';
@@ -8817,6 +9096,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/positions":
             self.send_page(PageState(active_tab="positions"))
             return
+        if parsed_url.path == "/home":
+            self.send_page(PageState(active_tab="home"))
+            return
         if parsed_url.path == "/orders":
             self.send_page(PageState(active_tab="order-management"))
             return
@@ -8986,6 +9268,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
+            home_tickers=first(form, "home_tickers", home_tickers_text()),
         )
 
         try:
@@ -9177,9 +9460,18 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         "OPENAI_API_KEY": state.openai_api_key or env_value("OPENAI_API_KEY"),
                     }
                 )
-                save_app_settings({"etf_buy_amount": state.etf_buy_amount})
+                normalized_home_tickers = normalize_home_tickers(state.home_tickers)
+                save_app_settings(
+                    {
+                        "etf_buy_amount": state.etf_buy_amount,
+                        "home_tickers": normalized_home_tickers,
+                    }
+                )
+                state.home_tickers = "\n".join(normalized_home_tickers)
+                clear_app_cache(("market-quotes", "kite:quote"))
                 state.message = (
-                    f"Kite setup saved to .env. ETF buy amount saved as {format_buy_amount(state.etf_buy_amount)}."
+                    f"Kite setup saved. ETF buy amount {format_buy_amount(state.etf_buy_amount)}. "
+                    f"Home watchlist has {len(normalized_home_tickers)} ticker(s)."
                 )
             elif self.path == "/kite-token/generate":
                 access_token, state.console_log = call_with_console(

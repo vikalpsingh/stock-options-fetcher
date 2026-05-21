@@ -1,3 +1,20 @@
 {
-  "etf_buy_amount": 10000.0
+  "etf_buy_amount": 10000.0,
+  "home_tickers": [
+    "BAJFINANCE",
+    "TATACONSUM",
+    "PGEL",
+    "TITAN",
+    "ETERNAL",
+    "UNITDSPR",
+    "HAVELLS",
+    "NAUKRI",
+    "PFC",
+    "CAMS",
+    "CDSL",
+    "MAZDOCK",
+    "NUVAMA",
+    "NTPC",
+    "WAAREEENER"
+  ]
 }
