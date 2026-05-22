@@ -2419,9 +2419,10 @@ def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
         )
     quote_key = f"NFO:{candidate['symbol']}"
     quote = cached_kite_quote(kite, [quote_key]).get(quote_key, {})
-    price = quote_ltp(quote)
-    if price <= 0:
+    current_price = quote_ltp(quote)
+    if current_price <= 0:
         raise ValueError(f"Could not read CE premium for {candidate['symbol']}.")
+    price = ceil_to_tick(current_price * 1.10, 0.05)
     order = {
         "variety": "regular",
         "exchange": "NFO",
@@ -2441,6 +2442,7 @@ def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
         "order_id": order_id,
         "detail": (
             f"SELL covered CE {covered_qty} qty at LIMIT {price:.2f}. "
+            f"10% above current premium {current_price:.2f}. "
             f"Holding {held_qty} shares of {clean_underlying}."
         ),
     }
@@ -2466,7 +2468,7 @@ def place_income_cash_secured_put_order(underlying: str) -> dict[str, Any]:
     current_price = quote_ltp(quote)
     if current_price <= 0:
         raise ValueError(f"Could not read PE premium for {candidate['symbol']}.")
-    price = ceil_to_tick(current_price * 1.20, 0.05)
+    price = ceil_to_tick(current_price * 1.10, 0.05)
     order = {
         "variety": "regular",
         "exchange": "NFO",
@@ -2488,7 +2490,7 @@ def place_income_cash_secured_put_order(underlying: str) -> dict[str, Any]:
         "order_id": order_id,
         "detail": (
             f"SELL cash-secured PE {lot_size} qty at LIMIT {price:.2f}, "
-            f"20% above CMP {current_price:.2f}. "
+            f"10% above current premium {current_price:.2f}. "
             f"Assignment value about {assignment_value:.0f}."
         ),
     }
@@ -2967,6 +2969,7 @@ def save_today_csv_text(csv_text: str) -> tuple[str, str]:
     today_path = dated_income_csv_path()
     normalized_new = text.rstrip() + "\n"
     archive_message = ""
+    archive_path = None
     if today_path.exists() and today_path.read_text(encoding="utf-8-sig").strip():
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         archive_path = today_path.with_name(f"{today_path.stem}_last_input_order_{stamp}.csv")
@@ -2976,10 +2979,29 @@ def save_today_csv_text(csv_text: str) -> tuple[str, str]:
         today_path.parent.mkdir(parents=True, exist_ok=True)
         today_path.write_text(normalized_new, encoding="utf-8")
     except PermissionError:
+        if archive_path and archive_path.exists() and not today_path.exists():
+            archive_path.replace(today_path)
         today_path = APP_ROOT / today_path.name
         today_path.write_text(normalized_new, encoding="utf-8")
         archive_message += "Repo root was not writable, saved in webapp folder. "
+    except Exception:
+        if archive_path and archive_path.exists() and not today_path.exists():
+            archive_path.replace(today_path)
+        raise
     return str(today_path), f"{archive_message}Saved CSV text to {today_path.name}."
+
+
+def restore_csv_text_after_save_error(csv_path: str) -> tuple[str, str]:
+    candidates = [
+        Path(csv_path).expanduser() if csv_path else None,
+        dated_income_csv_path(),
+        DEFAULT_CSV_PATH,
+        LEGACY_CSV_PATH,
+    ]
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            return str(candidate), candidate.read_text(encoding="utf-8-sig")
+    return str(DEFAULT_CSV_PATH), ""
 
 
 def mmi_zone(value: float) -> str:
@@ -4988,6 +5010,7 @@ def render_analytics_panel(state: PageState) -> str:
 
     return f"""
     <form id="analytics-panel" method="post" action="/analytics/load"{'' if state.active_tab == 'analytics' else ' style="display:none"'}>
+      {active_section}
       <section class="panel analytics-picker-panel">
         <div class="panel-title">Load Option Analytics</div>
         <div class="analytics-links">{links or '<span class="status">No CSV symbols found.</span>'}</div>
@@ -4998,7 +5021,6 @@ def render_analytics_panel(state: PageState) -> str:
         </div>
       </section>
       {detail}
-      {active_section}
       {render_console(state.console_log)}
     </form>"""
 
@@ -5184,6 +5206,18 @@ def render_research_panel(state: PageState) -> str:
         </div>
       </section>
       {table}
+      <section class="panel">
+        <div class="panel-title">CSV Source</div>
+        {render_input("csv_path", "CSV path", state.csv_path)}
+        <div class="status">CSV path can be a local file or a public Google Sheets link. Google Sheets must be shared as viewable by anyone with the link.</div>
+        <label><span>Upload CSV</span><input id="csv-file" type="file" accept=".csv,text/csv"></label>
+        <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
+        <div class="actions">
+          <button type="submit" formaction="/csv/save-today">Save as Today CSV</button>
+          <button type="button" class="secondary" id="clear-csv-text">Clear CSV text</button>
+        </div>
+        <div class="status">Saves CSV text to {html.escape(str(dated_income_csv_path()))} and updates CSV path.</div>
+      </section>
       {render_console(state.console_log)}
     </form>"""
 
@@ -8284,13 +8318,13 @@ def render_page(state: PageState) -> bytes:
     {alert}
     <div class="tabs">
       <button class="tab-button utility-action home-tab {home_tab_class}" type="button" data-tab="home">Home</button>
-      <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
-      <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">Positions</button>
-      <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
+      <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">Position</button>
       <button class="tab-button utility-action {research_tab_class}" type="button" data-tab="research">Research</button>
+      <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
+      <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Modify / Cancel</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
-      <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Mofify / Cancel</button>
+      <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT</button>
       <button class="tab-button utility-action {kite_setup_tab_class}" type="button" data-tab="kite-setup">Kite Setup</button>
     </div>
@@ -8309,19 +8343,6 @@ def render_page(state: PageState) -> bytes:
         </div>
         {render_results(state.results)}
       </section>
-      <div>
-        <section class="panel">
-          <div class="panel-title">CSV Source</div>
-          {render_input("csv_path", "CSV path", state.csv_path)}
-          <div class="status">CSV path can be a local file or a public Google Sheets link. Google Sheets must be shared as viewable by anyone with the link.</div>
-          <label><span>Upload CSV</span><input id="csv-file" type="file" accept=".csv,text/csv"></label>
-          <label><span>CSV text</span><textarea id="csv-text" name="csv_text" placeholder="Paste CSV here or choose a file above">{html.escape(state.csv_text)}</textarea></label>
-          <div class="actions">
-            <button type="submit" formaction="/csv/save-today">Save as Today CSV</button>
-          </div>
-          <div class="status">Saves CSV text to {html.escape(str(dated_income_csv_path()))} and updates CSV path.</div>
-        </section>
-      </div>
       {render_console(state.console_log)}
     </form>
     {render_order_management_panel(state)}
@@ -8435,12 +8456,22 @@ def render_page(state: PageState) -> bytes:
   <script>
     const fileInput = document.getElementById('csv-file');
     const textArea = document.getElementById('csv-text');
+    const clearCsvButton = document.getElementById('clear-csv-text');
     const showCredentials = Array.from(document.querySelectorAll('input[name="show_credentials"]'));
     const secretFields = Array.from(document.querySelectorAll('.secret-field'));
     fileInput && fileInput.addEventListener('change', async () => {{
       const file = fileInput.files && fileInput.files[0];
       if (!file) return;
       textArea.value = await file.text();
+    }});
+    clearCsvButton && clearCsvButton.addEventListener('click', () => {{
+      if (textArea) {{
+        textArea.value = '';
+        textArea.focus();
+      }}
+      if (fileInput) {{
+        fileInput.value = '';
+      }}
     }});
     for (const toggle of showCredentials) {{
       toggle.addEventListener('change', () => {{
@@ -9218,7 +9249,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             active_tab=(
                 "positions"
                 if self.path.startswith("/positions")
-                else "place"
+                else "research"
                 if self.path.startswith("/csv")
                 else "commodity"
                 if self.path.startswith("/commodity")
@@ -9602,6 +9633,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             else:
                 state.error = f"Unknown path: {self.path}"
         except Exception as exc:
+            if self.path == "/csv/save-today":
+                state.csv_path, state.csv_text = restore_csv_text_after_save_error(state.csv_path)
             state.error = f"{exc}\n\n{traceback.format_exc()}"
 
         self.send_page(state)
