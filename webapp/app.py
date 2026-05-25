@@ -161,7 +161,11 @@ TOP_WATCHLIST = [
     "WAAREEENER",
 ]
 GLOBAL_MARKET_WATCHLIST = [
-    {"label": "Nifty Fut", "symbol": "^NSEI"},
+    {"label": "NIFTY", "symbol": "^NSEI"},
+    {"label": "BANKNIFTY", "symbol": "^NSEBANK"},
+    {"label": "SENSEX", "symbol": "^BSESN"},
+    {"label": "INDIA VIX", "symbol": "^INDIAVIX"},
+    {"label": "USD/INR", "symbol": "INR=X"},
     {"label": "Nasdaq", "symbol": "^IXIC"},
     {"label": "FTSE", "symbol": "^FTSE"},
     {"label": "Hang Seng", "symbol": "^HSI"},
@@ -2935,6 +2939,29 @@ def load_rows(csv_path: str, csv_text: str) -> tuple[list[dict[str, str]], str]:
     text = path.read_text(encoding="utf-8-sig")
     text = normalize_kite_csv_input(text)
     return parse_csv_text(text), text
+
+
+def validate_kite_order_rows(rows: list[dict[str, str]]) -> None:
+    errors: list[str] = []
+    for index, row in enumerate(rows, start=1):
+        symbol = (row.get("tradingsymbol") or row.get("symbol") or "").strip().upper()
+        transaction_type = (row.get("transaction_type") or "").strip().upper()
+        quantity_text = (row.get("quantity") or "").strip()
+        if not symbol:
+            errors.append(f"Row {index}: missing tradingsymbol.")
+        if transaction_type not in {"BUY", "SELL"}:
+            errors.append(f"Row {index}: transaction_type must be BUY or SELL.")
+        try:
+            quantity = int(float(quantity_text or "0"))
+        except ValueError:
+            errors.append(f"Row {index}: quantity must be numeric.")
+            continue
+        if quantity <= 0:
+            errors.append(f"Row {index}: quantity must be greater than 0 for {symbol or 'this order'}.")
+    if errors:
+        preview = "\n".join(errors[:8])
+        more = f"\n...and {len(errors) - 8} more issue(s)." if len(errors) > 8 else ""
+        raise ValueError(f"CSV order validation failed:\n{preview}{more}")
 
 
 def persist_default_csv_text(csv_text: str) -> str:
@@ -5737,7 +5764,7 @@ def render_market_topper(state: PageState) -> str:
         <div>
           <div class="home-kicker">Today decision cockpit</div>
           <h2>Should I sell premium today, close risk, or wait?</h2>
-          <p>Use this screen first. It combines mood, expiry distance, global cues, and your watchlist movement into one calm pre-trade view.</p>
+          <p>Use this screen first. It combines MMI, Indian indices, global cues, expiry distance, and your watchlist movement into one calm pre-trade view.</p>
         </div>
         <div class="home-hero-date">{quote_date}</div>
       </div>
@@ -5775,7 +5802,7 @@ def render_market_topper(state: PageState) -> str:
         </div>
       </div>
       <div class="global-market-strip">
-        <div class="global-market-title">Global cues</div>
+        <div class="global-market-title">Market cues</div>
         <div class="global-error" id="global-error"></div>
         <div class="global-grid" id="global-grid">{global_quote_cards}</div>
       </div>
@@ -6011,7 +6038,7 @@ def render_page(state: PageState) -> bytes:
       border: 1px solid rgba(254, 243, 199, 0.18);
     }}
     main {{
-      width: min(1180px, calc(100vw - 32px));
+      width: min(1480px, calc(100vw - 28px));
       margin: 22px auto 40px;
     }}
     .market-shell {{
@@ -6069,7 +6096,7 @@ def render_page(state: PageState) -> bytes:
     }}
     .home-decision-grid {{
       display: grid;
-      grid-template-columns: 1.2fr 1fr 1fr 0.95fr;
+      grid-template-columns: minmax(260px, 1.25fr) minmax(240px, 1fr) minmax(240px, 1fr) minmax(220px, 0.9fr);
       gap: 10px;
       margin-bottom: 10px;
     }}
@@ -6329,14 +6356,14 @@ def render_page(state: PageState) -> bytes:
     .quote-change.down {{ color: #b42318; }}
     .global-market-strip {{
       margin: 0 0 8px;
-      padding: 7px 10px;
+      padding: 10px 12px;
       border: 1px solid rgba(15, 118, 110, 0.16);
-      border-radius: 12px;
+      border-radius: 15px;
       background: linear-gradient(135deg, rgba(240, 253, 250, 0.92), rgba(239, 246, 255, 0.92));
       display: grid;
-      grid-template-columns: auto 1fr;
-      gap: 8px;
-      align-items: center;
+      grid-template-columns: 110px 1fr;
+      gap: 10px;
+      align-items: start;
     }}
     .global-market-title {{
       color: #0f766e;
@@ -6344,20 +6371,22 @@ def render_page(state: PageState) -> bytes:
       font-weight: 900;
       text-transform: uppercase;
       white-space: nowrap;
+      padding-top: 6px;
     }}
     .global-grid {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 4px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+      gap: 6px;
       align-items: center;
     }}
     .global-card {{
-      display: inline-flex;
-      align-items: baseline;
-      gap: 5px;
-      min-height: 22px;
-      padding: 2px 7px;
-      border-radius: 999px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 4px 8px;
+      min-height: 42px;
+      padding: 6px 9px;
+      border-radius: 12px;
       border: 1px solid #c7d2fe;
       background: #f8fafc;
     }}
@@ -6371,17 +6400,18 @@ def render_page(state: PageState) -> bytes:
     }}
     .global-label {{
       color: #334155;
-      font-size: 9px;
+      font-size: 9.5px;
       font-weight: 900;
       text-transform: uppercase;
     }}
     .global-ltp {{
-      font-size: 11px;
+      font-size: 13px;
       font-weight: 950;
       color: #07152b;
     }}
     .global-change {{
-      font-size: 9.5px;
+      grid-column: 1 / -1;
+      font-size: 10px;
       font-weight: 900;
       color: #64748b;
     }}
@@ -6420,7 +6450,7 @@ def render_page(state: PageState) -> bytes:
       margin-top: 16px;
     }}
     .top-command-center {{
-      padding: 10px;
+      padding: 14px;
       margin-bottom: 14px;
       border-radius: 16px;
       background:
@@ -6484,19 +6514,23 @@ def render_page(state: PageState) -> bytes:
       font-size: 10.5px;
     }}
     .top-command-center .quote-grid {{
-      gap: 3px;
-      padding: 4px 8px 7px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+      gap: 6px;
+      padding: 8px 10px 10px;
     }}
     .top-command-center .quote-card {{
-      min-height: 22px;
-      gap: 4px;
-      padding: 2px 6px;
+      justify-content: space-between;
+      min-height: 34px;
+      gap: 5px;
+      padding: 6px 8px;
+      border-radius: 11px;
     }}
     .top-command-center .quote-symbol {{
-      font-size: 8.5px;
+      font-size: 9px;
     }}
     .top-command-center .quote-ltp {{
-      font-size: 11.5px;
+      font-size: 13px;
     }}
     .top-command-center .quote-change {{
       font-size: 9.5px;
@@ -6522,9 +6556,9 @@ def render_page(state: PageState) -> bytes:
       min-height: 270px;
     }}
     .commodity-card.buy-now {{
-      background: #fee2e2;
-      border-color: #f87171;
-      box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.22), 0 16px 36px rgba(185, 28, 28, 0.16);
+      background: linear-gradient(135deg, #ecfdf5 0%, #dcfce7 100%);
+      border-color: #22c55e;
+      box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.20), 0 16px 36px rgba(21, 128, 61, 0.16);
     }}
     .commodity-meta {{
       display: flex;
@@ -6575,7 +6609,7 @@ def render_page(state: PageState) -> bytes:
       text-align: center;
     }}
     .commodity-card.buy-now .commodity-action {{
-      background: #b91c1c;
+      background: #15803d;
       color: #ffffff;
       font-size: 16px;
       text-transform: uppercase;
@@ -6595,8 +6629,8 @@ def render_page(state: PageState) -> bytes:
       cursor: pointer;
     }}
     .commodity-card.buy-now .commodity-buy-button {{
-      background: linear-gradient(135deg, #b91c1c, #ef4444);
-      box-shadow: 0 8px 22px rgba(185, 28, 28, 0.2);
+      background: linear-gradient(135deg, #16a34a, #0f766e);
+      box-shadow: 0 8px 22px rgba(21, 128, 61, 0.22);
     }}
     .commodity-holdings-panel {{
       border-color: #bbf7d0;
@@ -8862,6 +8896,9 @@ def render_page(state: PageState) -> bytes:
       const cards = Array.from(document.querySelectorAll('.global-card[data-global-symbol]'));
       if (!cards.length) return;
       const errorBox = document.getElementById('global-error');
+      const inverseRiskSymbols = new Set(['^INDIAVIX', 'CL=F', 'INR=X']);
+      const isRiskRed = (symbol, pct) => inverseRiskSymbols.has(symbol) ? pct > 0.5 : pct < -0.5;
+      const isRiskGreen = (symbol, pct) => inverseRiskSymbols.has(symbol) ? pct <= 0 : pct >= 0;
       try {{
         const response = await fetch('/global-quotes', {{ cache: 'no-store' }});
         const data = await response.json();
@@ -8893,9 +8930,9 @@ def render_page(state: PageState) -> bytes:
             const sign = pct > 0 ? '+' : '';
             change.textContent = `${{sign}}${{pct.toFixed(2)}}%`;
             change.className = `global-change ${{pct >= 0 ? 'up' : 'down'}}`;
-            card.classList.toggle('up', pct >= 0);
-            card.classList.toggle('down', pct < 0);
-            if (pct < -0.5) redCount += 1;
+            card.classList.toggle('up', isRiskGreen(symbol, pct));
+            card.classList.toggle('down', isRiskRed(symbol, pct));
+            if (isRiskRed(symbol, pct)) redCount += 1;
           }}
         }}
         homeGlobalRedCount = redCount;
@@ -9011,7 +9048,7 @@ def render_page(state: PageState) -> bytes:
           }}
           card.classList.toggle('buy-now', Boolean(quote.buy_signal));
           action.innerHTML = quote.buy_signal
-            ? `<strong>Action: ${{escapeHtml(quote.action || 'buy the ETF today')}} (${{quote.multiplier}}x)</strong>`
+            ? `<strong>BUY NOW</strong> | ${{escapeHtml(quote.action || 'buy the ETF today')}} (${{quote.multiplier}}x)`
             : `Wait | fall ${{Number(quote.daily_fall_pct || 0).toFixed(2)}}%`;
           if (buyButton) {{
             buyButton.textContent = `Add more ${{assetName}}`;
@@ -9142,7 +9179,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/research":
             self.send_page(PageState(active_tab="research"))
             return
-        if parsed_url.path == "/gpt":
+        if parsed_url.path.startswith("/gpt"):
             self.send_page(PageState(active_tab="gpt"))
             return
         if parsed_url.path == "/kite-setup":
@@ -9222,10 +9259,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:
+        request_path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         form = parse_qs(body, keep_blank_values=True)
-        if self.path == "/login":
+        if request_path == "/login":
             username = first(form, "username")
             password = first(form, "password")
             if verify_login(username, password):
@@ -9247,24 +9285,26 @@ class KiteWebHandler(BaseHTTPRequestHandler):
 
         state = PageState(
             active_tab=(
-                "positions"
-                if self.path.startswith("/positions")
+                "place"
+                if request_path in {"/load", "/execute"}
+                else "positions"
+                if request_path.startswith("/positions")
                 else "research"
-                if self.path.startswith("/csv")
+                if request_path.startswith("/csv")
                 else "commodity"
-                if self.path.startswith("/commodity")
+                if request_path.startswith("/commodity")
                 else "income"
-                if self.path.startswith("/income")
+                if request_path.startswith("/income")
                 else "gpt"
-                if self.path.startswith("/gpt")
+                if request_path.startswith("/gpt")
                 else "kite-setup"
-                if self.path.startswith("/kite-setup") or self.path.startswith("/kite-token") or self.path.startswith("/kite-ip")
+                if request_path.startswith("/kite-setup") or request_path.startswith("/kite-token") or request_path.startswith("/kite-ip")
                 else "order-management"
-                if self.path.startswith("/orders")
+                if request_path.startswith("/orders")
                 else "analytics"
-                if self.path.startswith("/analytics")
+                if request_path.startswith("/analytics")
                 else "research"
-                if self.path.startswith("/research")
+                if request_path.startswith("/research")
                 else default_active_tab()
             ),
             csv_path=first(form, "csv_path", str(DEFAULT_CSV_PATH)),
@@ -9306,9 +9346,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         )
 
         try:
-            if self.path == "/load":
+            if request_path == "/load":
                 persist_message = persist_default_csv_text(state.csv_text)
                 state.rows, state.csv_text = load_rows(state.csv_path, state.csv_text)
+                validate_kite_order_rows(state.rows)
                 state.orders, state.console_log = call_with_console(
                     build_orders,
                     state.rows,
@@ -9318,10 +9359,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.trade_validations = validate_trade_orders(state.orders)
                 state.selected_indexes = default_selected_order_indexes(state.orders)
                 state.message = f"{persist_message} Loaded {len(state.orders)} order(s).".strip()
-            elif self.path == "/csv/save-today":
+            elif request_path == "/csv/save-today":
                 state.csv_path, state.message = save_today_csv_text(state.csv_text)
                 state.csv_text = Path(state.csv_path).read_text(encoding="utf-8-sig")
-            elif self.path == "/execute":
+            elif request_path == "/execute":
                 rows_payload = first(form, "rows_payload")
                 state.rows = decode_rows(rows_payload) if rows_payload else None
                 if not state.rows:
@@ -9329,6 +9370,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.rows, state.csv_text = load_rows(state.csv_path, state.csv_text)
                 else:
                     persist_message = ""
+                validate_kite_order_rows(state.rows)
                 selected = {int(value) for value in form.get("selected", [])}
                 (state.orders, state.results), state.console_log = call_with_console(
                     execute_orders,
@@ -9349,7 +9391,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.message = (
                         f"{persist_message} Submitted {len(state.orders)} selected order(s) to Kite."
                     ).strip()
-            elif self.path == "/orders/cancel-all":
+            elif request_path == "/orders/cancel-all":
                 state.results, state.console_log = call_with_console(cancel_all_open_orders)
                 try:
                     state.order_book = kite_order_book()
@@ -9358,7 +9400,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 cancelled = sum(1 for item in state.results if item.get("status") == "CANCELLED")
                 errors = sum(1 for item in state.results if item.get("status") == "ERROR")
                 state.message = f"Cancel all completed. Cancelled {cancelled} order(s); errors {errors}."
-            elif self.path == "/orders/cancel-selected":
+            elif request_path == "/orders/cancel-selected":
                 selected_order_keys = form.get("order_key", [])
                 state.results, state.console_log = call_with_console(
                     cancel_selected_orders,
@@ -9374,7 +9416,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = (
                     f"Cancel selected completed. Cancelled {cancelled}; skipped {skipped}; errors {errors}."
                 )
-            elif self.path == "/orders/modify-selected":
+            elif request_path == "/orders/modify-selected":
                 selected_order_keys = form.get("order_key", [])
                 state.results, state.console_log = call_with_console(
                     modify_selected_orders,
@@ -9391,17 +9433,17 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = (
                     f"Modify selected completed. Modified {modified}; skipped {skipped}; errors {errors}."
                 )
-            elif self.path == "/orders/refresh":
+            elif request_path == "/orders/refresh":
                 state.order_book, state.console_log = call_with_console(kite_order_book)
                 state.message = f"Loaded {len(state.order_book)} Kite order(s)."
-            elif self.path == "/positions/load":
+            elif request_path == "/positions/load":
                 state.position_orders, state.console_log = call_with_console(
                     build_position_buy_orders,
                     state,
                 )
                 state.position_selected_indexes = set(range(len(state.position_orders)))
                 state.message = f"Loaded {len(state.position_orders)} BUY order(s) from current positions."
-            elif self.path == "/positions/execute":
+            elif request_path == "/positions/execute":
                 orders_payload = first(form, "position_orders_payload")
                 state.position_orders = decode_orders(orders_payload) if orders_payload else None
                 if not state.position_orders:
@@ -9430,7 +9472,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.message = (
                         f"Submitted {len(state.position_orders)} selected BUY order(s) to Kite."
                     )
-            elif self.path == "/positions/close-buy":
+            elif request_path == "/positions/close-buy":
                 close_symbol = first(form, "close_symbol")
                 result, state.console_log = call_with_console(
                     place_position_close_buy_order,
@@ -9443,16 +9485,16 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 ), refresh_log = call_with_console(positions_research)
                 state.console_log = f"{state.console_log}{refresh_log}"
                 state.message = f"Submitted BUY close order for {close_symbol.upper()}."
-            elif self.path == "/gpt/load":
+            elif request_path == "/gpt/load":
                 state.gpt_conversation, state.console_log = call_with_console(
                     fetch_gpt_conversation,
                     state.gpt_url,
                 )
                 state.message = "Fetched GPT share conversation. Review it, then extract CSV."
-            elif self.path == "/gpt/extract":
+            elif request_path == "/gpt/extract":
                 state.gpt_csv_text = extract_csv_from_text(state.gpt_conversation)
                 state.message = "Extracted CSV from GPT conversation."
-            elif self.path == "/gpt/generate":
+            elif request_path == "/gpt/generate":
                 (
                     state.gpt_csv_text,
                     state.gpt_api_output,
@@ -9464,13 +9506,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.openai_system_prompt,
                 )
                 state.message = "Generated Kite order CSV with OpenAI. Review before saving or placing orders."
-            elif self.path in {"/gpt/save", "/gpt/save-preview"}:
+            elif request_path in {"/gpt/save", "/gpt/save-preview", "/gpt/save_preview"}:
                 if not state.gpt_csv_text.strip():
                     state.gpt_csv_text = extract_csv_from_text(state.gpt_conversation)
                 state.gpt_csv_text = normalize_kite_csv_input(state.gpt_csv_text)
                 persist_message = persist_default_csv_text(state.gpt_csv_text)
                 state.csv_text = state.gpt_csv_text
-                if self.path == "/gpt/save-preview":
+                if request_path in {"/gpt/save-preview", "/gpt/save_preview"}:
                     state.rows = parse_csv_text(state.gpt_csv_text)
                     state.orders, state.console_log = call_with_console(
                         build_orders,
@@ -9484,7 +9526,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     ).strip()
                 else:
                     state.message = persist_message
-            elif self.path == "/kite-setup":
+            elif request_path == "/kite-setup":
                 save_env_values(
                     {
                         "KITE_CONFIRM_LIVE_ORDER": state.confirm_live_order or env_value("KITE_CONFIRM_LIVE_ORDER"),
@@ -9507,14 +9549,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     f"Kite setup saved. ETF buy amount {format_buy_amount(state.etf_buy_amount)}. "
                     f"Home watchlist has {len(normalized_home_tickers)} ticker(s)."
                 )
-            elif self.path == "/kite-token/generate":
+            elif request_path == "/kite-token/generate":
                 access_token, state.console_log = call_with_console(
                     generate_kite_access_token,
                     state.kite_request_token,
                 )
                 state.access_token = access_token
                 state.message = "Generated today's KITE_ACCESS_TOKEN, saved it to .env, and applied it to this running app."
-            elif self.path == "/kite-ip/check":
+            elif request_path == "/kite-ip/check":
                 state.kite_ip_data, state.console_log = call_with_console(fetch_public_ip_data)
                 ips = [item["ip"] for item in state.kite_ip_data if item.get("ip")]
                 state.message = (
@@ -9522,22 +9564,22 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     if ips
                     else "Could not fetch public IP. Check network and try again."
                 )
-            elif self.path == "/analytics/load":
+            elif request_path == "/analytics/load":
                 state.analytics_data, state.console_log = call_with_console(
                     option_analytics_for_symbol,
                     state.analytics_symbol,
                 )
                 state.message = f"Loaded analytics for {state.analytics_symbol.upper()}."
-            elif self.path == "/research/load":
+            elif request_path == "/research/load":
                 state.research_rows, state.console_log = call_with_console(research_csv_symbols)
                 state.message = f"Research completed for {len(state.research_rows)} CSV symbol(s)."
-            elif self.path == "/income/load":
+            elif request_path == "/income/load":
                 (
                     state.income_rows,
                     state.income_summary,
                 ), state.console_log = call_with_console(income_strategy_candidates)
                 state.message = f"Income strategy refreshed for {len(state.income_rows)} stock(s)."
-            elif self.path == "/income/sell-ce":
+            elif request_path == "/income/sell-ce":
                 underlying = first(form, "income_underlying")
                 result, state.console_log = call_with_console(
                     place_income_covered_call_order,
@@ -9550,7 +9592,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 ), refresh_log = call_with_console(income_strategy_candidates)
                 state.console_log = f"{state.console_log}{refresh_log}"
                 state.message = f"Submitted covered CE order for {underlying.upper()}."
-            elif self.path == "/income/sell-pe":
+            elif request_path == "/income/sell-pe":
                 underlying = first(form, "income_underlying")
                 result, state.console_log = call_with_console(
                     place_income_cash_secured_put_order,
@@ -9563,7 +9605,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 ), refresh_log = call_with_console(income_strategy_candidates)
                 state.console_log = f"{state.console_log}{refresh_log}"
                 state.message = f"Submitted cash-secured PE order for {underlying.upper()}."
-            elif self.path == "/positions-research/load":
+            elif request_path == "/positions-research/load":
                 (
                     state.positions_rows,
                     state.positions_summary,
@@ -9571,13 +9613,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = (
                     f"Loaded analytics for {len(state.positions_rows)} active option position(s)."
                 )
-            elif self.path == "/commodity/refresh":
+            elif request_path == "/commodity/refresh":
                 state.commodity_holdings, state.console_log = call_with_console(
                     commodity_etf_holdings
                 )
                 non_zero = sum(1 for item in state.commodity_holdings if item.get("quantity"))
                 state.message = f"Refreshed commodity ETF holdings. Found {non_zero} holding(s)."
-            elif self.path == "/commodity/buy":
+            elif request_path == "/commodity/buy":
                 symbol = first(form, "commodity_symbol")
                 try:
                     result, state.console_log = call_with_console(
@@ -9602,7 +9644,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.commodity_holdings = commodity_etf_holdings()
                 except Exception as exc:
                     state.commodity_error = f"Holdings refresh failed: {exc}"
-            elif self.path == "/commodity/sell":
+            elif request_path == "/commodity/sell":
                 symbol = first(form, "commodity_symbol")
                 try:
                     if not checked(form, "commodity_confirmed"):
@@ -9631,9 +9673,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     state.commodity_error = f"Holdings refresh failed: {exc}"
             else:
-                state.error = f"Unknown path: {self.path}"
+                state.error = f"Unknown path: {request_path}"
         except Exception as exc:
-            if self.path == "/csv/save-today":
+            if request_path == "/csv/save-today":
                 state.csv_path, state.csv_text = restore_csv_text_after_save_error(state.csv_path)
             state.error = f"{exc}\n\n{traceback.format_exc()}"
 
