@@ -162,8 +162,6 @@ TOP_WATCHLIST = [
 ]
 GLOBAL_MARKET_WATCHLIST = [
     {"label": "NIFTY", "symbol": "^NSEI"},
-    {"label": "BANKNIFTY", "symbol": "^NSEBANK"},
-    {"label": "SENSEX", "symbol": "^BSESN"},
     {"label": "INDIA VIX", "symbol": "^INDIAVIX"},
     {"label": "USD/INR", "symbol": "INR=X"},
     {"label": "Nasdaq", "symbol": "^IXIC"},
@@ -213,6 +211,48 @@ STOCK_SECTORS = {
     "NTPC": "Power",
     "WAAREEENER": "Energy",
 }
+INVESTING_HOLDINGS = [
+    {"code": "NSE:SCHNEIDER", "company": "Schneider", "sector": "Elec Infra", "core": "Y", "quantity": 3435, "avg_price": 475.37},
+    {"code": "NSE:PGEL", "company": "PG Electroplast Ltd", "sector": "Manf", "core": "Y", "quantity": 7350, "avg_price": 107.40},
+    {"code": "BSE:501423", "company": "Shaily Engg", "sector": "Manf", "core": "N", "quantity": 1206, "avg_price": 174.98},
+    {"code": "NSE:ETERNAL", "company": "Eternal Ltd", "sector": "Quick Comm", "core": "N", "quantity": 11500, "avg_price": 63.59},
+    {"code": "NSE:CAPLIPOINT", "company": "Caplin Point Laboratories Ltd", "sector": "Pharma", "core": "Y", "quantity": 1099, "avg_price": 532.00},
+    {"code": "NSE:BAJFINANCE", "company": "Bajaj Finance Ltd", "sector": "NBFC", "core": "Y", "quantity": 2310, "avg_price": 666.45},
+    {"code": "NSE:BANCOINDIA", "company": "Banco Products (India) Ltd", "sector": "Auto", "core": "Y", "quantity": 3577, "avg_price": 91.97},
+    {"code": "NSE:UNITDSPR", "company": "United Spirits Ltd", "sector": "FMCG", "core": "Y", "quantity": 1522, "avg_price": 883.67},
+    {"code": "NSE:JAYKAY", "company": "Jaykay", "sector": "Manf", "core": "N", "quantity": 12000, "avg_price": 38.40},
+    {"code": "NSE:E2E", "company": "E2E Networks", "sector": "Data Center", "core": "", "quantity": 463, "avg_price": 2130.92},
+    {"code": "NSE:PFC", "company": "Power Finance Corporation Ltd", "sector": "Power", "core": "Y", "quantity": 3515, "avg_price": 167.71},
+    {"code": "NSE:NAZARA", "company": "Nazara Tech", "sector": "EGAME", "core": "Y", "quantity": 4412, "avg_price": 162.65},
+    {"code": "NSE:ZENTEC", "company": "Zen Tech", "sector": "Defence", "core": "N", "quantity": 794, "avg_price": 417.36},
+    {"code": "NSE:MAZDOCK", "company": "Mazagon Dock Shipbuilders Ltd", "sector": "Service", "core": "", "quantity": 475, "avg_price": 290.53},
+    {"code": "NSE:TATACONSUM", "company": "Tata Consumer Products Ltd", "sector": "FMCG", "core": "Y", "quantity": 650, "avg_price": 828.00},
+    {"code": "NSE:MAXIND", "company": "Max India Ltd", "sector": "Health", "core": "N", "quantity": 4900, "avg_price": 152.13},
+    {"code": "NSE:TITAN", "company": "Titan", "sector": "Cosmetic", "core": "Y", "quantity": 182, "avg_price": 3409.78},
+    {"code": "NSE:JSWINFRA", "company": "JSW Infra", "sector": "Infra", "core": "Y", "quantity": 2755, "avg_price": 184.63},
+    {"code": "NSE:FIEMIND", "company": "Fiem Industries Ltd", "sector": "Auto", "core": "N", "quantity": 333, "avg_price": 677.39},
+    {"code": "NSE:HAVELLS", "company": "Havells India Ltd", "sector": "Good", "core": "Y", "quantity": 520, "avg_price": 1375.19},
+    {"code": "NSE:NAUKRI", "company": "Info Edge", "sector": "Start ups", "core": "Y", "quantity": 615, "avg_price": 771.21},
+    {"code": "NSE:CDSL", "company": "Central Depository Services (India) Ltd", "sector": "Capital Market", "core": "Y", "quantity": 410, "avg_price": 678.05},
+    {"code": "NSE:EPACK", "company": "Epack Durable Ltd", "sector": "Manf", "core": "", "quantity": 1750, "avg_price": 176.00},
+    {"code": "BSE:516030", "company": "Pakka Limited", "sector": "Manf", "core": "N", "quantity": 4400, "avg_price": 184.00},
+    {"code": "NSE:LATENTVIEW", "company": "Latent View", "sector": "IT", "core": "N", "quantity": 1250, "avg_price": 373.40},
+    {"code": "NSE:URBANCO", "company": "Urban Company", "sector": "Services", "core": "", "quantity": 3411, "avg_price": 168.89},
+    {"code": "NSE:WAAREEENER", "company": "Waaree Energies", "sector": "Energy", "core": "", "quantity": 130, "avg_price": 1503.00},
+    {"code": "NSE:NTPC", "company": "NTPC Ltd", "sector": "Manf", "core": "", "quantity": 927, "avg_price": 214.53},
+    {"code": "NSE:NSE", "company": "NSE", "sector": "Capital Market", "core": "", "quantity": 175, "avg_price": 2000.00},
+    {"code": "NSE:CAMS", "company": "Computer Age Management Services Ltd", "sector": "Capital Market", "core": "", "quantity": 410, "avg_price": 582.00},
+    {"code": "NSE:NIFTYBEES", "company": "Nifty INDEX", "sector": "Index", "core": "", "quantity": 1175, "avg_price": 265.00},
+    {"code": "NSE:OLAELEC", "company": "OLA Elec", "sector": "EV", "core": "", "quantity": 8265, "avg_price": 73.91},
+    {"code": "NSE:FRESHARA", "company": "Freshara", "sector": "Food", "core": "", "quantity": 1200, "avg_price": 180.00},
+    {"code": "BSE:543940", "company": "Beacon Trusteeship", "sector": "Capital Market", "core": "", "quantity": 2000, "avg_price": 82.00},
+    {"code": "NSE:JYOTICNC", "company": "Jyoti CNC Automation Ltd", "sector": "CNC Auto", "core": "", "quantity": 245, "avg_price": 389.00},
+    {"code": "NSE:ANANTRAJ", "company": "Anant Raj", "sector": "Capital Market", "core": "", "quantity": 250, "avg_price": 495.00},
+    {"code": "NSE:PROTEAN", "company": "Protean EGov", "sector": "IT", "core": "Y", "quantity": 200, "avg_price": 883.00},
+    {"code": "BSE:544278", "company": "Addictive Learning", "sector": "EDU TECH", "core": "", "quantity": 1000, "avg_price": 114.00},
+    {"code": "NSE:MEGATHERM", "company": "Megatherm", "sector": "Metal", "core": "", "quantity": 400, "avg_price": 300.00},
+    {"code": "NSE:NUVAMA", "company": "NUVAMA", "sector": "Capital Market", "core": "", "quantity": 0, "avg_price": 0.0},
+]
 COMMODITY_ETFS = [
     {
         "key": "nasdaq",
@@ -620,6 +660,7 @@ class PageState:
     position_autoslice: bool = False
     position_keep_existing_orders: bool = False
     position_max_orders: str = ""
+    position_live_confirmed: bool = False
     gpt_url: str = DEFAULT_GPT_SHARE_URL
     gpt_conversation: str = ""
     gpt_csv_text: str = ""
@@ -638,6 +679,8 @@ class PageState:
     commodity_results: list[dict[str, Any]] | None = None
     commodity_holdings: list[dict[str, Any]] | None = None
     commodity_error: str = ""
+    investing_rows: list[dict[str, Any]] | None = None
+    investing_summary: dict[str, Any] | None = None
     income_rows: list[dict[str, Any]] | None = None
     income_summary: dict[str, Any] | None = None
     income_results: list[dict[str, Any]] | None = None
@@ -3335,6 +3378,126 @@ def fetch_commodity_etf_quotes() -> dict[str, Any]:
     return cached_payload("commodity-quotes", fetch_commodity_etf_quotes_uncached)
 
 
+def investing_quote_key(code: str) -> str:
+    clean = code.strip().replace('"', "").upper()
+    exchange, _, symbol = clean.partition(":")
+    if not symbol:
+        symbol = exchange
+        exchange = "NSE"
+    if exchange in {"BOM", "BSE"}:
+        exchange = "BSE"
+    return f"{exchange}:{symbol.strip()}"
+
+
+def fetch_investing_news(rows: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    news_by_symbol: dict[str, dict[str, str]] = {}
+    # Keep this intentionally small; news RSS calls can otherwise dominate tab load.
+    watch_rows = sorted(
+        [row for row in rows if row.get("quantity")],
+        key=lambda row: float(row.get("market_value") or row.get("cost_value") or 0),
+        reverse=True,
+    )[:8]
+    for row in watch_rows:
+        symbol = str(row.get("symbol") or "")
+        company = str(row.get("company") or symbol)
+        sector = str(row.get("sector") or "")
+        query = quote_plus(f"{company} {sector} NSE stock news")
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+        try:
+            request = Request(url, headers={"User-Agent": "KiteTraderLocalApp/1.0"})
+            with urlopen(request, timeout=5) as response:
+                xml_text = response.read().decode("utf-8", errors="ignore")
+            root = ElementTree.fromstring(xml_text)
+            item = root.find(".//item")
+            if item is None:
+                continue
+            title = item.findtext("title") or ""
+            link = item.findtext("link") or ""
+            published = item.findtext("pubDate") or ""
+            published_at = parse_news_pubdate(published)
+            news_by_symbol[symbol] = {
+                "title": title,
+                "link": link,
+                "date": published_at.strftime("%d %b") if published_at else "",
+                "sentiment": classify_news_sentiment(title),
+            }
+        except Exception as exc:
+            news_by_symbol[symbol] = {
+                "title": f"News unavailable: {exc}",
+                "link": "",
+                "date": "",
+                "sentiment": "neutral",
+            }
+    return news_by_symbol
+
+
+def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    quote_keys = [investing_quote_key(str(item["code"])) for item in INVESTING_HOLDINGS]
+    raw_quotes: dict[str, Any] = {}
+    quote_error = ""
+    if kite_orders is not None:
+        try:
+            raw_quotes = cached_kite_quote(kite_orders.kite_client(), quote_keys)
+        except Exception as exc:
+            quote_error = str(exc)
+    else:
+        quote_error = f"Could not import kite_place_order.py: {IMPORT_ERROR}"
+
+    for item in INVESTING_HOLDINGS:
+        code = str(item["code"])
+        key = investing_quote_key(code)
+        symbol = key.split(":", 1)[1]
+        quantity = int(float(item.get("quantity") or 0))
+        avg_price = float(item.get("avg_price") or 0)
+        quote = raw_quotes.get(key, {})
+        cmp_value = quote_ltp(quote) if quote else 0.0
+        cost_value = quantity * avg_price
+        market_value = quantity * cmp_value if cmp_value > 0 else 0.0
+        pnl = market_value - cost_value if cmp_value > 0 else None
+        pnl_pct = (pnl / cost_value * 100) if pnl is not None and cost_value > 0 else None
+        rows.append(
+            {
+                "code": code,
+                "quote_key": key,
+                "symbol": symbol,
+                "company": item["company"],
+                "sector": item["sector"],
+                "core": item.get("core") or "",
+                "quantity": quantity,
+                "avg_price": avg_price,
+                "cmp": cmp_value if cmp_value > 0 else None,
+                "cost_value": cost_value,
+                "market_value": market_value if cmp_value > 0 else None,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "pe": "N/A",
+                "sector_pe": "N/A",
+                "opm": "N/A",
+                "mcap": "N/A",
+                "debt": "N/A",
+                "news": None,
+                "error": "" if quote else quote_error or "Quote unavailable",
+            }
+        )
+    news_by_symbol = fetch_investing_news(rows)
+    for row in rows:
+        row["news"] = news_by_symbol.get(str(row["symbol"]), None)
+    total_cost = sum(float(row.get("cost_value") or 0) for row in rows)
+    total_market = sum(float(row.get("market_value") or 0) for row in rows)
+    total_pnl = total_market - total_cost if total_market > 0 else None
+    core_value = sum(float(row.get("market_value") or 0) for row in rows if row.get("core") == "Y")
+    return rows, {
+        "total_cost": total_cost,
+        "total_market": total_market,
+        "total_pnl": total_pnl,
+        "total_pnl_pct": (total_pnl / total_cost * 100) if total_pnl is not None and total_cost > 0 else None,
+        "core_value": core_value,
+        "core_pct": (core_value / total_market * 100) if total_market > 0 else None,
+        "quote_error": quote_error,
+    }
+
+
 def commodity_etf_by_symbol(symbol: str) -> dict[str, Any]:
     clean = symbol.strip().upper()
     for item in COMMODITY_ETFS:
@@ -3943,7 +4106,33 @@ def should_fallback_to_new_order(error: Exception) -> bool:
     return any(term in text for term in fallback_terms)
 
 
+KITE_PLACE_ORDER_FIELDS = {
+    "variety",
+    "exchange",
+    "tradingsymbol",
+    "transaction_type",
+    "quantity",
+    "product",
+    "order_type",
+    "price",
+    "validity",
+    "tag",
+    "autoslice",
+    "market_protection",
+    "trigger_price",
+}
+
+
+def kite_order_payload(order: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in order.items()
+        if key in KITE_PLACE_ORDER_FIELDS and value not in {None, ""}
+    }
+
+
 def modify_or_place_order_with_new_fallback(kite: Any, order: dict[str, Any]) -> tuple[str, str]:
+    order = kite_order_payload(order)
     similar_orders = kite_orders.find_similar_open_orders(kite, order)
     if not similar_orders:
         order_id = kite_orders.place_order(kite, order)
@@ -4004,11 +4193,12 @@ def execute_orders(
     results: list[dict[str, Any]] = []
     for order in orders:
         try:
+            payload = kite_order_payload(order)
             if keep_existing_orders:
-                order_id = kite_orders.place_order(kite, order)
+                order_id = kite_orders.place_order(kite, payload)
                 action = "placed_new_requested"
             else:
-                order_id, action = modify_or_place_order_with_new_fallback(kite, order)
+                order_id, action = modify_or_place_order_with_new_fallback(kite, payload)
             results.append(
                 {
                     "tradingsymbol": order["tradingsymbol"],
@@ -4038,12 +4228,107 @@ CANCELLABLE_ORDER_STATUSES = {
 }
 
 
+def order_completed_quantity(order: dict[str, Any]) -> int:
+    for key in ("filled_quantity", "quantity"):
+        try:
+            quantity = int(float(order.get(key) or 0))
+            if quantity > 0:
+                return quantity
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def order_average_fill_price(order: dict[str, Any]) -> float:
+    for key in ("average_price", "price"):
+        try:
+            price = float(order.get(key) or 0)
+            if price > 0:
+                return price
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def order_sort_value(order: dict[str, Any]) -> str:
+    for key in ("order_timestamp", "exchange_timestamp", "exchange_update_timestamp"):
+        value = order.get(key)
+        if value:
+            return str(value)
+    return str(order.get("order_id") or "")
+
+
+def completed_close_pnl_by_order_id(
+    orders: list[dict[str, Any]], positions: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Estimate realised P&L when a completed BUY closes an earlier sold option."""
+    current_qty_by_symbol: dict[str, int] = {}
+    for position in positions:
+        symbol = str(position.get("tradingsymbol") or "").upper()
+        if not symbol:
+            continue
+        try:
+            current_qty_by_symbol[symbol] = int(float(position.get("quantity") or 0))
+        except (TypeError, ValueError):
+            current_qty_by_symbol[symbol] = 0
+
+    sell_pool: dict[str, dict[str, float]] = {}
+    close_pnl: dict[str, dict[str, Any]] = {}
+    completed = [
+        order
+        for order in orders
+        if str(order.get("status") or "").upper() == "COMPLETE"
+        and option_symbol_parts(str(order.get("tradingsymbol") or "").upper())
+    ]
+    for order in sorted(completed, key=order_sort_value):
+        symbol = str(order.get("tradingsymbol") or "").upper()
+        side = str(order.get("transaction_type") or "").upper()
+        quantity = order_completed_quantity(order)
+        price = order_average_fill_price(order)
+        if quantity <= 0 or price <= 0:
+            continue
+        pool = sell_pool.setdefault(symbol, {"qty": 0.0, "value": 0.0})
+        if side == "SELL":
+            pool["qty"] += quantity
+            pool["value"] += price * quantity
+            continue
+        if side != "BUY" or pool["qty"] <= 0:
+            continue
+
+        close_qty = min(float(quantity), pool["qty"])
+        sell_avg = pool["value"] / pool["qty"] if pool["qty"] else 0.0
+        pnl = (sell_avg - price) * close_qty
+        pool["qty"] -= close_qty
+        pool["value"] = max(0.0, pool["value"] - (sell_avg * close_qty))
+        if pool["qty"] <= 0.0001:
+            pool["qty"] = 0.0
+            pool["value"] = 0.0
+
+        current_qty = current_qty_by_symbol.get(symbol, 0)
+        if current_qty < 0:
+            portfolio_note = f"Current short remains {current_qty}."
+        elif current_qty == 0:
+            portfolio_note = "No current open quantity remains."
+        else:
+            portfolio_note = f"Current net quantity is {current_qty}."
+        close_pnl[str(order.get("order_id") or "")] = {
+            "pnl": pnl,
+            "close_qty": int(close_qty),
+            "sell_avg": sell_avg,
+            "buy_avg": price,
+            "note": portfolio_note,
+        }
+    return close_pnl
+
+
 def kite_order_book() -> list[dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     kite = kite_orders.kite_client()
     rows: list[dict[str, Any]] = []
     orders = list(reversed(cached_kite_orders(kite)))
+    positions = cached_kite_positions(kite)
+    close_pnl_by_order = completed_close_pnl_by_order_id(orders, positions)
     quote_keys = sorted(
         {
             f"{str(order.get('exchange') or '').upper()}:{str(order.get('tradingsymbol') or '').upper()}"
@@ -4067,6 +4352,7 @@ def kite_order_book() -> list[dict[str, Any]]:
                 price_diff_pct = ((order_price - live_price) / live_price) * 100
         except Exception:
             price_diff_pct = None
+        close_pnl = close_pnl_by_order.get(str(order.get("order_id") or ""))
         rows.append(
             {
                 "order_id": str(order.get("order_id") or ""),
@@ -4081,6 +4367,8 @@ def kite_order_book() -> list[dict[str, Any]]:
                 "price": price,
                 "ltp": ltp,
                 "price_diff_pct": price_diff_pct,
+                "close_pnl": close_pnl.get("pnl") if close_pnl else None,
+                "close_pnl_detail": close_pnl,
                 "status": status,
                 "status_message": str(order.get("status_message") or ""),
                 "is_cancellable": status in CANCELLABLE_ORDER_STATUSES,
@@ -4666,6 +4954,20 @@ def render_order_book(state: PageState) -> str:
         if price_diff is not None:
             diff_value = float(price_diff)
             diff_class = "pnl-positive" if diff_value >= 0 else "pnl-negative"
+        close_pnl = order.get("close_pnl")
+        close_pnl_detail = order.get("close_pnl_detail") or {}
+        close_pnl_class = ""
+        close_pnl_cell = "N/A"
+        if close_pnl is not None:
+            close_pnl_value = float(close_pnl)
+            close_pnl_class = "pnl-positive" if close_pnl_value >= 0 else "pnl-negative"
+            close_pnl_cell = (
+                f"<strong>{html.escape(display_cell('pnl', close_pnl_value))}</strong>"
+                f"<small>Qty {html.escape(str(close_pnl_detail.get('close_qty', '')))} | "
+                f"Sell {html.escape(fmt_number(close_pnl_detail.get('sell_avg')))} / "
+                f"Buy {html.escape(fmt_number(close_pnl_detail.get('buy_avg')))}</small>"
+                f"<small>{html.escape(str(close_pnl_detail.get('note') or ''))}</small>"
+            )
         rows.append(
             "<tr>"
             f'<td><input type="checkbox" name="order_key" value="{html.escape(key, quote=True)}"{checked_attr}{disabled_attr}></td>'
@@ -4679,13 +4981,14 @@ def render_order_book(state: PageState) -> str:
             f"<td>{price_cell}</td>"
             f"<td>{html.escape(fmt_number(order.get('ltp')))}</td>"
             f'<td class="{diff_class}">{html.escape(fmt_number(price_diff))}%</td>'
+            f'<td class="{close_pnl_class}">{close_pnl_cell}</td>'
             f"<td>{html.escape(str(order.get('status', '')))}</td>"
             "</tr>"
         )
     body = (
         "".join(rows)
         if rows
-        else '<tr><td colspan="12" class="status">No Kite orders found.</td></tr>'
+        else '<tr><td colspan="13" class="status">No Kite orders found.</td></tr>'
     )
     error_html = render_graceful_error(error, "Kite Orders Error")
     return (
@@ -4697,7 +5000,7 @@ def render_order_book(state: PageState) -> str:
         '<button type="submit" formaction="/orders/refresh">Refresh Orders</button></div>'
         '<div class="table-wrap"><table class="order-book-table"><thead><tr>'
         '<th>Select</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Pending</th>'
-        '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>% Diff</th><th>Status</th>'
+        '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>% Diff</th><th>Close P&L</th><th>Status</th>'
         f"</tr></thead><tbody>{body}</tbody></table></div></section>"
     )
 
@@ -4758,6 +5061,135 @@ def floor_to_tick(value: float, tick_size: float = 0.05) -> float:
     if tick_size <= 0:
         return round(value, 2)
     return round(math.floor(value / tick_size) * tick_size, 2)
+
+
+def render_investing_panel(state: PageState) -> str:
+    rows = state.investing_rows or [
+        {
+            "symbol": investing_quote_key(str(item["code"])).split(":", 1)[1],
+            "company": item["company"],
+            "sector": item["sector"],
+            "core": item.get("core") or "",
+            "quantity": int(float(item.get("quantity") or 0)),
+            "avg_price": float(item.get("avg_price") or 0),
+            "cmp": None,
+            "cost_value": int(float(item.get("quantity") or 0)) * float(item.get("avg_price") or 0),
+            "market_value": None,
+            "pnl": None,
+            "pnl_pct": None,
+            "pe": "N/A",
+            "sector_pe": "N/A",
+            "opm": "N/A",
+            "mcap": "N/A",
+            "debt": "N/A",
+            "news": None,
+            "error": "Click refresh for live CMP",
+        }
+        for item in INVESTING_HOLDINGS
+    ]
+    summary = state.investing_summary or {
+        "total_cost": sum(float(row.get("cost_value") or 0) for row in rows),
+        "total_market": None,
+        "total_pnl": None,
+        "total_pnl_pct": None,
+        "core_value": None,
+        "core_pct": None,
+    }
+
+    def money_cell(value: Any) -> str:
+        return format_buy_amount(value) if value not in {None, ""} else "N/A"
+
+    def news_cell(row: dict[str, Any]) -> str:
+        news = row.get("news") or {}
+        if not news:
+            return '<td class="investing-news-cell muted-cell">Refresh to load top news</td>'
+        title = str(news.get("title") or "No recent news")
+        date_text = str(news.get("date") or "")
+        sentiment = str(news.get("sentiment") or "neutral")
+        link = str(news.get("link") or "")
+        content = f'<span class="news-tag news-sentiment-{html.escape(sentiment)}">{html.escape(sentiment.upper())}</span> '
+        if date_text:
+            content += f'<span class="news-date">{html.escape(date_text)}</span> '
+        content += (
+            f'<a href="{html.escape(link, quote=True)}" target="_blank" rel="noopener">{html.escape(title)}</a>'
+            if link
+            else html.escape(title)
+        )
+        return f'<td class="investing-news-cell">{content}</td>'
+
+    table_rows = ""
+    for row in rows:
+        pnl = row.get("pnl")
+        pnl_class = "signal-neutral"
+        if isinstance(pnl, (int, float)):
+            pnl_class = "signal-green" if pnl >= 0 else "signal-red"
+        core = "CORE" if row.get("core") == "Y" else "SAT"
+        table_rows += (
+            "<tr>"
+            f'<td class="position-symbol-cell">{html.escape(str(row.get("symbol", "")))}<span>{html.escape(str(row.get("company", "")))}</span></td>'
+            f'<td>{html.escape(str(row.get("sector", "")))}</td>'
+            f'<td><span class="investing-core-pill {core.lower()}">{core}</span></td>'
+            f'<td>{html.escape(str(row.get("quantity", "")))}</td>'
+            f'<td>{html.escape(fmt_number(row.get("avg_price")))}</td>'
+            f'<td>{html.escape(fmt_number(row.get("cmp")))}</td>'
+            f'<td>{html.escape(money_cell(row.get("cost_value")))}</td>'
+            f'<td>{html.escape(money_cell(row.get("market_value")))}</td>'
+            f'<td class="{pnl_class}">{html.escape(money_cell(row.get("pnl")))}<br><small>{html.escape(fmt_number(row.get("pnl_pct")))}%</small></td>'
+            f"{news_cell(row)}"
+            f'<td>{html.escape(str(row.get("pe", "N/A")))}</td>'
+            f'<td>{html.escape(str(row.get("sector_pe", "N/A")))}</td>'
+            f'<td>{html.escape(str(row.get("opm", "N/A")))}</td>'
+            f'<td>{html.escape(str(row.get("mcap", "N/A")))}</td>'
+            f'<td>{html.escape(str(row.get("debt", "N/A")))}</td>'
+            f'<td class="muted-cell">{html.escape(str(row.get("error", "")))}</td>'
+            "</tr>"
+        )
+    if not table_rows:
+        table_rows = (
+            '<tr><td colspan="16" class="muted-cell">'
+            "Click Refresh Investing Portfolio to load live CMP, P&L, and latest news."
+            "</td></tr>"
+        )
+
+    summary_cards = "".join(
+        [
+            f'<div class="summary-card"><span>Cost value</span><strong>{html.escape(money_cell(summary.get("total_cost")))}</strong></div>',
+            f'<div class="summary-card"><span>Market value</span><strong>{html.escape(money_cell(summary.get("total_market")))}</strong></div>',
+            f'<div class="summary-card"><span>Total P&L</span><strong>{html.escape(money_cell(summary.get("total_pnl")))}</strong><small>{html.escape(fmt_number(summary.get("total_pnl_pct")))}%</small></div>',
+            f'<div class="summary-card"><span>Core allocation</span><strong>{html.escape(fmt_number(summary.get("core_pct")))}%</strong><small>{html.escape(money_cell(summary.get("core_value")))}</small></div>',
+        ]
+    )
+    return f"""
+    <form id="investing-panel" method="post" action="/investing/load"{'' if state.active_tab == 'investing' else ' style="display:none"'}>
+      {env_hidden_fields_for_render()}
+      <section class="panel investing-hero-panel">
+        <div>
+          <div class="panel-title">Investing Portfolio</div>
+          <p class="status">Long-term share holdings with live CMP, P&L, sector view, recent news, and financial-ratio placeholders.</p>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/investing/load">Refresh Investing Portfolio</button>
+        </div>
+      </section>
+      <section class="panel investing-summary-panel">
+        <div class="summary-grid">{summary_cards}</div>
+      </section>
+      <section class="panel investing-table-panel">
+        <div class="panel-title">Share Holdings</div>
+        <div class="status">Financial ratios show N/A until a fundamentals data source is connected. News is limited to the largest holdings for speed.</div>
+        <div class="table-wrap">
+          <table class="investing-table">
+            <thead><tr>
+              <th>Share</th><th>Sector</th><th>Type</th><th>Qty</th><th>Avg</th><th>CMP</th>
+              <th>Cost</th><th>Market Value</th><th>P&L</th><th>News / Sector</th>
+              <th>PE</th><th>Sector PE</th><th>OPM</th><th>MCAP</th><th>Debt</th><th>Note</th>
+            </tr></thead>
+            <tbody>{table_rows}</tbody>
+          </table>
+        </div>
+      </section>
+      {render_console(state.console_log)}
+    </form>"""
 
 
 def render_analytics_panel(state: PageState) -> str:
@@ -5335,6 +5767,7 @@ def render_positions_panel(
     return f"""
     <form id="positions-panel" method="post" action="/positions-research/load"{'' if state.active_tab == 'positions' else ' style="display:none"'}>
       {env_hidden_fields_for_render()}
+      <input type="hidden" name="position_live_confirmed" id="position-live-confirmed" value="0">
       <input type="hidden" name="position_orders_payload" value="{html.escape(position_orders_payload, quote=True)}">
       <section class="panel calm-hero-panel">
         <div>
@@ -5863,7 +6296,7 @@ def render_page(state: PageState) -> bytes:
         else ""
     )
     position_execute_button = (
-        '<button type="submit" formaction="/positions/execute" class="danger">Execute Selected BUY</button>'
+        '<button type="submit" formaction="/positions/execute" class="danger" id="position-execute-selected-button">Execute Selected BUY</button>'
         if state.position_orders
         else ""
     )
@@ -5877,6 +6310,7 @@ def render_page(state: PageState) -> bytes:
     commodity_tab_class = "active" if state.active_tab == "commodity" else ""
     income_tab_class = "active" if state.active_tab == "income" else ""
     order_management_tab_class = "active" if state.active_tab == "order-management" else ""
+    investing_tab_class = "active" if state.active_tab == "investing" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
     kite_setup_panel_style = "" if state.active_tab == "kite-setup" else ' style="display:none"'
@@ -6788,6 +7222,58 @@ def render_page(state: PageState) -> bytes:
       max-width: 260px;
       white-space: normal;
     }}
+    .investing-hero-panel {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      border-color: #99f6e4;
+      background: linear-gradient(135deg, #f8fafc 0%, #ecfeff 52%, #f0fdf4 100%);
+    }}
+    .investing-summary-panel {{
+      border-color: #bfdbfe;
+      background: linear-gradient(135deg, #ffffff 0%, #f0f9ff 100%);
+    }}
+    .investing-table-panel {{
+      border-color: #a7f3d0;
+      background: linear-gradient(135deg, #ffffff 0%, #f8fffd 100%);
+    }}
+    .investing-table {{
+      min-width: 1780px;
+    }}
+    .investing-table th {{
+      background: linear-gradient(135deg, #0f4c5c, #0f766e);
+      color: #ffffff;
+      font-size: 11px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }}
+    .investing-core-pill {{
+      display: inline-flex;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 10px;
+      font-weight: 950;
+      background: #f1f5f9;
+      color: #475569;
+    }}
+    .investing-core-pill.core {{
+      background: #dcfce7;
+      color: #166534;
+    }}
+    .investing-core-pill.sat {{
+      background: #eef2ff;
+      color: #3730a3;
+    }}
+    .investing-news-cell {{
+      min-width: 340px;
+      white-space: normal;
+      line-height: 1.35;
+    }}
+    .muted-cell {{
+      color: #64748b;
+      font-size: 12px;
+    }}
     .income-filter strong,
     .income-filter span,
     .income-filter small {{
@@ -6992,6 +7478,12 @@ def render_page(state: PageState) -> bytes:
       --tab-b: #fef9c3;
       --tab-ink: #047857;
       --tab-shadow: rgba(22, 163, 74, 0.16);
+    }}
+    .tab-button[data-tab="investing"] {{
+      --tab-a: #dbeafe;
+      --tab-b: #ecfdf5;
+      --tab-ink: #0f766e;
+      --tab-shadow: rgba(14, 165, 233, 0.14);
     }}
     .tab-button[data-tab="commodity"] {{
       --tab-a: #fed7aa;
@@ -7929,6 +8421,24 @@ def render_page(state: PageState) -> bytes:
       overflow-wrap: anywhere;
       vertical-align: top;
     }}
+    .order-book-table small {{
+      display: block;
+      margin-top: 2px;
+      color: #475569;
+      font-size: 10px;
+      font-weight: 750;
+      line-height: 1.2;
+    }}
+    .order-book-table .pnl-positive {{
+      background: #ecfdf5;
+      color: #047857;
+      font-weight: 900;
+    }}
+    .order-book-table .pnl-negative {{
+      background: #fef2f2;
+      color: #b91c1c;
+      font-weight: 900;
+    }}
     .order-edit-input {{
       width: 96px;
       padding: 6px 8px;
@@ -8357,6 +8867,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
       <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Modify / Cancel</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
+      <button class="tab-button utility-action {investing_tab_class}" type="button" data-tab="investing">Investing</button>
       <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
       <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT</button>
@@ -8451,6 +8962,7 @@ def render_page(state: PageState) -> bytes:
     {render_analytics_panel(state)}
     {render_research_panel(state)}
     {render_income_panel(state)}
+    {render_investing_panel(state)}
     {render_commodity_panel(state)}
   </main>
   <div class="live-modal-backdrop" id="live-confirm-modal">
@@ -8471,6 +8983,23 @@ def render_page(state: PageState) -> bytes:
       <div class="modal-actions">
         <button type="button" class="secondary" id="live-cancel">Cancel</button>
         <button type="button" class="danger" id="live-good" disabled>Good to go</button>
+      </div>
+    </div>
+  </div>
+  <div class="live-modal-backdrop" id="position-confirm-modal">
+    <div class="live-modal">
+      <h2>Pause Before Position BUY</h2>
+      <p>Selected BUY orders are about to run. Breathe in, breathe out, and review current stock movement.</p>
+      <div class="breath-circle"></div>
+      <div class="breath-text" id="position-breath-text">Breathe in</div>
+      <div class="countdown" id="position-countdown">10</div>
+      <div class="news-box guardrail-box">
+        <h3>CMP and Current Movement</h3>
+        <div id="position-quote-check">Loading current prices...</div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="position-cancel">Cancel</button>
+        <button type="button" class="danger" id="position-good" disabled>Good to go</button>
       </div>
     </div>
   </div>
@@ -8550,6 +9079,7 @@ def render_page(state: PageState) -> bytes:
         document.getElementById('analytics-panel').style.display = active === 'analytics' ? '' : 'none';
         document.getElementById('research-panel').style.display = active === 'research' ? '' : 'none';
         document.getElementById('income-panel').style.display = active === 'income' ? '' : 'none';
+        document.getElementById('investing-panel').style.display = active === 'investing' ? '' : 'none';
         document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
         for (const item of document.querySelectorAll('.tab-button')) {{
           item.classList.toggle('active', item.dataset.tab === active);
@@ -8587,10 +9117,21 @@ def render_page(state: PageState) -> bytes:
     const commodityGood = document.getElementById('commodity-good');
     const commodityCountdown = document.getElementById('commodity-countdown');
     const commodityBreathText = document.getElementById('commodity-breath-text');
+    const positionForm = document.getElementById('positions-panel');
+    const positionExecuteButton = document.getElementById('position-execute-selected-button');
+    const positionModal = document.getElementById('position-confirm-modal');
+    const positionCancel = document.getElementById('position-cancel');
+    const positionGood = document.getElementById('position-good');
+    const positionCountdown = document.getElementById('position-countdown');
+    const positionBreathText = document.getElementById('position-breath-text');
+    const positionLiveConfirmed = document.getElementById('position-live-confirmed');
+    const positionQuoteCheck = document.getElementById('position-quote-check');
     let pendingLiveSubmit = false;
     let countdownTimer = null;
     let pendingCommodityForm = null;
     let commodityCountdownTimer = null;
+    let pendingPositionSubmit = false;
+    let positionCountdownTimer = null;
     function stopLiveCountdown() {{
       if (countdownTimer) {{
         clearInterval(countdownTimer);
@@ -8659,6 +9200,50 @@ def render_page(state: PageState) -> bytes:
         }});
       }}
       return orders;
+    }}
+    function selectedPositionStocks() {{
+      const stocks = [];
+      const seen = new Set();
+      if (!positionForm) return stocks;
+      const rows = positionForm.querySelectorAll('table tbody tr');
+      for (const row of rows) {{
+        const checkbox = row.querySelector('input[name="position_selected"]');
+        if (!checkbox || !checkbox.checked || row.cells.length < 3) continue;
+        const symbol = row.cells[2].innerText.trim();
+        const stock = optionUnderlying(symbol);
+        if (stock && !seen.has(stock)) {{
+          stocks.push(stock);
+          seen.add(stock);
+        }}
+      }}
+      return stocks;
+    }}
+    async function loadPositionQuoteCheck(stocks) {{
+      if (!positionQuoteCheck) return;
+      if (!stocks.length) {{
+        positionQuoteCheck.textContent = 'No selected position BUY orders found.';
+        return;
+      }}
+      positionQuoteCheck.textContent = `Loading CMP for ${{stocks.join(', ')}}...`;
+      try {{
+        const response = await fetch('/market-quotes', {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load market quotes');
+        const bySymbol = new Map((data.quotes || []).map((quote) => [String(quote.symbol || '').toUpperCase(), quote]));
+        positionQuoteCheck.innerHTML = '<div class="guardrail-grid">' + stocks.map((stock) => {{
+          const quote = bySymbol.get(stock.toUpperCase());
+          if (!quote || quote.ltp === null || quote.ltp === undefined) {{
+            return `<div><span>${{escapeHtml(stock)}}</span><strong>N/A</strong><small>Quote unavailable</small></div>`;
+          }}
+          const pct = quote.change_percent === null || quote.change_percent === undefined ? null : Number(quote.change_percent);
+          const sign = pct !== null && pct > 0 ? '+' : '';
+          const move = pct === null ? '--' : `${{sign}}${{pct.toFixed(2)}}%`;
+          const cls = pct !== null && pct >= 0 ? 'news-sentiment-positive' : 'news-sentiment-negative';
+          return `<div class="${{cls}}"><span>${{escapeHtml(stock)}}</span><strong>${{Number(quote.ltp).toFixed(2)}}</strong><small>${{move}} today</small></div>`;
+        }}).join('') + '</div>';
+      }} catch (error) {{
+        positionQuoteCheck.textContent = `Quote check error: ${{error.message}}`;
+      }}
     }}
     async function loadTradeGuardrails() {{
       if (!tradeGuardrails) return;
@@ -8737,6 +9322,39 @@ def render_page(state: PageState) -> bytes:
         commodityCountdownTimer = null;
       }}
     }}
+    function stopPositionCountdown() {{
+      if (positionCountdownTimer) {{
+        clearInterval(positionCountdownTimer);
+        positionCountdownTimer = null;
+      }}
+    }}
+    function openPositionModal() {{
+      const stocks = selectedPositionStocks();
+      let remaining = Math.max(5, stocks.length * 5);
+      pendingPositionSubmit = true;
+      positionGood.disabled = true;
+      positionCountdown.textContent = String(remaining);
+      positionBreathText.textContent = 'Breathe in';
+      positionModal.style.display = 'flex';
+      loadPositionQuoteCheck(stocks);
+      stopPositionCountdown();
+      positionCountdownTimer = setInterval(() => {{
+        remaining -= 1;
+        positionCountdown.textContent = String(Math.max(remaining, 0));
+        positionBreathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          stopPositionCountdown();
+          positionBreathText.textContent = 'Ready';
+          positionGood.disabled = false;
+        }}
+      }}, 1000);
+    }}
+    function closePositionModal() {{
+      pendingPositionSubmit = false;
+      if (positionLiveConfirmed) positionLiveConfirmed.value = '0';
+      positionModal.style.display = 'none';
+      stopPositionCountdown();
+    }}
     function openCommodityModal(form) {{
       let remaining = 10;
       pendingCommodityForm = form;
@@ -8789,6 +9407,31 @@ def render_page(state: PageState) -> bytes:
       if (liveConfirmed) liveConfirmed.value = '1';
       executeButton.setAttribute('formaction', '/execute');
       placeForm.requestSubmit(executeButton);
+    }});
+    positionForm && positionForm.addEventListener('submit', (event) => {{
+      const submitter = event.submitter;
+      if (!submitter || submitter.id !== 'position-execute-selected-button') {{
+        return;
+      }}
+      const dryRun = positionForm.querySelector('input[name="position_dry_run"]');
+      if (dryRun && dryRun.checked) {{
+        return;
+      }}
+      if (positionLiveConfirmed && positionLiveConfirmed.value === '1') {{
+        return;
+      }}
+      event.preventDefault();
+      openPositionModal();
+    }});
+    positionCancel && positionCancel.addEventListener('click', closePositionModal);
+    positionGood && positionGood.addEventListener('click', () => {{
+      if (positionGood.disabled || !pendingPositionSubmit) return;
+      pendingPositionSubmit = false;
+      stopPositionCountdown();
+      positionModal.style.display = 'none';
+      if (positionLiveConfirmed) positionLiveConfirmed.value = '1';
+      positionExecuteButton.setAttribute('formaction', '/positions/execute');
+      positionForm.requestSubmit(positionExecuteButton);
     }});
     for (const form of document.querySelectorAll('.commodity-confirm-form')) {{
       form.addEventListener('submit', (event) => {{
@@ -9176,6 +9819,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/income":
             self.send_page(PageState(active_tab="income"))
             return
+        if parsed_url.path == "/investing":
+            self.send_page(PageState(active_tab="investing"))
+            return
         if parsed_url.path == "/research":
             self.send_page(PageState(active_tab="research"))
             return
@@ -9295,6 +9941,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/commodity")
                 else "income"
                 if request_path.startswith("/income")
+                else "investing"
+                if request_path.startswith("/investing")
                 else "gpt"
                 if request_path.startswith("/gpt")
                 else "kite-setup"
@@ -9330,6 +9978,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             position_autoslice=checked(form, "position_autoslice"),
             position_keep_existing_orders=checked(form, "position_keep_existing_orders"),
             position_max_orders=first(form, "position_max_orders"),
+            position_live_confirmed=first(form, "position_live_confirmed") == "1",
             gpt_url=first(form, "gpt_url", DEFAULT_GPT_SHARE_URL),
             gpt_conversation=first(form, "gpt_conversation"),
             gpt_csv_text=first(form, "gpt_csv_text"),
@@ -9452,6 +10101,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         state,
                     )
                 selected = {int(value) for value in form.get("position_selected", [])}
+                if selected and not state.position_dry_run and not state.position_live_confirmed:
+                    raise PermissionError(
+                        "Position BUY live order needs breathe confirmation before order placement."
+                    )
                 (
                     state.position_orders,
                     state.position_results,
@@ -9579,6 +10232,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.income_summary,
                 ), state.console_log = call_with_console(income_strategy_candidates)
                 state.message = f"Income strategy refreshed for {len(state.income_rows)} stock(s)."
+            elif request_path == "/investing/load":
+                (
+                    state.investing_rows,
+                    state.investing_summary,
+                ), state.console_log = call_with_console(investing_holdings_rows)
+                state.message = f"Investing portfolio refreshed for {len(state.investing_rows)} holding(s)."
             elif request_path == "/income/sell-ce":
                 underlying = first(form, "income_underlying")
                 result, state.console_log = call_with_console(
