@@ -24,6 +24,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import sys
 import time
 import traceback
@@ -67,6 +68,7 @@ def dated_income_csv_path(day: date | None = None) -> Path:
 DEFAULT_CSV_PATH = Path(os.getenv("KITE_DEFAULT_CSV_PATH", str(dated_income_csv_path())))
 LEGACY_CSV_PATH = PROJECT_ROOT / "src" / "script" / "kite_orders.csv"
 SETTINGS_PATH = APP_ROOT / "app_settings.json"
+APP_DB_PATH = APP_ROOT / "vikalp_income.db"
 OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_KITE_ENV = {
@@ -161,9 +163,11 @@ TOP_WATCHLIST = [
     "WAAREEENER",
 ]
 GLOBAL_MARKET_WATCHLIST = [
-    {"label": "NIFTY", "symbol": "^NSEI"},
-    {"label": "INDIA VIX", "symbol": "^INDIAVIX"},
+    {"label": "NIFTY", "symbol": "KITE:NIFTY_50", "source": "kite_quote", "kite_key": "NSE:NIFTY 50", "fallback_symbol": "^NSEI"},
+    {"label": "NIFTY FUT", "symbol": "KITE:NIFTY_FUT", "source": "kite_nifty_fut", "fallback_symbol": "^NSEI"},
+    {"label": "INDIA VIX", "symbol": "KITE:INDIA_VIX", "source": "kite_quote", "kite_key": "NSE:INDIA VIX", "fallback_symbol": "^INDIAVIX"},
     {"label": "USD/INR", "symbol": "INR=X"},
+    {"label": "NASDAQ FUT", "symbol": "NQ=F"},
     {"label": "Nasdaq", "symbol": "^IXIC"},
     {"label": "FTSE", "symbol": "^FTSE"},
     {"label": "Hang Seng", "symbol": "^HSI"},
@@ -350,6 +354,143 @@ for env_name, env_value_default in DEFAULT_KITE_ENV.items():
     os.environ.setdefault(env_name, env_value_default)
 if os.environ.get("KITE_API_KEY") in BAD_KITE_API_KEYS:
     os.environ["KITE_API_KEY"] = DEFAULT_KITE_ENV["KITE_API_KEY"]
+
+
+def app_now() -> datetime:
+    return datetime.now()
+
+
+def app_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(APP_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS booked_pnl (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booked_date TEXT NOT NULL,
+            month_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            tradingsymbol TEXT NOT NULL,
+            order_id TEXT NOT NULL UNIQUE,
+            close_qty INTEGER NOT NULL,
+            sell_avg REAL NOT NULL,
+            buy_avg REAL NOT NULL,
+            pnl REAL NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_booked_pnl_month ON booked_pnl(month_key, source)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_booked_pnl_date ON booked_pnl(booked_date)")
+    conn.commit()
+    return conn
+
+
+def parse_order_date(order: dict[str, Any]) -> date:
+    for key in ("order_timestamp", "exchange_timestamp", "exchange_update_timestamp"):
+        value = order.get(key)
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if value:
+            text = str(value).strip()
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d-%m-%Y %H:%M:%S"):
+                try:
+                    return datetime.strptime(text[:19], fmt).date()
+                except ValueError:
+                    continue
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+            except ValueError:
+                pass
+    return app_now().date()
+
+
+def booked_pnl_source(symbol: str) -> str:
+    underlying = underlying_for_symbol(symbol)
+    return "income" if underlying in {item["symbol"] for item in INCOME_UNDERLYINGS} else "trading"
+
+
+def save_booked_pnl_records(records: list[dict[str, Any]]) -> int:
+    if not records:
+        return 0
+    saved = 0
+    now_text = app_now().isoformat(timespec="seconds")
+    conn = app_db_connection()
+    try:
+        for record in records:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO booked_pnl (
+                    booked_date, month_key, source, tradingsymbol, order_id,
+                    close_qty, sell_avg, buy_avg, pnl, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["booked_date"],
+                    record["month_key"],
+                    record["source"],
+                    record["tradingsymbol"],
+                    record["order_id"],
+                    int(record["close_qty"]),
+                    float(record["sell_avg"]),
+                    float(record["buy_avg"]),
+                    float(record["pnl"]),
+                    record.get("note") or "",
+                    now_text,
+                ),
+            )
+            saved += int(cursor.rowcount or 0)
+        conn.commit()
+    finally:
+        conn.close()
+    return saved
+
+
+def monthly_booked_pnl_summary(day: date | None = None) -> dict[str, Any]:
+    day = day or app_now().date()
+    month_key = day.strftime("%Y-%m")
+    summary = {
+        "month_key": month_key,
+        "month_label": day.strftime("%b %Y"),
+        "trading_pnl": 0.0,
+        "income_pnl": 0.0,
+        "overall_pnl": 0.0,
+        "today_pnl": 0.0,
+        "trade_count": 0,
+        "today_count": 0,
+    }
+    if not APP_DB_PATH.exists():
+        return summary
+    try:
+        conn = app_db_connection()
+        try:
+            rows = conn.execute(
+                "SELECT source, SUM(pnl) AS pnl, COUNT(*) AS count FROM booked_pnl WHERE month_key = ? GROUP BY source",
+                (month_key,),
+            ).fetchall()
+            for row in rows:
+                source = str(row["source"])
+                pnl = float(row["pnl"] or 0)
+                if source == "income":
+                    summary["income_pnl"] = pnl
+                else:
+                    summary["trading_pnl"] += pnl
+                summary["trade_count"] += int(row["count"] or 0)
+            today_row = conn.execute(
+                "SELECT SUM(pnl) AS pnl, COUNT(*) AS count FROM booked_pnl WHERE booked_date = ?",
+                (day.isoformat(),),
+            ).fetchone()
+            summary["today_pnl"] = float(today_row["pnl"] or 0) if today_row else 0.0
+            summary["today_count"] = int(today_row["count"] or 0) if today_row else 0
+        finally:
+            conn.close()
+    except Exception:
+        return summary
+    summary["overall_pnl"] = float(summary["trading_pnl"]) + float(summary["income_pnl"])
+    return summary
 
 
 def load_app_settings() -> dict[str, Any]:
@@ -3303,12 +3444,108 @@ def fetch_yahoo_quote(symbol: str, label: str) -> dict[str, Any]:
     }
 
 
+def kite_quote_from_key(label: str, symbol: str, kite_key: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    quote = cached_kite_quote(kite, [kite_key]).get(kite_key, {})
+    ltp = quote_ltp(quote)
+    previous_close = float(
+        ((quote.get("ohlc") or {}).get("close"))
+        or quote.get("close")
+        or 0
+    )
+    change_percent = ((ltp - previous_close) / previous_close * 100) if ltp and previous_close else None
+    return {
+        "label": label,
+        "symbol": symbol,
+        "ltp": round(float(ltp), 2) if ltp else None,
+        "change_percent": round(change_percent, 2) if change_percent is not None else None,
+        "source": "Kite",
+        "quote_key": kite_key,
+    }
+
+
+def nearest_nifty_future_quote() -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    today = datetime.now().date()
+    futures: list[dict[str, Any]] = []
+    for item in cached_kite_instruments(kite, "NFO"):
+        if str(item.get("name") or "").upper() != "NIFTY":
+            continue
+        if str(item.get("instrument_type") or "").upper() != "FUT":
+            continue
+        expiry_value = item.get("expiry")
+        if isinstance(expiry_value, datetime):
+            expiry_day = expiry_value.date()
+        elif isinstance(expiry_value, date):
+            expiry_day = expiry_value
+        elif expiry_value:
+            try:
+                expiry_day = datetime.fromisoformat(str(expiry_value)).date()
+            except ValueError:
+                continue
+        else:
+            continue
+        if expiry_day >= today:
+            futures.append({**item, "_expiry_day": expiry_day})
+    if not futures:
+        raise ValueError("No active NIFTY futures contract found in Kite NFO instruments.")
+    instrument = min(futures, key=lambda item: item.get("_expiry_day"))
+    tradingsymbol = str(instrument.get("tradingsymbol") or "")
+    quote_key = f"NFO:{tradingsymbol}"
+    quote = cached_kite_quote(kite, [quote_key]).get(quote_key, {})
+    ltp = quote_ltp(quote)
+    previous_close = float(
+        ((quote.get("ohlc") or {}).get("close"))
+        or quote.get("close")
+        or quote.get("last_price")
+        or 0
+    )
+    change_percent = ((ltp - previous_close) / previous_close * 100) if ltp and previous_close else None
+    return {
+        "label": "NIFTY FUT",
+        "symbol": "KITE:NIFTY_FUT",
+        "contract": tradingsymbol or "NIFTY FUT",
+        "ltp": round(float(ltp), 2) if ltp else None,
+        "change_percent": round(change_percent, 2) if change_percent is not None else None,
+        "source": "Kite",
+        "quote_key": quote_key,
+    }
+
+
+def global_quote_with_fallback(item: dict[str, Any]) -> dict[str, Any]:
+    label = str(item["label"])
+    display_symbol = str(item["symbol"])
+    try:
+        if item.get("source") == "kite_quote":
+            return kite_quote_from_key(label, display_symbol, str(item["kite_key"]))
+        if item.get("source") == "kite_nifty_fut":
+            return nearest_nifty_future_quote()
+        return fetch_yahoo_quote(display_symbol, label)
+    except Exception as kite_exc:
+        fallback_symbol = str(item.get("fallback_symbol") or "")
+        if not fallback_symbol:
+            raise
+        fallback = fetch_yahoo_quote(fallback_symbol, label)
+        fallback["symbol"] = display_symbol
+        fallback["fallback_symbol"] = fallback_symbol
+        fallback["warning"] = f"Kite quote unavailable, using fallback {fallback_symbol}: {kite_exc}"
+        return fallback
+
+
 def fetch_global_market_quotes_uncached() -> dict[str, Any]:
     quotes: list[dict[str, Any]] = []
     errors: list[str] = []
+    warnings: list[str] = []
     for item in GLOBAL_MARKET_WATCHLIST:
         try:
-            quotes.append(fetch_yahoo_quote(str(item["symbol"]), str(item["label"])))
+            quote = global_quote_with_fallback(item)
+            if quote.get("warning"):
+                warnings.append(str(quote["warning"]))
+            quotes.append(quote)
         except Exception as exc:
             errors.append(f"{item['label']}: {exc}")
             quotes.append(
@@ -3323,6 +3560,7 @@ def fetch_global_market_quotes_uncached() -> dict[str, Any]:
         "ok": not errors,
         "quotes": quotes,
         "error": "; ".join(errors),
+        "warning": "; ".join(warnings),
     }
 
 
@@ -3389,6 +3627,59 @@ def investing_quote_key(code: str) -> str:
     return f"{exchange}:{symbol.strip()}"
 
 
+def google_finance_link_for_code(code: str) -> str:
+    quote_key = investing_quote_key(code)
+    exchange, symbol = quote_key.split(":", 1)
+    google_exchange = "BOM" if exchange == "BSE" else "NSE"
+    return f"https://www.google.com/finance/quote/{quote_plus(symbol)}:{google_exchange}"
+
+
+def screener_link_for_code(code: str) -> str:
+    quote_key = investing_quote_key(code)
+    _, symbol = quote_key.split(":", 1)
+    return f"https://www.screener.in/company/{quote_plus(symbol)}/"
+
+
+def yahoo_symbol_for_investing_code(code: str) -> str:
+    quote_key = investing_quote_key(code)
+    exchange, symbol = quote_key.split(":", 1)
+    suffix = ".BO" if exchange == "BSE" else ".NS"
+    return f"{symbol}{suffix}"
+
+
+def fetch_yahoo_52_week_uncached(code: str) -> dict[str, float | None]:
+    yahoo_symbol = yahoo_symbol_for_investing_code(code)
+    encoded_symbol = quote_plus(yahoo_symbol)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}?range=1y&interval=1d"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+            )
+        },
+    )
+    with urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    result = ((payload.get("chart") or {}).get("result") or [{}])[0]
+    quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    highs = [float(value) for value in quotes.get("high", []) if value is not None]
+    lows = [float(value) for value in quotes.get("low", []) if value is not None]
+    return {
+        "high": max(highs) if highs else None,
+        "low": min(lows) if lows else None,
+    }
+
+
+def investing_52_week_levels(code: str) -> dict[str, float | None]:
+    return cached_value(
+        f"investing:52week:{investing_quote_key(code)}",
+        lambda: fetch_yahoo_52_week_uncached(code),
+        12 * 60 * 60,
+    )
+
+
 def fetch_investing_news(rows: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
     news_by_symbol: dict[str, dict[str, str]] = {}
     # Keep this intentionally small; news RSS calls can otherwise dominate tab load.
@@ -3452,14 +3743,37 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         avg_price = float(item.get("avg_price") or 0)
         quote = raw_quotes.get(key, {})
         cmp_value = quote_ltp(quote) if quote else 0.0
+        week_52_high = float(
+            quote.get("yearly_high")
+            or quote.get("52_week_high")
+            or quote.get("fifty_two_week_high")
+            or 0
+        )
+        week_52_low = float(
+            quote.get("yearly_low")
+            or quote.get("52_week_low")
+            or quote.get("fifty_two_week_low")
+            or 0
+        )
+        if (week_52_high <= 0 or week_52_low <= 0) and cmp_value > 0:
+            try:
+                levels_52_week = investing_52_week_levels(code)
+                week_52_high = week_52_high or float(levels_52_week.get("high") or 0)
+                week_52_low = week_52_low or float(levels_52_week.get("low") or 0)
+            except Exception:
+                pass
         cost_value = quantity * avg_price
         market_value = quantity * cmp_value if cmp_value > 0 else 0.0
         pnl = market_value - cost_value if cmp_value > 0 else None
         pnl_pct = (pnl / cost_value * 100) if pnl is not None and cost_value > 0 else None
+        pct_to_52_high = ((cmp_value - week_52_high) / week_52_high * 100) if cmp_value > 0 and week_52_high > 0 else None
+        pct_from_52_low = ((cmp_value - week_52_low) / week_52_low * 100) if cmp_value > 0 and week_52_low > 0 else None
         rows.append(
             {
                 "code": code,
                 "quote_key": key,
+                "finance_url": google_finance_link_for_code(code),
+                "screener_url": screener_link_for_code(code),
                 "symbol": symbol,
                 "company": item["company"],
                 "sector": item["sector"],
@@ -3471,6 +3785,9 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 "market_value": market_value if cmp_value > 0 else None,
                 "pnl": pnl,
                 "pnl_pct": pnl_pct,
+                "pct_to_52_high": pct_to_52_high,
+                "pct_from_52_low": pct_from_52_low,
+                "portfolio_pct": None,
                 "pe": "N/A",
                 "sector_pe": "N/A",
                 "opm": "N/A",
@@ -3485,6 +3802,9 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         row["news"] = news_by_symbol.get(str(row["symbol"]), None)
     total_cost = sum(float(row.get("cost_value") or 0) for row in rows)
     total_market = sum(float(row.get("market_value") or 0) for row in rows)
+    for row in rows:
+        market_value = float(row.get("market_value") or 0)
+        row["portfolio_pct"] = (market_value / total_market * 100) if total_market > 0 and market_value > 0 else None
     total_pnl = total_market - total_cost if total_market > 0 else None
     core_value = sum(float(row.get("market_value") or 0) for row in rows if row.get("core") == "Y")
     return rows, {
@@ -4088,7 +4408,28 @@ def build_orders(
     row_args = [kite_orders.args_for_csv_row(base_args, row) for row in rows]
     needs_kite = any(not item.no_ltp_price for item in row_args)
     kite = kite_orders.kite_client() if needs_kite else None
-    return [kite_orders.build_order(item, kite) for item in row_args]
+    orders: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, item in enumerate(row_args, start=1):
+        symbol = str(getattr(item, "symbol", "") or rows[index - 1].get("tradingsymbol", "")).upper()
+        exchange = str(getattr(item, "exchange", "") or rows[index - 1].get("exchange", "NFO")).upper()
+        try:
+            orders.append(kite_orders.build_order(item, kite))
+        except KeyError as exc:
+            missing_key = str(exc).strip("'\"") or f"{exchange}:{symbol}"
+            errors.append(
+                f"Row {index}: Kite did not return LTP for {missing_key}. "
+                f"Verify the contract exists and is active, or fix/remove {symbol}. "
+                "If you want to use manual CSV prices, turn on 'Use CSV/manual price only' and provide a positive LIMIT price."
+            )
+        except SystemExit as exc:
+            detail = str(exc) or "Order build stopped."
+            errors.append(f"Row {index}: {symbol} could not be previewed. {detail}")
+        except Exception as exc:
+            errors.append(f"Row {index}: {symbol} could not be previewed. {exc}")
+    if errors:
+        raise ValueError("Order preview could not be completed:\n" + "\n".join(errors))
+    return orders
 
 
 def should_fallback_to_new_order(error: Exception) -> bool:
@@ -4321,6 +4662,37 @@ def completed_close_pnl_by_order_id(
     return close_pnl
 
 
+def sync_booked_pnl_from_kite_orders(
+    orders: list[dict[str, Any]], positions: list[dict[str, Any]]
+) -> int:
+    close_pnl_by_order = completed_close_pnl_by_order_id(orders, positions)
+    if not close_pnl_by_order:
+        return 0
+    by_order_id = {str(order.get("order_id") or ""): order for order in orders}
+    records: list[dict[str, Any]] = []
+    for order_id, detail in close_pnl_by_order.items():
+        order = by_order_id.get(order_id) or {}
+        symbol = str(order.get("tradingsymbol") or "").upper()
+        if not symbol:
+            continue
+        booked_date = parse_order_date(order)
+        records.append(
+            {
+                "booked_date": booked_date.isoformat(),
+                "month_key": booked_date.strftime("%Y-%m"),
+                "source": booked_pnl_source(symbol),
+                "tradingsymbol": symbol,
+                "order_id": order_id,
+                "close_qty": detail.get("close_qty") or 0,
+                "sell_avg": detail.get("sell_avg") or 0,
+                "buy_avg": detail.get("buy_avg") or 0,
+                "pnl": detail.get("pnl") or 0,
+                "note": detail.get("note") or "",
+            }
+        )
+    return save_booked_pnl_records(records)
+
+
 def kite_order_book() -> list[dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -4328,6 +4700,7 @@ def kite_order_book() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     orders = list(reversed(cached_kite_orders(kite)))
     positions = cached_kite_positions(kite)
+    saved_booked_count = sync_booked_pnl_from_kite_orders(orders, positions)
     close_pnl_by_order = completed_close_pnl_by_order_id(orders, positions)
     quote_keys = sorted(
         {
@@ -4369,6 +4742,7 @@ def kite_order_book() -> list[dict[str, Any]]:
                 "price_diff_pct": price_diff_pct,
                 "close_pnl": close_pnl.get("pnl") if close_pnl else None,
                 "close_pnl_detail": close_pnl,
+                "booked_pnl_saved": bool(close_pnl) and saved_booked_count >= 0,
                 "status": status,
                 "status_message": str(order.get("status_message") or ""),
                 "is_cancellable": status in CANCELLABLE_ORDER_STATUSES,
@@ -5064,9 +5438,16 @@ def floor_to_tick(value: float, tick_size: float = 0.05) -> float:
 
 
 def render_investing_panel(state: PageState) -> str:
+    if state.active_tab != "investing" and state.investing_rows is None:
+        return f"""
+    <form id="investing-panel" method="post" action="/investing/load" style="display:none">
+      {env_hidden_fields_for_render()}
+    </form>"""
     rows = state.investing_rows or [
         {
             "symbol": investing_quote_key(str(item["code"])).split(":", 1)[1],
+            "finance_url": google_finance_link_for_code(str(item["code"])),
+            "screener_url": screener_link_for_code(str(item["code"])),
             "company": item["company"],
             "sector": item["sector"],
             "core": item.get("core") or "",
@@ -5077,6 +5458,9 @@ def render_investing_panel(state: PageState) -> str:
             "market_value": None,
             "pnl": None,
             "pnl_pct": None,
+            "pct_to_52_high": None,
+            "pct_from_52_low": None,
+            "portfolio_pct": None,
             "pe": "N/A",
             "sector_pe": "N/A",
             "opm": "N/A",
@@ -5124,9 +5508,11 @@ def render_investing_panel(state: PageState) -> str:
         if isinstance(pnl, (int, float)):
             pnl_class = "signal-green" if pnl >= 0 else "signal-red"
         core = "CORE" if row.get("core") == "Y" else "SAT"
+        finance_url = str(row.get("finance_url") or google_finance_link_for_code(f"NSE:{row.get('symbol', '')}"))
+        screener_url = str(row.get("screener_url") or screener_link_for_code(f"NSE:{row.get('symbol', '')}"))
         table_rows += (
             "<tr>"
-            f'<td class="position-symbol-cell">{html.escape(str(row.get("symbol", "")))}<span>{html.escape(str(row.get("company", "")))}</span></td>'
+            f'<td class="position-symbol-cell"><a href="{html.escape(finance_url, quote=True)}" target="_blank" rel="noopener">{html.escape(str(row.get("symbol", "")))}</a><span>{html.escape(str(row.get("company", "")))}</span><span><a class="mini-link" href="{html.escape(screener_url, quote=True)}" target="_blank" rel="noopener">Screener</a></span></td>'
             f'<td>{html.escape(str(row.get("sector", "")))}</td>'
             f'<td><span class="investing-core-pill {core.lower()}">{core}</span></td>'
             f'<td>{html.escape(str(row.get("quantity", "")))}</td>'
@@ -5135,6 +5521,9 @@ def render_investing_panel(state: PageState) -> str:
             f'<td>{html.escape(money_cell(row.get("cost_value")))}</td>'
             f'<td>{html.escape(money_cell(row.get("market_value")))}</td>'
             f'<td class="{pnl_class}">{html.escape(money_cell(row.get("pnl")))}<br><small>{html.escape(fmt_number(row.get("pnl_pct")))}%</small></td>'
+            f'<td>{html.escape(fmt_number(row.get("pct_to_52_high")))}%</td>'
+            f'<td>{html.escape(fmt_number(row.get("pct_from_52_low")))}%</td>'
+            f'<td>{html.escape(fmt_number(row.get("portfolio_pct")))}%</td>'
             f"{news_cell(row)}"
             f'<td>{html.escape(str(row.get("pe", "N/A")))}</td>'
             f'<td>{html.escape(str(row.get("sector_pe", "N/A")))}</td>'
@@ -5146,17 +5535,17 @@ def render_investing_panel(state: PageState) -> str:
         )
     if not table_rows:
         table_rows = (
-            '<tr><td colspan="16" class="muted-cell">'
+            '<tr><td colspan="19" class="muted-cell">'
             "Click Refresh Investing Portfolio to load live CMP, P&L, and latest news."
             "</td></tr>"
         )
 
     summary_cards = "".join(
         [
-            f'<div class="summary-card"><span>Cost value</span><strong>{html.escape(money_cell(summary.get("total_cost")))}</strong></div>',
-            f'<div class="summary-card"><span>Market value</span><strong>{html.escape(money_cell(summary.get("total_market")))}</strong></div>',
-            f'<div class="summary-card"><span>Total P&L</span><strong>{html.escape(money_cell(summary.get("total_pnl")))}</strong><small>{html.escape(fmt_number(summary.get("total_pnl_pct")))}%</small></div>',
-            f'<div class="summary-card"><span>Core allocation</span><strong>{html.escape(fmt_number(summary.get("core_pct")))}%</strong><small>{html.escape(money_cell(summary.get("core_value")))}</small></div>',
+            f'<div class="investing-summary-card"><span>Cost value</span><strong>{html.escape(money_cell(summary.get("total_cost")))}</strong><small>Capital invested</small></div>',
+            f'<div class="investing-summary-card"><span>Market value</span><strong>{html.escape(money_cell(summary.get("total_market")))}</strong><small>Live value after refresh</small></div>',
+            f'<div class="investing-summary-card highlight"><span>Total P&L</span><strong>{html.escape(money_cell(summary.get("total_pnl")))}</strong><small>{html.escape(fmt_number(summary.get("total_pnl_pct")))}% return</small></div>',
+            f'<div class="investing-summary-card"><span>Core allocation</span><strong>{html.escape(fmt_number(summary.get("core_pct")))}%</strong><small>{html.escape(money_cell(summary.get("core_value")))}</small></div>',
         ]
     )
     return f"""
@@ -5178,10 +5567,14 @@ def render_investing_panel(state: PageState) -> str:
         <div class="panel-title">Share Holdings</div>
         <div class="status">Financial ratios show N/A until a fundamentals data source is connected. News is limited to the largest holdings for speed.</div>
         <div class="table-wrap">
-          <table class="investing-table">
+          <table class="investing-table" id="investing-holdings-table">
             <thead><tr>
               <th>Share</th><th>Sector</th><th>Type</th><th>Qty</th><th>Avg</th><th>CMP</th>
-              <th>Cost</th><th>Market Value</th><th>P&L</th><th>News / Sector</th>
+              <th><button type="button" class="sort-header" data-sort-col="6">Cost</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="7">Market Value</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="8">P&L</button></th>
+              <th>% to 52W High</th><th>% from 52W Low</th><th>Portfolio %</th>
+              <th>News / Sector</th>
               <th>PE</th><th>Sector PE</th><th>OPM</th><th>MCAP</th><th>Debt</th><th>Note</th>
             </tr></thead>
             <tbody>{table_rows}</tbody>
@@ -6191,6 +6584,18 @@ def render_market_topper(state: PageState) -> str:
         else ""
     )
     quote_date = datetime.now().strftime("%d %b %Y")
+    pnl_summary = monthly_booked_pnl_summary()
+    pnl_class = "pnl-positive" if float(pnl_summary["overall_pnl"]) >= 0 else "pnl-negative"
+    today_class = "pnl-positive" if float(pnl_summary["today_pnl"]) >= 0 else "pnl-negative"
+    pnl_cards = (
+        f'<div class="home-pnl-card featured"><span>{html.escape(pnl_summary["month_label"])} - Monthly P&L</span>'
+        f'<strong class="{pnl_class}">{html.escape(display_cell("pnl", pnl_summary["overall_pnl"]))}</strong>'
+        f'<small>{int(pnl_summary["trade_count"])} booked close trade(s)</small></div>'
+        f'<div class="home-pnl-card"><span>Trading booked</span><strong>{html.escape(display_cell("pnl", pnl_summary["trading_pnl"]))}</strong></div>'
+        f'<div class="home-pnl-card"><span>Income booked</span><strong>{html.escape(display_cell("pnl", pnl_summary["income_pnl"]))}</strong></div>'
+        f'<div class="home-pnl-card"><span>Today booked</span><strong class="{today_class}">{html.escape(display_cell("pnl", pnl_summary["today_pnl"]))}</strong>'
+        f'<small>{int(pnl_summary["today_count"])} close(s)</small></div>'
+    )
     return f"""
     <section class="market-shell top-command-center">
       <div class="home-hero">
@@ -6201,6 +6606,7 @@ def render_market_topper(state: PageState) -> str:
         </div>
         <div class="home-hero-date">{quote_date}</div>
       </div>
+      <div class="home-pnl-strip">{pnl_cards}</div>
       <div class="home-decision-grid">
         <div class="decision-tile decision-primary" id="home-bias-card">
           <span>Market bias</span>
@@ -6528,6 +6934,39 @@ def render_page(state: PageState) -> bytes:
       font-weight: 900;
       white-space: nowrap;
     }}
+    .home-pnl-strip {{
+      display: grid;
+      grid-template-columns: minmax(260px, 1.35fr) repeat(3, minmax(160px, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }}
+    .home-pnl-card {{
+      padding: 12px 14px;
+      border: 1px solid #bfdbfe;
+      border-radius: 16px;
+      background: linear-gradient(135deg, #ffffff 0%, #eff6ff 100%);
+      box-shadow: 0 10px 22px rgba(15, 23, 42, 0.06);
+    }}
+    .home-pnl-card.featured {{
+      border-color: #86efac;
+      background: linear-gradient(135deg, #ecfdf5 0%, #f0fdfa 100%);
+    }}
+    .home-pnl-card span,
+    .home-pnl-card small {{
+      display: block;
+      color: #64748b;
+      font-size: 10.5px;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }}
+    .home-pnl-card strong {{
+      display: block;
+      margin: 4px 0;
+      color: #07152b;
+      font-size: 20px;
+      font-weight: 950;
+    }}
     .home-decision-grid {{
       display: grid;
       grid-template-columns: minmax(260px, 1.25fr) minmax(240px, 1fr) minmax(240px, 1fr) minmax(220px, 0.9fr);
@@ -6746,14 +7185,16 @@ def render_page(state: PageState) -> bytes:
       font-weight: 800;
     }}
     .quote-card {{
-      display: inline-flex;
-      align-items: baseline;
+      display: grid;
+      grid-template-columns: minmax(54px, 1fr) auto auto;
+      align-items: center;
       gap: 5px;
       border: 1px solid var(--line);
       border-radius: 999px;
       padding: 3px 7px;
       background: #f8fafc;
       min-height: 24px;
+      overflow: hidden;
     }}
     .quote-card.strong-up {{
       background: #dcfce7;
@@ -6776,15 +7217,21 @@ def render_page(state: PageState) -> bytes:
       color: var(--muted);
       font-size: 9px;
       font-weight: 800;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }}
     .quote-ltp {{
       font-size: 12px;
       font-weight: 900;
+      white-space: nowrap;
     }}
     .quote-change {{ 
       font-size: 10px;
       font-weight: 800;
       color: var(--muted);
+      white-space: nowrap;
     }}
     .quote-change.up {{ color: #047857; }}
     .quote-change.down {{ color: #b42318; }}
@@ -6949,16 +7396,17 @@ def render_page(state: PageState) -> bytes:
     }}
     .top-command-center .quote-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
       gap: 6px;
       padding: 8px 10px 10px;
     }}
     .top-command-center .quote-card {{
-      justify-content: space-between;
+      grid-template-columns: minmax(70px, 1fr) auto auto;
       min-height: 34px;
       gap: 5px;
       padding: 6px 8px;
       border-radius: 11px;
+      min-width: 0;
     }}
     .top-command-center .quote-symbol {{
       font-size: 9px;
@@ -7227,12 +7675,53 @@ def render_page(state: PageState) -> bytes:
       justify-content: space-between;
       align-items: center;
       gap: 14px;
-      border-color: #99f6e4;
-      background: linear-gradient(135deg, #f8fafc 0%, #ecfeff 52%, #f0fdf4 100%);
+      border-color: #86efac;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(34, 197, 94, 0.14), transparent 32%),
+        linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 48%, #f8fffb 100%);
+      box-shadow: 0 18px 38px rgba(22, 101, 52, 0.08);
     }}
     .investing-summary-panel {{
-      border-color: #bfdbfe;
-      background: linear-gradient(135deg, #ffffff 0%, #f0f9ff 100%);
+      border-color: #bbf7d0;
+      background:
+        radial-gradient(circle at top right, rgba(187, 247, 208, 0.44), transparent 34%),
+        linear-gradient(135deg, #f0fdf4 0%, #ffffff 100%);
+      padding: 14px;
+    }}
+    .investing-summary-panel .summary-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(160px, 1fr));
+      gap: 12px;
+    }}
+    .investing-summary-card {{
+      min-height: 98px;
+      padding: 14px;
+      border: 1px solid #bbf7d0;
+      border-radius: 16px;
+      background: linear-gradient(135deg, #ffffff 0%, #ecfdf5 100%);
+      box-shadow: 0 12px 28px rgba(22, 101, 52, 0.08);
+    }}
+    .investing-summary-card.highlight {{
+      border-color: #86efac;
+      background: linear-gradient(135deg, #dcfce7 0%, #f0fdf4 100%);
+    }}
+    .investing-summary-card span,
+    .investing-summary-card small {{
+      display: block;
+      color: #64748b;
+      font-size: 10.5px;
+      font-weight: 900;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }}
+    .investing-summary-card strong {{
+      display: block;
+      margin: 7px 0 5px;
+      color: #065f46;
+      font-size: 22px;
+      font-weight: 950;
+      line-height: 1.05;
+      overflow-wrap: anywhere;
     }}
     .investing-table-panel {{
       border-color: #a7f3d0;
@@ -7247,6 +7736,31 @@ def render_page(state: PageState) -> bytes:
       font-size: 11px;
       letter-spacing: 0.02em;
       text-transform: uppercase;
+    }}
+    .investing-table .sort-header {{
+      width: 100%;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #ffffff;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 950;
+      letter-spacing: inherit;
+      text-align: left;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }}
+    .investing-table .sort-header::after {{
+      content: "  ↕";
+      color: #bbf7d0;
+      font-size: 10px;
+    }}
+    .investing-table .sort-header[data-sort-dir="asc"]::after {{
+      content: "  ↑";
+    }}
+    .investing-table .sort-header[data-sort-dir="desc"]::after {{
+      content: "  ↓";
     }}
     .investing-core-pill {{
       display: inline-flex;
@@ -8350,6 +8864,14 @@ def render_page(state: PageState) -> bytes:
       font-weight: 950;
       overflow-wrap: anywhere;
     }}
+    .position-symbol-cell .mini-link {{
+      display: inline-block;
+      margin-top: 3px;
+      color: #1769aa;
+      font-size: 10px;
+      font-weight: 900;
+      text-decoration: underline;
+    }}
     .positions-table .pnl-positive {{
       background: #ecfdf5;
       color: #047857;
@@ -8825,8 +9347,11 @@ def render_page(state: PageState) -> bytes:
       .analytics-two-column {{ grid-template-columns: 1fr; }}
       .home-hero {{ grid-template-columns: 1fr; }}
       .home-hero h2 {{ font-size: 20px; }}
+      .home-pnl-strip {{ grid-template-columns: 1fr; }}
       .home-decision-grid {{ grid-template-columns: 1fr; }}
       .home-action-grid {{ grid-template-columns: 1fr; }}
+      .investing-hero-panel {{ align-items: flex-start; flex-direction: column; }}
+      .investing-summary-panel .summary-grid {{ grid-template-columns: 1fr; }}
       .compact-rules {{ grid-template-columns: 1fr; }}
       .decision-tile {{ min-height: auto; }}
       .tab-button[data-tab="home"] {{ display: inline-flex; }}
@@ -9051,6 +9576,34 @@ def render_page(state: PageState) -> bytes:
         field.type = 'text';
       }}
     }}
+    const investingTable = document.getElementById('investing-holdings-table');
+    function numericTableValue(cell) {{
+      const text = (cell && cell.textContent ? cell.textContent : '').replace(/,/g, '');
+      const match = text.match(/-?[0-9]+(?:[.][0-9]+)?/);
+      return match ? Number(match[0]) : Number.NEGATIVE_INFINITY;
+    }}
+    if (investingTable) {{
+      for (const header of investingTable.querySelectorAll('.sort-header')) {{
+        header.addEventListener('click', () => {{
+          const column = Number(header.dataset.sortCol);
+          const currentDir = header.dataset.sortDir === 'desc' ? 'asc' : 'desc';
+          for (const other of investingTable.querySelectorAll('.sort-header')) {{
+            other.dataset.sortDir = '';
+          }}
+          header.dataset.sortDir = currentDir;
+          const tbody = investingTable.tBodies[0];
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((left, right) => {{
+            const leftValue = numericTableValue(left.cells[column]);
+            const rightValue = numericTableValue(right.cells[column]);
+            return currentDir === 'asc' ? leftValue - rightValue : rightValue - leftValue;
+          }});
+          for (const row of rows) {{
+            tbody.appendChild(row);
+          }}
+        }});
+      }}
+    }}
     for (const button of document.querySelectorAll('.tab-button')) {{
       button.addEventListener('click', () => {{
         const active = button.dataset.tab;
@@ -9061,6 +9614,7 @@ def render_page(state: PageState) -> bytes:
           analytics: '/analytics',
           research: '/research',
           income: '/income',
+          investing: '/investing',
           commodity: '/commodity',
           'order-management': '/orders',
           gpt: '/gpt',
@@ -9539,7 +10093,7 @@ def render_page(state: PageState) -> bytes:
       const cards = Array.from(document.querySelectorAll('.global-card[data-global-symbol]'));
       if (!cards.length) return;
       const errorBox = document.getElementById('global-error');
-      const inverseRiskSymbols = new Set(['^INDIAVIX', 'CL=F', 'INR=X']);
+      const inverseRiskSymbols = new Set(['KITE:INDIA_VIX', '^INDIAVIX', 'CL=F', 'INR=X']);
       const isRiskRed = (symbol, pct) => inverseRiskSymbols.has(symbol) ? pct > 0.5 : pct < -0.5;
       const isRiskGreen = (symbol, pct) => inverseRiskSymbols.has(symbol) ? pct <= 0 : pct >= 0;
       try {{
