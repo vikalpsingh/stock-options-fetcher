@@ -179,8 +179,10 @@ TOP_QUOTE_REFRESH_MS = 300000
 TOP_QUOTE_CACHE_SECONDS = 300
 APP_CACHE: dict[str, tuple[float, Any]] = {}
 KITE_READ_CACHE_SECONDS = 60
-KITE_QUOTE_CACHE_SECONDS = 30
+KITE_QUOTE_CACHE_SECONDS = 60
 KITE_INSTRUMENT_CACHE_SECONDS = 3600
+INVESTING_NEWS_CACHE_SECONDS = 12 * 60 * 60
+INVESTING_52W_CACHE_SECONDS = 24 * 60 * 60
 STOCK_NEWS_NAMES = {
     "BAJFINANCE": "Bajaj Finance",
     "TATACONSUM": "Tata Consumer Products",
@@ -3676,7 +3678,7 @@ def investing_52_week_levels(code: str) -> dict[str, float | None]:
     return cached_value(
         f"investing:52week:{investing_quote_key(code)}",
         lambda: fetch_yahoo_52_week_uncached(code),
-        12 * 60 * 60,
+        INVESTING_52W_CACHE_SECONDS,
     )
 
 
@@ -3743,6 +3745,8 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         avg_price = float(item.get("avg_price") or 0)
         quote = raw_quotes.get(key, {})
         cmp_value = quote_ltp(quote) if quote else 0.0
+        close = float((quote.get("ohlc") or {}).get("close") or 0)
+        daily_change_pct = ((cmp_value - close) / close * 100) if cmp_value > 0 and close > 0 else None
         week_52_high = float(
             quote.get("yearly_high")
             or quote.get("52_week_high")
@@ -3781,6 +3785,7 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 "quantity": quantity,
                 "avg_price": avg_price,
                 "cmp": cmp_value if cmp_value > 0 else None,
+                "daily_change_pct": daily_change_pct,
                 "cost_value": cost_value,
                 "market_value": market_value if cmp_value > 0 else None,
                 "pnl": pnl,
@@ -5371,7 +5376,9 @@ def render_order_book(state: PageState) -> str:
         f"{error_html}"
         '<div class="actions"><button type="submit" formaction="/orders/modify-selected">Modify Selected Orders</button>'
         '<button type="submit" formaction="/orders/cancel-selected" class="cancel-all-button">Cancel Selected Orders</button>'
-        '<button type="submit" formaction="/orders/refresh">Refresh Orders</button></div>'
+        '<button type="submit" formaction="/orders/refresh">Refresh Orders</button>'
+        '<button type="button" class="secondary compact-action-button" id="orders-select-all">Select All</button>'
+        '<button type="button" class="secondary compact-action-button" id="orders-unselect-all">Unselect All</button></div>'
         '<div class="table-wrap"><table class="order-book-table"><thead><tr>'
         '<th>Select</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Pending</th>'
         '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>% Diff</th><th>Close P&L</th><th>Status</th>'
@@ -5454,6 +5461,7 @@ def render_investing_panel(state: PageState) -> str:
             "quantity": int(float(item.get("quantity") or 0)),
             "avg_price": float(item.get("avg_price") or 0),
             "cmp": None,
+            "daily_change_pct": None,
             "cost_value": int(float(item.get("quantity") or 0)) * float(item.get("avg_price") or 0),
             "market_value": None,
             "pnl": None,
@@ -5507,22 +5515,34 @@ def render_investing_panel(state: PageState) -> str:
         pnl_class = "signal-neutral"
         if isinstance(pnl, (int, float)):
             pnl_class = "signal-green" if pnl >= 0 else "signal-red"
+        pct_to_high = row.get("pct_to_52_high")
+        pct_from_low = row.get("pct_from_52_low")
+        high_class = ""
+        low_class = ""
+        if isinstance(pct_to_high, (int, float)) and pct_to_high >= -5:
+            high_class = "near-52-high"
+        if isinstance(pct_from_low, (int, float)) and pct_from_low <= 10:
+            low_class = "near-52-low"
         core = "CORE" if row.get("core") == "Y" else "SAT"
+        daily_change_pct = row.get("daily_change_pct")
+        daily_class = ""
+        if isinstance(daily_change_pct, (int, float)):
+            daily_class = "pnl-positive" if daily_change_pct >= 0 else "pnl-negative"
         finance_url = str(row.get("finance_url") or google_finance_link_for_code(f"NSE:{row.get('symbol', '')}"))
         screener_url = str(row.get("screener_url") or screener_link_for_code(f"NSE:{row.get('symbol', '')}"))
         table_rows += (
             "<tr>"
             f'<td class="position-symbol-cell"><a href="{html.escape(finance_url, quote=True)}" target="_blank" rel="noopener">{html.escape(str(row.get("symbol", "")))}</a><span>{html.escape(str(row.get("company", "")))}</span><span><a class="mini-link" href="{html.escape(screener_url, quote=True)}" target="_blank" rel="noopener">Screener</a></span></td>'
             f'<td>{html.escape(str(row.get("sector", "")))}</td>'
-            f'<td><span class="investing-core-pill {core.lower()}">{core}</span></td>'
             f'<td>{html.escape(str(row.get("quantity", "")))}</td>'
             f'<td>{html.escape(fmt_number(row.get("avg_price")))}</td>'
             f'<td>{html.escape(fmt_number(row.get("cmp")))}</td>'
+            f'<td class="{daily_class}">{html.escape(fmt_number(daily_change_pct))}%</td>'
             f'<td>{html.escape(money_cell(row.get("cost_value")))}</td>'
             f'<td>{html.escape(money_cell(row.get("market_value")))}</td>'
             f'<td class="{pnl_class}">{html.escape(money_cell(row.get("pnl")))}<br><small>{html.escape(fmt_number(row.get("pnl_pct")))}%</small></td>'
-            f'<td>{html.escape(fmt_number(row.get("pct_to_52_high")))}%</td>'
-            f'<td>{html.escape(fmt_number(row.get("pct_from_52_low")))}%</td>'
+            f'<td class="{high_class}">{html.escape(fmt_number(pct_to_high))}%</td>'
+            f'<td class="{low_class}">{html.escape(fmt_number(pct_from_low))}%</td>'
             f'<td>{html.escape(fmt_number(row.get("portfolio_pct")))}%</td>'
             f"{news_cell(row)}"
             f'<td>{html.escape(str(row.get("pe", "N/A")))}</td>'
@@ -5569,7 +5589,7 @@ def render_investing_panel(state: PageState) -> str:
         <div class="table-wrap">
           <table class="investing-table" id="investing-holdings-table">
             <thead><tr>
-              <th>Share</th><th>Sector</th><th>Type</th><th>Qty</th><th>Avg</th><th>CMP</th>
+              <th>Share</th><th>Sector</th><th>Qty</th><th>Avg</th><th>CMP</th><th>% Change</th>
               <th><button type="button" class="sort-header" data-sort-col="6">Cost</button></th>
               <th><button type="button" class="sort-header" data-sort-col="7">Market Value</button></th>
               <th><button type="button" class="sort-header" data-sort-col="8">P&L</button></th>
@@ -7784,6 +7804,16 @@ def render_page(state: PageState) -> bytes:
       white-space: normal;
       line-height: 1.35;
     }}
+    .investing-table td.near-52-high {{
+      background: #fee2e2;
+      color: #991b1b;
+      font-weight: 950;
+    }}
+    .investing-table td.near-52-low {{
+      background: #dcfce7;
+      color: #166534;
+      font-weight: 950;
+    }}
     .muted-cell {{
       color: #64748b;
       font-size: 12px;
@@ -9604,6 +9634,15 @@ def render_page(state: PageState) -> bytes:
         }});
       }}
     }}
+    const ordersSelectAll = document.getElementById('orders-select-all');
+    const ordersUnselectAll = document.getElementById('orders-unselect-all');
+    function setOrderCheckboxes(checked) {{
+      for (const checkbox of document.querySelectorAll('#order-management-panel input[name="order_key"]:not(:disabled)')) {{
+        checkbox.checked = checked;
+      }}
+    }}
+    ordersSelectAll && ordersSelectAll.addEventListener('click', () => setOrderCheckboxes(true));
+    ordersUnselectAll && ordersUnselectAll.addEventListener('click', () => setOrderCheckboxes(false));
     for (const button of document.querySelectorAll('.tab-button')) {{
       button.addEventListener('click', () => {{
         const active = button.dataset.tab;
