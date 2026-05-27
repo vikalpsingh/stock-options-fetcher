@@ -183,6 +183,7 @@ KITE_QUOTE_CACHE_SECONDS = 60
 KITE_INSTRUMENT_CACHE_SECONDS = 3600
 INVESTING_NEWS_CACHE_SECONDS = 12 * 60 * 60
 INVESTING_52W_CACHE_SECONDS = 24 * 60 * 60
+COMMODITY_DMA_CACHE_SECONDS = 12 * 60 * 60
 STOCK_NEWS_NAMES = {
     "BAJFINANCE": "Bajaj Finance",
     "TATACONSUM": "Tata Consumer Products",
@@ -941,6 +942,21 @@ def render_login_page(error: str = "") -> bytes:
       font-weight: 700;
       background: #f8fafc;
     }}
+    .show-password {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: -2px 0 14px;
+      color: #475569;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .show-password input {{
+      width: auto;
+      margin: 0;
+      accent-color: #0f766e;
+    }}
     button {{
       width: 100%;
       border: 0;
@@ -970,9 +986,17 @@ def render_login_page(error: str = "") -> bytes:
     <p>Sign in to access trading, positions, income strategy, ETF actions, and Kite setup.</p>
     {error_html}
     <label>Username<input name="username" autocomplete="username" autofocus></label>
-    <label>Password<input name="password" type="password" autocomplete="current-password"></label>
+    <label>Password<input id="login-password" name="password" type="password" autocomplete="current-password"></label>
+    <label class="show-password"><input id="show-login-password" type="checkbox"> Show password</label>
     <button type="submit">Log in</button>
   </form>
+  <script>
+    const showPassword = document.getElementById('show-login-password');
+    const password = document.getElementById('login-password');
+    showPassword && password && showPassword.addEventListener('change', () => {{
+      password.type = showPassword.checked ? 'text' : 'password';
+    }});
+  </script>
 </body>
 </html>""".encode("utf-8")
 
@@ -1068,6 +1092,23 @@ def generate_kite_access_token(request_token: str) -> str:
         }
     )
     return access_token
+
+
+def save_kite_access_token(access_token: str) -> str:
+    token = str(access_token or "").strip()
+    if not token:
+        raise ValueError("Paste KITE_ACCESS_TOKEN before saving.")
+    os.environ["KITE_ACCESS_TOKEN"] = token
+    DEFAULT_KITE_ENV["KITE_ACCESS_TOKEN"] = token
+    save_env_values(
+        {
+            "KITE_CONFIRM_LIVE_ORDER": env_value("KITE_CONFIRM_LIVE_ORDER") or "YES",
+            "KITE_API_KEY": env_value("KITE_API_KEY") or DEFAULT_KITE_ENV["KITE_API_KEY"],
+            "KITE_API_SECRET": env_value("KITE_API_SECRET") or DEFAULT_KITE_ENV["KITE_API_SECRET"],
+            "KITE_ACCESS_TOKEN": token,
+        }
+    )
+    return token
 
 
 def fetch_public_ip_data() -> list[dict[str, str]]:
@@ -3570,6 +3611,40 @@ def fetch_global_market_quotes() -> dict[str, Any]:
     return cached_payload("global-quotes", fetch_global_market_quotes_uncached)
 
 
+def fetch_yahoo_moving_averages(symbol: str) -> dict[str, float | None]:
+    yahoo_symbol = f"{symbol.upper()}.NS"
+    encoded_symbol = quote_plus(yahoo_symbol)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}?range=1y&interval=1d"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+            )
+        },
+    )
+    with urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    result = ((payload.get("chart") or {}).get("result") or [{}])[0]
+    close_values = (
+        ((result.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+    )
+    closes = [float(value) for value in close_values if value is not None and float(value) > 0]
+    return {
+        "dma_50": round(sum(closes[-50:]) / 50, 2) if len(closes) >= 50 else None,
+        "dma_200": round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else None,
+    }
+
+
+def commodity_moving_averages(symbol: str) -> dict[str, float | None]:
+    return cached_value(
+        f"commodity:dma:{symbol.upper()}",
+        lambda: fetch_yahoo_moving_averages(symbol),
+        COMMODITY_DMA_CACHE_SECONDS,
+    )
+
+
 def fetch_commodity_etf_quotes_uncached() -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -3587,6 +3662,12 @@ def fetch_commodity_etf_quotes_uncached() -> dict[str, Any]:
         daily_fall_pct = commodity_daily_fall_pct(close, ltp)
         threshold = float(item["threshold"])
         sizing = commodity_strategy_buy_amount(item, daily_fall_pct)
+        try:
+            dma = commodity_moving_averages(str(item["symbol"]))
+            dma_error = ""
+        except Exception as exc:
+            dma = {"dma_50": None, "dma_200": None}
+            dma_error = str(exc)
         quotes.append(
             {
                 "key": item["key"],
@@ -3609,6 +3690,9 @@ def fetch_commodity_etf_quotes_uncached() -> dict[str, Any]:
                 if sizing["buy_signal"]
                 else "Wait",
                 "buy_amount": round(sizing["final_buy_amount"], 2),
+                "dma_50": dma.get("dma_50"),
+                "dma_200": dma.get("dma_200"),
+                "dma_error": dma_error,
             }
         )
     return {"ok": True, "quotes": quotes}
@@ -3627,6 +3711,15 @@ def investing_quote_key(code: str) -> str:
     if exchange in {"BOM", "BSE"}:
         exchange = "BSE"
     return f"{exchange}:{symbol.strip()}"
+
+
+def investing_quote_candidates(code: str) -> list[str]:
+    primary = investing_quote_key(code)
+    exchange, symbol = primary.split(":", 1)
+    alternate_exchange = "NSE" if exchange == "BSE" else "BSE"
+    candidates = [primary, f"{alternate_exchange}:{symbol}"]
+    seen: set[str] = set()
+    return [item for item in candidates if not (item in seen or seen.add(item))]
 
 
 def google_finance_link_for_code(code: str) -> str:
@@ -3726,7 +3819,10 @@ def fetch_investing_news(rows: list[dict[str, Any]]) -> dict[str, dict[str, str]
 
 def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    quote_keys = [investing_quote_key(str(item["code"])) for item in INVESTING_HOLDINGS]
+    quote_keys: list[str] = []
+    for item in INVESTING_HOLDINGS:
+        quote_keys.extend(investing_quote_candidates(str(item["code"])))
+    quote_keys = list(dict.fromkeys(quote_keys))
     raw_quotes: dict[str, Any] = {}
     quote_error = ""
     if kite_orders is not None:
@@ -3743,7 +3839,14 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         symbol = key.split(":", 1)[1]
         quantity = int(float(item.get("quantity") or 0))
         avg_price = float(item.get("avg_price") or 0)
-        quote = raw_quotes.get(key, {})
+        quote = {}
+        resolved_key = key
+        for candidate_key in investing_quote_candidates(code):
+            candidate_quote = raw_quotes.get(candidate_key, {})
+            if quote_ltp(candidate_quote) > 0:
+                quote = candidate_quote
+                resolved_key = candidate_key
+                break
         cmp_value = quote_ltp(quote) if quote else 0.0
         close = float((quote.get("ohlc") or {}).get("close") or 0)
         daily_change_pct = ((cmp_value - close) / close * 100) if cmp_value > 0 and close > 0 else None
@@ -3775,7 +3878,7 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         rows.append(
             {
                 "code": code,
-                "quote_key": key,
+                "quote_key": resolved_key,
                 "finance_url": google_finance_link_for_code(code),
                 "screener_url": screener_link_for_code(code),
                 "symbol": symbol,
@@ -4756,6 +4859,67 @@ def kite_order_book() -> list[dict[str, Any]]:
     return rows
 
 
+def order_action_suggestion(order: dict[str, Any]) -> dict[str, Any]:
+    status = str(order.get("status") or "").upper()
+    side = str(order.get("transaction_type") or "").upper()
+    symbol = str(order.get("tradingsymbol") or "").upper()
+    option_type = "PUT" if symbol.endswith("PE") else "CALL" if symbol.endswith("CE") else "OPTION"
+    ltp = order.get("ltp")
+    price = order.get("price")
+    try:
+        ltp_value = float(ltp or 0)
+        price_value = float(price or 0)
+    except (TypeError, ValueError):
+        ltp_value = 0.0
+        price_value = 0.0
+    if status not in CANCELLABLE_ORDER_STATUSES:
+        return {
+            "score": 0,
+            "grade": "DONE",
+            "class": "validation-neutral",
+            "text": "Order is not open; no price action needed.",
+        }
+    if ltp_value <= 0 or price_value <= 0:
+        return {
+            "score": 35,
+            "grade": "CHECK",
+            "class": "validation-yellow",
+            "text": "LTP unavailable; refresh orders before modifying price.",
+        }
+    diff_pct = ((price_value - ltp_value) / ltp_value) * 100
+    abs_diff = abs(diff_pct)
+    if side == "SELL":
+        if diff_pct >= 25:
+            score, grade, css = 45, "LOWER", "validation-yellow"
+            text = f"SELL {option_type}: ask is {diff_pct:.1f}% above LTP. Lower toward LTP +5-10% if fill is needed."
+        elif diff_pct >= 8:
+            score, grade, css = 72, "WAIT", "validation-green"
+            text = f"SELL {option_type}: premium ask is above market. Wait, or lower 1-2 ticks near close."
+        elif diff_pct >= 0:
+            score, grade, css = 88, "GOOD", "validation-green"
+            text = f"SELL {option_type}: price is near LTP. Good fill balance."
+        else:
+            score, grade, css = 62, "RAISE", "validation-yellow"
+            text = f"SELL {option_type}: price is below LTP. Raise toward LTP to avoid selling cheap."
+    elif side == "BUY":
+        if diff_pct <= -20:
+            score, grade, css = 42, "RAISE", "validation-yellow"
+            text = f"BUY {option_type}: bid is far below LTP. Raise price if exit is important."
+        elif diff_pct <= -5:
+            score, grade, css = 64, "RAISE", "validation-yellow"
+            text = f"BUY {option_type}: bargain bid. Raise closer to LTP if risk is increasing."
+        elif diff_pct <= 5:
+            score, grade, css = 86, "GOOD", "validation-green"
+            text = f"BUY {option_type}: near LTP. Good for controlled close."
+        else:
+            score, grade, css = 58, "LOWER", "validation-red" if abs_diff > 25 else "validation-yellow"
+            text = f"BUY {option_type}: price is above LTP. Lower if not urgent; keep only for fast exit."
+    else:
+        score, grade, css = 40, "CHECK", "validation-yellow"
+        text = "Unknown side; review manually before modifying."
+    return {"score": score, "grade": grade, "class": css, "text": text}
+
+
 def order_form_key(order_key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", order_key)
 
@@ -5347,6 +5511,14 @@ def render_order_book(state: PageState) -> str:
                 f"Buy {html.escape(fmt_number(close_pnl_detail.get('buy_avg')))}</small>"
                 f"<small>{html.escape(str(close_pnl_detail.get('note') or ''))}</small>"
             )
+        suggestion = order_action_suggestion(order)
+        suggestion_score = int(suggestion.get("score") or 0)
+        suggestion_cell = (
+            f'<div class="order-suggestion {html.escape(str(suggestion.get("class", "")))}">'
+            f'<strong>{html.escape(str(suggestion.get("grade", "")))}</strong>'
+            f'<span>{html.escape(str(suggestion.get("text", "")))}</span>'
+            "</div>"
+        )
         rows.append(
             "<tr>"
             f'<td><input type="checkbox" name="order_key" value="{html.escape(key, quote=True)}"{checked_attr}{disabled_attr}></td>'
@@ -5360,6 +5532,8 @@ def render_order_book(state: PageState) -> str:
             f"<td>{price_cell}</td>"
             f"<td>{html.escape(fmt_number(order.get('ltp')))}</td>"
             f'<td class="{diff_class}">{html.escape(fmt_number(price_diff))}%</td>'
+            f'<td><span class="order-score score-{suggestion_score // 20}">{suggestion_score}/100</span></td>'
+            f"<td>{suggestion_cell}</td>"
             f'<td class="{close_pnl_class}">{close_pnl_cell}</td>'
             f"<td>{html.escape(str(order.get('status', '')))}</td>"
             "</tr>"
@@ -5367,7 +5541,7 @@ def render_order_book(state: PageState) -> str:
     body = (
         "".join(rows)
         if rows
-        else '<tr><td colspan="13" class="status">No Kite orders found.</td></tr>'
+        else '<tr><td colspan="15" class="status">No Kite orders found.</td></tr>'
     )
     error_html = render_graceful_error(error, "Kite Orders Error")
     return (
@@ -5381,7 +5555,7 @@ def render_order_book(state: PageState) -> str:
         '<button type="button" class="secondary compact-action-button" id="orders-unselect-all">Unselect All</button></div>'
         '<div class="table-wrap"><table class="order-book-table"><thead><tr>'
         '<th>Select</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Pending</th>'
-        '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>% Diff</th><th>Close P&L</th><th>Status</th>'
+        '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>% Diff</th><th>Score</th><th>Suggestion</th><th>Close P&L</th><th>Status</th>'
         f"</tr></thead><tbody>{body}</tbody></table></div></section>"
     )
 
@@ -5491,6 +5665,15 @@ def render_investing_panel(state: PageState) -> str:
     def money_cell(value: Any) -> str:
         return format_buy_amount(value) if value not in {None, ""} else "N/A"
 
+    def crore_cell(value: Any) -> str:
+        if value in {None, ""}:
+            return "N/A"
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        return f"{amount / 10_000_000:.2f} Cr"
+
     def news_cell(row: dict[str, Any]) -> str:
         news = row.get("news") or {}
         if not news:
@@ -5562,10 +5745,10 @@ def render_investing_panel(state: PageState) -> str:
 
     summary_cards = "".join(
         [
-            f'<div class="investing-summary-card"><span>Cost value</span><strong>{html.escape(money_cell(summary.get("total_cost")))}</strong><small>Capital invested</small></div>',
-            f'<div class="investing-summary-card"><span>Market value</span><strong>{html.escape(money_cell(summary.get("total_market")))}</strong><small>Live value after refresh</small></div>',
-            f'<div class="investing-summary-card highlight"><span>Total P&L</span><strong>{html.escape(money_cell(summary.get("total_pnl")))}</strong><small>{html.escape(fmt_number(summary.get("total_pnl_pct")))}% return</small></div>',
-            f'<div class="investing-summary-card"><span>Core allocation</span><strong>{html.escape(fmt_number(summary.get("core_pct")))}%</strong><small>{html.escape(money_cell(summary.get("core_value")))}</small></div>',
+            f'<div class="investing-summary-card"><span>Cost value</span><strong>{html.escape(crore_cell(summary.get("total_cost")))}</strong><small>Capital invested</small></div>',
+            f'<div class="investing-summary-card"><span>Market value</span><strong>{html.escape(crore_cell(summary.get("total_market")))}</strong><small>Live value after refresh</small></div>',
+            f'<div class="investing-summary-card highlight"><span>Total P&L</span><strong>{html.escape(crore_cell(summary.get("total_pnl")))}</strong><small>{html.escape(fmt_number(summary.get("total_pnl_pct")))}% return</small></div>',
+            f'<div class="investing-summary-card"><span>Core allocation</span><strong>{html.escape(fmt_number(summary.get("core_pct")))}%</strong><small>{html.escape(crore_cell(summary.get("core_value")))} core value</small></div>',
         ]
     )
     return f"""
@@ -5589,11 +5772,14 @@ def render_investing_panel(state: PageState) -> str:
         <div class="table-wrap">
           <table class="investing-table" id="investing-holdings-table">
             <thead><tr>
-              <th>Share</th><th>Sector</th><th>Qty</th><th>Avg</th><th>CMP</th><th>% Change</th>
+              <th>Share</th><th>Sector</th><th>Qty</th><th>Avg</th><th>CMP</th>
+              <th><button type="button" class="sort-header" data-sort-col="5">% Change</button></th>
               <th><button type="button" class="sort-header" data-sort-col="6">Cost</button></th>
               <th><button type="button" class="sort-header" data-sort-col="7">Market Value</button></th>
               <th><button type="button" class="sort-header" data-sort-col="8">P&L</button></th>
-              <th>% to 52W High</th><th>% from 52W Low</th><th>Portfolio %</th>
+              <th><button type="button" class="sort-header" data-sort-col="9">% to 52W High</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="10">% from 52W Low</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="11">Portfolio %</button></th>
               <th>News / Sector</th>
               <th>PE</th><th>Sector PE</th><th>OPM</th><th>MCAP</th><th>Debt</th><th>Note</th>
             </tr></thead>
@@ -6307,6 +6493,7 @@ def render_commodity_panel(state: PageState) -> str:
           </div>
           <div class="commodity-price">...</div>
           <div class="commodity-change">--</div>
+          <div class="commodity-dma">50 DMA -- | 200 DMA --</div>
           <div class="commodity-threshold">Buy trigger: down {html.escape(str(item['threshold']))}% | Allocation {int(float(item['allocation']) * 100)}% | 1x {html.escape(format_buy_amount(commodity_yearly_base_amount() * float(item['allocation'])))}</div>
           <div class="commodity-action">Wait</div>
           <form class="commodity-buy-form commodity-confirm-form" method="post" action="/commodity/buy">
@@ -6759,6 +6946,9 @@ def render_page(state: PageState) -> bytes:
               {render_input("api_secret", "KITE_API_SECRET", state.api_secret or env_value("KITE_API_SECRET"), "password")}
               {render_input("access_token", "KITE_ACCESS_TOKEN", state.access_token or env_value("KITE_ACCESS_TOKEN"), "password")}
             </div>
+            <div class="actions compact-actions">
+              <button type="submit" formaction="/kite-token/save">Save Access Token</button>
+            </div>
             {render_checkbox("show_credentials", "Show credential values", False, "Reveals KITE_API_SECRET, KITE_ACCESS_TOKEN, and OPENAI_API_KEY in this local browser page.")}
           </section>
           <section class="panel kite-setup-card token-card">
@@ -7206,14 +7396,14 @@ def render_page(state: PageState) -> bytes:
     }}
     .quote-card {{
       display: grid;
-      grid-template-columns: minmax(54px, 1fr) auto auto;
+      grid-template-columns: minmax(62px, 1fr) auto minmax(48px, auto);
       align-items: center;
-      gap: 5px;
+      gap: 7px;
       border: 1px solid var(--line);
       border-radius: 999px;
-      padding: 3px 7px;
+      padding: 4px 8px;
       background: #f8fafc;
-      min-height: 24px;
+      min-height: 28px;
       overflow: hidden;
     }}
     .quote-card.strong-up {{
@@ -7248,13 +7438,17 @@ def render_page(state: PageState) -> bytes:
       white-space: nowrap;
     }}
     .quote-change {{ 
-      font-size: 10px;
-      font-weight: 800;
+      justify-self: end;
+      border-radius: 999px;
+      padding: 2px 5px;
+      background: #eef2f7;
+      font-size: 10.5px;
+      font-weight: 950;
       color: var(--muted);
       white-space: nowrap;
     }}
-    .quote-change.up {{ color: #047857; }}
-    .quote-change.down {{ color: #b42318; }}
+    .quote-change.up {{ color: #047857; background: #dcfce7; }}
+    .quote-change.down {{ color: #b42318; background: #fee2e2; }}
     .global-market-strip {{
       margin: 0 0 8px;
       padding: 10px 12px;
@@ -7416,14 +7610,14 @@ def render_page(state: PageState) -> bytes:
     }}
     .top-command-center .quote-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
       gap: 6px;
       padding: 8px 10px 10px;
     }}
     .top-command-center .quote-card {{
-      grid-template-columns: minmax(70px, 1fr) auto auto;
-      min-height: 34px;
-      gap: 5px;
+      grid-template-columns: minmax(78px, 1fr) auto minmax(52px, auto);
+      min-height: 36px;
+      gap: 7px;
       padding: 6px 8px;
       border-radius: 11px;
       min-width: 0;
@@ -7435,7 +7629,8 @@ def render_page(state: PageState) -> bytes:
       font-size: 13px;
     }}
     .top-command-center .quote-change {{
-      font-size: 9.5px;
+      font-size: 10.5px;
+      padding: 2px 6px;
     }}
     .commodity-panel {{
       border-color: #fed7aa;
@@ -7494,6 +7689,22 @@ def render_page(state: PageState) -> bytes:
     }}
     .commodity-change.up {{ color: #047857; }}
     .commodity-change.down {{ color: #b91c1c; }}
+    .commodity-dma {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+      color: #0f3b65;
+      font-size: 11px;
+      font-weight: 900;
+    }}
+    .commodity-dma span {{
+      border: 1px solid #cfe4f3;
+      border-radius: 999px;
+      padding: 4px 7px;
+      background: #f0f9ff;
+      white-space: nowrap;
+    }}
     .commodity-threshold {{
       margin-top: 8px;
       color: #64748b;
@@ -7695,29 +7906,37 @@ def render_page(state: PageState) -> bytes:
       justify-content: space-between;
       align-items: center;
       gap: 14px;
+      padding: 12px 16px;
       border-color: #86efac;
       background:
         radial-gradient(circle at 12% 0%, rgba(34, 197, 94, 0.14), transparent 32%),
         linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 48%, #f8fffb 100%);
       box-shadow: 0 18px 38px rgba(22, 101, 52, 0.08);
     }}
+    .investing-hero-panel .panel-title {{
+      font-size: 16px;
+    }}
+    .investing-hero-panel .status {{
+      margin-top: 4px;
+      font-size: 12px;
+    }}
     .investing-summary-panel {{
       border-color: #bbf7d0;
       background:
         radial-gradient(circle at top right, rgba(187, 247, 208, 0.44), transparent 34%),
         linear-gradient(135deg, #f0fdf4 0%, #ffffff 100%);
-      padding: 14px;
+      padding: 10px 12px;
     }}
     .investing-summary-panel .summary-grid {{
       display: grid;
       grid-template-columns: repeat(4, minmax(160px, 1fr));
-      gap: 12px;
+      gap: 10px;
     }}
     .investing-summary-card {{
-      min-height: 98px;
-      padding: 14px;
+      min-height: 76px;
+      padding: 10px 12px;
       border: 1px solid #bbf7d0;
-      border-radius: 16px;
+      border-radius: 12px;
       background: linear-gradient(135deg, #ffffff 0%, #ecfdf5 100%);
       box-shadow: 0 12px 28px rgba(22, 101, 52, 0.08);
     }}
@@ -7729,16 +7948,16 @@ def render_page(state: PageState) -> bytes:
     .investing-summary-card small {{
       display: block;
       color: #64748b;
-      font-size: 10.5px;
+      font-size: 9.5px;
       font-weight: 900;
       letter-spacing: 0.03em;
       text-transform: uppercase;
     }}
     .investing-summary-card strong {{
       display: block;
-      margin: 7px 0 5px;
+      margin: 5px 0 3px;
       color: #065f46;
-      font-size: 22px;
+      font-size: 19px;
       font-weight: 950;
       line-height: 1.05;
       overflow-wrap: anywhere;
@@ -8296,7 +8515,7 @@ def render_page(state: PageState) -> bytes:
     }}
     .kite-setup-grid {{
       display: grid;
-      grid-template-columns: minmax(340px, 1.1fr) minmax(320px, 0.9fr);
+      grid-template-columns: repeat(2, minmax(320px, 1fr));
       gap: 12px;
       padding: 12px;
       border-radius: 12px;
@@ -8312,14 +8531,15 @@ def render_page(state: PageState) -> bytes:
       overflow: hidden;
       border-color: #bae6fd;
       background: rgba(255, 255, 255, 0.94);
+      padding: 16px;
     }}
     .kite-setup-card::after {{
       content: "";
       position: absolute;
-      width: 110px;
-      height: 110px;
-      right: -42px;
-      top: -46px;
+      width: 84px;
+      height: 84px;
+      right: -34px;
+      top: -34px;
       border-radius: 50%;
       background: rgba(167, 243, 208, 0.42);
       pointer-events: none;
@@ -8336,13 +8556,12 @@ def render_page(state: PageState) -> bytes:
       font-weight: 950;
       font-size: 12px;
     }}
-    .credential-card {{ grid-row: span 2; }}
     .token-card {{ border-color: #bfdbfe; }}
     .etf-card {{ border-color: #bbf7d0; }}
     .ip-card {{ border-color: #fde68a; }}
     .kite-action-preview {{
       margin-top: 8px;
-      padding: 12px;
+      padding: 10px;
       border-radius: 10px;
       border: 1px solid #86efac;
       background: #f0fdf4;
@@ -8539,6 +8758,10 @@ def render_page(state: PageState) -> bytes:
       color: #0f3b65;
       font-size: 13px;
       font-weight: 950;
+    }}
+    .compact-actions {{
+      margin-top: 8px;
+      margin-bottom: 2px;
     }}
     .console {{
       margin: 0;
@@ -8965,7 +9188,7 @@ def render_page(state: PageState) -> bytes:
       background: #f8fbff;
     }}
     .order-book-table {{
-      min-width: 1180px;
+      min-width: 1480px;
     }}
     .order-book-table td,
     .order-book-table th {{
@@ -9003,6 +9226,53 @@ def render_page(state: PageState) -> bytes:
     .order-edit-input:disabled {{
       color: var(--muted);
       background: #f1f5f9;
+    }}
+    .order-score {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 64px;
+      border-radius: 999px;
+      padding: 5px 8px;
+      background: #f1f5f9;
+      color: #475569;
+      font-size: 12px;
+      font-weight: 950;
+      white-space: nowrap;
+    }}
+    .order-score.score-4,
+    .order-score.score-5 {{
+      background: #dcfce7;
+      color: #047857;
+    }}
+    .order-score.score-2,
+    .order-score.score-3 {{
+      background: #fef9c3;
+      color: #a16207;
+    }}
+    .order-score.score-0,
+    .order-score.score-1 {{
+      background: #fee2e2;
+      color: #b91c1c;
+    }}
+    .order-suggestion {{
+      max-width: 260px;
+      border: 1px solid rgba(100, 116, 139, 0.22);
+      border-radius: 9px;
+      padding: 7px 8px;
+      line-height: 1.25;
+    }}
+    .order-suggestion strong {{
+      display: inline-block;
+      margin-bottom: 3px;
+      font-size: 12px;
+      letter-spacing: 0.03em;
+    }}
+    .order-suggestion span {{
+      display: block;
+      color: #1f2937;
+      font-size: 11px;
+      font-weight: 750;
     }}
     .validation-table {{
       min-width: 1040px;
@@ -9266,7 +9536,7 @@ def render_page(state: PageState) -> bytes:
     .gpt-api-output {{ min-height: 240px; background: #f8fafc; }}
     .gpt-fallback-box {{ min-height: 130px; }}
     .watchlist-box {{
-      min-height: 160px;
+      min-height: 118px;
       font-family: Consolas, monospace;
       text-transform: uppercase;
     }}
@@ -10259,12 +10529,14 @@ def render_page(state: PageState) -> bytes:
           const quote = bySymbol.get(symbol);
           const price = card.querySelector('.commodity-price');
           const change = card.querySelector('.commodity-change');
+          const dma = card.querySelector('.commodity-dma');
           const action = card.querySelector('.commodity-action');
           const buyButton = card.querySelector('.commodity-buy-button');
           if (!quote || !quote.ltp) {{
             price.textContent = 'N/A';
             change.textContent = 'Quote unavailable';
             change.className = 'commodity-change';
+            if (dma) dma.textContent = '50 DMA -- | 200 DMA --';
             action.textContent = 'Wait';
             if (buyButton) buyButton.textContent = `Add more ${{assetName}}`;
             card.classList.remove('buy-now');
@@ -10281,6 +10553,11 @@ def render_page(state: PageState) -> bytes:
             const sign = pct > 0 ? '+' : '';
             change.textContent = `${{sign}}${{pct.toFixed(2)}}%`;
             change.className = `commodity-change ${{pct >= 0 ? 'up' : 'down'}}`;
+          }}
+          if (dma) {{
+            const dma50 = quote.dma_50 === null || quote.dma_50 === undefined ? '--' : Number(quote.dma_50).toFixed(2);
+            const dma200 = quote.dma_200 === null || quote.dma_200 === undefined ? '--' : Number(quote.dma_200).toFixed(2);
+            dma.innerHTML = `<span>50 DMA ${{dma50}}</span><span>200 DMA ${{dma200}}</span>`;
           }}
           card.classList.toggle('buy-now', Boolean(quote.buy_signal));
           action.innerHTML = quote.buy_signal
@@ -10802,6 +11079,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 state.access_token = access_token
                 state.message = "Generated today's KITE_ACCESS_TOKEN, saved it to .env, and applied it to this running app."
+            elif request_path == "/kite-token/save":
+                access_token, state.console_log = call_with_console(
+                    save_kite_access_token,
+                    state.access_token or env_value("KITE_ACCESS_TOKEN"),
+                )
+                state.access_token = access_token
+                state.message = "Saved KITE_ACCESS_TOKEN to .env and applied it to this running app."
             elif request_path == "/kite-ip/check":
                 state.kite_ip_data, state.console_log = call_with_console(fetch_public_ip_data)
                 ips = [item["ip"] for item in state.kite_ip_data if item.get("ip")]
