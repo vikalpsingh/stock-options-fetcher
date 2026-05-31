@@ -184,6 +184,7 @@ KITE_INSTRUMENT_CACHE_SECONDS = 3600
 INVESTING_NEWS_CACHE_SECONDS = 12 * 60 * 60
 INVESTING_52W_CACHE_SECONDS = 24 * 60 * 60
 COMMODITY_DMA_CACHE_SECONDS = 12 * 60 * 60
+INCOME_GROWTH_GPT_CACHE_SECONDS = 30 * 60
 STOCK_NEWS_NAMES = {
     "BAJFINANCE": "Bajaj Finance",
     "TATACONSUM": "Tata Consumer Products",
@@ -301,6 +302,27 @@ COMMODITY_YEARLY_BASE_AMOUNTS = {
     2026: 75938.0,
 }
 COMMODITY_MAX_MULTIPLIER = 2
+INCOME_GROWTH_SHEET = [
+    {"symbol": "BAJFINANCE", "holding": 2310, "times_lot": 3.08, "lots_can_sell": 1.0, "cmp": 909.3, "call_strike": 982, "value": 2100483, "to_sell": 825, "lot_size": 750, "gap_pct": 8, "put_down_pct": 29.8, "pe": 837, "week_52": -21.25, "one_year": 1.78, "month": -4.3, "week_1": -3.46, "today": -2.4},
+    {"symbol": "TATACONSUM", "holding": 650, "times_lot": 1.18, "lots_can_sell": 1.0, "cmp": 1173.4, "call_strike": 1267, "value": 762710, "to_sell": 605, "lot_size": 550, "gap_pct": 8, "put_down_pct": 75.33, "pe": 1080, "week_52": -9.31, "one_year": 5.53, "month": 1.12, "week_1": -1.16, "today": -2.6},
+    {"symbol": "PGEL", "holding": 7350, "times_lot": 8.17, "lots_can_sell": 3.0, "cmp": 483, "call_strike": 522, "value": 3550050, "to_sell": 990, "lot_size": 900, "gap_pct": 8, "put_down_pct": 50.06, "pe": 444, "week_52": -73.18, "one_year": -37.95, "month": -9.64, "week_1": 2.49, "today": 1.5},
+    {"symbol": "TITAN", "holding": 182, "times_lot": 1.04, "lots_can_sell": 1.0, "cmp": 4112.1, "call_strike": 4441, "value": 748402.2, "to_sell": 192.5, "lot_size": 175, "gap_pct": 8, "put_down_pct": 71.94, "pe": 3783, "week_52": -11.99, "one_year": 17.35, "month": -5.75, "week_1": -1.13, "today": -0.6},
+    {"symbol": "ETERNAL", "holding": 11500, "times_lot": 4.69, "lots_can_sell": 2.0, "cmp": 251.99, "call_strike": 272, "value": 2897885, "to_sell": 2695, "lot_size": 2450, "gap_pct": 8, "put_down_pct": 646.13, "pe": 232, "week_52": -46.22, "one_year": -1.78, "month": 0.04, "week_1": 1.74, "today": -1.8},
+    {"symbol": "UNITDSPR", "holding": 1522, "times_lot": 4.35, "lots_can_sell": 2.0, "cmp": 1271, "call_strike": 1373, "value": 1934462, "to_sell": 385, "lot_size": 350, "gap_pct": 8, "put_down_pct": None, "pe": 1169, "week_52": -29.43, "one_year": -21.06, "month": -3.84, "week_1": -1.02, "today": -2.4},
+    {"symbol": "HAVELLS", "holding": 520, "times_lot": 1.04, "lots_can_sell": 1.0, "cmp": 1186, "call_strike": 1281, "value": 616720, "to_sell": 550, "lot_size": 500, "gap_pct": 8, "put_down_pct": 44.02, "pe": 1091, "week_52": -36.69, "one_year": -20.3, "month": -5.62, "week_1": -1.48, "today": -2.1},
+    {"symbol": "NAUKRI", "holding": 615, "times_lot": 1.64, "lots_can_sell": 1.0, "cmp": 1002, "call_strike": 1082, "value": 616230, "to_sell": 412.5, "lot_size": 375, "gap_pct": 8, "put_down_pct": 44.81, "pe": 922, "week_52": -54.69, "one_year": -32.04, "month": 2.6, "week_1": 6.77, "today": -0.4},
+    {"symbol": "PFC", "holding": 3515, "times_lot": 2.70, "lots_can_sell": 2.0, "cmp": 431, "call_strike": 465, "value": 1514965, "to_sell": 1430, "lot_size": 1300, "gap_pct": 8, "put_down_pct": 5.49, "pe": 397, "week_52": -12.88, "one_year": 5.66, "month": -3.85, "week_1": -1.8, "today": -0.6},
+    {"symbol": "CAMS", "holding": 410, "times_lot": 1.03, "lots_can_sell": 1.0, "cmp": 790, "call_strike": 853, "value": 323900, "to_sell": 440, "lot_size": 400, "gap_pct": 8, "put_down_pct": 41.3, "pe": 727, "week_52": -10.76, "one_year": -7.02, "month": 8.09, "week_1": 2.64, "today": 0.4},
+    {"symbol": "CDSL", "holding": 410, "times_lot": 0.86, "lots_can_sell": 1.0, "cmp": 1245, "call_strike": 1345, "value": 510450, "to_sell": 522.5, "lot_size": 475, "gap_pct": 8, "put_down_pct": 57.06, "pe": 1145, "week_52": -46.90, "one_year": -30.01, "month": 0.54, "week_1": 2.27, "today": 0.1},
+    {"symbol": "MAZDOCK", "holding": 475, "times_lot": 1.58, "lots_can_sell": 1.0, "cmp": 2460, "call_strike": 2657, "value": 1168500, "to_sell": 330, "lot_size": 300, "gap_pct": 8, "put_down_pct": 38.41, "pe": 2263, "week_52": -53.46, "one_year": -28.28, "month": -5.8, "week_1": -0.41, "today": 0.2},
+    {"symbol": "NUVAMA", "holding": 0, "times_lot": 0.0, "lots_can_sell": 0.0, "cmp": 1563, "call_strike": 1688, "value": 0, "to_sell": 550, "lot_size": 500, "gap_pct": 8, "put_down_pct": 27.88, "pe": 1438, "week_52": -8.87, "one_year": 8.34, "month": 17.58, "week_1": 3.87, "today": 1.7},
+    {"symbol": "NTPC", "holding": 927, "times_lot": 0.62, "lots_can_sell": 1.0, "cmp": 389.5, "call_strike": 421, "value": 361066.5, "to_sell": 1650, "lot_size": 1500, "gap_pct": 8, "put_down_pct": 13.96, "pe": 358, "week_52": -6.39, "one_year": 18.52, "month": -2.64, "week_1": -0.14, "today": -2.2},
+    {"symbol": "WAAREEENER", "holding": 130, "times_lot": 0.74, "lots_can_sell": 1.0, "cmp": 3129.1, "call_strike": 3379, "value": 406783, "to_sell": 192.5, "lot_size": 175, "gap_pct": 8, "put_down_pct": 24.29, "pe": 2879, "week_52": -23.52, "one_year": 9.7, "month": -0.23, "week_1": 4.86, "today": 0.0},
+]
+INCOME_GROWTH_BY_SYMBOL = {
+    str(item["symbol"]).upper().replace("NSE:", "").replace("BSE:", ""): item
+    for item in INCOME_GROWTH_SHEET
+}
 INCOME_ROLL_TRADING_DAY_THRESHOLD = 9
 INCOME_UNDERLYINGS = [
     {
@@ -825,6 +847,13 @@ class PageState:
     commodity_error: str = ""
     investing_rows: list[dict[str, Any]] | None = None
     investing_summary: dict[str, Any] | None = None
+    income_growth_rows: list[dict[str, Any]] | None = None
+    income_growth_summary: dict[str, Any] | None = None
+    income_growth_gpt_csv: str = ""
+    income_growth_gpt_output: str = ""
+    income_growth_gpt_response_id: str = ""
+    income_growth_gpt_prompt: str = ""
+    income_growth_gpt_cached: bool = False
     income_rows: list[dict[str, Any]] | None = None
     income_summary: dict[str, Any] | None = None
     income_results: list[dict[str, Any]] | None = None
@@ -2095,11 +2124,11 @@ def option_chain_analytics(kite: Any, parts: dict[str, Any], spot: float) -> dic
     }
 
 
-def open_option_positions() -> list[dict[str, Any]]:
+def open_option_positions(use_cache: bool = True) -> list[dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     kite = kite_orders.kite_client()
-    positions = cached_kite_positions(kite)
+    positions = cached_kite_positions(kite) if use_cache else kite.positions().get("net", [])
     active: list[dict[str, Any]] = []
     for position in positions:
         quantity = int(position.get("quantity") or 0)
@@ -3068,15 +3097,18 @@ def place_position_close_buy_order(symbol: str) -> dict[str, Any]:
     }
 
 
-def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
-    cached = APP_CACHE.get("positions-research")
     now = time.time()
-    if cached and now - cached[0] < KITE_READ_CACHE_SECONDS:
-        return copy.deepcopy(cached[1])
+    if force_refresh:
+        clear_app_cache(("kite:positions", "kite:quote", "positions-research"))
+    else:
+        cached = APP_CACHE.get("positions-research")
+        if cached and now - cached[0] < KITE_READ_CACHE_SECONDS:
+            return copy.deepcopy(cached[1])
     kite = kite_orders.kite_client()
-    positions = open_option_positions()
+    positions = open_option_positions(use_cache=not force_refresh)
     rows: list[dict[str, Any]] = []
     total_pnl = 0.0
     total_deployed = 0.0
@@ -3138,6 +3170,8 @@ def positions_research() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "total_pnl": total_pnl,
         "total_deployed": total_deployed,
         "return_pct": (total_pnl / total_deployed * 100) if total_deployed > 0 else None,
+        "as_of": app_now().strftime("%d %b %Y %H:%M:%S"),
+        "fresh": force_refresh,
     }
     result = (rows, summary)
     APP_CACHE["positions-research"] = (now, copy.deepcopy(result))
@@ -3924,6 +3958,329 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "core_pct": (core_value / total_market * 100) if total_market > 0 else None,
         "quote_error": quote_error,
     }
+
+
+def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    investing_rows, investing_summary = investing_holdings_rows()
+    kite = kite_orders.kite_client()
+    today = app_now().date()
+    option_rows_by_name: dict[str, list[dict[str, Any]]] = {}
+    for item in cached_kite_instruments(kite, "NFO"):
+        if str(item.get("instrument_type") or "").upper() != "CE":
+            continue
+        name = str(item.get("name") or "").upper().strip()
+        if not name:
+            continue
+        expiry_value = item.get("expiry")
+        if isinstance(expiry_value, datetime):
+            expiry_day = expiry_value.date()
+        elif isinstance(expiry_value, date):
+            expiry_day = expiry_value
+        elif expiry_value:
+            try:
+                expiry_day = datetime.fromisoformat(str(expiry_value)).date()
+            except ValueError:
+                continue
+        else:
+            continue
+        if expiry_day >= today:
+            option_rows_by_name.setdefault(name, []).append({**item, "_expiry_day": expiry_day})
+
+    quote_keys: list[str] = []
+    selected_by_symbol: dict[str, dict[str, Any]] = {}
+    for row in investing_rows:
+        symbol = str(row.get("symbol") or "").upper()
+        sheet = INCOME_GROWTH_BY_SYMBOL.get(symbol)
+        cmp_value = float((sheet or {}).get("cmp") or row.get("cmp") or 0)
+        quantity = int(float((sheet or {}).get("holding") or row.get("quantity") or 0))
+        if cmp_value <= 0 or quantity <= 0:
+            continue
+        target_strike = float((sheet or {}).get("call_strike") or (cmp_value * 1.10))
+        options = [
+            item
+            for item in option_rows_by_name.get(symbol, [])
+            if float(item.get("strike") or 0) >= target_strike
+        ]
+        if not options:
+            continue
+        nearest_expiry = min(item["_expiry_day"] for item in options)
+        same_expiry = [item for item in options if item["_expiry_day"] == nearest_expiry]
+        candidate = min(same_expiry, key=lambda item: float(item.get("strike") or 0))
+        quote_key = f"NFO:{candidate.get('tradingsymbol')}"
+        selected_by_symbol[symbol] = {**candidate, "_quote_key": quote_key}
+        quote_keys.append(quote_key)
+
+    option_quotes = cached_kite_quote(kite, quote_keys) if quote_keys else {}
+    rows: list[dict[str, Any]] = []
+    total_existing_income = 0.0
+    best_additional = 0.0
+    for row in investing_rows:
+        symbol = str(row.get("symbol") or "").upper()
+        sheet = INCOME_GROWTH_BY_SYMBOL.get(symbol)
+        cmp_value = float((sheet or {}).get("cmp") or row.get("cmp") or 0)
+        quantity = int(float((sheet or {}).get("holding") or row.get("quantity") or 0))
+        market_value = float((sheet or {}).get("value") or (quantity * cmp_value if cmp_value else 0))
+        candidate = selected_by_symbol.get(symbol)
+        core = str(row.get("core") or "").upper()
+        quality_score = 1.0 if core == "Y" else 0.75 if quantity > 0 else 0.4
+        pct_to_high = (sheet or {}).get("week_52") if sheet else row.get("pct_to_52_high")
+        pct_from_low = row.get("pct_from_52_low")
+        valuation_score = 0.7
+        if isinstance(pct_to_high, (int, float)) and pct_to_high >= -5:
+            valuation_score = 0.45
+        elif isinstance(pct_from_low, (int, float)) and pct_from_low <= 15:
+            valuation_score = 0.9
+        pe_value = (sheet or {}).get("put_down_pct")
+        if isinstance(pe_value, (int, float)) and pe_value > 60:
+            valuation_score = min(valuation_score, 0.45)
+        elif pe_value is None:
+            valuation_score = min(valuation_score, 0.65)
+        today_change = float((sheet or {}).get("today") or 0)
+        week_change = float((sheet or {}).get("week_1") or 0)
+        month_change = float((sheet or {}).get("month") or 0)
+        trend_score = 0.75
+        if today_change <= 0 and week_change <= 0:
+            trend_score = 1.0
+        elif today_change > 2 or week_change > 5:
+            trend_score = 0.45
+        elif month_change < -8:
+            trend_score = 0.6
+        input_lot_size = int(float((sheet or {}).get("lot_size") or 0))
+        input_lots_can_sell = int(float((sheet or {}).get("lots_can_sell") or 0))
+        input_call_strike = (sheet or {}).get("call_strike")
+        input_put_strike = (sheet or {}).get("pe")
+        input_to_sell = (sheet or {}).get("to_sell")
+        input_gap_pct = (sheet or {}).get("gap_pct")
+        input_put_down_pct = (
+            ((cmp_value - float(input_put_strike)) / cmp_value * 100)
+            if cmp_value > 0 and isinstance(input_put_strike, (int, float))
+            else None
+        )
+        input_times_lot = (sheet or {}).get("times_lot")
+        base_row = {
+            **row,
+            "quantity": quantity,
+            "cmp": cmp_value if cmp_value > 0 else row.get("cmp"),
+            "market_value": market_value,
+            "sheet_source": bool(sheet),
+            "times_lot": input_times_lot,
+            "lots_can_sell_input": input_lots_can_sell,
+            "input_call_strike": input_call_strike,
+            "input_put_strike": input_put_strike,
+            "input_to_sell": input_to_sell,
+            "input_lot_size": input_lot_size,
+            "input_gap_pct": input_gap_pct,
+            "input_put_down_pct": input_put_down_pct,
+            "input_pe": pe_value,
+            "input_52w": pct_to_high,
+            "input_1y": (sheet or {}).get("one_year"),
+            "input_month": (sheet or {}).get("month"),
+            "input_1w": (sheet or {}).get("week_1"),
+            "input_today": (sheet or {}).get("today"),
+        }
+        if not candidate or cmp_value <= 0:
+            # Income Growth is only useful for F&O names where covered CALLs can be researched.
+            continue
+        lot_size = input_lot_size or int(candidate.get("lot_size") or 0)
+        premium = quote_ltp(option_quotes.get(str(candidate.get("_quote_key")), {}))
+        covered_lots = input_lots_can_sell if sheet else (quantity // lot_size if lot_size > 0 else 0)
+        remainder = quantity % lot_size if lot_size > 0 else 0
+        extra_shares = (lot_size - remainder) if lot_size > 0 and remainder else 0
+        capital_for_next_lot = extra_shares * cmp_value if extra_shares else 0.0
+        monthly_income = covered_lots * lot_size * premium
+        premium_yield_pct = (premium / cmp_value * 100) if cmp_value > 0 and premium > 0 else 0.0
+        liquidity_score = 1.0 if premium > 0 and monthly_income >= 5000 else 0.7 if premium > 0 else 0.25
+        gap_score = 1.0 if isinstance(input_gap_pct, (int, float)) and input_gap_pct >= 8 else 0.7
+        cc_capacity_score = covered_lots * premium_yield_pct * liquidity_score * quality_score * valuation_score * trend_score * gap_score
+        additional_income = lot_size * premium
+        additional_capacity_per_lakh = additional_income / (capital_for_next_lot / 100000) if capital_for_next_lot and premium > 0 else 0.0
+        coverage_ok = quantity >= lot_size and (not isinstance(input_times_lot, (int, float)) or input_times_lot >= 1)
+        if quantity <= 0:
+            decision, color = "NO_HOLDING_NO_CC", "red"
+        elif not coverage_ok:
+            decision, color = "NEED_MORE_SHARES_FOR_LOT", "red"
+        elif capital_for_next_lot and capital_for_next_lot <= 100000 and additional_capacity_per_lakh > 1500:
+            decision, color = "BUY_TO_COMPLETE_NEXT_LOT", "green"
+        elif covered_lots > 0 and premium > 0:
+            decision, color = "SELL_COVERED_CALL_CANDIDATE", "green"
+        elif premium <= 0:
+            decision, color = "CHECK_LIVE_PREMIUM", "yellow"
+        elif valuation_score < 0.6:
+            decision, color = "WAIT_VALUATION_RISK", "yellow"
+        else:
+            decision, color = "ACCUMULATE_SLOWLY", "yellow"
+        total_existing_income += monthly_income
+        best_additional = max(best_additional, additional_capacity_per_lakh)
+        rows.append({**base_row, "candidate_ce": str(candidate.get("tradingsymbol") or f"{symbol} CALL {fmt_number(input_call_strike)}"), "lot_size": lot_size, "covered_lots": covered_lots, "extra_shares": extra_shares, "capital_for_next_lot": capital_for_next_lot, "premium": premium if premium > 0 else None, "monthly_income": monthly_income, "premium_yield_pct": premium_yield_pct, "liquidity_score": liquidity_score, "quality_score": quality_score, "valuation_score": valuation_score, "trend_score": trend_score, "cc_capacity_score": cc_capacity_score, "additional_capacity_per_lakh": additional_capacity_per_lakh, "decision": decision, "decision_color": color})
+    rows.sort(key=lambda row: (float(row.get("additional_capacity_per_lakh") or 0), float(row.get("cc_capacity_score") or 0)), reverse=True)
+    return rows, {
+        "existing_monthly_income": total_existing_income,
+        "best_additional_per_lakh": best_additional,
+        "portfolio_market": investing_summary.get("total_market"),
+        "count": len(rows),
+        "as_of": app_now().strftime("%d %b %Y %H:%M:%S"),
+    }
+
+
+def income_growth_gpt_user_prompt(rows: list[dict[str, Any]], summary: dict[str, Any]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "Stock",
+            "Holding shares",
+            "Times of lot size",
+            "Lots can be sold",
+            "CMP",
+            "CALL STRIKE",
+            "Value",
+            "TO SELL",
+            "Lot Size",
+            "GAP for %",
+            "% down for PUT",
+            "PUT Strike",
+            "PE",
+            "52W",
+            "1Y R",
+            "Month",
+            "1W",
+            "Today",
+            "Kite CE",
+            "Live Premium",
+            "App Decision",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row.get("symbol"),
+                row.get("quantity"),
+                row.get("times_lot"),
+                row.get("covered_lots"),
+                row.get("cmp"),
+                row.get("input_call_strike"),
+                row.get("market_value"),
+                row.get("input_to_sell"),
+                row.get("lot_size") or row.get("input_lot_size"),
+                row.get("input_gap_pct"),
+                row.get("input_put_down_pct"),
+                row.get("input_put_strike"),
+                row.get("input_pe"),
+                row.get("input_52w"),
+                row.get("input_1y"),
+                row.get("input_month"),
+                row.get("input_1w"),
+                row.get("input_today"),
+                row.get("candidate_ce"),
+                row.get("premium"),
+                row.get("decision"),
+            ]
+        )
+    return (
+        "Provide best shares to take position today and generate CSV file in the exact format "
+        "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity.\n"
+        "Use the Monthly Income by Trading GPT rules from the system prompt. Prefer conservative covered CALLs "
+        "from this Income Growth table. Skip any row that is not fully covered, has no valid option symbol, "
+        "or violates conservative monthly income rules. If live premium is unavailable, use price as 0.\n\n"
+        f"Income Growth summary: {json.dumps(summary, default=str)}\n\n"
+        f"Income Growth candidate table:\n{output.getvalue()}"
+    )
+
+
+def validate_income_growth_with_openai(
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+    model: str,
+    system_prompt: str,
+    prompt: str = "",
+    force_refresh: bool = False,
+) -> tuple[str, str, str, bool]:
+    final_prompt = prompt.strip() or income_growth_gpt_user_prompt(rows, summary)
+    cache_seed = json.dumps(
+        {
+            "model": model.strip() or DEFAULT_OPENAI_MODEL,
+            "system_prompt": system_prompt.strip() or DEFAULT_OPENAI_SYSTEM_PROMPT,
+            "prompt": final_prompt,
+        },
+        sort_keys=True,
+    )
+    cache_key = "income-growth:gpt:" + hashlib.sha256(cache_seed.encode("utf-8")).hexdigest()
+    now = time.time()
+    cached = APP_CACHE.get(cache_key)
+    if cached and not force_refresh and now - cached[0] < INCOME_GROWTH_GPT_CACHE_SECONDS:
+        csv_text, output, response_id = copy.deepcopy(cached[1])
+        return csv_text, output, response_id, True
+    result = generate_csv_with_openai(final_prompt, model, system_prompt)
+    APP_CACHE[cache_key] = (now, copy.deepcopy(result))
+    return result[0], result[1], result[2], False
+
+
+def income_growth_pe_sell_candidates(rows: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            symbol = str(row.get("symbol") or "").upper()
+            cmp_value = float(row.get("cmp") or 0)
+            put_strike = float(row.get("input_put_strike") or 0)
+            lot_size = int(float(row.get("lot_size") or row.get("input_lot_size") or 0))
+            pe_value = row.get("input_pe")
+            pct_52w = row.get("input_52w")
+            month = float(row.get("input_month") or 0)
+            week_1 = float(row.get("input_1w") or 0)
+            today = float(row.get("input_today") or 0)
+            if not symbol or cmp_value <= 0 or put_strike <= 0 or lot_size <= 0:
+                continue
+            put_down_pct = ((cmp_value - put_strike) / cmp_value) * 100
+            cash_required = put_strike * lot_size * 0.90
+            cash_score = 25 if cash_required <= 500000 else 20 if cash_required <= 800000 else 12 if cash_required <= 1000000 else 0
+            buffer_score = 25 if put_down_pct >= 10 else 20 if put_down_pct >= 8 else 12 if put_down_pct >= 5 else 0
+            valuation_score = 12
+            if isinstance(pe_value, (int, float)):
+                valuation_score = 20 if pe_value <= 30 else 15 if pe_value <= 50 else 8 if pe_value <= 70 else 2
+            week52_score = 12
+            if isinstance(pct_52w, (int, float)):
+                week52_score = 20 if pct_52w <= -20 else 15 if pct_52w <= -10 else 8 if pct_52w <= -5 else 2
+            trend_score = 15
+            if month < -12 or week_1 < -8:
+                trend_score = 5
+            elif -8 <= month <= 8 and -5 <= week_1 <= 4 and today <= 2:
+                trend_score = 20
+            elif today > 4 or week_1 > 7:
+                trend_score = 8
+            score = min(100, cash_score + buffer_score + valuation_score + week52_score + trend_score)
+            if score >= 80:
+                color, label = "green", "GOOD PE SELL"
+            elif score >= 65:
+                color, label = "yellow", "OK PE SELL"
+            else:
+                color, label = "red", "WAIT"
+            reasons = [
+                f"PUT {put_strike:.0f} is {put_down_pct:.1f}% below CMP",
+                f"cash req ~{format_buy_amount(cash_required)}",
+                f"PE {fmt_number(pe_value, 1)}",
+                f"52W {fmt_number(pct_52w, 1)}%",
+                f"1W {week_1:.1f}%, today {today:.1f}%",
+            ]
+            candidates.append(
+                {
+                    "symbol": symbol,
+                    "put_strike": put_strike,
+                    "cash_required": cash_required,
+                    "put_down_pct": put_down_pct,
+                    "pe": pe_value,
+                    "score": score,
+                    "label": label,
+                    "color": color,
+                    "reasons": reasons,
+                    "future_call_note": "If assigned, later use holding for covered CALL income.",
+                }
+            )
+        except Exception:
+            continue
+    candidates.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+    return candidates[:limit]
 
 
 def commodity_etf_by_symbol(symbol: str) -> dict[str, Any]:
@@ -5294,23 +5651,65 @@ def order_has_active_position(order: dict[str, Any], active_underlyings: set[str
     return symbol in active_underlyings or bool(underlying and underlying in active_underlyings)
 
 
-def default_selected_order_indexes(orders: list[dict[str, Any]]) -> set[int]:
+def validation_score_percent(validation: dict[str, Any] | None) -> float | None:
+    if not validation:
+        return None
+    try:
+        score = float(validation.get("score") or 0)
+        max_score = float(validation.get("max_score") or 0)
+        if max_score <= 0:
+            return 0.0
+        return (score / max_score) * 100
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def score_status(score_pct: float | None) -> str:
+    if score_pct is None:
+        return "CHECK"
+    if score_pct >= 80:
+        return "GOOD"
+    if score_pct >= 65:
+        return "OK"
+    if score_pct >= 50:
+        return "RISKY"
+    return "AVOID"
+
+
+def render_score_badge(score_pct: float | None) -> str:
+    status = score_status(score_pct)
+    text = "N/A" if score_pct is None else f"{score_pct:.0f}"
+    return f'<span class="score-badge {status.lower()}">{html.escape(text)}<small>{html.escape(status)}</small></span>'
+
+
+def default_selected_order_indexes(
+    orders: list[dict[str, Any]],
+    validations: list[dict[str, Any]] | None = None,
+) -> set[int]:
     try:
         active_underlyings = active_position_underlyings()
     except Exception:
         active_underlyings = set()
-    return {
-        index
-        for index, order in enumerate(orders)
-        if not order_has_active_position(order, active_underlyings)
-    }
+    selected: set[int] = set()
+    for index, order in enumerate(orders):
+        if order_has_active_position(order, active_underlyings):
+            continue
+        validation = validations[index] if validations and index < len(validations) else None
+        score_pct = validation_score_percent(validation)
+        if score_pct is None or score_pct >= 65:
+            selected.add(index)
+    return selected
 
 
-def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] | None = None) -> str:
+def render_orders_table(
+    orders: list[dict[str, Any]] | None,
+    selected: set[int] | None = None,
+    validations: list[dict[str, Any]] | None = None,
+) -> str:
     if not orders:
         return ""
     if selected is None:
-        selected = default_selected_order_indexes(orders)
+        selected = default_selected_order_indexes(orders, validations)
     try:
         active_underlyings = active_position_underlyings()
     except Exception:
@@ -5318,11 +5717,15 @@ def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] 
     header = "".join(f"<th>{html.escape(field)}</th>" for field in DISPLAY_FIELDS)
     rows = []
     for index, order in enumerate(orders):
-        checked_attr = " checked" if index in selected else ""
         symbol = str(order.get("tradingsymbol") or "").strip().upper()
         underlying = underlying_for_symbol(symbol) if symbol else ""
         has_active_position = order_has_active_position(order, active_underlyings)
-        row_class = ' class="order-existing-position"' if has_active_position else ""
+        validation = validations[index] if validations and index < len(validations) else None
+        score_pct = validation_score_percent(validation)
+        disable_checkbox = has_active_position or (score_pct is not None and score_pct < 50)
+        checked_attr = " checked" if index in selected and not disable_checkbox else ""
+        disabled_attr = " disabled" if disable_checkbox else ""
+        row_class = ' class="order-existing-position active-position-row"' if has_active_position else ""
         row_title = (
             f' title="Existing Kite position found for {html.escape(underlying or symbol, quote=True)}"'
             if has_active_position
@@ -5334,13 +5737,14 @@ def render_orders_table(orders: list[dict[str, Any]] | None, selected: set[int] 
         )
         rows.append(
             f"<tr{row_class}{row_title}>"
-            f'<td><input type="checkbox" name="selected" value="{index}"{checked_attr}></td>'
+            f'<td><input type="checkbox" name="selected" value="{index}"{checked_attr}{disabled_attr}></td>'
+            f"<td>{render_score_badge(score_pct)}</td>"
             f"{cells}</tr>"
         )
     return (
         '<section class="panel"><div class="panel-title">Orders</div>'
         '<div class="status order-position-note">Rows in light red already have an active Kite position for the same underlying.</div>'
-        '<div class="table-wrap"><table><thead><tr><th>Select</th>'
+        '<div class="table-wrap"><table><thead><tr><th>Select</th><th>Score</th>'
         f"{header}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
     )
 
@@ -5489,8 +5893,12 @@ def render_order_book(state: PageState) -> str:
             f'name="modify_quantity_{field_key}" value="{quantity}"{disabled_attr}>'
         )
         price_cell = (
-            f'<input class="order-edit-input" type="number" min="0" step="0.01" '
+            '<div class="price-adjuster">'
+            f'<button type="button" class="price-step-button" data-price-step="-1"{disabled_attr}>-1%</button>'
+            f'<input class="order-edit-input price-adjust-input" type="number" min="0" step="0.01" '
             f'name="modify_price_{field_key}" value="{price}"{disabled_attr}>'
+            f'<button type="button" class="price-step-button" data-price-step="1"{disabled_attr}>+1%</button>'
+            "</div>"
         )
         price_diff = order.get("price_diff_pct")
         diff_class = ""
@@ -5531,9 +5939,9 @@ def render_order_book(state: PageState) -> str:
             f"<td>{html.escape(str(order.get('order_type', '')))}</td>"
             f"<td>{price_cell}</td>"
             f"<td>{html.escape(fmt_number(order.get('ltp')))}</td>"
+            f"<td>{suggestion_cell}</td>"
             f'<td class="{diff_class}">{html.escape(fmt_number(price_diff))}%</td>'
             f'<td><span class="order-score score-{suggestion_score // 20}">{suggestion_score}/100</span></td>'
-            f"<td>{suggestion_cell}</td>"
             f'<td class="{close_pnl_class}">{close_pnl_cell}</td>'
             f"<td>{html.escape(str(order.get('status', '')))}</td>"
             "</tr>"
@@ -5555,7 +5963,7 @@ def render_order_book(state: PageState) -> str:
         '<button type="button" class="secondary compact-action-button" id="orders-unselect-all">Unselect All</button></div>'
         '<div class="table-wrap"><table class="order-book-table"><thead><tr>'
         '<th>Select</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Pending</th>'
-        '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>% Diff</th><th>Score</th><th>Suggestion</th><th>Close P&L</th><th>Status</th>'
+        '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>Suggestion</th><th>% Diff</th><th>Score</th><th>Close P&L</th><th>Status</th>'
         f"</tr></thead><tbody>{body}</tbody></table></div></section>"
     )
 
@@ -5787,6 +6195,188 @@ def render_investing_panel(state: PageState) -> str:
           </table>
         </div>
       </section>
+      {render_console(state.console_log)}
+    </form>"""
+
+
+def render_income_growth_panel(state: PageState) -> str:
+    panel_style = "" if state.active_tab == "income-growth" else ' style="display:none"'
+    rows = state.income_growth_rows or []
+    summary = state.income_growth_summary or {}
+    gpt_result = ""
+    default_gpt_prompt = income_growth_gpt_user_prompt(rows, summary) if rows else ""
+    gpt_prompt_text = state.income_growth_gpt_prompt or default_gpt_prompt
+    if state.income_growth_gpt_csv or state.income_growth_gpt_output:
+        response_link = (
+            f'<a class="inline-link" href="https://platform.openai.com/logs" target="_blank" rel="noopener">Response: {html.escape(state.income_growth_gpt_response_id or "OpenAI logs")}</a>'
+            if state.income_growth_gpt_response_id
+            else ""
+        )
+        cache_note = "Cached result reused." if state.income_growth_gpt_cached else "Fresh GPT response."
+        gpt_result = f"""
+      <section class="panel income-growth-gpt-result">
+        <div class="panel-title">GPT Validation Result</div>
+        <div class="status">Review this independent GPT validation before placing any covered CALL order. {html.escape(cache_note)} {response_link}</div>
+        <label><span>Kite CSV from GPT</span><textarea class="csv-output" readonly>{html.escape(state.income_growth_gpt_csv)}</textarea></label>
+        <details><summary>Show full GPT response</summary><textarea class="conversation" readonly>{html.escape(state.income_growth_gpt_output)}</textarea></details>
+      </section>"""
+    def pct_cell(value: Any) -> str:
+        if isinstance(value, (int, float)):
+            return f"{value:.2f}%"
+        return "N/A" if value is None or value == "" else str(value)
+
+    def income_growth_52w_class(value: Any) -> str:
+        if not isinstance(value, (int, float)):
+            return ""
+        if value >= -10:
+            return "strength-lightgreen"
+        if value <= -50:
+            return "strength-lightcoral"
+        return ""
+
+    def income_growth_1y_class(value: Any) -> str:
+        if not isinstance(value, (int, float)):
+            return ""
+        if value > 10:
+            return "signal-green"
+        if value < -10:
+            return "strength-lightcoral"
+        return ""
+
+    def income_growth_month_class(value: Any) -> str:
+        if not isinstance(value, (int, float)):
+            return ""
+        if value > 5:
+            return "strength-lightgreen"
+        if value < -5:
+            return "strength-lightcoral"
+        return ""
+
+    summary_cards = "".join(
+        f'<div class="investing-summary-card"><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong><small>{html.escape(detail)}</small></div>'
+        for label, value, detail in [
+            ("Est monthly CC income", fmt_number(summary.get("existing_monthly_income")), "from currently covered lots"),
+            ("Best add per 1L", fmt_number(summary.get("best_additional_per_lakh")), "premium unlocked per extra capital"),
+            ("Portfolio value", format_buy_amount(summary.get("portfolio_market")), "live market value"),
+            ("Updated", str(summary.get("as_of") or "Not refreshed"), "manual refresh only"),
+        ]
+    )
+    table_rows = "".join(
+        "<tr>"
+        f'<td class="position-symbol-cell">{render_symbol_value("tradingsymbol", row.get("symbol", ""))}<span>{html.escape(str(row.get("company", "")))}</span></td>'
+        f"<td>{html.escape(str(row.get('quantity', '')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('times_lot'), 2))}</td>"
+        f"<td><strong>{html.escape(str(row.get('covered_lots', row.get('lots_can_sell_input', 0))))}</strong></td>"
+        f"<td>{html.escape(fmt_number(row.get('cmp')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('input_call_strike')))}</td>"
+        f"<td>{html.escape(format_buy_amount(row.get('market_value')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('input_to_sell')))}</td>"
+        f"<td>{html.escape(str(row.get('lot_size') or row.get('input_lot_size') or 'N/A'))}</td>"
+        f"<td>{html.escape(pct_cell(row.get('input_gap_pct')))}</td>"
+        f"<td>{html.escape(pct_cell(row.get('input_put_down_pct')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('input_put_strike')))}</td>"
+        f"<td>{html.escape('N/A' if row.get('input_pe') is None else fmt_number(row.get('input_pe'), 2))}</td>"
+        f'<td class="{income_growth_52w_class(row.get("input_52w"))}">{html.escape(pct_cell(row.get("input_52w")))}</td>'
+        f'<td class="{income_growth_1y_class(row.get("input_1y"))}">{html.escape(pct_cell(row.get("input_1y")))}</td>'
+        f'<td class="{income_growth_month_class(row.get("input_month"))}">{html.escape(pct_cell(row.get("input_month")))}</td>'
+        f"<td>{html.escape(pct_cell(row.get('input_1w')))}</td>"
+        f"<td>{html.escape(pct_cell(row.get('input_today')))}</td>"
+        f"<td>{render_symbol_value('tradingsymbol', row.get('candidate_ce', ''))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('premium')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('monthly_income')))}</td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('cc_capacity_score'), 2))}</strong></td>"
+        f'<td class="{strength_class(row.get("decision_color"))}"><strong>{html.escape(str(row.get("decision", "")))}</strong></td>'
+        "</tr>"
+        for row in rows
+    )
+    if not table_rows:
+        table_rows = '<tr><td colspan="23" class="muted-cell">Click Refresh Income Growth to calculate covered-call capacity from your holdings sheet.</td></tr>'
+    pe_candidates = income_growth_pe_sell_candidates(rows)
+    pe_cards = "".join(
+        f'<div class="pe-candidate-card {strength_class(item.get("color"))}">'
+        f'<div><strong>{render_symbol_value("tradingsymbol", item.get("symbol", ""))}</strong>'
+        f'<span>{html.escape(str(item.get("label", "")))} | Score {html.escape(fmt_number(item.get("score"), 0))}</span></div>'
+        f'<p>SELL PE near <strong>{html.escape(fmt_number(item.get("put_strike")))}</strong> | '
+        f'Buffer {html.escape(fmt_number(item.get("put_down_pct"), 1))}% | '
+        f'Cash {html.escape(format_buy_amount(item.get("cash_required")))}</p>'
+        f'<small>{html.escape(" | ".join(str(reason) for reason in item.get("reasons", [])))}</small>'
+        f'<em>{html.escape(str(item.get("future_call_note", "")))}</em>'
+        "</div>"
+        for item in pe_candidates
+    )
+    if not pe_cards:
+        pe_cards = '<div class="muted-cell">Refresh Income Growth to calculate PE sell candidates.</div>'
+    headers = [
+        "Stock",
+        "Holding",
+        "Times lot",
+        "Lots sell",
+        "CMP",
+        "CALL Strike",
+        "Value",
+        "To sell",
+        "Lot Size",
+        "Gap %",
+        "PUT down %",
+        "PUT Strike",
+        "PE",
+        "52W",
+        "1Y",
+        "Month",
+        "1W",
+        "Today",
+        "Kite CE",
+        "Premium",
+        "Monthly income",
+        "Score",
+        "Decision",
+    ]
+    header_html = "".join(
+        f'<th><button type="button" class="sort-header" data-sort-col="{index}">{html.escape(label)}</button></th>'
+        for index, label in enumerate(headers)
+    )
+    return f"""
+    <form id="income-growth-panel" method="post" action="/income-growth/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <input type="hidden" name="income_growth_gpt_csv" value="{html.escape(state.income_growth_gpt_csv, quote=True)}">
+      <input type="hidden" name="income_growth_gpt_output" value="{html.escape(state.income_growth_gpt_output, quote=True)}">
+      <input type="hidden" name="income_growth_gpt_response_id" value="{html.escape(state.income_growth_gpt_response_id, quote=True)}">
+      <input type="hidden" name="income_growth_gpt_cached" value="{'1' if state.income_growth_gpt_cached else '0'}">
+      <section class="panel income-growth-hero">
+        <div>
+          <div class="panel-title">Income Growth</div>
+          <p class="status">Ranks holdings by covered-call capacity, option income efficiency, and capital needed to unlock the next lot.</p>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/income-growth/load">Refresh Income Growth</button>
+          <button type="submit" formaction="/income-growth/gpt">Validate with GPT</button>
+          <button type="button" id="income-growth-edit-gpt">Modify GPT Prompt</button>
+        </div>
+      </section>
+      <section class="panel investing-summary-panel"><div class="summary-grid">{summary_cards}</div></section>
+      {gpt_result}
+      <section class="panel income-growth-pe-panel">
+        <div class="panel-title">Top 3 PE Sell Candidates For Today</div>
+        <div class="status">Shortlisted for cash-secured PUT selling first; if assigned, these can later become covered-CALL income holdings.</div>
+        <div class="pe-candidate-grid">{pe_cards}</div>
+      </section>
+      <section class="panel income-growth-table-panel">
+        <div class="panel-title">Covered Call Capacity Score From Current Holding Sheet</div>
+        <div class="status">Uses your holding shares, lot multiple, lots can be sold, CMP, call strike, PE, 52W, 1Y, monthly, weekly, and today move. Kite option quotes enrich the live premium when available.</div>
+        <div class="table-wrap"><table id="income-growth-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{table_rows}</tbody></table></div>
+      </section>
+      <div class="live-modal-backdrop" id="income-growth-gpt-modal">
+        <div class="live-modal income-growth-prompt-modal">
+          <h2>Modify Income Growth GPT Prompt</h2>
+          <p class="status">Edit the prompt and send a fresh GPT request. Normal Validate with GPT reuses the cache when the prompt is unchanged.</p>
+          <label><span>Prompt sent to GPT</span><textarea class="conversation" name="income_growth_gpt_prompt" id="income-growth-gpt-prompt">{html.escape(gpt_prompt_text)}</textarea></label>
+          <input type="hidden" name="income_growth_force_gpt" id="income-growth-force-gpt" value="0">
+          <div class="modal-actions">
+            <button type="button" class="secondary" id="income-growth-gpt-cancel">Cancel</button>
+            <button type="submit" formaction="/income-growth/gpt" id="income-growth-gpt-refresh">Refresh GPT Response</button>
+          </div>
+        </div>
+      </div>
       {render_console(state.console_log)}
     </form>"""
 
@@ -6355,6 +6945,7 @@ def render_positions_panel(
     table = (
         '<section class="panel positions-analytics-panel"><div class="panel-title">Active Position Analytics</div>'
         '<div class="research-table-hint">Premium capture: book sold options at 50-70% decay; roll near expiry if capture is not enough.</div>'
+        f'<div class="status">Market data as of: <strong>{html.escape(str(summary.get("as_of") or "Not loaded"))}</strong>. Use Load Active Positions for a fresh Kite pull.</div>'
         '<div class="table-wrap positions-table-wrap"><table class="positions-table"><thead><tr>'
         '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>Buy</th>'
         '<th>POP</th><th>OTM</th><th>Sell</th><th>Strength</th><th>Delta</th>'
@@ -6886,7 +7477,7 @@ def render_page(state: PageState) -> bytes:
     if state.error:
         alert += render_graceful_error(state.error)
 
-    orders_table = render_orders_table(state.orders, state.selected_indexes)
+    orders_table = render_orders_table(state.orders, state.selected_indexes, state.trade_validations)
     trade_validation_table = render_trade_validation_table(state.trade_validations)
     position_orders_table = render_position_orders_table(
         state.position_orders, state.position_selected_indexes
@@ -6924,6 +7515,7 @@ def render_page(state: PageState) -> bytes:
     income_tab_class = "active" if state.active_tab == "income" else ""
     order_management_tab_class = "active" if state.active_tab == "order-management" else ""
     investing_tab_class = "active" if state.active_tab == "investing" else ""
+    income_growth_tab_class = "active" if state.active_tab == "income-growth" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
     kite_setup_panel_style = "" if state.active_tab == "kite-setup" else ' style="display:none"'
@@ -7976,7 +8568,8 @@ def render_page(state: PageState) -> bytes:
       letter-spacing: 0.02em;
       text-transform: uppercase;
     }}
-    .investing-table .sort-header {{
+    .investing-table .sort-header,
+    .income-growth-table .sort-header {{
       width: 100%;
       padding: 0;
       border: 0;
@@ -7990,16 +8583,120 @@ def render_page(state: PageState) -> bytes:
       text-transform: uppercase;
       white-space: nowrap;
     }}
-    .investing-table .sort-header::after {{
+    .investing-table .sort-header::after,
+    .income-growth-table .sort-header::after {{
       content: "  ↕";
       color: #bbf7d0;
       font-size: 10px;
     }}
-    .investing-table .sort-header[data-sort-dir="asc"]::after {{
+    .investing-table .sort-header[data-sort-dir="asc"]::after,
+    .income-growth-table .sort-header[data-sort-dir="asc"]::after {{
       content: "  ↑";
     }}
-    .investing-table .sort-header[data-sort-dir="desc"]::after {{
+    .investing-table .sort-header[data-sort-dir="desc"]::after,
+    .income-growth-table .sort-header[data-sort-dir="desc"]::after {{
       content: "  ↓";
+    }}
+    .income-growth-hero {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-color: #86efac;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(45, 212, 191, 0.16), transparent 32%),
+        linear-gradient(135deg, #ecfeff 0%, #f0fdf4 52%, #ffffff 100%);
+    }}
+    .income-growth-table-panel {{
+      border-color: #99f6e4;
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
+    }}
+    .income-growth-gpt-result {{
+      border-color: #7dd3fc;
+      background:
+        radial-gradient(circle at top right, rgba(125, 211, 252, 0.24), transparent 34%),
+        linear-gradient(135deg, #f0fdfa 0%, #eff6ff 100%);
+    }}
+    .income-growth-gpt-result textarea {{
+      min-height: 118px;
+      font-family: Consolas, "Courier New", monospace;
+    }}
+    .income-growth-pe-panel {{
+      border-color: #a7f3d0;
+      background:
+        radial-gradient(circle at top left, rgba(16, 185, 129, 0.16), transparent 30%),
+        linear-gradient(135deg, #ffffff 0%, #ecfdf5 100%);
+    }}
+    .pe-candidate-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .pe-candidate-card {{
+      border: 1px solid rgba(15, 118, 110, 0.18);
+      border-radius: 12px;
+      padding: 11px 12px;
+      box-shadow: 0 12px 28px rgba(15, 118, 110, 0.08);
+    }}
+    .pe-candidate-card div {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }}
+    .pe-candidate-card strong {{
+      display: block;
+      font-size: 15px;
+      font-weight: 950;
+    }}
+    .pe-candidate-card span {{
+      display: block;
+      color: #475569;
+      font-size: 10px;
+      font-weight: 950;
+      text-transform: uppercase;
+    }}
+    .pe-candidate-card p {{
+      margin: 8px 0 5px;
+      font-size: 12px;
+      font-weight: 850;
+    }}
+    .pe-candidate-card small,
+    .pe-candidate-card em {{
+      display: block;
+      color: #334155;
+      font-size: 10.5px;
+      line-height: 1.35;
+    }}
+    .pe-candidate-card em {{
+      margin-top: 6px;
+      color: #047857;
+      font-style: normal;
+      font-weight: 850;
+    }}
+    .income-growth-prompt-modal {{
+      width: min(980px, calc(100vw - 32px));
+    }}
+    .income-growth-prompt-modal textarea {{
+      min-height: 360px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+    }}
+    .income-growth-table {{
+      min-width: 2140px;
+    }}
+    .income-growth-table th {{
+      background: linear-gradient(135deg, #0f766e, #166534);
+      color: #ffffff;
+      font-size: 11px;
+      text-transform: uppercase;
+      border: 1px solid rgba(6, 95, 70, 0.34);
+    }}
+    .income-growth-table td {{
+      vertical-align: top;
+      border: 1px solid rgba(15, 118, 110, 0.18);
     }}
     .investing-core-pill {{
       display: inline-flex;
@@ -8242,6 +8939,12 @@ def render_page(state: PageState) -> bytes:
       --tab-ink: #047857;
       --tab-shadow: rgba(22, 163, 74, 0.16);
     }}
+    .tab-button[data-tab="income-growth"] {{
+      --tab-a: #ccfbf1;
+      --tab-b: #dcfce7;
+      --tab-ink: #0f766e;
+      --tab-shadow: rgba(20, 184, 166, 0.16);
+    }}
     .tab-button[data-tab="investing"] {{
       --tab-a: #dbeafe;
       --tab-b: #ecfdf5;
@@ -8451,6 +9154,47 @@ def render_page(state: PageState) -> bytes:
     }}
     tr.order-existing-position td a {{
       color: #9f1239;
+    }}
+    .score-badge {{
+      display: inline-flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-width: 48px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 950;
+      line-height: 1.05;
+      text-align: center;
+      white-space: nowrap;
+    }}
+    .score-badge small {{
+      display: block;
+      margin-top: 2px;
+      font-size: 8px;
+      font-weight: 950;
+      letter-spacing: 0.03em;
+    }}
+    .score-badge.good {{
+      background: #dcfce7;
+      color: #166534;
+    }}
+    .score-badge.ok {{
+      background: #fef9c3;
+      color: #854d0e;
+    }}
+    .score-badge.risky {{
+      background: #ffedd5;
+      color: #9a3412;
+    }}
+    .score-badge.avoid {{
+      background: #fee2e2;
+      color: #991b1b;
+    }}
+    .score-badge.check {{
+      background: #e0f2fe;
+      color: #075985;
     }}
     .execution-checks {{
       margin-top: 12px;
@@ -9227,6 +9971,40 @@ def render_page(state: PageState) -> bytes:
       color: var(--muted);
       background: #f1f5f9;
     }}
+    .price-adjuster {{
+      display: grid;
+      grid-template-columns: auto minmax(76px, 96px) auto;
+      gap: 4px;
+      align-items: center;
+      min-width: 178px;
+    }}
+    .price-adjuster .order-edit-input {{
+      width: 100%;
+      text-align: center;
+    }}
+    .price-step-button {{
+      border: 0;
+      border-radius: 6px;
+      padding: 6px 7px;
+      background: #e0f2fe;
+      color: #075985;
+      font-size: 11px;
+      font-weight: 950;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .price-step-button[data-price-step="-1"] {{
+      background: #fee2e2;
+      color: #991b1b;
+    }}
+    .price-step-button[data-price-step="1"] {{
+      background: #dcfce7;
+      color: #047857;
+    }}
+    .price-step-button:disabled {{
+      cursor: not-allowed;
+      opacity: 0.5;
+    }}
     .order-score {{
       display: inline-flex;
       align-items: center;
@@ -9691,8 +10469,9 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {research_tab_class}" type="button" data-tab="research">Research</button>
       <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
       <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Modify / Cancel</button>
-      <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       <button class="tab-button utility-action {investing_tab_class}" type="button" data-tab="investing">Investing</button>
+      <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
+      <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
       <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT</button>
@@ -9788,6 +10567,7 @@ def render_page(state: PageState) -> bytes:
     {render_research_panel(state)}
     {render_income_panel(state)}
     {render_investing_panel(state)}
+    {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
   </main>
   <div class="live-modal-backdrop" id="live-confirm-modal">
@@ -9882,21 +10662,40 @@ def render_page(state: PageState) -> bytes:
       const match = text.match(/-?[0-9]+(?:[.][0-9]+)?/);
       return match ? Number(match[0]) : Number.NEGATIVE_INFINITY;
     }}
-    if (investingTable) {{
-      for (const header of investingTable.querySelectorAll('.sort-header')) {{
+    function sortableTableValue(cell) {{
+      const raw = (cell && cell.textContent ? cell.textContent : '').trim();
+      const cleaned = raw.replace(/,/g, '');
+      const match = cleaned.match(/-?[0-9]+(?:[.][0-9]+)?/);
+      if (match) {{
+        return {{ kind: 'number', value: Number(match[0]) }};
+      }}
+      return {{ kind: 'text', value: raw.toLowerCase() }};
+    }}
+    function compareSortableCells(leftCell, rightCell, dir) {{
+      const left = sortableTableValue(leftCell);
+      const right = sortableTableValue(rightCell);
+      let result = 0;
+      if (left.kind === 'number' && right.kind === 'number') {{
+        result = left.value - right.value;
+      }} else {{
+        result = String(left.value).localeCompare(String(right.value), undefined, {{ numeric: true, sensitivity: 'base' }});
+      }}
+      return dir === 'asc' ? result : -result;
+    }}
+    function enableTableSorting(table) {{
+      if (!table) return;
+      for (const header of table.querySelectorAll('.sort-header')) {{
         header.addEventListener('click', () => {{
           const column = Number(header.dataset.sortCol);
           const currentDir = header.dataset.sortDir === 'desc' ? 'asc' : 'desc';
-          for (const other of investingTable.querySelectorAll('.sort-header')) {{
+          for (const other of table.querySelectorAll('.sort-header')) {{
             other.dataset.sortDir = '';
           }}
           header.dataset.sortDir = currentDir;
-          const tbody = investingTable.tBodies[0];
+          const tbody = table.tBodies[0];
           const rows = Array.from(tbody.querySelectorAll('tr'));
           rows.sort((left, right) => {{
-            const leftValue = numericTableValue(left.cells[column]);
-            const rightValue = numericTableValue(right.cells[column]);
-            return currentDir === 'asc' ? leftValue - rightValue : rightValue - leftValue;
+            return compareSortableCells(left.cells[column], right.cells[column], currentDir);
           }});
           for (const row of rows) {{
             tbody.appendChild(row);
@@ -9904,6 +10703,8 @@ def render_page(state: PageState) -> bytes:
         }});
       }}
     }}
+    enableTableSorting(investingTable);
+    enableTableSorting(document.getElementById('income-growth-table'));
     const ordersSelectAll = document.getElementById('orders-select-all');
     const ordersUnselectAll = document.getElementById('orders-unselect-all');
     function setOrderCheckboxes(checked) {{
@@ -9913,6 +10714,19 @@ def render_page(state: PageState) -> bytes:
     }}
     ordersSelectAll && ordersSelectAll.addEventListener('click', () => setOrderCheckboxes(true));
     ordersUnselectAll && ordersUnselectAll.addEventListener('click', () => setOrderCheckboxes(false));
+    for (const button of document.querySelectorAll('.price-step-button')) {{
+      button.addEventListener('click', () => {{
+        const wrapper = button.closest('.price-adjuster');
+        const input = wrapper ? wrapper.querySelector('.price-adjust-input') : null;
+        if (!input || input.disabled) return;
+        const stepPct = Number(button.dataset.priceStep || 0);
+        const current = Number(input.value || 0);
+        if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(stepPct)) return;
+        const next = Math.max(current * (1 + stepPct / 100), 0.01);
+        input.value = next.toFixed(2);
+        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+      }});
+    }}
     for (const button of document.querySelectorAll('.tab-button')) {{
       button.addEventListener('click', () => {{
         const active = button.dataset.tab;
@@ -9924,6 +10738,7 @@ def render_page(state: PageState) -> bytes:
           research: '/research',
           income: '/income',
           investing: '/investing',
+          'income-growth': '/income-growth',
           commodity: '/commodity',
           'order-management': '/orders',
           gpt: '/gpt',
@@ -9943,6 +10758,7 @@ def render_page(state: PageState) -> bytes:
         document.getElementById('research-panel').style.display = active === 'research' ? '' : 'none';
         document.getElementById('income-panel').style.display = active === 'income' ? '' : 'none';
         document.getElementById('investing-panel').style.display = active === 'investing' ? '' : 'none';
+        document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
         document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
         for (const item of document.querySelectorAll('.tab-button')) {{
           item.classList.toggle('active', item.dataset.tab === active);
@@ -9989,12 +10805,27 @@ def render_page(state: PageState) -> bytes:
     const positionBreathText = document.getElementById('position-breath-text');
     const positionLiveConfirmed = document.getElementById('position-live-confirmed');
     const positionQuoteCheck = document.getElementById('position-quote-check');
+    const incomeGrowthGptModal = document.getElementById('income-growth-gpt-modal');
+    const incomeGrowthEditGpt = document.getElementById('income-growth-edit-gpt');
+    const incomeGrowthGptCancel = document.getElementById('income-growth-gpt-cancel');
+    const incomeGrowthGptRefresh = document.getElementById('income-growth-gpt-refresh');
+    const incomeGrowthForceGpt = document.getElementById('income-growth-force-gpt');
     let pendingLiveSubmit = false;
     let countdownTimer = null;
     let pendingCommodityForm = null;
     let commodityCountdownTimer = null;
     let pendingPositionSubmit = false;
     let positionCountdownTimer = null;
+    incomeGrowthEditGpt && incomeGrowthEditGpt.addEventListener('click', () => {{
+      if (incomeGrowthGptModal) incomeGrowthGptModal.style.display = 'flex';
+    }});
+    incomeGrowthGptCancel && incomeGrowthGptCancel.addEventListener('click', () => {{
+      if (incomeGrowthGptModal) incomeGrowthGptModal.style.display = 'none';
+      if (incomeGrowthForceGpt) incomeGrowthForceGpt.value = '0';
+    }});
+    incomeGrowthGptRefresh && incomeGrowthGptRefresh.addEventListener('click', () => {{
+      if (incomeGrowthForceGpt) incomeGrowthForceGpt.value = '1';
+    }});
     function stopLiveCountdown() {{
       if (countdownTimer) {{
         clearInterval(countdownTimer);
@@ -10692,6 +11523,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/investing":
             self.send_page(PageState(active_tab="investing"))
             return
+        if parsed_url.path == "/income-growth":
+            self.send_page(PageState(active_tab="income-growth"))
+            return
         if parsed_url.path == "/research":
             self.send_page(PageState(active_tab="research"))
             return
@@ -10809,6 +11643,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/csv")
                 else "commodity"
                 if request_path.startswith("/commodity")
+                else "income-growth"
+                if request_path.startswith("/income-growth")
                 else "income"
                 if request_path.startswith("/income")
                 else "investing"
@@ -10858,6 +11694,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             openai_model=first(form, "openai_model", DEFAULT_OPENAI_MODEL),
             openai_system_prompt=first(form, "openai_system_prompt", read_openai_csv_system_prompt()),
             openai_prompt=first(form, "openai_prompt", DEFAULT_OPENAI_PROMPT),
+            income_growth_gpt_csv=first(form, "income_growth_gpt_csv"),
+            income_growth_gpt_output=first(form, "income_growth_gpt_output"),
+            income_growth_gpt_response_id=first(form, "income_growth_gpt_response_id"),
+            income_growth_gpt_prompt=first(form, "income_growth_gpt_prompt"),
+            income_growth_gpt_cached=first(form, "income_growth_gpt_cached") == "1",
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -10876,7 +11717,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.keep_existing_orders,
                 )
                 state.trade_validations = validate_trade_orders(state.orders)
-                state.selected_indexes = default_selected_order_indexes(state.orders)
+                state.selected_indexes = default_selected_order_indexes(
+                    state.orders,
+                    state.trade_validations,
+                )
                 state.message = f"{persist_message} Loaded {len(state.orders)} order(s).".strip()
             elif request_path == "/csv/save-today":
                 state.csv_path, state.message = save_today_csv_text(state.csv_text)
@@ -10956,6 +11800,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.order_book, state.console_log = call_with_console(kite_order_book)
                 state.message = f"Loaded {len(state.order_book)} Kite order(s)."
             elif request_path == "/positions/load":
+                clear_app_cache(("kite:positions", "kite:quote", "positions-research"))
                 state.position_orders, state.console_log = call_with_console(
                     build_position_buy_orders,
                     state,
@@ -11005,7 +11850,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 (
                     state.positions_rows,
                     state.positions_summary,
-                ), refresh_log = call_with_console(positions_research)
+                ), refresh_log = call_with_console(positions_research, True)
                 state.console_log = f"{state.console_log}{refresh_log}"
                 state.message = f"Submitted BUY close order for {close_symbol.upper()}."
             elif request_path == "/gpt/load":
@@ -11043,7 +11888,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         True,
                         state.keep_existing_orders,
                     )
-                    state.selected_indexes = default_selected_order_indexes(state.orders)
+                    state.trade_validations = validate_trade_orders(state.orders)
+                    state.selected_indexes = default_selected_order_indexes(
+                        state.orders,
+                        state.trade_validations,
+                    )
                     state.message = (
                         f"{persist_message} Previewed {len(state.orders)} order(s)."
                     ).strip()
@@ -11115,6 +11964,37 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.investing_summary,
                 ), state.console_log = call_with_console(investing_holdings_rows)
                 state.message = f"Investing portfolio refreshed for {len(state.investing_rows)} holding(s)."
+            elif request_path == "/income-growth/load":
+                (
+                    state.income_growth_rows,
+                    state.income_growth_summary,
+                ), state.console_log = call_with_console(income_growth_candidates)
+                state.message = f"Income growth capacity refreshed for {len(state.income_growth_rows)} holding(s)."
+            elif request_path == "/income-growth/gpt":
+                (
+                    state.income_growth_rows,
+                    state.income_growth_summary,
+                ), growth_log = call_with_console(income_growth_candidates)
+                (
+                    state.income_growth_gpt_csv,
+                    state.income_growth_gpt_output,
+                    state.income_growth_gpt_response_id,
+                    state.income_growth_gpt_cached,
+                ), gpt_log = call_with_console(
+                    validate_income_growth_with_openai,
+                    state.income_growth_rows,
+                    state.income_growth_summary,
+                    state.openai_model,
+                    state.openai_system_prompt,
+                    state.income_growth_gpt_prompt,
+                    first(form, "income_growth_force_gpt") == "1",
+                )
+                state.console_log = f"{growth_log}{gpt_log}"
+                state.message = (
+                    "GPT validation reused cached CSV. Review before trading."
+                    if state.income_growth_gpt_cached
+                    else "GPT validated Income Growth candidates and returned fresh Kite CSV. Review before trading."
+                )
             elif request_path == "/income/sell-ce":
                 underlying = first(form, "income_underlying")
                 result, state.console_log = call_with_console(
@@ -11145,9 +12025,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 (
                     state.positions_rows,
                     state.positions_summary,
-                ), state.console_log = call_with_console(positions_research)
+                ), state.console_log = call_with_console(positions_research, True)
                 state.message = (
-                    f"Loaded analytics for {len(state.positions_rows)} active option position(s)."
+                    f"Loaded fresh Kite analytics for {len(state.positions_rows)} active option position(s)."
                 )
             elif request_path == "/commodity/refresh":
                 state.commodity_holdings, state.console_log = call_with_console(
