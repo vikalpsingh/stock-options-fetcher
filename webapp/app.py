@@ -10820,6 +10820,9 @@ def render_page(state: PageState) -> bytes:
           : Math.floor(rawNext / tickSize);
         const next = Math.max(roundedTicks * tickSize, tickSize);
         input.value = next.toFixed(2);
+        const row = button.closest('tr');
+        const checkbox = row ? row.querySelector('input[name="order_key"]:not(:disabled)') : null;
+        if (checkbox) checkbox.checked = true;
         input.dispatchEvent(new Event('change', {{ bubbles: true }}));
       }});
     }}
