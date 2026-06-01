@@ -4798,7 +4798,13 @@ def call_openai_responses_api(
 
     output = response_output_text(payload)
     if not output:
-        raise RuntimeError("OpenAI returned an empty response.")
+        payload_preview = json.dumps(payload, indent=2)[:2000]
+        raise RuntimeError(
+            "OpenAI returned an empty response.\n\n"
+            f"Response ID: {payload.get('id') or 'N/A'}\n"
+            f"Model: {payload.get('model') or body['model']}\n\n"
+            f"OpenAI raw output preview:\n{payload_preview}"
+        )
     return output, str(payload.get("id") or "")
 
 
@@ -5850,12 +5856,77 @@ def render_graceful_error(error: str, title: str = "Error") -> str:
     lines = str(error).strip().splitlines()
     top_lines = "\n".join(lines[:4]).strip()
     remaining = "\n".join(lines[4:]).strip()
+    gpt_preview = ""
+    error_text = str(error)
+    for marker in ("OpenAI raw output preview:", "Repair raw output preview:"):
+        if marker in error_text:
+            preview = error_text.split(marker, 1)[1]
+            preview = re.split(r"\n\s*(Repair attempt also failed:|Repair raw output preview:|Traceback \(most recent call last\):)", preview, maxsplit=1)[0]
+            if preview.strip():
+                gpt_preview = preview.strip()
+                break
+    modal_id = "gpt-error-modal-" + hashlib.sha1(error_text.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    gpt_button = (
+        f'<button type="button" class="secondary show-gpt-response" data-target="{html.escape(modal_id, quote=True)}">Show GPT response</button>'
+        if gpt_preview
+        else ""
+    )
+    gpt_modal = (
+        f"""
+        <div class="live-modal-backdrop gpt-error-modal" id="{html.escape(modal_id, quote=True)}">
+          <div class="live-modal gpt-response-modal">
+            <h2>GPT Response Preview</h2>
+            <p class="status">This is the raw GPT/OpenAI text captured before CSV validation failed.</p>
+            <textarea class="conversation" readonly>{html.escape(gpt_preview)}</textarea>
+            <div class="modal-actions">
+              <button type="button" class="secondary close-gpt-response" data-target="{html.escape(modal_id, quote=True)}">Close</button>
+            </div>
+          </div>
+        </div>
+        """
+        if gpt_preview
+        else ""
+    )
+    api_issue = ""
+    if "openai" in error_text.lower():
+        likely_causes = [
+            "The OpenAI API returned no usable text. This can happen when the model produced an empty response, the response shape changed, output was blocked, or the request timed out upstream.",
+            "Check OPENAI_API_KEY in Kite Setup, model name, account quota/billing, and whether the prompt is too large.",
+            "Try Modify GPT Prompt with a shorter prompt, or click Validate with GPT again after a minute.",
+        ]
+        api_issue = "\n".join(likely_causes) + "\n\nCaptured error:\n" + error_text
+    api_modal_id = "openai-api-modal-" + hashlib.sha1(("api:" + error_text).encode("utf-8", errors="ignore")).hexdigest()[:10]
+    api_button = (
+        f'<button type="button" class="secondary show-gpt-response" data-target="{html.escape(api_modal_id, quote=True)}">Show API issue</button>'
+        if api_issue
+        else ""
+    )
+    api_modal = (
+        f"""
+        <div class="live-modal-backdrop gpt-error-modal" id="{html.escape(api_modal_id, quote=True)}">
+          <div class="live-modal gpt-response-modal">
+            <h2>OpenAI API Diagnostics</h2>
+            <p class="status">Use this to understand why the GPT validation call failed.</p>
+            <textarea class="conversation" readonly>{html.escape(api_issue)}</textarea>
+            <div class="modal-actions">
+              <button type="button" class="secondary close-gpt-response" data-target="{html.escape(api_modal_id, quote=True)}">Close</button>
+            </div>
+          </div>
+        </div>
+        """
+        if api_issue
+        else ""
+    )
+    action_buttons = "".join([gpt_button, api_button])
+    modals = "".join([gpt_modal, api_modal])
     if not remaining:
         return (
             '<div class="alert error graceful-error">'
             '<button type="button" class="alert-close" aria-label="Close error" onclick="this.parentElement.style.display=\'none\'">x</button>'
             f"<strong>{html.escape(title)}</strong>"
             f"<pre>{html.escape(top_lines)}</pre>"
+            f'<div class="error-actions">{action_buttons}</div>'
+            f"{modals}"
             "</div>"
         )
     return (
@@ -5863,10 +5934,12 @@ def render_graceful_error(error: str, title: str = "Error") -> str:
         '<button type="button" class="alert-close" aria-label="Close error" onclick="this.parentElement.style.display=\'none\'">x</button>'
         f"<strong>{html.escape(title)}</strong>"
         f"<pre>{html.escape(top_lines)}</pre>"
+        f'<div class="error-actions">{action_buttons}</div>'
         "<details>"
         "<summary>Show full details</summary>"
         f'<textarea class="error-details" readonly>{html.escape(str(error))}</textarea>'
         "</details>"
+        f"{modals}"
         "</div>"
     )
 
@@ -5894,10 +5967,10 @@ def render_order_book(state: PageState) -> str:
         )
         price_cell = (
             '<div class="price-adjuster">'
-            f'<button type="button" class="price-step-button" data-price-step="-1"{disabled_attr}>-1%</button>'
+            f'<button type="button" class="price-step-button" data-price-step="-3"{disabled_attr}>-3%</button>'
             f'<input class="order-edit-input price-adjust-input" type="number" min="0" step="0.01" '
             f'name="modify_price_{field_key}" value="{price}"{disabled_attr}>'
-            f'<button type="button" class="price-step-button" data-price-step="1"{disabled_attr}>+1%</button>'
+            f'<button type="button" class="price-step-button" data-price-step="3"{disabled_attr}>+3%</button>'
             "</div>"
         )
         price_diff = order.get("price_diff_pct")
@@ -9349,6 +9422,12 @@ def render_page(state: PageState) -> bytes:
       margin-top: 10px;
       color: var(--text);
     }}
+    .graceful-error .error-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 6px 0 2px;
+    }}
     .graceful-error summary {{
       cursor: pointer;
       font-weight: 900;
@@ -9367,6 +9446,15 @@ def render_page(state: PageState) -> bytes:
       font-family: Consolas, "Courier New", monospace;
       font-size: 12px;
       white-space: pre;
+    }}
+    .gpt-response-modal {{
+      width: min(860px, calc(100vw - 32px));
+    }}
+    .gpt-response-modal textarea {{
+      min-height: 320px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.35;
     }}
     .live-modal-backdrop {{
       position: fixed;
@@ -9993,11 +10081,11 @@ def render_page(state: PageState) -> bytes:
       cursor: pointer;
       white-space: nowrap;
     }}
-    .price-step-button[data-price-step="-1"] {{
+    .price-step-button[data-price-step="-3"] {{
       background: #fee2e2;
       color: #991b1b;
     }}
-    .price-step-button[data-price-step="1"] {{
+    .price-step-button[data-price-step="3"] {{
       background: #dcfce7;
       color: #047857;
     }}
@@ -10722,7 +10810,15 @@ def render_page(state: PageState) -> bytes:
         const stepPct = Number(button.dataset.priceStep || 0);
         const current = Number(input.value || 0);
         if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(stepPct)) return;
-        const next = Math.max(current * (1 + stepPct / 100), 0.01);
+        const tickSize = 0.05;
+        const rawMove = current * Math.abs(stepPct) / 100;
+        const move = Math.max(rawMove, tickSize);
+        const direction = stepPct >= 0 ? 1 : -1;
+        const rawNext = Math.max(current + (direction * move), tickSize);
+        const roundedTicks = direction >= 0
+          ? Math.ceil(rawNext / tickSize)
+          : Math.floor(rawNext / tickSize);
+        const next = Math.max(roundedTicks * tickSize, tickSize);
         input.value = next.toFixed(2);
         input.dispatchEvent(new Event('change', {{ bubbles: true }}));
       }});
@@ -10826,6 +10922,18 @@ def render_page(state: PageState) -> bytes:
     incomeGrowthGptRefresh && incomeGrowthGptRefresh.addEventListener('click', () => {{
       if (incomeGrowthForceGpt) incomeGrowthForceGpt.value = '1';
     }});
+    for (const button of document.querySelectorAll('.show-gpt-response')) {{
+      button.addEventListener('click', () => {{
+        const modal = document.getElementById(button.dataset.target || '');
+        if (modal) modal.style.display = 'flex';
+      }});
+    }}
+    for (const button of document.querySelectorAll('.close-gpt-response')) {{
+      button.addEventListener('click', () => {{
+        const modal = document.getElementById(button.dataset.target || '');
+        if (modal) modal.style.display = 'none';
+      }});
+    }}
     function stopLiveCountdown() {{
       if (countdownTimer) {{
         clearInterval(countdownTimer);
