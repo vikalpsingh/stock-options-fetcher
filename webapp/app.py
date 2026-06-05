@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -178,6 +179,8 @@ GLOBAL_MARKET_WATCHLIST = [
 TOP_QUOTE_REFRESH_MS = 300000
 TOP_QUOTE_CACHE_SECONDS = 300
 APP_CACHE: dict[str, tuple[float, Any]] = {}
+APP_CACHE_LOCK = threading.Lock()
+APP_CACHE_KEY_LOCKS: dict[str, threading.Lock] = {}
 KITE_READ_CACHE_SECONDS = 60
 KITE_QUOTE_CACHE_SECONDS = 60
 KITE_INSTRUMENT_CACHE_SECONDS = 3600
@@ -385,6 +388,10 @@ def app_now() -> datetime:
     return datetime.now()
 
 
+def normalize_income_growth_symbol(value: Any) -> str:
+    return str(value or "").upper().replace("NSE:", "").replace("BSE:", "").strip()
+
+
 def app_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(APP_DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -408,6 +415,63 @@ def app_db_connection() -> sqlite3.Connection:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_booked_pnl_month ON booked_pnl(month_key, source)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_booked_pnl_date ON booked_pnl(booked_date)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS income_growth_holdings (
+            symbol TEXT PRIMARY KEY,
+            holding REAL NOT NULL DEFAULT 0,
+            times_lot REAL,
+            lots_can_sell REAL,
+            cmp REAL,
+            call_strike REAL,
+            value REAL,
+            to_sell REAL,
+            lot_size REAL,
+            gap_pct REAL,
+            put_down_pct REAL,
+            pe REAL,
+            week_52 REAL,
+            one_year REAL,
+            month REAL,
+            week_1 REAL,
+            today REAL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    existing_income_growth = conn.execute("SELECT COUNT(*) FROM income_growth_holdings").fetchone()[0]
+    if existing_income_growth == 0:
+        now_text = app_now().isoformat(timespec="seconds")
+        for item in INCOME_GROWTH_SHEET:
+            conn.execute(
+                """
+                INSERT INTO income_growth_holdings (
+                    symbol, holding, times_lot, lots_can_sell, cmp, call_strike, value,
+                    to_sell, lot_size, gap_pct, put_down_pct, pe, week_52, one_year,
+                    month, week_1, today, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalize_income_growth_symbol(item.get("symbol")),
+                    item.get("holding") or 0,
+                    item.get("times_lot"),
+                    item.get("lots_can_sell"),
+                    item.get("cmp"),
+                    item.get("call_strike"),
+                    item.get("value"),
+                    item.get("to_sell"),
+                    item.get("lot_size"),
+                    item.get("gap_pct"),
+                    item.get("put_down_pct"),
+                    item.get("pe"),
+                    item.get("week_52"),
+                    item.get("one_year"),
+                    item.get("month"),
+                    item.get("week_1"),
+                    item.get("today"),
+                    now_text,
+                ),
+            )
     conn.commit()
     return conn
 
@@ -1305,9 +1369,106 @@ def checked(form: dict[str, list[str]], name: str, default: bool = False) -> boo
     return first(form, name).lower() in {"1", "true", "yes", "on"}
 
 
+def optional_float_text(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text or text.upper() in {"N/A", "NA", "#DIV/0!"}:
+        return None
+    return float(text.replace(",", "").replace("%", ""))
+
+
 def optional_int_text(value: str) -> int | None:
     text = value.strip()
     return int(text) if text else None
+
+
+def load_income_growth_holding_map() -> dict[str, dict[str, Any]]:
+    conn = app_db_connection()
+    rows = conn.execute(
+        """
+        SELECT symbol, holding, times_lot, lots_can_sell, cmp, call_strike, value,
+               to_sell, lot_size, gap_pct, put_down_pct, pe, week_52, one_year,
+               month, week_1, today, updated_at
+        FROM income_growth_holdings
+        ORDER BY symbol
+        """
+    ).fetchall()
+    return {str(row["symbol"]).upper(): dict(row) for row in rows}
+
+
+def save_income_growth_holding_from_form(form: dict[str, list[str]]) -> tuple[str, dict[str, Any]]:
+    symbol = normalize_income_growth_symbol(first(form, "income_growth_symbol"))
+    if not symbol:
+        raise ValueError("Enter a stock symbol to update Income Growth holding data.")
+    current = load_income_growth_holding_map().get(symbol, {})
+
+    def number_field(name: str, current_key: str) -> float | None:
+        text = first(form, name).strip()
+        if text == "":
+            current_value = current.get(current_key)
+            return float(current_value) if isinstance(current_value, (int, float)) else None
+        return optional_float_text(text)
+
+    holding = number_field("income_growth_holding", "holding") or 0.0
+    cmp_value = number_field("income_growth_cmp", "cmp")
+    explicit_value = number_field("income_growth_value", "value")
+    value = explicit_value
+    if value is None and cmp_value is not None:
+        value = holding * cmp_value
+    payload = {
+        "symbol": symbol,
+        "holding": holding,
+        "times_lot": number_field("income_growth_times_lot", "times_lot"),
+        "lots_can_sell": number_field("income_growth_lots_can_sell", "lots_can_sell"),
+        "cmp": cmp_value,
+        "call_strike": number_field("income_growth_call_strike", "call_strike"),
+        "value": value,
+        "to_sell": number_field("income_growth_to_sell", "to_sell"),
+        "lot_size": number_field("income_growth_lot_size", "lot_size"),
+        "gap_pct": number_field("income_growth_gap_pct", "gap_pct"),
+        "put_down_pct": number_field("income_growth_put_down_pct", "put_down_pct"),
+        "pe": number_field("income_growth_pe", "pe"),
+        "week_52": number_field("income_growth_week_52", "week_52"),
+        "one_year": number_field("income_growth_one_year", "one_year"),
+        "month": number_field("income_growth_month", "month"),
+        "week_1": number_field("income_growth_week_1", "week_1"),
+        "today": number_field("income_growth_today", "today"),
+        "updated_at": app_now().isoformat(timespec="seconds"),
+    }
+    conn = app_db_connection()
+    conn.execute(
+        """
+        INSERT INTO income_growth_holdings (
+            symbol, holding, times_lot, lots_can_sell, cmp, call_strike, value,
+            to_sell, lot_size, gap_pct, put_down_pct, pe, week_52, one_year,
+            month, week_1, today, updated_at
+        ) VALUES (
+            :symbol, :holding, :times_lot, :lots_can_sell, :cmp, :call_strike, :value,
+            :to_sell, :lot_size, :gap_pct, :put_down_pct, :pe, :week_52, :one_year,
+            :month, :week_1, :today, :updated_at
+        )
+        ON CONFLICT(symbol) DO UPDATE SET
+            holding = excluded.holding,
+            times_lot = excluded.times_lot,
+            lots_can_sell = excluded.lots_can_sell,
+            cmp = excluded.cmp,
+            call_strike = excluded.call_strike,
+            value = excluded.value,
+            to_sell = excluded.to_sell,
+            lot_size = excluded.lot_size,
+            gap_pct = excluded.gap_pct,
+            put_down_pct = excluded.put_down_pct,
+            pe = excluded.pe,
+            week_52 = excluded.week_52,
+            one_year = excluded.one_year,
+            month = excluded.month,
+            week_1 = excluded.week_1,
+            today = excluded.today,
+            updated_at = excluded.updated_at
+        """,
+        payload,
+    )
+    conn.commit()
+    return symbol, payload
 
 
 def encode_orders(orders: list[dict[str, Any]]) -> str:
@@ -2149,6 +2310,52 @@ def open_option_positions(use_cache: bool = True) -> list[dict[str, Any]]:
     return active
 
 
+def fresh_kite_ltp_map(kite: Any, instruments: list[str] | tuple[str, ...]) -> dict[str, float]:
+    clean = [str(item).strip().upper() for item in instruments if str(item).strip()]
+    if not clean:
+        return {}
+    quotes = kite.ltp(clean)
+    result: dict[str, float] = {}
+    for key in clean:
+        quote = quotes.get(key) or quotes.get(key.upper()) or {}
+        ltp = float(quote.get("last_price") or 0)
+        if ltp > 0:
+            result[key] = ltp
+    return result
+
+
+def option_position_pnl(quantity: int, average_price: float, ltp: float) -> float:
+    if quantity < 0:
+        return (average_price - ltp) * abs(quantity)
+    return (ltp - average_price) * quantity
+
+
+def refresh_option_positions_with_live_ltp(
+    positions: list[dict[str, Any]],
+    kite: Any,
+) -> list[dict[str, Any]]:
+    keys = [
+        f"{position.get('exchange') or 'NFO'}:{position.get('tradingsymbol')}"
+        for position in positions
+        if position.get("tradingsymbol")
+    ]
+    live_ltp = fresh_kite_ltp_map(kite, keys)
+    refreshed: list[dict[str, Any]] = []
+    for position in positions:
+        updated = dict(position)
+        key = f"{updated.get('exchange') or 'NFO'}:{updated.get('tradingsymbol')}".upper()
+        ltp = live_ltp.get(key)
+        if ltp is not None:
+            quantity = int(updated.get("quantity") or 0)
+            average_price = float(updated.get("average_price") or 0)
+            updated["ltp"] = ltp
+            updated["last_price"] = ltp
+            if average_price > 0 and quantity:
+                updated["pnl"] = option_position_pnl(quantity, average_price, ltp)
+        refreshed.append(updated)
+    return refreshed
+
+
 def active_position_underlyings() -> set[str]:
     if kite_orders is None:
         return set()
@@ -2173,6 +2380,33 @@ def active_position_underlyings() -> set[str]:
         active.add(symbol)
         active.add(underlying_for_symbol(symbol))
     return {item for item in active if item}
+
+
+def active_position_option_block_keys() -> set[str]:
+    if kite_orders is None:
+        return set()
+    try:
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            kite = kite_orders.kite_client()
+            positions = cached_kite_positions(kite)
+    except Exception:
+        return set()
+    active: set[str] = set()
+    for position in positions:
+        try:
+            quantity = int(float(position.get("quantity") or 0))
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity == 0:
+            continue
+        symbol = str(position.get("tradingsymbol") or "").strip().upper()
+        parts = option_symbol_parts(symbol)
+        if not symbol or not parts:
+            continue
+        active.add(symbol)
+        active.add(f"{parts['underlying']}:{parts['option_type']}")
+    return active
 
 
 EVENT_RISK_TERMS = {
@@ -2895,9 +3129,19 @@ def income_strategy_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return rows, summary
 
 
-def research_csv_symbols() -> list[dict[str, Any]]:
+def research_csv_symbols(csv_text: str = "", csv_path: str = "") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for csv_row in safe_csv_rows(read_default_csv_text()):
+    source_text = ""
+    if csv_text.strip():
+        source_text = normalize_kite_csv_input(csv_text)
+    elif csv_path.strip():
+        try:
+            _, source_text = load_rows(csv_path, "")
+        except Exception:
+            source_text = read_default_csv_text()
+    else:
+        source_text = read_default_csv_text()
+    for csv_row in safe_csv_rows(source_text):
         symbol = (csv_row.get("tradingsymbol") or csv_row.get("symbol") or "").strip().upper()
         if not symbol:
             continue
@@ -3109,6 +3353,8 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
             return copy.deepcopy(cached[1])
     kite = kite_orders.kite_client()
     positions = open_option_positions(use_cache=not force_refresh)
+    if force_refresh:
+        positions = refresh_option_positions_with_live_ltp(positions, kite)
     rows: list[dict[str, Any]] = []
     total_pnl = 0.0
     total_deployed = 0.0
@@ -3306,36 +3552,58 @@ def mmi_zone(value: float) -> str:
 
 def cached_value(cache_key: str, fetcher: Any, ttl_seconds: int) -> Any:
     now = time.time()
-    cached = APP_CACHE.get(cache_key)
-    if cached and now - cached[0] < ttl_seconds:
-        return copy.deepcopy(cached[1])
-    value = fetcher()
-    APP_CACHE[cache_key] = (now, copy.deepcopy(value))
+    with APP_CACHE_LOCK:
+        cached = APP_CACHE.get(cache_key)
+        if cached and now - cached[0] < ttl_seconds:
+            return copy.deepcopy(cached[1])
+        key_lock = APP_CACHE_KEY_LOCKS.setdefault(cache_key, threading.Lock())
+    with key_lock:
+        now = time.time()
+        with APP_CACHE_LOCK:
+            cached = APP_CACHE.get(cache_key)
+            if cached and now - cached[0] < ttl_seconds:
+                return copy.deepcopy(cached[1])
+        value = fetcher()
+        with APP_CACHE_LOCK:
+            APP_CACHE[cache_key] = (time.time(), copy.deepcopy(value))
     return value
 
 
 def cached_payload(cache_key: str, fetcher: Any, ttl_seconds: int = TOP_QUOTE_CACHE_SECONDS) -> dict[str, Any]:
     now = time.time()
-    cached = APP_CACHE.get(cache_key)
-    if cached and now - cached[0] < ttl_seconds:
-        payload = copy.deepcopy(cached[1])
-        payload["cached"] = True
-        payload["cache_age_seconds"] = int(now - cached[0])
-        return payload
-    payload = fetcher()
-    payload["cached"] = False
-    payload["cache_age_seconds"] = 0
-    APP_CACHE[cache_key] = (now, copy.deepcopy(payload))
+    with APP_CACHE_LOCK:
+        cached = APP_CACHE.get(cache_key)
+        if cached and now - cached[0] < ttl_seconds:
+            payload = copy.deepcopy(cached[1])
+            payload["cached"] = True
+            payload["cache_age_seconds"] = int(now - cached[0])
+            return payload
+        key_lock = APP_CACHE_KEY_LOCKS.setdefault(cache_key, threading.Lock())
+    with key_lock:
+        now = time.time()
+        with APP_CACHE_LOCK:
+            cached = APP_CACHE.get(cache_key)
+            if cached and now - cached[0] < ttl_seconds:
+                payload = copy.deepcopy(cached[1])
+                payload["cached"] = True
+                payload["cache_age_seconds"] = int(now - cached[0])
+                return payload
+        payload = fetcher()
+        payload["cached"] = False
+        payload["cache_age_seconds"] = 0
+        with APP_CACHE_LOCK:
+            APP_CACHE[cache_key] = (time.time(), copy.deepcopy(payload))
     return payload
 
 
 def clear_app_cache(prefixes: tuple[str, ...] = ()) -> None:
-    if not prefixes:
-        APP_CACHE.clear()
-        return
-    for key in list(APP_CACHE):
-        if key.startswith(prefixes):
-            APP_CACHE.pop(key, None)
+    with APP_CACHE_LOCK:
+        if not prefixes:
+            APP_CACHE.clear()
+            return
+        for key in list(APP_CACHE):
+            if key.startswith(prefixes):
+                APP_CACHE.pop(key, None)
 
 
 def cached_kite_quote(kite: Any, keys: list[str] | tuple[str, ...], ttl_seconds: int = KITE_QUOTE_CACHE_SECONDS) -> dict[str, Any]:
@@ -3963,6 +4231,7 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    income_growth_by_symbol = load_income_growth_holding_map()
     investing_rows, investing_summary = investing_holdings_rows()
     kite = kite_orders.kite_client()
     today = app_now().date()
@@ -3992,7 +4261,7 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     selected_by_symbol: dict[str, dict[str, Any]] = {}
     for row in investing_rows:
         symbol = str(row.get("symbol") or "").upper()
-        sheet = INCOME_GROWTH_BY_SYMBOL.get(symbol)
+        sheet = income_growth_by_symbol.get(symbol)
         cmp_value = float((sheet or {}).get("cmp") or row.get("cmp") or 0)
         quantity = int(float((sheet or {}).get("holding") or row.get("quantity") or 0))
         if cmp_value <= 0 or quantity <= 0:
@@ -4018,7 +4287,7 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     best_additional = 0.0
     for row in investing_rows:
         symbol = str(row.get("symbol") or "").upper()
-        sheet = INCOME_GROWTH_BY_SYMBOL.get(symbol)
+        sheet = income_growth_by_symbol.get(symbol)
         cmp_value = float((sheet or {}).get("cmp") or row.get("cmp") or 0)
         quantity = int(float((sheet or {}).get("holding") or row.get("quantity") or 0))
         market_value = float((sheet or {}).get("value") or (quantity * cmp_value if cmp_value else 0))
@@ -5164,13 +5433,27 @@ def sync_booked_pnl_from_kite_orders(
     return save_booked_pnl_records(records)
 
 
-def kite_order_book() -> list[dict[str, Any]]:
+def kite_order_book(force_refresh: bool = False) -> list[dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if force_refresh:
+        clear_app_cache(("kite:orders", "kite:positions", "kite:quote"))
     kite = kite_orders.kite_client()
     rows: list[dict[str, Any]] = []
     orders = list(reversed(cached_kite_orders(kite)))
     positions = cached_kite_positions(kite)
+    position_by_symbol: dict[str, dict[str, Any]] = {}
+    for position in positions:
+        symbol = str(position.get("tradingsymbol") or "").upper()
+        if not symbol:
+            continue
+        try:
+            quantity = int(float(position.get("quantity") or 0))
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity == 0:
+            continue
+        position_by_symbol[symbol] = position
     saved_booked_count = sync_booked_pnl_from_kite_orders(orders, positions)
     close_pnl_by_order = completed_close_pnl_by_order_id(orders, positions)
     quote_keys = sorted(
@@ -5196,6 +5479,18 @@ def kite_order_book() -> list[dict[str, Any]]:
                 price_diff_pct = ((order_price - live_price) / live_price) * 100
         except Exception:
             price_diff_pct = None
+        position = position_by_symbol.get(symbol.upper()) or {}
+        position_avg_price = None
+        position_pnl = None
+        position_qty = None
+        if position:
+            position_qty = int(float(position.get("quantity") or 0))
+            position_avg_price = float(position.get("average_price") or 0) or None
+            position_ltp = float(ltp or position.get("last_price") or position.get("ltp") or 0)
+            if position_avg_price and position_ltp and position_qty:
+                position_pnl = option_position_pnl(position_qty, position_avg_price, position_ltp)
+            elif position.get("pnl") is not None:
+                position_pnl = float(position.get("pnl") or 0)
         close_pnl = close_pnl_by_order.get(str(order.get("order_id") or ""))
         rows.append(
             {
@@ -5211,6 +5506,9 @@ def kite_order_book() -> list[dict[str, Any]]:
                 "price": price,
                 "ltp": ltp,
                 "price_diff_pct": price_diff_pct,
+                "position_avg_price": position_avg_price,
+                "position_pnl": position_pnl,
+                "position_qty": position_qty,
                 "close_pnl": close_pnl.get("pnl") if close_pnl else None,
                 "close_pnl_detail": close_pnl,
                 "booked_pnl_saved": bool(close_pnl) and saved_booked_count >= 0,
@@ -5528,11 +5826,13 @@ def build_position_buy_orders(state: PageState) -> list[dict[str, Any]]:
     args = position_args_from_state(state)
     kite = kite_buy_positions.kite_client()
     positions = kite_buy_positions.current_positions(kite, args)
+    positions = refresh_option_positions_with_live_ltp(positions, kite)
     orders = [
         order
         for position in positions
         if (order := kite_buy_positions.build_buy_order(position, args, kite)) is not None
     ]
+    orders = refresh_position_buy_order_prices(orders, kite, args)
     if not orders:
         raise ValueError("No matching positions found after filters.")
     if args.max_orders is not None and len(orders) > args.max_orders:
@@ -5540,6 +5840,46 @@ def build_position_buy_orders(state: PageState) -> list[dict[str, Any]]:
             f"Refusing to create {len(orders)} orders because max-orders is {args.max_orders}."
         )
     return orders
+
+
+def refresh_position_buy_order_prices(
+    orders: list[dict[str, Any]],
+    kite: Any,
+    args: Any | None = None,
+) -> list[dict[str, Any]]:
+    keys = [
+        f"{order.get('exchange') or 'NFO'}:{order.get('tradingsymbol')}"
+        for order in orders
+        if order.get("tradingsymbol")
+    ]
+    live_ltp = fresh_kite_ltp_map(kite, keys)
+    refreshed: list[dict[str, Any]] = []
+    for order in orders:
+        updated = dict(order)
+        key = f"{updated.get('exchange') or 'NFO'}:{updated.get('tradingsymbol')}".upper()
+        ltp = live_ltp.get(key)
+        if ltp is None:
+            refreshed.append(updated)
+            continue
+        quantity = int(updated.get("quantity") or 0)
+        average_price = float(updated.get("average_price") or 0)
+        position_quantity = -abs(quantity) if str(updated.get("transaction_type") or "").upper() == "BUY" else quantity
+        pnl = option_position_pnl(position_quantity, average_price, ltp) if average_price > 0 and quantity else float(updated.get("pnl") or 0)
+        discount_percent = float(
+            getattr(args, "discount_percent", updated.get("discount_percent", 20.0)) or 20.0
+        )
+        tick_size = float(getattr(args, "tick_size", 0.05) or 0.05)
+        is_profitable = pnl > 0 or (average_price > 0 and ltp > 0 and ltp < average_price)
+        price_basis_name = "LTP" if is_profitable else "average_price"
+        price_basis = ltp if is_profitable else average_price
+        if price_basis > 0:
+            updated["price"] = floor_to_tick(price_basis * (1 - discount_percent / 100), tick_size)
+        updated["ltp"] = ltp
+        updated["pnl"] = pnl
+        updated["price_basis"] = price_basis_name
+        updated["discount_percent"] = discount_percent
+        refreshed.append(updated)
+    return refreshed
 
 
 def execute_position_buy_orders(
@@ -5649,12 +5989,15 @@ def render_symbol_value(field: str, value: Any) -> str:
     return html.escape(text)
 
 
-def order_has_active_position(order: dict[str, Any], active_underlyings: set[str]) -> bool:
+def order_has_active_position(order: dict[str, Any], active_option_keys: set[str]) -> bool:
     symbol = str(order.get("tradingsymbol") or "").strip().upper()
     if not symbol:
         return False
-    underlying = underlying_for_symbol(symbol)
-    return symbol in active_underlyings or bool(underlying and underlying in active_underlyings)
+    parts = option_symbol_parts(symbol)
+    if not parts:
+        return symbol in active_option_keys
+    option_key = f"{parts['underlying']}:{parts['option_type']}"
+    return symbol in active_option_keys or option_key in active_option_keys
 
 
 def validation_score_percent(validation: dict[str, Any] | None) -> float | None:
@@ -5693,12 +6036,12 @@ def default_selected_order_indexes(
     validations: list[dict[str, Any]] | None = None,
 ) -> set[int]:
     try:
-        active_underlyings = active_position_underlyings()
+        active_option_keys = active_position_option_block_keys()
     except Exception:
-        active_underlyings = set()
+        active_option_keys = set()
     selected: set[int] = set()
     for index, order in enumerate(orders):
-        if order_has_active_position(order, active_underlyings):
+        if order_has_active_position(order, active_option_keys):
             continue
         validation = validations[index] if validations and index < len(validations) else None
         score_pct = validation_score_percent(validation)
@@ -5717,23 +6060,26 @@ def render_orders_table(
     if selected is None:
         selected = default_selected_order_indexes(orders, validations)
     try:
-        active_underlyings = active_position_underlyings()
+        active_option_keys = active_position_option_block_keys()
     except Exception:
-        active_underlyings = set()
+        active_option_keys = set()
     header = "".join(f"<th>{html.escape(field)}</th>" for field in DISPLAY_FIELDS)
     rows = []
     for index, order in enumerate(orders):
         symbol = str(order.get("tradingsymbol") or "").strip().upper()
-        underlying = underlying_for_symbol(symbol) if symbol else ""
-        has_active_position = order_has_active_position(order, active_underlyings)
+        parts = option_symbol_parts(symbol) if symbol else None
+        underlying = parts["underlying"] if parts else underlying_for_symbol(symbol) if symbol else ""
+        option_type = parts["option_type"] if parts else ""
+        has_active_position = order_has_active_position(order, active_option_keys)
         validation = validations[index] if validations and index < len(validations) else None
         score_pct = validation_score_percent(validation)
         disable_checkbox = has_active_position or (score_pct is not None and score_pct < 50)
         checked_attr = " checked" if index in selected and not disable_checkbox else ""
         disabled_attr = " disabled" if disable_checkbox else ""
         row_class = ' class="order-existing-position active-position-row"' if has_active_position else ""
+        option_label = option_type or "option"
         row_title = (
-            f' title="Existing Kite position found for {html.escape(underlying or symbol, quote=True)}"'
+            f' title="Existing Kite {html.escape(option_label, quote=True)} position found for {html.escape(underlying or symbol, quote=True)}"'
             if has_active_position
             else ""
         )
@@ -5749,7 +6095,7 @@ def render_orders_table(
         )
     return (
         '<section class="panel"><div class="panel-title">Orders</div>'
-        '<div class="status order-position-note">Rows in light red already have an active Kite position for the same underlying.</div>'
+        '<div class="status order-position-note">Rows in light red already have an active Kite position for the same underlying and same option side. Opposite side CE/PE remains selectable.</div>'
         '<div class="table-wrap"><table><thead><tr><th>Select</th><th>Score</th>'
         f"{header}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
     )
@@ -5825,6 +6171,10 @@ def render_position_orders_table(
         )
     return (
         '<section class="panel"><div class="panel-title">Position BUY Orders</div>'
+        '<div class="actions compact-table-actions">'
+        '<button type="button" class="secondary compact-action-button" id="position-select-all">Select All</button>'
+        '<button type="button" class="secondary compact-action-button" id="position-unselect-all">Deselect All</button>'
+        '</div>'
         '<div class="table-wrap"><table><thead><tr><th>Select</th>'
         f"{header}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
     )
@@ -6000,18 +6350,27 @@ def render_order_book(state: PageState) -> str:
             f'<span>{html.escape(str(suggestion.get("text", "")))}</span>'
             "</div>"
         )
+        position_pnl = order.get("position_pnl")
+        position_pnl_class = ""
+        position_pnl_cell = "N/A"
+        if position_pnl is not None:
+            position_pnl_value = float(position_pnl)
+            position_pnl_class = "pnl-positive" if position_pnl_value >= 0 else "pnl-negative"
+            position_pnl_cell = (
+                f"<strong>{html.escape(display_cell('pnl', position_pnl_value))}</strong>"
+                f"<small>Qty {html.escape(str(order.get('position_qty') or ''))}</small>"
+            )
         rows.append(
             "<tr>"
             f'<td><input type="checkbox" name="order_key" value="{html.escape(key, quote=True)}"{checked_attr}{disabled_attr}></td>'
-            f"<td>{html.escape(str(order.get('order_id', '')))}</td>"
             f"<td>{html.escape(str(order.get('tradingsymbol', '')))}</td>"
             f"<td>{html.escape(str(order.get('transaction_type', '')))}</td>"
             f"<td>{qty_cell}</td>"
             f"<td>{html.escape(str(order.get('pending_quantity', '')))}</td>"
-            f"<td>{html.escape(str(order.get('product', '')))}</td>"
-            f"<td>{html.escape(str(order.get('order_type', '')))}</td>"
             f"<td>{price_cell}</td>"
             f"<td>{html.escape(fmt_number(order.get('ltp')))}</td>"
+            f"<td>{html.escape(fmt_number(order.get('position_avg_price')))}</td>"
+            f'<td class="{position_pnl_class}">{position_pnl_cell}</td>'
             f"<td>{suggestion_cell}</td>"
             f'<td class="{diff_class}">{html.escape(fmt_number(price_diff))}%</td>'
             f'<td><span class="order-score score-{suggestion_score // 20}">{suggestion_score}/100</span></td>'
@@ -6022,7 +6381,7 @@ def render_order_book(state: PageState) -> str:
     body = (
         "".join(rows)
         if rows
-        else '<tr><td colspan="15" class="status">No Kite orders found.</td></tr>'
+        else '<tr><td colspan="14" class="status">No Kite orders found.</td></tr>'
     )
     error_html = render_graceful_error(error, "Kite Orders Error")
     return (
@@ -6035,8 +6394,8 @@ def render_order_book(state: PageState) -> str:
         '<button type="button" class="secondary compact-action-button" id="orders-select-all">Select All</button>'
         '<button type="button" class="secondary compact-action-button" id="orders-unselect-all">Unselect All</button></div>'
         '<div class="table-wrap"><table class="order-book-table"><thead><tr>'
-        '<th>Select</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Pending</th>'
-        '<th>Product</th><th>Type</th><th>Price</th><th>LTP</th><th>Suggestion</th><th>% Diff</th><th>Score</th><th>Close P&L</th><th>Status</th>'
+        '<th>Select</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Pending</th>'
+        '<th>Price</th><th>LTP</th><th>Avg Price</th><th>Current P&L</th><th>Suggestion</th><th>% Diff</th><th>Score</th><th>Close P&L</th><th>Status</th>'
         f"</tr></thead><tbody>{body}</tbody></table></div></section>"
     )
 
@@ -6364,6 +6723,34 @@ def render_income_growth_panel(state: PageState) -> str:
     )
     if not table_rows:
         table_rows = '<tr><td colspan="23" class="muted-cell">Click Refresh Income Growth to calculate covered-call capacity from your holdings sheet.</td></tr>'
+    try:
+        stored_holdings = load_income_growth_holding_map()
+    except Exception:
+        stored_holdings = {
+            normalize_income_growth_symbol(item.get("symbol")): item
+            for item in INCOME_GROWTH_SHEET
+        }
+    symbol_options = "".join(
+        f'<option value="{html.escape(symbol)}">'
+        for symbol in sorted(stored_holdings)
+    )
+    latest_update = max(
+        (str(item.get("updated_at") or "") for item in stored_holdings.values()),
+        default="Seeded from app defaults",
+    )
+    update_form_html = f"""
+      <section class="panel income-growth-update-panel">
+        <div class="panel-title">Update Holding Data</div>
+        <div class="status">Saved in lightweight SQLite DB: {html.escape(str(APP_DB_PATH.name))}. Update only the holding quantity when your portfolio changes. Last DB update: {html.escape(latest_update or "N/A")}.</div>
+        <div class="compact-form-grid income-growth-edit-grid">
+          <label><span>Symbol</span><input list="income-growth-symbols" name="income_growth_symbol" placeholder="PFC"></label>
+          <datalist id="income-growth-symbols">{symbol_options}</datalist>
+          <label><span>Holding shares</span><input name="income_growth_holding" inputmode="decimal" placeholder="3515"></label>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/income-growth/save-holding">Save Holding Data</button>
+        </div>
+      </section>"""
     pe_candidates = income_growth_pe_sell_candidates(rows)
     pe_cards = "".join(
         f'<div class="pe-candidate-card {strength_class(item.get("color"))}">'
@@ -6438,6 +6825,7 @@ def render_income_growth_panel(state: PageState) -> str:
         <div class="status">Uses your holding shares, lot multiple, lots can be sold, CMP, call strike, PE, 52W, 1Y, monthly, weekly, and today move. Kite option quotes enrich the live premium when available.</div>
         <div class="table-wrap"><table id="income-growth-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{table_rows}</tbody></table></div>
       </section>
+      {update_form_html}
       <div class="live-modal-backdrop" id="income-growth-gpt-modal">
         <div class="live-modal income-growth-prompt-modal">
           <h2>Modify Income Growth GPT Prompt</h2>
@@ -7174,7 +7562,7 @@ def render_commodity_panel(state: PageState) -> str:
     <div id="commodity-panel"{panel_style}>
       <section class="panel commodity-panel">
         <div class="panel-title">Commodity ETF Watch</div>
-        <div class="status">Tracks ETF day change. Buy amount = yearly base x ETF allocation x dip multiplier, capped at {COMMODITY_MAX_MULTIPLIER}x. Current yearly base: {html.escape(format_buy_amount(commodity_yearly_base_amount()))}.</div>
+        <div class="status">Tracks ETF day change. Buy amount = yearly base x ETF allocation x dip multiplier, capped at {COMMODITY_MAX_MULTIPLIER}x. Current yearly base: {html.escape(format_buy_amount(commodity_yearly_base_amount()))}. <button type="button" class="mini-refresh-button" id="refresh-commodity-quotes">Refresh ETF quotes</button></div>
         <div class="quote-error" id="commodity-error"></div>
         <div class="commodity-grid" id="commodity-grid">{cards}</div>
       </section>
@@ -7512,7 +7900,7 @@ def render_market_topper(state: PageState) -> str:
         </div>
       </div>
       <div class="global-market-strip">
-        <div class="global-market-title">Market cues</div>
+        <div class="global-market-title">Market cues <button type="button" class="mini-refresh-button" id="refresh-global-quotes">Refresh</button></div>
         <div class="global-error" id="global-error"></div>
         <div class="global-grid" id="global-grid">{global_quote_cards}</div>
       </div>
@@ -7521,7 +7909,7 @@ def render_market_topper(state: PageState) -> str:
         {warning_html}
       </div>
       <div class="ticker-panel">
-        <div class="ticker-title live-title">Kite LTP and Day Change | {quote_date}</div>
+        <div class="ticker-title live-title">Kite LTP and Day Change | {quote_date} <button type="button" class="mini-refresh-button" id="refresh-market-quotes">Refresh</button></div>
         <div class="quote-error" id="quote-error"></div>
         <div class="quote-grid" id="quote-grid">{quote_cards}</div>
       </div>
@@ -8699,6 +9087,39 @@ def render_page(state: PageState) -> bytes:
       background:
         radial-gradient(circle at top left, rgba(16, 185, 129, 0.16), transparent 30%),
         linear-gradient(135deg, #ffffff 0%, #ecfdf5 100%);
+    }}
+    .income-growth-update-panel {{
+      border-color: #bae6fd;
+      background:
+        radial-gradient(circle at 100% 0%, rgba(56, 189, 248, 0.14), transparent 30%),
+        linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
+    }}
+    .compact-form-grid {{
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .compact-form-grid label span {{
+      display: block;
+      margin-bottom: 4px;
+      color: #475569;
+      font-size: 10px;
+      font-weight: 900;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }}
+    .compact-form-grid input {{
+      min-height: 34px;
+      padding: 7px 9px;
+      border: 1px solid #cbd5e1;
+      border-radius: 9px;
+      background: rgba(255, 255, 255, 0.9);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 750;
+      width: 100%;
+      box-sizing: border-box;
     }}
     .pe-candidate-grid {{
       display: grid;
@@ -10020,7 +10441,8 @@ def render_page(state: PageState) -> bytes:
       background: #f8fbff;
     }}
     .order-book-table {{
-      min-width: 1480px;
+      min-width: 1540px;
+      table-layout: fixed;
     }}
     .order-book-table td,
     .order-book-table th {{
@@ -10028,6 +10450,34 @@ def render_page(state: PageState) -> bytes:
       overflow-wrap: anywhere;
       vertical-align: top;
     }}
+    .order-book-table th:nth-child(1),
+    .order-book-table td:nth-child(1) {{ width: 44px; text-align: center; }}
+    .order-book-table th:nth-child(2),
+    .order-book-table td:nth-child(2) {{ width: 218px; }}
+    .order-book-table th:nth-child(3),
+    .order-book-table td:nth-child(3) {{ width: 58px; white-space: nowrap; overflow-wrap: normal; word-break: normal; }}
+    .order-book-table th:nth-child(4),
+    .order-book-table td:nth-child(4) {{ width: 106px; }}
+    .order-book-table th:nth-child(5),
+    .order-book-table td:nth-child(5) {{ width: 82px; white-space: nowrap; overflow-wrap: normal; word-break: normal; text-align: right; }}
+    .order-book-table th:nth-child(6),
+    .order-book-table td:nth-child(6) {{ width: 190px; }}
+    .order-book-table th:nth-child(7),
+    .order-book-table td:nth-child(7) {{ width: 74px; white-space: nowrap; overflow-wrap: normal; word-break: normal; }}
+    .order-book-table th:nth-child(8),
+    .order-book-table td:nth-child(8) {{ width: 90px; white-space: nowrap; overflow-wrap: normal; word-break: normal; }}
+    .order-book-table th:nth-child(9),
+    .order-book-table td:nth-child(9) {{ width: 112px; }}
+    .order-book-table th:nth-child(10),
+    .order-book-table td:nth-child(10) {{ width: 280px; }}
+    .order-book-table th:nth-child(11),
+    .order-book-table td:nth-child(11) {{ width: 92px; white-space: nowrap; overflow-wrap: normal; word-break: normal; }}
+    .order-book-table th:nth-child(12),
+    .order-book-table td:nth-child(12) {{ width: 86px; white-space: nowrap; overflow-wrap: normal; word-break: normal; }}
+    .order-book-table th:nth-child(13),
+    .order-book-table td:nth-child(13) {{ width: 118px; }}
+    .order-book-table th:nth-child(14),
+    .order-book-table td:nth-child(14) {{ width: 92px; white-space: nowrap; overflow-wrap: normal; word-break: normal; }}
     .order-book-table small {{
       display: block;
       margin-top: 2px;
@@ -10092,6 +10542,21 @@ def render_page(state: PageState) -> bytes:
     .price-step-button:disabled {{
       cursor: not-allowed;
       opacity: 0.5;
+    }}
+    .mini-refresh-button {{
+      margin-left: 8px;
+      border: 1px solid rgba(15, 118, 110, 0.24);
+      border-radius: 999px;
+      padding: 4px 9px;
+      background: #ecfeff;
+      color: #0f766e;
+      font-size: 10px;
+      font-weight: 950;
+      cursor: pointer;
+      vertical-align: middle;
+    }}
+    .mini-refresh-button:hover {{
+      background: #ccfbf1;
     }}
     .order-score {{
       display: inline-flex;
@@ -10802,6 +11267,15 @@ def render_page(state: PageState) -> bytes:
     }}
     ordersSelectAll && ordersSelectAll.addEventListener('click', () => setOrderCheckboxes(true));
     ordersUnselectAll && ordersUnselectAll.addEventListener('click', () => setOrderCheckboxes(false));
+    const positionSelectAll = document.getElementById('position-select-all');
+    const positionUnselectAll = document.getElementById('position-unselect-all');
+    function setPositionCheckboxes(checked) {{
+      for (const checkbox of document.querySelectorAll('#positions-panel input[name="position_selected"]:not(:disabled)')) {{
+        checkbox.checked = checked;
+      }}
+    }}
+    positionSelectAll && positionSelectAll.addEventListener('click', () => setPositionCheckboxes(true));
+    positionUnselectAll && positionUnselectAll.addEventListener('click', () => setPositionCheckboxes(false));
     for (const button of document.querySelectorAll('.price-step-button')) {{
       button.addEventListener('click', () => {{
         const wrapper = button.closest('.price-adjuster');
@@ -10880,6 +11354,7 @@ def render_page(state: PageState) -> bytes:
       const setupTab = document.querySelector('.tab-button[data-tab="kite-setup"]');
       if (setupTab) setupTab.click();
     }}
+    const isHomePage = window.location.pathname === '/home';
     const executeButton = document.getElementById('execute-selected-button');
     const placeForm = document.getElementById('place-panel');
     const liveModal = document.getElementById('live-confirm-modal');
@@ -11338,8 +11813,10 @@ def render_page(state: PageState) -> bytes:
         action.innerHTML = '| Signal: <strong>unavailable</strong>';
       }}
     }}
-    refreshMmi();
-    setInterval(refreshMmi, {TOP_QUOTE_REFRESH_MS});
+    if (isHomePage) {{
+      refreshMmi();
+      setInterval(refreshMmi, {TOP_QUOTE_REFRESH_MS});
+    }}
     async function refreshGlobalQuotes() {{
       const cards = Array.from(document.querySelectorAll('.global-card[data-global-symbol]'));
       if (!cards.length) return;
@@ -11392,8 +11869,12 @@ def render_page(state: PageState) -> bytes:
         }}
       }}
     }}
-    refreshGlobalQuotes();
-    setInterval(refreshGlobalQuotes, {TOP_QUOTE_REFRESH_MS});
+    const refreshGlobalButton = document.getElementById('refresh-global-quotes');
+    refreshGlobalButton && refreshGlobalButton.addEventListener('click', refreshGlobalQuotes);
+    if (isHomePage) {{
+      refreshGlobalQuotes();
+      setInterval(refreshGlobalQuotes, {TOP_QUOTE_REFRESH_MS});
+    }}
     async function refreshQuotes() {{
       const cards = Array.from(document.querySelectorAll('.quote-card[data-symbol]'));
       if (!cards.length) return;
@@ -11450,8 +11931,12 @@ def render_page(state: PageState) -> bytes:
         }}
       }}
     }}
-    refreshQuotes();
-    setInterval(refreshQuotes, {TOP_QUOTE_REFRESH_MS});
+    const refreshMarketButton = document.getElementById('refresh-market-quotes');
+    refreshMarketButton && refreshMarketButton.addEventListener('click', refreshQuotes);
+    if (isHomePage) {{
+      refreshQuotes();
+      setInterval(refreshQuotes, {TOP_QUOTE_REFRESH_MS});
+    }}
     async function refreshCommodityQuotes() {{
       const cards = Array.from(document.querySelectorAll('.commodity-card[data-symbol]'));
       if (!cards.length) return;
@@ -11517,8 +12002,8 @@ def render_page(state: PageState) -> bytes:
         }}
       }}
     }}
-    refreshCommodityQuotes();
-    setInterval(refreshCommodityQuotes, {TOP_QUOTE_REFRESH_MS});
+    const refreshCommodityButton = document.getElementById('refresh-commodity-quotes');
+    refreshCommodityButton && refreshCommodityButton.addEventListener('click', refreshCommodityQuotes);
   </script>
 </body>
 </html>"""
@@ -11836,6 +12321,16 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             elif request_path == "/csv/save-today":
                 state.csv_path, state.message = save_today_csv_text(state.csv_text)
                 state.csv_text = Path(state.csv_path).read_text(encoding="utf-8-sig")
+                state.research_rows, research_log = call_with_console(
+                    research_csv_symbols,
+                    state.csv_text,
+                    state.csv_path,
+                )
+                state.console_log = f"{state.console_log}{research_log}"
+                state.message = (
+                    f"{state.message} Loaded CSV Symbol Research Comparison for "
+                    f"{len(state.research_rows)} symbol(s)."
+                )
             elif request_path == "/execute":
                 rows_payload = first(form, "rows_payload")
                 state.rows = decode_rows(rows_payload) if rows_payload else None
@@ -11868,7 +12363,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             elif request_path == "/orders/cancel-all":
                 state.results, state.console_log = call_with_console(cancel_all_open_orders)
                 try:
-                    state.order_book = kite_order_book()
+                    state.order_book = kite_order_book(True)
                 except Exception as exc:
                     state.order_book_error = str(exc)
                 cancelled = sum(1 for item in state.results if item.get("status") == "CANCELLED")
@@ -11881,7 +12376,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     selected_order_keys,
                 )
                 try:
-                    state.order_book = kite_order_book()
+                    state.order_book = kite_order_book(True)
                 except Exception as exc:
                     state.order_book_error = str(exc)
                 cancelled = sum(1 for item in state.results if item.get("status") == "CANCELLED")
@@ -11898,7 +12393,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     form,
                 )
                 try:
-                    state.order_book = kite_order_book()
+                    state.order_book = kite_order_book(True)
                 except Exception as exc:
                     state.order_book_error = str(exc)
                 modified = sum(1 for item in state.results if item.get("status") == "MODIFIED")
@@ -11908,7 +12403,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     f"Modify selected completed. Modified {modified}; skipped {skipped}; errors {errors}."
                 )
             elif request_path == "/orders/refresh":
-                state.order_book, state.console_log = call_with_console(kite_order_book)
+                state.order_book, state.console_log = call_with_console(kite_order_book, True)
                 state.message = f"Loaded {len(state.order_book)} Kite order(s)."
             elif request_path == "/positions/load":
                 clear_app_cache(("kite:positions", "kite:quote", "positions-research"))
@@ -11925,6 +12420,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.position_orders, state.console_log = call_with_console(
                         build_position_buy_orders,
                         state,
+                    )
+                else:
+                    fresh_kite = kite_buy_positions.kite_client()
+                    state.position_orders = refresh_position_buy_order_prices(
+                        state.position_orders,
+                        fresh_kite,
+                        position_args_from_state(state),
                     )
                 selected = {int(value) for value in form.get("position_selected", [])}
                 if selected and not state.position_dry_run and not state.position_live_confirmed:
@@ -12061,7 +12563,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 state.message = f"Loaded analytics for {state.analytics_symbol.upper()}."
             elif request_path == "/research/load":
-                state.research_rows, state.console_log = call_with_console(research_csv_symbols)
+                state.research_rows, state.console_log = call_with_console(
+                    research_csv_symbols,
+                    state.csv_text,
+                    state.csv_path,
+                )
                 state.message = f"Research completed for {len(state.research_rows)} CSV symbol(s)."
             elif request_path == "/income/load":
                 (
@@ -12081,6 +12587,20 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.income_growth_summary,
                 ), state.console_log = call_with_console(income_growth_candidates)
                 state.message = f"Income growth capacity refreshed for {len(state.income_growth_rows)} holding(s)."
+            elif request_path == "/income-growth/save-holding":
+                (updated_symbol, _), save_log = call_with_console(
+                    save_income_growth_holding_from_form,
+                    form,
+                )
+                (
+                    state.income_growth_rows,
+                    state.income_growth_summary,
+                ), refresh_log = call_with_console(income_growth_candidates)
+                state.console_log = f"{save_log}{refresh_log}"
+                state.message = (
+                    f"Saved Income Growth holding data for {updated_symbol}. "
+                    f"Refreshed {len(state.income_growth_rows)} option-income candidate(s)."
+                )
             elif request_path == "/income-growth/gpt":
                 (
                     state.income_growth_rows,
