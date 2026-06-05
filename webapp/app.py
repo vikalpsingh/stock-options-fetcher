@@ -7358,8 +7358,8 @@ def render_positions_panel(
             return ""
 
     summary_cards = "".join(
-        f'<div class="decision-card"><div class="decision-label">{html.escape(label)}</div>'
-        f'<div class="decision-value">{html.escape(value)}</div></div>'
+        f'<div class="position-summary-chip"><span>{html.escape(label)}</span>'
+        f'<strong>{html.escape(value)}</strong></div>'
         for label, value in [
             ("Active option trades", str(summary.get("count", 0))),
             ("Current P&L", fmt_number(summary.get("total_pnl"))),
@@ -7431,7 +7431,7 @@ def render_positions_panel(
           {position_execute_button}
         </div>
       </section>
-      <section class="panel"><div class="panel-title">Positions Summary</div><div class="decision-grid">{summary_cards}</div></section>
+      <section class="panel positions-summary-panel"><div class="position-summary-strip">{summary_cards}</div></section>
       {table}
       {position_orders_table}
       {render_results(state.position_results)}
@@ -10295,6 +10295,61 @@ def render_page(state: PageState) -> bytes:
         radial-gradient(circle at top left, rgba(204, 251, 241, 0.55), transparent 34%),
         linear-gradient(135deg, #ffffff 0%, #f8fffd 100%);
     }}
+    .positions-summary-panel {{
+      padding: 10px 14px;
+      margin-top: 10px;
+      margin-bottom: 10px;
+    }}
+    .position-summary-strip {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 8px;
+    }}
+    .position-summary-chip {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 34px;
+      padding: 7px 10px;
+      border: 1px solid #cfe4df;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #f8fffd 0%, #ffffff 100%);
+    }}
+    .position-summary-chip span {{
+      color: #64748b;
+      font-size: 10.5px;
+      font-weight: 900;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }}
+    .position-summary-chip strong {{
+      color: #0f172a;
+      font-size: 15px;
+      font-weight: 950;
+      line-height: 1;
+      white-space: nowrap;
+    }}
+    #positions-panel .calm-hero-panel {{
+      padding: 10px 14px;
+      margin-bottom: 10px;
+    }}
+    #positions-panel .calm-hero-panel .calm-quote {{
+      margin: 0 0 2px;
+      font-size: 15px;
+      line-height: 1.15;
+    }}
+    #positions-panel .calm-hero-panel .status {{
+      margin: 0;
+      font-size: 11px;
+    }}
+    #positions-panel .calm-hero-panel .actions {{
+      gap: 8px;
+    }}
+    #positions-panel .calm-hero-panel button {{
+      padding: 8px 12px;
+      min-height: 34px;
+    }}
     .positions-table-wrap {{
       border: 1px solid #b7e4da;
       border-radius: 14px;
@@ -10983,6 +11038,8 @@ def render_page(state: PageState) -> bytes:
       .home-action-grid {{ grid-template-columns: 1fr; }}
       .investing-hero-panel {{ align-items: flex-start; flex-direction: column; }}
       .investing-summary-panel .summary-grid {{ grid-template-columns: 1fr; }}
+      .position-summary-strip {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .position-summary-chip {{ align-items: flex-start; flex-direction: column; gap: 4px; }}
       .compact-rules {{ grid-template-columns: 1fr; }}
       .decision-tile {{ min-height: auto; }}
       .tab-button[data-tab="home"] {{ display: inline-flex; }}
