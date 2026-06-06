@@ -78,6 +78,8 @@ DEFAULT_KITE_ENV = {
     "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
     "KITE_ACCESS_TOKEN": "TqL81HKQXjdi6KQ9jxsYUz5AIUgrrwxB",
 }
+KITE_PROFILE_NAMES = ["Vikalp", "Monika", "Shanti", "Aanya"]
+DEFAULT_KITE_PROFILE = "Shanti"
 BAD_KITE_API_KEYS = {"wg21s30mtedr53q0"}
 AUTH_USERNAME = "vikalpsingh"
 AUTH_PASSWORD_SALT = b"vikalp-income-desk-v1"
@@ -622,6 +624,97 @@ def save_env_values(values: dict[str, str], env_path: Path = APP_ROOT / ".env") 
     env_path.write_text(env_text + ("\n" if env_text else ""), encoding="utf-8")
 
 
+def blank_kite_profile() -> dict[str, str]:
+    return {
+        "KITE_CONFIRM_LIVE_ORDER": "YES",
+        "KITE_API_KEY": "",
+        "KITE_API_SECRET": "",
+        "KITE_ACCESS_TOKEN": "",
+    }
+
+
+def shanti_default_kite_profile() -> dict[str, str]:
+    return {
+        "KITE_CONFIRM_LIVE_ORDER": env_value("KITE_CONFIRM_LIVE_ORDER")
+        or DEFAULT_KITE_ENV["KITE_CONFIRM_LIVE_ORDER"],
+        "KITE_API_KEY": env_value("KITE_API_KEY") or DEFAULT_KITE_ENV["KITE_API_KEY"],
+        "KITE_API_SECRET": env_value("KITE_API_SECRET") or DEFAULT_KITE_ENV["KITE_API_SECRET"],
+        "KITE_ACCESS_TOKEN": env_value("KITE_ACCESS_TOKEN")
+        or DEFAULT_KITE_ENV["KITE_ACCESS_TOKEN"],
+    }
+
+
+def normalize_kite_profile_name(value: str | None) -> str:
+    text = str(value or "").strip()
+    for name in KITE_PROFILE_NAMES:
+        if text.lower() == name.lower():
+            return name
+    saved = str(load_app_settings().get("selected_kite_profile") or "").strip()
+    for name in KITE_PROFILE_NAMES:
+        if saved.lower() == name.lower():
+            return name
+    return DEFAULT_KITE_PROFILE
+
+
+def load_kite_profiles() -> dict[str, dict[str, str]]:
+    settings = load_app_settings()
+    saved_profiles = settings.get("kite_profiles")
+    profiles = {name: blank_kite_profile() for name in KITE_PROFILE_NAMES}
+    profiles[DEFAULT_KITE_PROFILE] = shanti_default_kite_profile()
+    if isinstance(saved_profiles, dict):
+        for name in KITE_PROFILE_NAMES:
+            saved_profile = saved_profiles.get(name)
+            if not isinstance(saved_profile, dict):
+                continue
+            merged = blank_kite_profile()
+            if name == DEFAULT_KITE_PROFILE:
+                merged.update(shanti_default_kite_profile())
+            for key in DEFAULT_KITE_ENV:
+                if key in saved_profile:
+                    merged[key] = str(saved_profile.get(key) or "").strip()
+            profiles[name] = merged
+    return profiles
+
+
+def selected_kite_profile_name(value: str | None = None) -> str:
+    return normalize_kite_profile_name(value)
+
+
+def save_kite_profile(profile_name: str, values: dict[str, str]) -> dict[str, str]:
+    clean_name = selected_kite_profile_name(profile_name)
+    profiles = load_kite_profiles()
+    current = profiles.get(clean_name, blank_kite_profile())
+    for key in DEFAULT_KITE_ENV:
+        if key in values:
+            current[key] = str(values.get(key) or "").strip()
+    if not current.get("KITE_CONFIRM_LIVE_ORDER"):
+        current["KITE_CONFIRM_LIVE_ORDER"] = "YES"
+    profiles[clean_name] = current
+    save_app_settings(
+        {
+            "kite_profiles": profiles,
+            "selected_kite_profile": clean_name,
+        }
+    )
+    return current
+
+
+def kite_profile_values_from_state(state: Any, access_token: str | None = None) -> dict[str, str]:
+    return {
+        "KITE_CONFIRM_LIVE_ORDER": str(state.confirm_live_order or "").strip() or "YES",
+        "KITE_API_KEY": str(state.api_key or "").strip(),
+        "KITE_API_SECRET": str(state.api_secret or "").strip(),
+        "KITE_ACCESS_TOKEN": str(
+            access_token if access_token is not None else state.access_token or ""
+        ).strip(),
+    }
+
+
+def apply_kite_profile_to_env(values: dict[str, str]) -> None:
+    for key in DEFAULT_KITE_ENV:
+        os.environ[key] = str(values.get(key) or "").strip()
+
+
 def etf_buy_amount_setting() -> float:
     value = load_app_settings().get("etf_buy_amount", DEFAULT_ETF_BUY_AMOUNT)
     try:
@@ -869,6 +962,7 @@ class PageState:
     api_secret: str = ""
     access_token: str = ""
     confirm_live_order: str = ""
+    kite_profile: str = field(default_factory=selected_kite_profile_name)
     results: list[dict[str, Any]] | None = None
     order_book: list[dict[str, Any]] | None = None
     order_book_error: str = ""
@@ -918,6 +1012,10 @@ class PageState:
     income_growth_gpt_response_id: str = ""
     income_growth_gpt_prompt: str = ""
     income_growth_gpt_cached: bool = False
+    income_growth_equity_results: list[dict[str, Any]] | None = None
+    equity_rows: list[dict[str, Any]] | None = None
+    equity_summary: dict[str, Any] | None = None
+    equity_results: list[dict[str, Any]] | None = None
     income_rows: list[dict[str, Any]] | None = None
     income_summary: dict[str, Any] | None = None
     income_results: list[dict[str, Any]] | None = None
@@ -1098,6 +1196,14 @@ def env_value(name: str) -> str:
     return os.getenv(name, "")
 
 
+try:
+    apply_kite_profile_to_env(
+        load_kite_profiles().get(selected_kite_profile_name(), shanti_default_kite_profile())
+    )
+except Exception:
+    pass
+
+
 def kite_setup_issue() -> str:
     if kite_orders is None:
         return f"Could not import kite_place_order.py: {IMPORT_ERROR}"
@@ -1128,12 +1234,12 @@ def set_kite_env(form: dict[str, list[str]]) -> None:
         "confirm_live_order": "KITE_CONFIRM_LIVE_ORDER",
     }
     for field, env_name in env_names.items():
-        value = first(form, field)
-        if value != "":
-            clean_value = value.strip()
-            if env_name == "KITE_API_KEY" and clean_value in BAD_KITE_API_KEYS:
-                clean_value = DEFAULT_KITE_ENV["KITE_API_KEY"]
-            os.environ[env_name] = clean_value
+        if field not in form:
+            continue
+        clean_value = first(form, field).strip()
+        if env_name == "KITE_API_KEY" and clean_value in BAD_KITE_API_KEYS:
+            clean_value = DEFAULT_KITE_ENV["KITE_API_KEY"]
+        os.environ[env_name] = clean_value
     openai_api_key = first(form, "openai_api_key")
     if openai_api_key:
         os.environ["OPENAI_API_KEY"] = openai_api_key.strip()
@@ -3550,6 +3656,46 @@ def mmi_zone(value: float) -> str:
     return "Extreme Fear"
 
 
+def friendly_external_error(exc: Exception, service: str = "Market data") -> str:
+    raw = str(exc or "").strip()
+    lower = raw.lower()
+    if (
+        "getaddrinfo failed" in lower
+        or "name resolution" in lower
+        or "failed to resolve" in lower
+        or "nodename nor servname" in lower
+        or "temporary failure in name resolution" in lower
+    ):
+        return (
+            f"{service} connection failed: DNS could not resolve the market-data host. "
+            "Check internet/DNS on this laptop/server, then refresh."
+        )
+    if "api.kite.trade" in lower or "kiteconnect" in lower:
+        return (
+            f"{service} connection failed: Kite API is unreachable from this machine. "
+            "Verify network, DNS, firewall, and the selected Kite profile token."
+        )
+    if "api_key" in lower or "access_token" in lower or "invalid session" in lower:
+        return (
+            f"{service} authentication failed: open Kite Setup, confirm the active profile, "
+            "and regenerate today's access token."
+        )
+    if "timed out" in lower or "timeout" in lower:
+        return f"{service} connection timed out. Retry after a few seconds."
+    if "max retries exceeded" in lower:
+        return f"{service} connection failed after retries. Check network/DNS and retry."
+    return raw[:260] if raw else f"{service} unavailable."
+
+
+def compact_error_list(errors: list[str], limit: int = 3) -> str:
+    clean = [str(error).strip() for error in errors if str(error).strip()]
+    if not clean:
+        return ""
+    visible = clean[:limit]
+    suffix = f" + {len(clean) - limit} more" if len(clean) > limit else ""
+    return "; ".join(visible) + suffix
+
+
 def cached_value(cache_key: str, fetcher: Any, ttl_seconds: int) -> Any:
     now = time.time()
     with APP_CACHE_LOCK:
@@ -3610,32 +3756,44 @@ def cached_kite_quote(kite: Any, keys: list[str] | tuple[str, ...], ttl_seconds:
     clean_keys = tuple(sorted(str(key) for key in keys if key))
     if not clean_keys:
         return {}
-    return cached_value(
-        "kite:quote:" + "|".join(clean_keys),
-        lambda: kite.quote(list(clean_keys)),
-        ttl_seconds,
-    )
+    try:
+        return cached_value(
+            "kite:quote:" + "|".join(clean_keys),
+            lambda: kite.quote(list(clean_keys)),
+            ttl_seconds,
+        )
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, "Kite quote")) from exc
 
 
 def cached_kite_positions(kite: Any) -> list[dict[str, Any]]:
-    return cached_value(
-        "kite:positions",
-        lambda: kite.positions().get("net", []),
-        KITE_READ_CACHE_SECONDS,
-    )
+    try:
+        return cached_value(
+            "kite:positions",
+            lambda: kite.positions().get("net", []),
+            KITE_READ_CACHE_SECONDS,
+        )
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, "Kite positions")) from exc
 
 
 def cached_kite_orders(kite: Any) -> list[dict[str, Any]]:
-    return cached_value("kite:orders", kite.orders, KITE_READ_CACHE_SECONDS)
+    try:
+        return cached_value("kite:orders", kite.orders, KITE_READ_CACHE_SECONDS)
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, "Kite orders")) from exc
 
 
 def cached_kite_instruments(kite: Any, exchange: str) -> list[dict[str, Any]]:
     clean_exchange = exchange.strip().upper()
-    return cached_value(
-        f"kite:instruments:{clean_exchange}",
-        lambda: kite.instruments(clean_exchange),
-        KITE_INSTRUMENT_CACHE_SECONDS,
-    )
+    try:
+        return cached_value(
+            f"kite:instruments:{clean_exchange}",
+            lambda: kite.instruments(clean_exchange),
+            KITE_INSTRUMENT_CACHE_SECONDS,
+        )
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, f"Kite {clean_exchange} instruments")) from exc
 
 
 def invalidate_kite_trade_cache() -> None:
@@ -3892,7 +4050,7 @@ def fetch_global_market_quotes_uncached() -> dict[str, Any]:
                 warnings.append(str(quote["warning"]))
             quotes.append(quote)
         except Exception as exc:
-            errors.append(f"{item['label']}: {exc}")
+            errors.append(f"{item['label']}: {friendly_external_error(exc, str(item['label']))}")
             quotes.append(
                 {
                     "label": str(item["label"]),
@@ -3904,8 +4062,8 @@ def fetch_global_market_quotes_uncached() -> dict[str, Any]:
     return {
         "ok": not errors,
         "quotes": quotes,
-        "error": "; ".join(errors),
-        "warning": "; ".join(warnings),
+        "error": compact_error_list(errors),
+        "warning": compact_error_list(warnings),
     }
 
 
@@ -4543,13 +4701,275 @@ def income_growth_pe_sell_candidates(rows: list[dict[str, Any]], limit: int = 3)
                     "label": label,
                     "color": color,
                     "reasons": reasons,
-                    "future_call_note": "If assigned, later use holding for covered CALL income.",
                 }
             )
         except Exception:
             continue
     candidates.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
     return candidates[:limit]
+
+
+def income_growth_equity_snapshot(symbol: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    clean_symbol = normalize_income_growth_symbol(symbol)
+    stored = load_income_growth_holding_map()
+    if clean_symbol not in stored:
+        raise ValueError(f"{clean_symbol} is not an Income Growth stock.")
+    kite = kite_orders.kite_client()
+    quote_key = f"NSE:{clean_symbol}"
+    try:
+        quote = kite.quote([quote_key]).get(quote_key, {})
+        holdings = kite.holdings()
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, f"{clean_symbol} equity quote")) from exc
+    ltp = quote_ltp(quote)
+    holding = next(
+        (
+            item
+            for item in holdings
+            if str(item.get("exchange") or "NSE").upper() == "NSE"
+            and str(item.get("tradingsymbol") or "").upper() == clean_symbol
+        ),
+        {},
+    )
+    actual_quantity = int(float(holding.get("quantity") or 0))
+    average_price = float(holding.get("average_price") or 0)
+    if average_price <= 0:
+        investing = next(
+            (
+                item
+                for item in INVESTING_HOLDINGS
+                if normalize_income_growth_symbol(item.get("code")) == clean_symbol
+            ),
+            {},
+        )
+        average_price = float(investing.get("avg_price") or 0)
+    if ltp <= 0:
+        ltp = float(holding.get("last_price") or stored[clean_symbol].get("cmp") or 0)
+    pnl = (ltp - average_price) * actual_quantity if ltp > 0 and average_price > 0 else None
+    return {
+        "symbol": clean_symbol,
+        "quantity": actual_quantity,
+        "average_price": average_price,
+        "ltp": ltp,
+        "pnl": pnl,
+        "return_pct": (pnl / (average_price * actual_quantity) * 100)
+        if pnl is not None and average_price > 0 and actual_quantity > 0
+        else None,
+    }
+
+
+def place_income_growth_equity_order(symbol: str, side: str, quantity: Any) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'Equity order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    clean_symbol = normalize_income_growth_symbol(symbol)
+    clean_side = str(side or "").strip().upper()
+    if clean_side not in {"BUY", "SELL"}:
+        raise ValueError("Select BUY or SELL before placing the equity order.")
+    try:
+        clean_quantity = int(float(quantity))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid whole-number equity quantity.") from exc
+    if clean_quantity <= 0:
+        raise ValueError("Equity quantity must be greater than zero.")
+    snapshot = income_growth_equity_snapshot(clean_symbol)
+    if clean_side == "SELL" and clean_quantity > int(snapshot.get("quantity") or 0):
+        raise ValueError(
+            f"SELL quantity {clean_quantity} exceeds current Kite holding "
+            f"{int(snapshot.get('quantity') or 0)} for {clean_symbol}."
+        )
+    ltp = float(snapshot.get("ltp") or 0)
+    if ltp <= 0:
+        raise ValueError(f"Could not read current LTP for {clean_symbol}.")
+    price = ceil_to_tick(ltp, 0.05) if clean_side == "BUY" else floor_to_tick(ltp, 0.05)
+    order = {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": clean_symbol,
+        "transaction_type": clean_side,
+        "quantity": clean_quantity,
+        "product": "CNC",
+        "order_type": "LIMIT",
+        "price": price,
+        "validity": "DAY",
+        "tag": "INC_GROWTH_EQ",
+    }
+    kite = kite_orders.kite_client()
+    order_id = kite_orders.place_order(kite, order)
+    invalidate_kite_trade_cache()
+    return {
+        "tradingsymbol": clean_symbol,
+        "status": "LIVE_SENT",
+        "order_id": order_id,
+        "detail": (
+            f"{clean_side} {clean_quantity} equity share(s) at LIMIT {price:.2f}; "
+            f"fresh LTP {ltp:.2f}. Active Kite profile: {selected_kite_profile_name()}."
+        ),
+    }
+
+
+def equity_holdings_snapshot() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    try:
+        holdings = kite.holdings()
+        quote_keys = [
+            f"{str(item.get('exchange') or 'NSE').upper()}:{str(item.get('tradingsymbol') or '').upper()}"
+            for item in holdings
+            if str(item.get("tradingsymbol") or "").strip()
+        ]
+        quotes = kite.quote(quote_keys) if quote_keys else {}
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, "Kite equity holdings")) from exc
+    rows: list[dict[str, Any]] = []
+    for holding in holdings:
+        symbol = str(holding.get("tradingsymbol") or "").upper()
+        exchange = str(holding.get("exchange") or "NSE").upper()
+        if not symbol:
+            continue
+        quantity = int(float(holding.get("quantity") or 0)) + int(
+            float(holding.get("t1_quantity") or 0)
+        )
+        average_price = float(holding.get("average_price") or 0)
+        quote = quotes.get(f"{exchange}:{symbol}", {})
+        ltp = quote_ltp(quote) or float(holding.get("last_price") or 0)
+        close_price = float(
+            (quote.get("ohlc") or {}).get("close")
+            or holding.get("close_price")
+            or 0
+        )
+        invested = average_price * quantity
+        market_value = ltp * quantity
+        pnl = market_value - invested
+        net_change_pct = (pnl / invested * 100) if invested else None
+        day_change = ltp - close_price if ltp > 0 and close_price > 0 else None
+        day_change_pct = (
+            (day_change / close_price * 100)
+            if day_change is not None and close_price > 0
+            else None
+        )
+        day_pnl = day_change * quantity if day_change is not None else None
+        rows.append(
+            {
+                "symbol": symbol,
+                "exchange": exchange,
+                "quantity": quantity,
+                "average_price": average_price,
+                "ltp": ltp,
+                "invested": invested,
+                "market_value": market_value,
+                "pnl": pnl,
+                "net_change_pct": net_change_pct,
+                "day_change": day_change,
+                "day_change_pct": day_change_pct,
+                "day_pnl": day_pnl,
+            }
+        )
+    rows.sort(key=lambda item: float(item.get("market_value") or 0), reverse=True)
+    invested_total = sum(float(row.get("invested") or 0) for row in rows)
+    market_total = sum(float(row.get("market_value") or 0) for row in rows)
+    pnl_total = sum(float(row.get("pnl") or 0) for row in rows)
+    day_pnl_total = sum(float(row.get("day_pnl") or 0) for row in rows)
+    summary = {
+        "count": len(rows),
+        "invested": invested_total,
+        "market_value": market_total,
+        "pnl": pnl_total,
+        "net_change_pct": (pnl_total / invested_total * 100) if invested_total else None,
+        "day_pnl": day_pnl_total,
+        "day_change_pct": (
+            day_pnl_total / (market_total - day_pnl_total) * 100
+            if market_total - day_pnl_total
+            else None
+        ),
+        "as_of": datetime.now().strftime("%d %b %Y %H:%M:%S"),
+    }
+    return rows, summary
+
+
+def equity_holding_snapshot(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
+    clean_symbol = str(symbol or "").strip().upper()
+    clean_exchange = str(exchange or "NSE").strip().upper()
+    rows, _ = equity_holdings_snapshot()
+    row = next(
+        (
+            item
+            for item in rows
+            if item["symbol"] == clean_symbol and item["exchange"] == clean_exchange
+        ),
+        None,
+    )
+    if row is None:
+        raise ValueError(f"{clean_exchange}:{clean_symbol} is not in the selected Kite profile holdings.")
+    return row
+
+
+def place_equity_holding_order(
+    symbol: str,
+    exchange: str,
+    side: str,
+    quantity: Any,
+    limit_price: Any,
+) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError('Equity order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.')
+    clean_side = str(side or "").strip().upper()
+    if clean_side not in {"BUY", "SELL"}:
+        raise ValueError("Select BUY or SELL before placing the equity order.")
+    try:
+        clean_quantity = int(float(quantity))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid whole-number equity quantity.") from exc
+    if clean_quantity <= 0:
+        raise ValueError("Equity quantity must be greater than zero.")
+    try:
+        entered_price = float(limit_price)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid limit price.") from exc
+    if entered_price <= 0:
+        raise ValueError("Limit price must be greater than zero. Market orders are not allowed.")
+    snapshot = equity_holding_snapshot(symbol, exchange)
+    if clean_side == "SELL" and clean_quantity > int(snapshot.get("quantity") or 0):
+        raise ValueError(
+            f"SELL quantity {clean_quantity} exceeds current holding "
+            f"{int(snapshot.get('quantity') or 0)} for {snapshot['symbol']}."
+        )
+    price = max(round(entered_price / 0.05) * 0.05, 0.05)
+    order = {
+        "variety": "regular",
+        "exchange": snapshot["exchange"],
+        "tradingsymbol": snapshot["symbol"],
+        "transaction_type": clean_side,
+        "quantity": clean_quantity,
+        "product": "CNC",
+        "order_type": "LIMIT",
+        "price": round(price, 2),
+        "validity": "DAY",
+        "tag": "EQUITY_DESK",
+    }
+    kite = kite_orders.kite_client()
+    order_id = kite_orders.place_order(kite, order)
+    invalidate_kite_trade_cache()
+    ltp = float(snapshot.get("ltp") or 0)
+    price_gap = ((price - ltp) / ltp * 100) if ltp else 0
+    return {
+        "tradingsymbol": snapshot["symbol"],
+        "status": "LIVE_SENT",
+        "order_id": order_id,
+        "detail": (
+            f"{clean_side} {clean_quantity} {snapshot['exchange']} equity share(s) at LIMIT "
+            f"{price:.2f}; fresh LTP {ltp:.2f}; limit {price_gap:+.2f}% vs LTP. "
+            f"Active Kite profile: {selected_kite_profile_name()}."
+        ),
+    }
 
 
 def commodity_etf_by_symbol(symbol: str) -> dict[str, Any]:
@@ -6430,6 +6850,70 @@ def render_order_management_panel(state: PageState) -> str:
     """
 
 
+def render_equity_panel(state: PageState) -> str:
+    if state.active_tab == "equity" and state.equity_rows is None:
+        try:
+            state.equity_rows, state.equity_summary = equity_holdings_snapshot()
+        except Exception as exc:
+            state.error = state.error or f"{exc}\n\n{traceback.format_exc()}"
+    rows = state.equity_rows or []
+    summary = state.equity_summary or {}
+
+    def metric_class(value: Any) -> str:
+        return "pnl-positive" if isinstance(value, (int, float)) and value >= 0 else "pnl-negative" if isinstance(value, (int, float)) else ""
+
+    def pct_text(value: Any) -> str:
+        return f"{float(value):+.2f}%" if isinstance(value, (int, float)) else "N/A"
+
+    summary_cards = "".join(
+        f'<div class="equity-summary-card"><span>{html.escape(label)}</span><strong class="{metric_class(raw) if colored else ""}">{html.escape(value)}</strong><small>{html.escape(detail)}</small></div>'
+        for label, value, detail, raw, colored in [
+            ("Holdings", str(summary.get("count") or 0), f"As of {summary.get('as_of') or 'not refreshed'}", None, False),
+            ("Total investment", format_buy_amount(summary.get("invested")), "Average cost x quantity", summary.get("invested"), False),
+            ("Current value", format_buy_amount(summary.get("market_value")), "Fresh Kite LTP x quantity", summary.get("market_value"), False),
+            ("Day P&L", format_buy_amount(summary.get("day_pnl")), pct_text(summary.get("day_change_pct")), summary.get("day_pnl"), True),
+            ("Total P&L", format_buy_amount(summary.get("pnl")), pct_text(summary.get("net_change_pct")), summary.get("pnl"), True),
+        ]
+    )
+    table_rows = "".join(
+        f'<tr><td><button type="button" class="equity-holding-stock" '
+        f'data-symbol="{html.escape(str(row.get("symbol") or ""), quote=True)}" data-exchange="{html.escape(str(row.get("exchange") or "NSE"), quote=True)}" '
+        f'data-quantity="{html.escape(str(row.get("quantity") or 0), quote=True)}" data-avg="{html.escape(str(row.get("average_price") or 0), quote=True)}" '
+        f'data-ltp="{html.escape(str(row.get("ltp") or 0), quote=True)}" data-pnl="{html.escape(str(row.get("pnl") or 0), quote=True)}">'
+        f'<strong>{html.escape(str(row.get("symbol") or ""))}</strong><span>{html.escape(str(row.get("exchange") or "NSE"))}</span></button></td>'
+        f'<td>{html.escape(fmt_number(row.get("quantity"), 0))}</td><td>{html.escape(fmt_number(row.get("average_price")))}</td>'
+        f'<td><strong>{html.escape(fmt_number(row.get("ltp")))}</strong></td><td>{html.escape(format_buy_amount(row.get("invested")))}</td>'
+        f'<td>{html.escape(format_buy_amount(row.get("market_value")))}</td><td class="{metric_class(row.get("pnl"))}"><strong>{html.escape(format_buy_amount(row.get("pnl")))}</strong></td>'
+        f'<td class="{metric_class(row.get("net_change_pct"))}">{html.escape(pct_text(row.get("net_change_pct")))}</td>'
+        f'<td class="{metric_class(row.get("day_change_pct"))}"><strong>{html.escape(pct_text(row.get("day_change_pct")))}</strong><span>{html.escape(format_buy_amount(row.get("day_pnl")))}</span></td></tr>'
+        for row in rows
+    ) or '<tr><td colspan="9" class="muted-cell">No equity holdings found for the selected Kite profile.</td></tr>'
+    headers = ["Stock", "Qty", "Avg cost", "LTP", "Invested", "Market value", "P&L", "Net change", "Day change"]
+    header_html = "".join(
+        f'<th><button type="button" class="sort-header" data-sort-col="{index}">{html.escape(label)}</button></th>'
+        for index, label in enumerate(headers)
+    )
+    panel_style = "" if state.active_tab == "equity" else ' style="display:none"'
+    return f"""
+    <form id="equity-panel" method="post" action="/equity/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <section class="panel equity-hero"><div><div class="panel-title">Equity Holdings</div><p class="status">Live holdings from the selected Kite profile. Click a stock to place a CNC limit BUY or SELL order.</p></div><button type="submit" formaction="/equity/load">Refresh Holdings</button></section>
+      {render_graceful_error(state.error, "Equity Holdings Error") if state.error else ""}
+      <section class="panel equity-summary-grid">{summary_cards}</section>
+      <section class="panel equity-table-panel"><div class="table-wrap"><table id="equity-holdings-table" class="equity-holdings-table"><thead><tr>{header_html}</tr></thead><tbody>{table_rows}</tbody></table></div></section>
+      {render_results(state.equity_results)}
+      <div class="live-modal-backdrop" id="equity-order-modal"><div class="live-modal equity-order-modal-card">
+        <h2 id="equity-order-title">Equity Limit Order</h2><p class="status">Market orders are disabled. Review the latest Kite holding and LTP before continuing.</p>
+        <div class="income-equity-metrics"><div><span>Current holding</span><strong id="equity-order-holding">--</strong></div><div><span>Average cost</span><strong id="equity-order-avg">--</strong></div><div><span>Live LTP</span><strong id="equity-order-ltp">--</strong></div><div><span>Current P&amp;L</span><strong id="equity-order-pnl">--</strong></div></div>
+        <div class="compact-grid"><label><span>Action</span><select name="equity_side" id="equity-order-side"><option value="BUY">BUY</option><option value="SELL">SELL</option></select></label><label><span>Quantity</span><input name="equity_quantity" id="equity-order-quantity" type="number" min="1" step="1" value="1"></label><label><span>Limit price</span><input name="equity_limit_price" id="equity-order-price" type="number" min="0.05" step="0.05"></label><div class="equity-price-gap"><span>Limit vs CMP</span><strong id="equity-order-gap">--</strong></div></div>
+        <input type="hidden" name="equity_symbol" id="equity-order-symbol"><input type="hidden" name="equity_exchange" id="equity-order-exchange"><input type="hidden" name="equity_confirmed" id="equity-order-confirmed" value="0">
+        <div class="income-equity-order-summary" id="equity-order-summary">Enter quantity and limit price.</div><div class="breath-circle equity-order-breath" id="equity-order-breath"></div><div class="breath-text" id="equity-order-breath-text">Review order first</div><div class="countdown" id="equity-order-countdown">10</div>
+        <div class="modal-actions"><button type="button" class="secondary" id="equity-order-cancel">Cancel</button><button type="button" id="equity-order-review">Submit &amp; Start 10s</button><button type="submit" class="danger" formaction="/equity/order" id="equity-order-go" disabled>GO</button></div>
+      </div></div>
+      {render_console(state.console_log)}
+    </form>"""
+
+
 def render_signal_cell(value: str) -> str:
     class_name = "signal-good" if value.strip().lower() == "good" else ""
     return f'<td class="{class_name}">{html.escape(value)}</td>'
@@ -6693,9 +7177,23 @@ def render_income_growth_panel(state: PageState) -> str:
             ("Updated", str(summary.get("as_of") or "Not refreshed"), "manual refresh only"),
         ]
     )
+    def equity_stock_button(row: dict[str, Any]) -> str:
+        symbol = str(row.get("symbol") or "").upper()
+        company = str(row.get("company") or "")
+        return (
+            f'<button type="button" class="income-equity-stock" '
+            f'data-symbol="{html.escape(symbol, quote=True)}" '
+            f'data-company="{html.escape(company, quote=True)}" '
+            f'data-holding="{html.escape(str(row.get("quantity") or 0), quote=True)}" '
+            f'data-avg="{html.escape(str(row.get("avg_price") or 0), quote=True)}" '
+            f'data-ltp="{html.escape(str(row.get("cmp") or 0), quote=True)}" '
+            f'data-pnl="{html.escape(str(row.get("pnl") or 0), quote=True)}">'
+            f'<strong>{html.escape(symbol)}</strong><span>{html.escape(company)}</span>'
+            "</button>"
+        )
     table_rows = "".join(
         "<tr>"
-        f'<td class="position-symbol-cell">{render_symbol_value("tradingsymbol", row.get("symbol", ""))}<span>{html.escape(str(row.get("company", "")))}</span></td>'
+        f'<td class="position-symbol-cell">{equity_stock_button(row)}</td>'
         f"<td>{html.escape(str(row.get('quantity', '')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('times_lot'), 2))}</td>"
         f"<td><strong>{html.escape(str(row.get('covered_lots', row.get('lots_can_sell_input', 0))))}</strong></td>"
@@ -6760,7 +7258,6 @@ def render_income_growth_panel(state: PageState) -> str:
         f'Buffer {html.escape(fmt_number(item.get("put_down_pct"), 1))}% | '
         f'Cash {html.escape(format_buy_amount(item.get("cash_required")))}</p>'
         f'<small>{html.escape(" | ".join(str(reason) for reason in item.get("reasons", [])))}</small>'
-        f'<em>{html.escape(str(item.get("future_call_note", "")))}</em>'
         "</div>"
         for item in pe_candidates
     )
@@ -6817,15 +7314,48 @@ def render_income_growth_panel(state: PageState) -> str:
       {gpt_result}
       <section class="panel income-growth-pe-panel">
         <div class="panel-title">Top 3 PE Sell Candidates For Today</div>
-        <div class="status">Shortlisted for cash-secured PUT selling first; if assigned, these can later become covered-CALL income holdings.</div>
+        <div class="status">Ranked by cash required, PUT strike buffer, valuation PE, 52-week position, and recent price trend. Only the three highest scores are shown.</div>
         <div class="pe-candidate-grid">{pe_cards}</div>
       </section>
       <section class="panel income-growth-table-panel">
         <div class="panel-title">Covered Call Capacity Score From Current Holding Sheet</div>
-        <div class="status">Uses your holding shares, lot multiple, lots can be sold, CMP, call strike, PE, 52W, 1Y, monthly, weekly, and today move. Kite option quotes enrich the live premium when available.</div>
+        <div class="status">Click a stock name to BUY or SELL equity through the selected Kite profile. Uses your holding shares, lot multiple, lots can be sold, CMP, call strike, PE, 52W, 1Y, monthly, weekly, and today move.</div>
         <div class="table-wrap"><table id="income-growth-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{table_rows}</tbody></table></div>
       </section>
+      {render_results(state.income_growth_equity_results)}
       {update_form_html}
+      <div class="live-modal-backdrop" id="income-equity-modal">
+        <div class="live-modal income-equity-modal-card">
+          <h2 id="income-equity-title">Income Growth Equity Order</h2>
+          <p class="status">NSE equity order using CNC, LIMIT, DAY. The price is refreshed from Kite before execution.</p>
+          <div class="income-equity-metrics">
+            <div><span>Current holding</span><strong id="income-equity-holding">--</strong></div>
+            <div><span>Average buy price</span><strong id="income-equity-avg">--</strong></div>
+            <div><span>Live LTP</span><strong id="income-equity-ltp">--</strong></div>
+            <div><span>Current P&amp;L</span><strong id="income-equity-pnl">--</strong></div>
+          </div>
+          <div class="compact-grid">
+            <label><span>Action</span>
+              <select name="income_growth_equity_side" id="income-equity-side">
+                <option value="BUY">BUY</option>
+                <option value="SELL">SELL</option>
+              </select>
+            </label>
+            <label><span>Stock quantity</span><input name="income_growth_equity_quantity" id="income-equity-quantity" type="number" min="1" step="1" value="1"></label>
+          </div>
+          <input type="hidden" name="income_growth_equity_symbol" id="income-equity-symbol">
+          <input type="hidden" name="income_growth_equity_confirmed" id="income-equity-confirmed" value="0">
+          <div class="income-equity-order-summary" id="income-equity-order-summary">Select BUY or SELL and enter quantity.</div>
+          <div class="breath-circle income-equity-breath" id="income-equity-breath"></div>
+          <div class="breath-text" id="income-equity-breath-text">Review order first</div>
+          <div class="countdown" id="income-equity-countdown">10</div>
+          <div class="modal-actions">
+            <button type="button" class="secondary" id="income-equity-cancel">Cancel</button>
+            <button type="button" id="income-equity-review">Review &amp; Start 10s</button>
+            <button type="submit" class="danger" formaction="/income-growth/equity-order" id="income-equity-execute" disabled>Execute Equity Order</button>
+          </div>
+        </div>
+      </div>
       <div class="live-modal-backdrop" id="income-growth-gpt-modal">
         <div class="live-modal income-growth-prompt-modal">
           <h2>Modify Income Growth GPT Prompt</h2>
@@ -7744,6 +8274,7 @@ def render_income_panel(state: PageState) -> str:
 
 def env_hidden_fields_for_render() -> str:
     return (
+        f'<input type="hidden" name="kite_profile" value="{html.escape(selected_kite_profile_name(), quote=True)}">'
         f'<input type="hidden" name="api_key" value="{html.escape(env_value("KITE_API_KEY"), quote=True)}">'
         f'<input type="hidden" name="api_secret" value="{html.escape(env_value("KITE_API_SECRET"), quote=True)}">'
         f'<input type="hidden" name="access_token" value="{html.escape(env_value("KITE_ACCESS_TOKEN"), quote=True)}">'
@@ -7977,10 +8508,54 @@ def render_page(state: PageState) -> bytes:
     order_management_tab_class = "active" if state.active_tab == "order-management" else ""
     investing_tab_class = "active" if state.active_tab == "investing" else ""
     income_growth_tab_class = "active" if state.active_tab == "income-growth" else ""
+    equity_tab_class = "active" if state.active_tab == "equity" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
     kite_setup_panel_style = "" if state.active_tab == "kite-setup" else ' style="display:none"'
     home_market_html = render_market_topper(state) if state.active_tab == "home" else ""
+    kite_profiles = load_kite_profiles()
+    active_kite_profile = selected_kite_profile_name(state.kite_profile)
+    active_kite_values = kite_profiles.get(active_kite_profile, blank_kite_profile())
+    active_profile_ready = all(
+        str(active_kite_values.get(key) or "").strip()
+        for key in ("KITE_API_KEY", "KITE_API_SECRET", "KITE_ACCESS_TOKEN")
+    )
+    active_profile_class = "ready" if active_profile_ready else "needs-setup"
+    active_profile_hint = "Ready" if active_profile_ready else "Setup needed"
+    if state.active_tab == "kite-setup":
+        active_kite_values = {
+            "KITE_API_KEY": state.api_key
+            if state.api_key != ""
+            else active_kite_values.get("KITE_API_KEY", ""),
+            "KITE_API_SECRET": state.api_secret
+            if state.api_secret != ""
+            else active_kite_values.get("KITE_API_SECRET", ""),
+            "KITE_ACCESS_TOKEN": state.access_token
+            if state.access_token != ""
+            else active_kite_values.get("KITE_ACCESS_TOKEN", ""),
+            "KITE_CONFIRM_LIVE_ORDER": state.confirm_live_order
+            if state.confirm_live_order != ""
+            else active_kite_values.get("KITE_CONFIRM_LIVE_ORDER", "YES"),
+        }
+        kite_profiles[active_kite_profile] = active_kite_values
+    kite_profiles_json = html.escape(json.dumps(kite_profiles), quote=True)
+    profile_options = "".join(
+        f'<option value="{html.escape(name, quote=True)}"{" selected" if name == active_kite_profile else ""}>{html.escape(name)}</option>'
+        for name in KITE_PROFILE_NAMES
+    )
+    active_login_url = (
+        "https://kite.zerodha.com/connect/login?"
+        f"api_key={quote_plus(active_kite_values.get('KITE_API_KEY') or '')}&v=3"
+    )
+    def kite_env_input(name: str, label: str, env_key: str, input_type: str = "text") -> str:
+        safe_value = html.escape(active_kite_values.get(env_key, ""), quote=True)
+        secret_class = " secret-field" if input_type == "password" else ""
+        input_id = f"kite-{name.replace('_', '-')}"
+        return (
+            f'<label><span>{html.escape(label)}</span>'
+            f'<input id="{input_id}" class="{secret_class}" name="{name}" type="{input_type}" '
+            f'value="{safe_value}" autocomplete="off"></label>'
+        )
     env_panel = f"""
         <section class="panel kite-setup-hero">
           <div>
@@ -7993,11 +8568,22 @@ def render_page(state: PageState) -> bytes:
           <section class="panel kite-setup-card credential-card">
             <div class="setup-card-kicker">01</div>
             <div class="panel-title">Environment</div>
+            <div class="profile-selector-row">
+              <label><span>Kite Profile</span>
+                <select id="kite-profile-select" name="kite_profile" data-profiles="{kite_profiles_json}" autocomplete="off">
+                  {profile_options}
+                </select>
+              </label>
+              <div class="profile-note">
+                <strong id="kite-profile-note-name">{html.escape(active_kite_profile)}</strong>
+                <span id="kite-profile-note-status">credentials are used for login, token generation, quotes, and order actions.</span>
+              </div>
+            </div>
             <div class="compact-grid">
-              {render_input("api_key", "KITE_API_KEY", state.api_key or env_value("KITE_API_KEY"))}
-              {render_input("confirm_live_order", "KITE_CONFIRM_LIVE_ORDER", state.confirm_live_order or env_value("KITE_CONFIRM_LIVE_ORDER"))}
-              {render_input("api_secret", "KITE_API_SECRET", state.api_secret or env_value("KITE_API_SECRET"), "password")}
-              {render_input("access_token", "KITE_ACCESS_TOKEN", state.access_token or env_value("KITE_ACCESS_TOKEN"), "password")}
+              {kite_env_input("api_key", "KITE_API_KEY", "KITE_API_KEY")}
+              {kite_env_input("confirm_live_order", "KITE_CONFIRM_LIVE_ORDER", "KITE_CONFIRM_LIVE_ORDER")}
+              {kite_env_input("api_secret", "KITE_API_SECRET", "KITE_API_SECRET", "password")}
+              {kite_env_input("access_token", "KITE_ACCESS_TOKEN", "KITE_ACCESS_TOKEN", "password")}
             </div>
             <div class="actions compact-actions">
               <button type="submit" formaction="/kite-token/save">Save Access Token</button>
@@ -8009,7 +8595,7 @@ def render_page(state: PageState) -> bytes:
             <div class="panel-title">Access Token</div>
             <p class="status">Open Kite login, paste the full redirected URL or only <code>request_token</code>, then generate and save today's token.</p>
             <div class="actions">
-              <a class="button-link" href="{html.escape(kite_login_url(), quote=True)}" target="_blank" rel="noopener">Open Kite Login</a>
+              <a id="kite-login-link" class="button-link" href="{html.escape(active_login_url, quote=True)}" target="_blank" rel="noopener">Open Kite Login</a>
             </div>
             {render_input("kite_request_token", "Redirected URL or request_token", state.kite_request_token)}
             <div class="actions">
@@ -8139,6 +8725,26 @@ def render_page(state: PageState) -> bytes:
       border-radius: 999px;
       background: rgba(255, 255, 255, 0.08);
       border: 1px solid rgba(254, 243, 199, 0.18);
+    }}
+    .profile-header-pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      border: 1px solid rgba(153, 246, 228, 0.32);
+      background: rgba(236, 254, 255, 0.12);
+      color: #e0f2fe;
+      font-size: 11px;
+      font-weight: 900;
+      line-height: 1;
+    }}
+    .profile-header-pill.ready strong {{ color: #bbf7d0; }}
+    .profile-header-pill.needs-setup strong {{ color: #fecaca; }}
+    .profile-header-pill span {{
+      color: #cbd5e1;
+      font-weight: 800;
     }}
     main {{
       width: min(1480px, calc(100vw - 28px));
@@ -9192,6 +9798,88 @@ def render_page(state: PageState) -> bytes:
       vertical-align: top;
       border: 1px solid rgba(15, 118, 110, 0.18);
     }}
+    .income-equity-stock {{
+      width: 100%;
+      border: 0;
+      padding: 0;
+      text-align: left;
+      color: #00786f;
+      background: transparent;
+      box-shadow: none;
+      cursor: pointer;
+    }}
+    .income-equity-stock:hover strong {{ text-decoration: underline; }}
+    .income-equity-stock strong,
+    .income-equity-stock span {{ display: block; }}
+    .income-equity-stock strong {{ font-size: 13px; }}
+    .income-equity-stock span {{
+      margin-top: 2px;
+      color: #49627d;
+      font-size: 9px;
+      font-weight: 700;
+    }}
+    .income-equity-modal-card {{ width: min(680px, calc(100vw - 24px)); }}
+    .equity-hero {{
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      border-left: 5px solid #0284c7; background: linear-gradient(120deg, #eff6ff, #ecfdf5);
+    }}
+    .equity-summary-grid {{ display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 10px; }}
+    .equity-summary-card {{ padding: 10px 12px; border: 1px solid #bae6fd; border-radius: 8px; background: #f8fafc; }}
+    .equity-summary-card span, .equity-summary-card strong, .equity-summary-card small {{ display: block; }}
+    .equity-summary-card span {{ color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; }}
+    .equity-summary-card strong {{ margin: 4px 0; font-size: 19px; color: #0f172a; }}
+    .equity-summary-card small {{ color: var(--muted); font-size: 11px; }}
+    .equity-holdings-table {{ min-width: 1040px; }}
+    .equity-holdings-table th, .equity-holdings-table td {{ padding: 9px 10px; border-right: 1px solid #dbe7ea; }}
+    .equity-holdings-table td span {{ display: block; font-size: 10px; color: var(--muted); }}
+    .equity-holdings-table .sort-header {{ border: 0; padding: 0; background: transparent; color: inherit; box-shadow: none; font: inherit; font-weight: 800; text-align: left; }}
+    .equity-holdings-table .sort-header::after {{ content: " ↕"; opacity: 0.65; }}
+    .equity-holding-stock {{ border: 0; padding: 0; background: transparent; box-shadow: none; color: #047857; text-align: left; cursor: pointer; }}
+    .equity-holding-stock:hover strong {{ text-decoration: underline; }}
+    .equity-holding-stock strong, .equity-holding-stock span {{ display: block; }}
+    .equity-order-modal-card {{ width: min(700px, calc(100vw - 24px)); }}
+    .equity-order-breath {{ display: none; }}
+    .equity-order-breath.active {{ display: block; }}
+    .equity-price-gap {{ padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: #f8fafc; }}
+    .equity-price-gap span, .equity-price-gap strong {{ display: block; }}
+    .equity-price-gap span {{ color: var(--muted); font-size: 11px; }}
+    .equity-price-gap strong {{ margin-top: 5px; font-size: 17px; }}
+    .income-equity-metrics {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(110px, 1fr));
+      gap: 8px;
+      margin: 12px 0;
+    }}
+    .income-equity-metrics div {{
+      padding: 10px;
+      border: 1px solid #bde8e3;
+      border-radius: 9px;
+      background: #f8fafc;
+    }}
+    .income-equity-metrics span,
+    .income-equity-metrics strong {{ display: block; }}
+    .income-equity-metrics span {{
+      color: #64748b;
+      font-size: 10px;
+      font-weight: 850;
+      text-transform: uppercase;
+    }}
+    .income-equity-metrics strong {{
+      margin-top: 5px;
+      color: #083344;
+      font-size: 18px;
+    }}
+    .income-equity-order-summary {{
+      margin: 12px 0;
+      padding: 10px;
+      border: 1px solid #99f6e4;
+      border-radius: 9px;
+      color: #0f766e;
+      background: #ecfdf5;
+      font-weight: 850;
+    }}
+    .income-equity-breath {{ display: none; }}
+    .income-equity-breath.active {{ display: block; }}
     .investing-core-pill {{
       display: inline-flex;
       border-radius: 999px;
@@ -9438,6 +10126,12 @@ def render_page(state: PageState) -> bytes:
       --tab-b: #dcfce7;
       --tab-ink: #0f766e;
       --tab-shadow: rgba(20, 184, 166, 0.16);
+    }}
+    .tab-button[data-tab="equity"] {{
+      --tab-a: #dbeafe;
+      --tab-b: #dcfce7;
+      --tab-ink: #075985;
+      --tab-shadow: rgba(14, 116, 144, 0.16);
     }}
     .tab-button[data-tab="investing"] {{
       --tab-a: #dbeafe;
@@ -9797,6 +10491,39 @@ def render_page(state: PageState) -> bytes:
     .token-card {{ border-color: #bfdbfe; }}
     .etf-card {{ border-color: #bbf7d0; }}
     .ip-card {{ border-color: #fde68a; }}
+    .profile-selector-row {{
+      display: grid;
+      grid-template-columns: minmax(220px, 0.45fr) 1fr;
+      gap: 10px;
+      align-items: end;
+      margin: 6px 0 12px;
+    }}
+    .profile-selector-row select {{
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid #bde8e3;
+      border-radius: 9px;
+      padding: 8px 10px;
+      background: #f8fafc;
+      color: #083344;
+      font-weight: 900;
+    }}
+    .profile-note {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      padding: 9px 10px;
+      border: 1px solid #99f6e4;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #ecfeff, #f0fdf4);
+      color: #475569;
+      font-size: 12px;
+    }}
+    .profile-note strong {{
+      color: #0f766e;
+      font-size: 14px;
+    }}
     .kite-action-preview {{
       margin-top: 8px;
       padding: 10px;
@@ -11032,12 +11759,15 @@ def render_page(state: PageState) -> bytes:
       .analytics-command-head {{ grid-template-columns: 1fr; }}
       .analytics-two-column {{ grid-template-columns: 1fr; }}
       .home-hero {{ grid-template-columns: 1fr; }}
+      .income-equity-metrics {{ grid-template-columns: repeat(2, minmax(110px, 1fr)); }}
       .home-hero h2 {{ font-size: 20px; }}
       .home-pnl-strip {{ grid-template-columns: 1fr; }}
       .home-decision-grid {{ grid-template-columns: 1fr; }}
       .home-action-grid {{ grid-template-columns: 1fr; }}
       .investing-hero-panel {{ align-items: flex-start; flex-direction: column; }}
       .investing-summary-panel .summary-grid {{ grid-template-columns: 1fr; }}
+      .equity-hero {{ align-items: flex-start; flex-direction: column; }}
+      .equity-summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .position-summary-strip {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .position-summary-chip {{ align-items: flex-start; flex-direction: column; gap: 4px; }}
       .compact-rules {{ grid-template-columns: 1fr; }}
@@ -11065,6 +11795,10 @@ def render_page(state: PageState) -> bytes:
       <div>
         <h1>Income Desk</h1>
         <p>Wheel income, positions, ETF actions, and calm execution.</p>
+        <div class="profile-header-pill {active_profile_class}">
+          Kite profile: <strong>{html.escape(active_kite_profile)}</strong>
+          <span>{html.escape(active_profile_hint)}</span>
+        </div>
       </div>
     </div>
     <div class="blessing">&#2384; | Jai Sri Ram | Jai Laxmi Mata</div>
@@ -11080,6 +11814,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
       <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Modify / Cancel</button>
       <button class="tab-button utility-action {investing_tab_class}" type="button" data-tab="investing">Investing</button>
+      <button class="tab-button utility-action {equity_tab_class}" type="button" data-tab="equity">Equity</button>
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
@@ -11177,6 +11912,7 @@ def render_page(state: PageState) -> bytes:
     {render_research_panel(state)}
     {render_income_panel(state)}
     {render_investing_panel(state)}
+    {render_equity_panel(state)}
     {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
   </main>
@@ -11266,6 +12002,49 @@ def render_page(state: PageState) -> bytes:
         field.type = 'text';
       }}
     }}
+    const kiteProfileSelect = document.getElementById('kite-profile-select');
+    const kiteLoginLink = document.getElementById('kite-login-link');
+    const kiteProfileNoteName = document.getElementById('kite-profile-note-name');
+    const kiteProfileNoteStatus = document.getElementById('kite-profile-note-status');
+    function setInputValue(id, value) {{
+      const input = document.getElementById(id);
+      if (input) input.value = value || '';
+    }}
+    function updateKiteLoginLink(apiKey) {{
+      if (!kiteLoginLink) return;
+      const cleanKey = String(apiKey || '').trim();
+      kiteLoginLink.href = 'https://kite.zerodha.com/connect/login?api_key='
+        + encodeURIComponent(cleanKey)
+        + '&v=3';
+    }}
+    function applySelectedKiteProfile() {{
+      if (!kiteProfileSelect) return;
+      let profiles = {{}};
+      try {{
+        profiles = JSON.parse(kiteProfileSelect.dataset.profiles || '{{}}');
+      }} catch (error) {{
+        profiles = {{}};
+      }}
+      const profile = profiles[kiteProfileSelect.value] || {{}};
+      setInputValue('kite-api-key', profile.KITE_API_KEY);
+      setInputValue('kite-api-secret', profile.KITE_API_SECRET);
+      setInputValue('kite-access-token', profile.KITE_ACCESS_TOKEN);
+      setInputValue('kite-confirm-live-order', profile.KITE_CONFIRM_LIVE_ORDER || 'YES');
+      updateKiteLoginLink(profile.KITE_API_KEY);
+      const ready = Boolean(
+        String(profile.KITE_API_KEY || '').trim()
+        && String(profile.KITE_API_SECRET || '').trim()
+        && String(profile.KITE_ACCESS_TOKEN || '').trim()
+      );
+      if (kiteProfileNoteName) kiteProfileNoteName.textContent = kiteProfileSelect.value;
+      if (kiteProfileNoteStatus) {{
+        kiteProfileNoteStatus.textContent = ready
+          ? 'profile ready for login, quotes, and order actions.'
+          : 'profile needs API key, secret, and today\\'s access token.';
+      }}
+    }}
+    kiteProfileSelect && kiteProfileSelect.addEventListener('change', applySelectedKiteProfile);
+    applySelectedKiteProfile();
     const investingTable = document.getElementById('investing-holdings-table');
     function numericTableValue(cell) {{
       const text = (cell && cell.textContent ? cell.textContent : '').replace(/,/g, '');
@@ -11315,6 +12094,7 @@ def render_page(state: PageState) -> bytes:
     }}
     enableTableSorting(investingTable);
     enableTableSorting(document.getElementById('income-growth-table'));
+    enableTableSorting(document.getElementById('equity-holdings-table'));
     const ordersSelectAll = document.getElementById('orders-select-all');
     const ordersUnselectAll = document.getElementById('orders-unselect-all');
     function setOrderCheckboxes(checked) {{
@@ -11368,6 +12148,7 @@ def render_page(state: PageState) -> bytes:
           research: '/research',
           income: '/income',
           investing: '/investing',
+          equity: '/equity',
           'income-growth': '/income-growth',
           commodity: '/commodity',
           'order-management': '/orders',
@@ -11388,6 +12169,7 @@ def render_page(state: PageState) -> bytes:
         document.getElementById('research-panel').style.display = active === 'research' ? '' : 'none';
         document.getElementById('income-panel').style.display = active === 'income' ? '' : 'none';
         document.getElementById('investing-panel').style.display = active === 'investing' ? '' : 'none';
+        document.getElementById('equity-panel').style.display = active === 'equity' ? '' : 'none';
         document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
         document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
         for (const item of document.querySelectorAll('.tab-button')) {{
@@ -11410,6 +12192,21 @@ def render_page(state: PageState) -> bytes:
       if (!isKiteSetupError(message)) return;
       const setupTab = document.querySelector('.tab-button[data-tab="kite-setup"]');
       if (setupTab) setupTab.click();
+    }}
+    function compactClientError(message, fallback) {{
+      const text = String(message || '').trim();
+      if (!text) return fallback || 'Data unavailable.';
+      const lower = text.toLowerCase();
+      if (lower.includes('getaddrinfo') || lower.includes('failed to resolve') || lower.includes('name resolution')) {{
+        return 'Network/DNS error: this machine cannot resolve Kite or market-data hosts. Check internet/DNS, then refresh.';
+      }}
+      if (lower.includes('api_key') || lower.includes('access_token') || lower.includes('invalid session')) {{
+        return 'Kite authentication error: confirm the active Kite profile and regenerate today\\'s access token.';
+      }}
+      if (lower.includes('timed out') || lower.includes('timeout')) {{
+        return 'Network timeout: retry after a few seconds.';
+      }}
+      return text.length > 240 ? text.slice(0, 240) + '...' : text;
     }}
     const isHomePage = window.location.pathname === '/home';
     const executeButton = document.getElementById('execute-selected-button');
@@ -11441,12 +12238,267 @@ def render_page(state: PageState) -> bytes:
     const incomeGrowthGptCancel = document.getElementById('income-growth-gpt-cancel');
     const incomeGrowthGptRefresh = document.getElementById('income-growth-gpt-refresh');
     const incomeGrowthForceGpt = document.getElementById('income-growth-force-gpt');
+    const equityOrderModal = document.getElementById('equity-order-modal');
+    const equityOrderTitle = document.getElementById('equity-order-title');
+    const equityOrderSymbol = document.getElementById('equity-order-symbol');
+    const equityOrderExchange = document.getElementById('equity-order-exchange');
+    const equityOrderSide = document.getElementById('equity-order-side');
+    const equityOrderQuantity = document.getElementById('equity-order-quantity');
+    const equityOrderPrice = document.getElementById('equity-order-price');
+    const equityOrderConfirmed = document.getElementById('equity-order-confirmed');
+    const equityOrderHolding = document.getElementById('equity-order-holding');
+    const equityOrderAvg = document.getElementById('equity-order-avg');
+    const equityOrderLtp = document.getElementById('equity-order-ltp');
+    const equityOrderPnl = document.getElementById('equity-order-pnl');
+    const equityOrderGap = document.getElementById('equity-order-gap');
+    const equityOrderSummary = document.getElementById('equity-order-summary');
+    const equityOrderReview = document.getElementById('equity-order-review');
+    const equityOrderGo = document.getElementById('equity-order-go');
+    const equityOrderCancel = document.getElementById('equity-order-cancel');
+    const equityOrderCountdown = document.getElementById('equity-order-countdown');
+    const equityOrderBreathText = document.getElementById('equity-order-breath-text');
+    const equityOrderBreath = document.getElementById('equity-order-breath');
+    const incomeEquityModal = document.getElementById('income-equity-modal');
+    const incomeEquityTitle = document.getElementById('income-equity-title');
+    const incomeEquitySymbol = document.getElementById('income-equity-symbol');
+    const incomeEquitySide = document.getElementById('income-equity-side');
+    const incomeEquityQuantity = document.getElementById('income-equity-quantity');
+    const incomeEquityConfirmed = document.getElementById('income-equity-confirmed');
+    const incomeEquityHolding = document.getElementById('income-equity-holding');
+    const incomeEquityAvg = document.getElementById('income-equity-avg');
+    const incomeEquityLtp = document.getElementById('income-equity-ltp');
+    const incomeEquityPnl = document.getElementById('income-equity-pnl');
+    const incomeEquitySummary = document.getElementById('income-equity-order-summary');
+    const incomeEquityReview = document.getElementById('income-equity-review');
+    const incomeEquityExecute = document.getElementById('income-equity-execute');
+    const incomeEquityCancel = document.getElementById('income-equity-cancel');
+    const incomeEquityCountdown = document.getElementById('income-equity-countdown');
+    const incomeEquityBreathText = document.getElementById('income-equity-breath-text');
+    const incomeEquityBreath = document.getElementById('income-equity-breath');
     let pendingLiveSubmit = false;
     let countdownTimer = null;
     let pendingCommodityForm = null;
     let commodityCountdownTimer = null;
     let pendingPositionSubmit = false;
     let positionCountdownTimer = null;
+    let equityOrderCountdownTimer = null;
+    let equityOrderSnapshot = null;
+    let incomeEquityCountdownTimer = null;
+    let incomeEquitySnapshot = null;
+    function stopEquityOrderCountdown() {{
+      if (equityOrderCountdownTimer) {{
+        clearInterval(equityOrderCountdownTimer);
+        equityOrderCountdownTimer = null;
+      }}
+    }}
+    function resetEquityOrderConfirmation() {{
+      stopEquityOrderCountdown();
+      if (equityOrderConfirmed) equityOrderConfirmed.value = '0';
+      if (equityOrderGo) equityOrderGo.disabled = true;
+      if (equityOrderCountdown) equityOrderCountdown.textContent = '10';
+      if (equityOrderBreathText) equityOrderBreathText.textContent = 'Review order first';
+      if (equityOrderBreath) equityOrderBreath.classList.remove('active');
+    }}
+    function updateEquityOrderSummary() {{
+      if (!equityOrderSummary) return;
+      const side = equityOrderSide ? equityOrderSide.value : 'BUY';
+      const quantity = Number(equityOrderQuantity ? equityOrderQuantity.value : 0);
+      const limit = Number(equityOrderPrice ? equityOrderPrice.value : 0);
+      const ltp = Number(equityOrderSnapshot && equityOrderSnapshot.ltp || 0);
+      const holding = Number(equityOrderSnapshot && equityOrderSnapshot.quantity || 0);
+      const gap = ltp > 0 && limit > 0 ? ((limit - ltp) / ltp) * 100 : 0;
+      if (equityOrderGap) {{
+        equityOrderGap.textContent = ltp > 0 && limit > 0 ? `${{gap >= 0 ? '+' : ''}}${{gap.toFixed(2)}}%` : '--';
+        equityOrderGap.className = gap >= 0 ? 'pnl-positive' : 'pnl-negative';
+      }}
+      equityOrderSummary.textContent = `${{side}} ${{quantity || 0}} ${{equityOrderSymbol ? equityOrderSymbol.value : ''}} at LIMIT ${{limit.toFixed(2)}} | LTP ${{ltp.toFixed(2)}} | Holding ${{holding}}`;
+      equityOrderSummary.classList.toggle('signal-red', side === 'SELL' && quantity > holding);
+    }}
+    async function openEquityOrderModal(button) {{
+      if (!equityOrderModal) return;
+      resetEquityOrderConfirmation();
+      const symbol = button.dataset.symbol || '';
+      const exchange = button.dataset.exchange || 'NSE';
+      equityOrderSnapshot = {{ symbol, exchange, quantity: Number(button.dataset.quantity || 0), average_price: Number(button.dataset.avg || 0), ltp: Number(button.dataset.ltp || 0), pnl: Number(button.dataset.pnl || 0) }};
+      equityOrderModal.style.display = 'flex';
+      if (equityOrderTitle) equityOrderTitle.textContent = `${{symbol}} Equity Limit Order`;
+      if (equityOrderSymbol) equityOrderSymbol.value = symbol;
+      if (equityOrderExchange) equityOrderExchange.value = exchange;
+      if (equityOrderSide) equityOrderSide.value = 'BUY';
+      if (equityOrderQuantity) equityOrderQuantity.value = '1';
+      if (equityOrderPrice) equityOrderPrice.value = (Math.round(Number(equityOrderSnapshot.ltp || 0) / 0.05) * 0.05).toFixed(2);
+      if (equityOrderHolding) equityOrderHolding.textContent = String(equityOrderSnapshot.quantity);
+      if (equityOrderAvg) equityOrderAvg.textContent = Number(equityOrderSnapshot.average_price || 0).toFixed(2);
+      if (equityOrderLtp) equityOrderLtp.textContent = Number(equityOrderSnapshot.ltp || 0).toFixed(2);
+      if (equityOrderPnl) equityOrderPnl.textContent = Number(equityOrderSnapshot.pnl || 0).toFixed(2);
+      updateEquityOrderSummary();
+      try {{
+        const response = await fetch(`/equity/quote?symbol=${{encodeURIComponent(symbol)}}&exchange=${{encodeURIComponent(exchange)}}`, {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not refresh equity holding');
+        equityOrderSnapshot = data;
+        if (equityOrderHolding) equityOrderHolding.textContent = String(data.quantity || 0);
+        if (equityOrderAvg) equityOrderAvg.textContent = Number(data.average_price || 0).toFixed(2);
+        if (equityOrderLtp) equityOrderLtp.textContent = Number(data.ltp || 0).toFixed(2);
+        if (equityOrderPnl) {{
+          equityOrderPnl.textContent = Number(data.pnl || 0).toFixed(2);
+          equityOrderPnl.className = Number(data.pnl || 0) >= 0 ? 'pnl-positive' : 'pnl-negative';
+        }}
+        if (equityOrderPrice) equityOrderPrice.value = (Math.round(Number(data.ltp || 0) / 0.05) * 0.05).toFixed(2);
+        updateEquityOrderSummary();
+      }} catch (error) {{
+        if (equityOrderSummary) equityOrderSummary.textContent = compactClientError(error.message, 'Could not refresh equity holding');
+      }}
+    }}
+    for (const button of document.querySelectorAll('.equity-holding-stock')) {{
+      button.addEventListener('click', () => openEquityOrderModal(button));
+    }}
+    for (const input of [equityOrderSide, equityOrderQuantity, equityOrderPrice]) {{
+      input && input.addEventListener(input === equityOrderPrice || input === equityOrderQuantity ? 'input' : 'change', () => {{
+        resetEquityOrderConfirmation();
+        updateEquityOrderSummary();
+      }});
+    }}
+    equityOrderCancel && equityOrderCancel.addEventListener('click', () => {{
+      resetEquityOrderConfirmation();
+      if (equityOrderModal) equityOrderModal.style.display = 'none';
+    }});
+    equityOrderReview && equityOrderReview.addEventListener('click', () => {{
+      const quantity = Number(equityOrderQuantity ? equityOrderQuantity.value : 0);
+      const limit = Number(equityOrderPrice ? equityOrderPrice.value : 0);
+      const holding = Number(equityOrderSnapshot && equityOrderSnapshot.quantity || 0);
+      const side = equityOrderSide ? equityOrderSide.value : '';
+      if (!Number.isInteger(quantity) || quantity <= 0 || !Number.isFinite(limit) || limit <= 0) {{
+        if (equityOrderSummary) equityOrderSummary.textContent = 'Enter a valid whole-number quantity and a positive limit price.';
+        return;
+      }}
+      if (side === 'SELL' && quantity > holding) {{
+        if (equityOrderSummary) equityOrderSummary.textContent = `SELL blocked: quantity ${{quantity}} exceeds current holding ${{holding}}.`;
+        return;
+      }}
+      resetEquityOrderConfirmation();
+      let remaining = 10;
+      if (equityOrderBreath) equityOrderBreath.classList.add('active');
+      if (equityOrderBreathText) equityOrderBreathText.textContent = 'Breathe in';
+      equityOrderCountdownTimer = setInterval(() => {{
+        remaining -= 1;
+        if (equityOrderCountdown) equityOrderCountdown.textContent = String(Math.max(remaining, 0));
+        if (equityOrderBreathText) equityOrderBreathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          stopEquityOrderCountdown();
+          if (equityOrderBreathText) equityOrderBreathText.textContent = 'Ready. Cancel or GO.';
+          if (equityOrderConfirmed) equityOrderConfirmed.value = '1';
+          if (equityOrderGo) equityOrderGo.disabled = false;
+        }}
+      }}, 1000);
+    }});
+    function stopIncomeEquityCountdown() {{
+      if (incomeEquityCountdownTimer) {{
+        clearInterval(incomeEquityCountdownTimer);
+        incomeEquityCountdownTimer = null;
+      }}
+    }}
+    function resetIncomeEquityConfirmation() {{
+      stopIncomeEquityCountdown();
+      if (incomeEquityConfirmed) incomeEquityConfirmed.value = '0';
+      if (incomeEquityExecute) incomeEquityExecute.disabled = true;
+      if (incomeEquityCountdown) incomeEquityCountdown.textContent = '10';
+      if (incomeEquityBreathText) incomeEquityBreathText.textContent = 'Review order first';
+      if (incomeEquityBreath) incomeEquityBreath.classList.remove('active');
+    }}
+    function updateIncomeEquitySummary() {{
+      if (!incomeEquitySummary) return;
+      const side = incomeEquitySide ? incomeEquitySide.value : 'BUY';
+      const quantity = Number(incomeEquityQuantity ? incomeEquityQuantity.value : 0);
+      const symbol = incomeEquitySymbol ? incomeEquitySymbol.value : '';
+      const ltp = Number(incomeEquitySnapshot && incomeEquitySnapshot.ltp || 0);
+      const holding = Number(incomeEquitySnapshot && incomeEquitySnapshot.quantity || 0);
+      const value = quantity > 0 && ltp > 0 ? quantity * ltp : 0;
+      incomeEquitySummary.textContent = `${{side}} ${{quantity || 0}} ${{symbol}} share(s) near LTP ${{ltp.toFixed(2)}} | Approx value ${{value.toFixed(2)}} | Holding ${{holding}}`;
+      incomeEquitySummary.classList.toggle('signal-red', side === 'SELL' && quantity > holding);
+    }}
+    async function openIncomeEquityModal(button) {{
+      if (!incomeEquityModal) return;
+      resetIncomeEquityConfirmation();
+      const symbol = button.dataset.symbol || '';
+      const company = button.dataset.company || '';
+      incomeEquitySnapshot = {{
+        symbol,
+        quantity: Number(button.dataset.holding || 0),
+        average_price: Number(button.dataset.avg || 0),
+        ltp: Number(button.dataset.ltp || 0),
+        pnl: Number(button.dataset.pnl || 0),
+      }};
+      incomeEquityModal.style.display = 'flex';
+      if (incomeEquityTitle) incomeEquityTitle.textContent = `${{symbol}} Equity Order`;
+      if (incomeEquitySymbol) incomeEquitySymbol.value = symbol;
+      if (incomeEquityQuantity) incomeEquityQuantity.value = '1';
+      if (incomeEquitySide) incomeEquitySide.value = 'BUY';
+      if (incomeEquityHolding) incomeEquityHolding.textContent = String(incomeEquitySnapshot.quantity);
+      if (incomeEquityAvg) incomeEquityAvg.textContent = Number(incomeEquitySnapshot.average_price || 0).toFixed(2);
+      if (incomeEquityLtp) incomeEquityLtp.textContent = Number(incomeEquitySnapshot.ltp || 0).toFixed(2);
+      if (incomeEquityPnl) incomeEquityPnl.textContent = Number(incomeEquitySnapshot.pnl || 0).toFixed(2);
+      updateIncomeEquitySummary();
+      try {{
+        const response = await fetch(`/income-growth/equity-quote?symbol=${{encodeURIComponent(symbol)}}`, {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not refresh equity data');
+        incomeEquitySnapshot = data;
+        if (incomeEquityHolding) incomeEquityHolding.textContent = String(data.quantity || 0);
+        if (incomeEquityAvg) incomeEquityAvg.textContent = Number(data.average_price || 0).toFixed(2);
+        if (incomeEquityLtp) incomeEquityLtp.textContent = Number(data.ltp || 0).toFixed(2);
+        if (incomeEquityPnl) {{
+          incomeEquityPnl.textContent = Number(data.pnl || 0).toFixed(2);
+          incomeEquityPnl.className = Number(data.pnl || 0) >= 0 ? 'pnl-positive' : 'pnl-negative';
+        }}
+        updateIncomeEquitySummary();
+      }} catch (error) {{
+        if (incomeEquitySummary) incomeEquitySummary.textContent = compactClientError(error.message, 'Could not refresh equity data');
+      }}
+    }}
+    for (const button of document.querySelectorAll('.income-equity-stock')) {{
+      button.addEventListener('click', () => openIncomeEquityModal(button));
+    }}
+    incomeEquitySide && incomeEquitySide.addEventListener('change', () => {{
+      resetIncomeEquityConfirmation();
+      updateIncomeEquitySummary();
+    }});
+    incomeEquityQuantity && incomeEquityQuantity.addEventListener('input', () => {{
+      resetIncomeEquityConfirmation();
+      updateIncomeEquitySummary();
+    }});
+    incomeEquityCancel && incomeEquityCancel.addEventListener('click', () => {{
+      resetIncomeEquityConfirmation();
+      if (incomeEquityModal) incomeEquityModal.style.display = 'none';
+    }});
+    incomeEquityReview && incomeEquityReview.addEventListener('click', () => {{
+      const quantity = Number(incomeEquityQuantity ? incomeEquityQuantity.value : 0);
+      const holding = Number(incomeEquitySnapshot && incomeEquitySnapshot.quantity || 0);
+      const side = incomeEquitySide ? incomeEquitySide.value : '';
+      if (!Number.isInteger(quantity) || quantity <= 0) {{
+        if (incomeEquitySummary) incomeEquitySummary.textContent = 'Enter a valid whole-number quantity greater than zero.';
+        return;
+      }}
+      if (side === 'SELL' && quantity > holding) {{
+        if (incomeEquitySummary) incomeEquitySummary.textContent = `SELL blocked: quantity ${{quantity}} exceeds current holding ${{holding}}.`;
+        return;
+      }}
+      resetIncomeEquityConfirmation();
+      let remaining = 10;
+      if (incomeEquityBreath) incomeEquityBreath.classList.add('active');
+      if (incomeEquityBreathText) incomeEquityBreathText.textContent = 'Breathe in';
+      incomeEquityCountdownTimer = setInterval(() => {{
+        remaining -= 1;
+        if (incomeEquityCountdown) incomeEquityCountdown.textContent = String(Math.max(remaining, 0));
+        if (incomeEquityBreathText) incomeEquityBreathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          stopIncomeEquityCountdown();
+          if (incomeEquityBreathText) incomeEquityBreathText.textContent = 'Ready to execute';
+          if (incomeEquityConfirmed) incomeEquityConfirmed.value = '1';
+          if (incomeEquityExecute) incomeEquityExecute.disabled = false;
+        }}
+      }}, 1000);
+    }});
     incomeGrowthEditGpt && incomeGrowthEditGpt.addEventListener('click', () => {{
       if (incomeGrowthGptModal) incomeGrowthGptModal.style.display = 'flex';
     }});
@@ -11887,7 +12939,7 @@ def render_page(state: PageState) -> bytes:
         const bySymbol = new Map((data.quotes || []).map((quote) => [quote.symbol, quote]));
         if (errorBox) {{
           errorBox.style.display = data.ok ? 'none' : 'block';
-          errorBox.textContent = data.ok ? '' : (data.error || 'Some global quotes unavailable');
+          errorBox.textContent = data.ok ? '' : compactClientError(data.error, 'Some global quotes unavailable');
         }}
         let redCount = 0;
         for (const card of cards) {{
@@ -11922,7 +12974,7 @@ def render_page(state: PageState) -> bytes:
       }} catch (error) {{
         if (errorBox) {{
           errorBox.style.display = 'block';
-          errorBox.textContent = `Global quote error: ${{error.message}}`;
+          errorBox.textContent = compactClientError(error.message, 'Global quote error');
         }}
       }}
     }}
@@ -11978,7 +13030,7 @@ def render_page(state: PageState) -> bytes:
         openKiteSetupForError(error.message);
         if (quoteError) {{
           quoteError.style.display = 'block';
-          quoteError.textContent = `Kite quote error: ${{error.message}}`;
+          quoteError.textContent = compactClientError(error.message, 'Kite quote error');
         }}
         for (const card of cards) {{
           card.querySelector('.quote-ltp').textContent = 'N/A';
@@ -12055,7 +13107,7 @@ def render_page(state: PageState) -> bytes:
         openKiteSetupForError(error.message);
         if (errorBox) {{
           errorBox.style.display = 'block';
-          errorBox.textContent = `ETF quote error: ${{error.message}}`;
+          errorBox.textContent = compactClientError(error.message, 'ETF quote error');
         }}
       }}
     }}
@@ -12176,8 +13228,40 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/investing":
             self.send_page(PageState(active_tab="investing"))
             return
+        if parsed_url.path == "/equity":
+            self.send_page(PageState(active_tab="equity"))
+            return
+        if parsed_url.path == "/equity/quote":
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            try:
+                snapshot = equity_holding_snapshot(
+                    first(query, "symbol"),
+                    first(query, "exchange", "NSE"),
+                )
+                self.send_json({"ok": True, **snapshot})
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": friendly_external_error(exc, "Kite equity holding"),
+                    }
+                )
+            return
         if parsed_url.path == "/income-growth":
             self.send_page(PageState(active_tab="income-growth"))
+            return
+        if parsed_url.path == "/income-growth/equity-quote":
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            try:
+                snapshot = income_growth_equity_snapshot(first(query, "symbol"))
+                self.send_json({"ok": True, **snapshot})
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": friendly_external_error(exc, "Income Growth equity quote"),
+                    }
+                )
             return
         if parsed_url.path == "/research":
             self.send_page(PageState(active_tab="research"))
@@ -12212,7 +13296,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 self.send_json(
                     {
                         "ok": False,
-                        "error": str(exc),
+                        "error": friendly_external_error(exc, "MMI"),
                         "source": MMI_URL,
                     }
                 )
@@ -12224,7 +13308,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 self.send_json(
                     {
                         "ok": False,
-                        "error": str(exc),
+                        "error": friendly_external_error(exc, "Kite quote"),
                         "quotes": [],
                     }
                 )
@@ -12236,7 +13320,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 self.send_json(
                     {
                         "ok": False,
-                        "error": str(exc),
+                        "error": friendly_external_error(exc, "Global market quote"),
                         "quotes": [],
                     }
                 )
@@ -12248,7 +13332,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 self.send_json(
                     {
                         "ok": False,
-                        "error": str(exc),
+                        "error": friendly_external_error(exc, "Commodity ETF quote"),
                         "quotes": [],
                     }
                 )
@@ -12302,6 +13386,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/income")
                 else "investing"
                 if request_path.startswith("/investing")
+                else "equity"
+                if request_path.startswith("/equity")
                 else "gpt"
                 if request_path.startswith("/gpt")
                 else "kite-setup"
@@ -12323,6 +13409,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             api_secret=first(form, "api_secret"),
             access_token=first(form, "access_token"),
             confirm_live_order=first(form, "confirm_live_order"),
+            kite_profile=selected_kite_profile_name(first(form, "kite_profile")),
             position_dry_run=checked(form, "position_dry_run"),
             position_discount_percent=float(first(form, "position_discount_percent", "20") or 20),
             position_exchange=first(form, "position_exchange", "NFO"),
@@ -12569,12 +13656,16 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 else:
                     state.message = persist_message
             elif request_path == "/kite-setup":
+                profile_name = selected_kite_profile_name(state.kite_profile)
+                profile_values = kite_profile_values_from_state(state)
+                saved_profile_values = save_kite_profile(profile_name, profile_values)
+                apply_kite_profile_to_env(saved_profile_values)
                 save_env_values(
                     {
-                        "KITE_CONFIRM_LIVE_ORDER": state.confirm_live_order or env_value("KITE_CONFIRM_LIVE_ORDER"),
-                        "KITE_API_KEY": state.api_key or env_value("KITE_API_KEY"),
-                        "KITE_API_SECRET": state.api_secret or env_value("KITE_API_SECRET"),
-                        "KITE_ACCESS_TOKEN": state.access_token or env_value("KITE_ACCESS_TOKEN"),
+                        "KITE_CONFIRM_LIVE_ORDER": saved_profile_values.get("KITE_CONFIRM_LIVE_ORDER", "YES"),
+                        "KITE_API_KEY": saved_profile_values.get("KITE_API_KEY", ""),
+                        "KITE_API_SECRET": saved_profile_values.get("KITE_API_SECRET", ""),
+                        "KITE_ACCESS_TOKEN": saved_profile_values.get("KITE_ACCESS_TOKEN", ""),
                         "OPENAI_API_KEY": state.openai_api_key or env_value("OPENAI_API_KEY"),
                     }
                 )
@@ -12583,12 +13674,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     {
                         "etf_buy_amount": state.etf_buy_amount,
                         "home_tickers": normalized_home_tickers,
+                        "selected_kite_profile": profile_name,
                     }
                 )
                 state.home_tickers = "\n".join(normalized_home_tickers)
                 clear_app_cache(("market-quotes", "kite:quote"))
                 state.message = (
-                    f"Kite setup saved. ETF buy amount {format_buy_amount(state.etf_buy_amount)}. "
+                    f"Kite setup saved for {profile_name}. ETF buy amount {format_buy_amount(state.etf_buy_amount)}. "
                     f"Home watchlist has {len(normalized_home_tickers)} ticker(s)."
                 )
             elif request_path == "/kite-token/generate":
@@ -12597,14 +13689,31 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.kite_request_token,
                 )
                 state.access_token = access_token
-                state.message = "Generated today's KITE_ACCESS_TOKEN, saved it to .env, and applied it to this running app."
+                profile_name = selected_kite_profile_name(state.kite_profile)
+                saved_profile_values = save_kite_profile(
+                    profile_name,
+                    kite_profile_values_from_state(state, access_token),
+                )
+                apply_kite_profile_to_env(saved_profile_values)
+                state.message = (
+                    f"Generated today's KITE_ACCESS_TOKEN for {profile_name}, saved it to .env, "
+                    "and applied it to this running app."
+                )
             elif request_path == "/kite-token/save":
                 access_token, state.console_log = call_with_console(
                     save_kite_access_token,
                     state.access_token or env_value("KITE_ACCESS_TOKEN"),
                 )
                 state.access_token = access_token
-                state.message = "Saved KITE_ACCESS_TOKEN to .env and applied it to this running app."
+                profile_name = selected_kite_profile_name(state.kite_profile)
+                saved_profile_values = save_kite_profile(
+                    profile_name,
+                    kite_profile_values_from_state(state, access_token),
+                )
+                apply_kite_profile_to_env(saved_profile_values)
+                state.message = (
+                    f"Saved KITE_ACCESS_TOKEN for {profile_name} to .env and applied it to this running app."
+                )
             elif request_path == "/kite-ip/check":
                 state.kite_ip_data, state.console_log = call_with_console(fetch_public_ip_data)
                 ips = [item["ip"] for item in state.kite_ip_data if item.get("ip")]
@@ -12638,6 +13747,33 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.investing_summary,
                 ), state.console_log = call_with_console(investing_holdings_rows)
                 state.message = f"Investing portfolio refreshed for {len(state.investing_rows)} holding(s)."
+            elif request_path == "/equity/load":
+                (
+                    state.equity_rows,
+                    state.equity_summary,
+                ), state.console_log = call_with_console(equity_holdings_snapshot)
+                state.message = f"Loaded {len(state.equity_rows)} live Kite equity holding(s)."
+            elif request_path == "/equity/order":
+                if first(form, "equity_confirmed") != "1":
+                    raise PermissionError("Equity order needs 10-second breathe confirmation.")
+                result, order_log = call_with_console(
+                    place_equity_holding_order,
+                    first(form, "equity_symbol"),
+                    first(form, "equity_exchange", "NSE"),
+                    first(form, "equity_side"),
+                    first(form, "equity_quantity"),
+                    first(form, "equity_limit_price"),
+                )
+                state.equity_results = [result]
+                (
+                    state.equity_rows,
+                    state.equity_summary,
+                ), refresh_log = call_with_console(equity_holdings_snapshot)
+                state.console_log = f"{order_log}{refresh_log}"
+                state.message = (
+                    f"Submitted {first(form, 'equity_side').upper()} equity limit order "
+                    f"for {first(form, 'equity_symbol').upper()}."
+                )
             elif request_path == "/income-growth/load":
                 (
                     state.income_growth_rows,
@@ -12657,6 +13793,27 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = (
                     f"Saved Income Growth holding data for {updated_symbol}. "
                     f"Refreshed {len(state.income_growth_rows)} option-income candidate(s)."
+                )
+            elif request_path == "/income-growth/equity-order":
+                if first(form, "income_growth_equity_confirmed") != "1":
+                    raise PermissionError(
+                        "Income Growth equity order needs 10-second breathe confirmation."
+                    )
+                result, state.console_log = call_with_console(
+                    place_income_growth_equity_order,
+                    first(form, "income_growth_equity_symbol"),
+                    first(form, "income_growth_equity_side"),
+                    first(form, "income_growth_equity_quantity"),
+                )
+                state.income_growth_equity_results = [result]
+                (
+                    state.income_growth_rows,
+                    state.income_growth_summary,
+                ), refresh_log = call_with_console(income_growth_candidates)
+                state.console_log = f"{state.console_log}{refresh_log}"
+                state.message = (
+                    f"Submitted {first(form, 'income_growth_equity_side').upper()} equity order "
+                    f"for {first(form, 'income_growth_equity_symbol').upper()}."
                 )
             elif request_path == "/income-growth/gpt":
                 (
@@ -12781,7 +13938,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             if request_path == "/csv/save-today":
                 state.csv_path, state.csv_text = restore_csv_text_after_save_error(state.csv_path)
-            state.error = f"{exc}\n\n{traceback.format_exc()}"
+            state.error = f"{friendly_external_error(exc, 'Kite/App action')}\n\n{traceback.format_exc()}"
 
         self.send_page(state)
 
