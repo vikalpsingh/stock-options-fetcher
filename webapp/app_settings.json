@@ -16,5 +16,32 @@
     "NUVAMA",
     "NTPC",
     "WAAREEENER"
-  ]
+  ],
+  "kite_profiles": {
+    "Aanya": {
+      "KITE_ACCESS_TOKEN": "",
+      "KITE_API_KEY": "",
+      "KITE_API_SECRET": "",
+      "KITE_CONFIRM_LIVE_ORDER": "YES"
+    },
+    "Monika": {
+      "KITE_ACCESS_TOKEN": "6Glq6ugLZkKfis3C9dVHHBOC40IXArFc",
+      "KITE_API_KEY": "2kc74rpxvr7jpn26",
+      "KITE_API_SECRET": "o0gd3x7bb1mhtkg7sj6m0z33zmkh3nnh",
+      "KITE_CONFIRM_LIVE_ORDER": "YES"
+    },
+    "Shanti": {
+      "KITE_ACCESS_TOKEN": "qjjfEMA1tuYAsmLSvzn04e9ZXR38kxwp",
+      "KITE_API_KEY": "vr6yz47r650vum8p",
+      "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
+      "KITE_CONFIRM_LIVE_ORDER": "YES"
+    },
+    "Vikalp": {
+      "KITE_ACCESS_TOKEN": "",
+      "KITE_API_KEY": "",
+      "KITE_API_SECRET": "",
+      "KITE_CONFIRM_LIVE_ORDER": "YES"
+    }
+  },
+  "selected_kite_profile": "Shanti"
 }

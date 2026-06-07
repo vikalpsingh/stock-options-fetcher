@@ -69,6 +69,8 @@ def dated_income_csv_path(day: date | None = None) -> Path:
 DEFAULT_CSV_PATH = Path(os.getenv("KITE_DEFAULT_CSV_PATH", str(dated_income_csv_path())))
 LEGACY_CSV_PATH = PROJECT_ROOT / "src" / "script" / "kite_orders.csv"
 SETTINGS_PATH = APP_ROOT / "app_settings.json"
+PE_SELL_SETTINGS_PATH = APP_ROOT / "pe_sell_strategy.json"
+CE_SELL_SETTINGS_PATH = APP_ROOT / "ce_sell_strategy.json"
 APP_DB_PATH = APP_ROOT / "vikalp_income.db"
 OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
@@ -190,6 +192,23 @@ INVESTING_NEWS_CACHE_SECONDS = 12 * 60 * 60
 INVESTING_52W_CACHE_SECONDS = 24 * 60 * 60
 COMMODITY_DMA_CACHE_SECONDS = 12 * 60 * 60
 INCOME_GROWTH_GPT_CACHE_SECONDS = 30 * 60
+INCOME_DASHBOARD_CACHE_SECONDS = 15 * 60
+CE_SELL_DASHBOARD_CACHE_SECONDS = 15 * 60
+DEFAULT_PE_SELL_SETTINGS = {
+    "max_assignment_cash_per_stock": 600000,
+    "min_otm_percent": 8,
+    "max_otm_percent": 12,
+    "min_premium_yield_percent": 0.30,
+    "min_sell_pop_percent": 88,
+    "max_delta": 0.20,
+    "min_option_oi": 0,
+    "min_option_volume": 0,
+    "max_bid_ask_spread_percent": 25,
+    "event_lookahead_trading_days": 5,
+    "preferred_dte_min": 12,
+    "preferred_dte_max": 28,
+    "price_markup_percent": 20,
+}
 STOCK_NEWS_NAMES = {
     "BAJFINANCE": "Bajaj Finance",
     "TATACONSUM": "Tata Consumer Products",
@@ -234,7 +253,7 @@ INVESTING_HOLDINGS = [
     {"code": "NSE:BANCOINDIA", "company": "Banco Products (India) Ltd", "sector": "Auto", "core": "Y", "quantity": 3577, "avg_price": 91.97},
     {"code": "NSE:UNITDSPR", "company": "United Spirits Ltd", "sector": "FMCG", "core": "Y", "quantity": 1522, "avg_price": 883.67},
     {"code": "NSE:JAYKAY", "company": "Jaykay", "sector": "Manf", "core": "N", "quantity": 12000, "avg_price": 38.40},
-    {"code": "NSE:E2E", "company": "E2E Networks", "sector": "Data Center", "core": "", "quantity": 463, "avg_price": 2130.92},
+    {"code": "NSE:E2E", "company": "E2E Networks", "sector": "Data Center", "core": "", "quantity": 4630, "avg_price": 213.00},
     {"code": "NSE:PFC", "company": "Power Finance Corporation Ltd", "sector": "Power", "core": "Y", "quantity": 3515, "avg_price": 167.71},
     {"code": "NSE:NAZARA", "company": "Nazara Tech", "sector": "EGAME", "core": "Y", "quantity": 4412, "avg_price": 162.65},
     {"code": "NSE:ZENTEC", "company": "Zen Tech", "sector": "Defence", "core": "N", "quantity": 794, "avg_price": 417.36},
@@ -307,23 +326,69 @@ COMMODITY_YEARLY_BASE_AMOUNTS = {
     2026: 75938.0,
 }
 COMMODITY_MAX_MULTIPLIER = 2
+CURRENT_FNO_LOT_SIZES = {
+    "ETERNAL": 2425,
+    "CAMS": 750,
+    "PGEL": 950,
+    "PFC": 1300,
+    "TITAN": 175,
+    "HAVELLS": 500,
+    "CDSL": 475,
+    "MAZDOCK": 200,
+    "WAAREEENER": 175,
+    "UNITDSPR": 400,
+    "BAJFINANCE": 750,
+    "TATACONSUM": 550,
+    "NAUKRI": 375,
+    "NTPC": 1500,
+}
+
+
+def current_lot_metrics(symbol: str, holding: Any, requested_lots: Any) -> dict[str, Any]:
+    lot_size = int(CURRENT_FNO_LOT_SIZES.get(str(symbol or "").upper()) or 0)
+    holding_qty = int(float(holding or 0))
+    configured_lots = max(0, int(float(requested_lots or 0)))
+    covered_lots = holding_qty // lot_size if lot_size > 0 else 0
+    lots_can_sell = min(configured_lots, covered_lots)
+    return {
+        "lot_size": lot_size,
+        "times_lot": round(holding_qty / lot_size, 2) if lot_size > 0 else 0.0,
+        "lots_can_sell": float(lots_can_sell),
+        "to_sell": lot_size * 1.10 if lot_size > 0 else 0.0,
+    }
+
+
 INCOME_GROWTH_SHEET = [
     {"symbol": "BAJFINANCE", "holding": 2310, "times_lot": 3.08, "lots_can_sell": 1.0, "cmp": 909.3, "call_strike": 982, "value": 2100483, "to_sell": 825, "lot_size": 750, "gap_pct": 8, "put_down_pct": 29.8, "pe": 837, "week_52": -21.25, "one_year": 1.78, "month": -4.3, "week_1": -3.46, "today": -2.4},
     {"symbol": "TATACONSUM", "holding": 650, "times_lot": 1.18, "lots_can_sell": 1.0, "cmp": 1173.4, "call_strike": 1267, "value": 762710, "to_sell": 605, "lot_size": 550, "gap_pct": 8, "put_down_pct": 75.33, "pe": 1080, "week_52": -9.31, "one_year": 5.53, "month": 1.12, "week_1": -1.16, "today": -2.6},
-    {"symbol": "PGEL", "holding": 7350, "times_lot": 8.17, "lots_can_sell": 3.0, "cmp": 483, "call_strike": 522, "value": 3550050, "to_sell": 990, "lot_size": 900, "gap_pct": 8, "put_down_pct": 50.06, "pe": 444, "week_52": -73.18, "one_year": -37.95, "month": -9.64, "week_1": 2.49, "today": 1.5},
+    {"symbol": "PGEL", "holding": 7350, "times_lot": 8.17, "lots_can_sell": 3.0, "cmp": 483, "call_strike": 522, "value": 3550050, "to_sell": 990, "lot_size": 950, "gap_pct": 8, "put_down_pct": 50.06, "pe": 444, "week_52": -73.18, "one_year": -37.95, "month": -9.64, "week_1": 2.49, "today": 1.5},
     {"symbol": "TITAN", "holding": 182, "times_lot": 1.04, "lots_can_sell": 1.0, "cmp": 4112.1, "call_strike": 4441, "value": 748402.2, "to_sell": 192.5, "lot_size": 175, "gap_pct": 8, "put_down_pct": 71.94, "pe": 3783, "week_52": -11.99, "one_year": 17.35, "month": -5.75, "week_1": -1.13, "today": -0.6},
-    {"symbol": "ETERNAL", "holding": 11500, "times_lot": 4.69, "lots_can_sell": 2.0, "cmp": 251.99, "call_strike": 272, "value": 2897885, "to_sell": 2695, "lot_size": 2450, "gap_pct": 8, "put_down_pct": 646.13, "pe": 232, "week_52": -46.22, "one_year": -1.78, "month": 0.04, "week_1": 1.74, "today": -1.8},
-    {"symbol": "UNITDSPR", "holding": 1522, "times_lot": 4.35, "lots_can_sell": 2.0, "cmp": 1271, "call_strike": 1373, "value": 1934462, "to_sell": 385, "lot_size": 350, "gap_pct": 8, "put_down_pct": None, "pe": 1169, "week_52": -29.43, "one_year": -21.06, "month": -3.84, "week_1": -1.02, "today": -2.4},
+    {"symbol": "ETERNAL", "holding": 11500, "times_lot": 4.69, "lots_can_sell": 2.0, "cmp": 251.99, "call_strike": 272, "value": 2897885, "to_sell": 2695, "lot_size": 2425, "gap_pct": 8, "put_down_pct": 646.13, "pe": 232, "week_52": -46.22, "one_year": -1.78, "month": 0.04, "week_1": 1.74, "today": -1.8},
+    {"symbol": "UNITDSPR", "holding": 1522, "times_lot": 4.35, "lots_can_sell": 2.0, "cmp": 1271, "call_strike": 1373, "value": 1934462, "to_sell": 385, "lot_size": 400, "gap_pct": 8, "put_down_pct": None, "pe": 1169, "week_52": -29.43, "one_year": -21.06, "month": -3.84, "week_1": -1.02, "today": -2.4},
     {"symbol": "HAVELLS", "holding": 520, "times_lot": 1.04, "lots_can_sell": 1.0, "cmp": 1186, "call_strike": 1281, "value": 616720, "to_sell": 550, "lot_size": 500, "gap_pct": 8, "put_down_pct": 44.02, "pe": 1091, "week_52": -36.69, "one_year": -20.3, "month": -5.62, "week_1": -1.48, "today": -2.1},
     {"symbol": "NAUKRI", "holding": 615, "times_lot": 1.64, "lots_can_sell": 1.0, "cmp": 1002, "call_strike": 1082, "value": 616230, "to_sell": 412.5, "lot_size": 375, "gap_pct": 8, "put_down_pct": 44.81, "pe": 922, "week_52": -54.69, "one_year": -32.04, "month": 2.6, "week_1": 6.77, "today": -0.4},
     {"symbol": "PFC", "holding": 3515, "times_lot": 2.70, "lots_can_sell": 2.0, "cmp": 431, "call_strike": 465, "value": 1514965, "to_sell": 1430, "lot_size": 1300, "gap_pct": 8, "put_down_pct": 5.49, "pe": 397, "week_52": -12.88, "one_year": 5.66, "month": -3.85, "week_1": -1.8, "today": -0.6},
-    {"symbol": "CAMS", "holding": 410, "times_lot": 1.03, "lots_can_sell": 1.0, "cmp": 790, "call_strike": 853, "value": 323900, "to_sell": 440, "lot_size": 400, "gap_pct": 8, "put_down_pct": 41.3, "pe": 727, "week_52": -10.76, "one_year": -7.02, "month": 8.09, "week_1": 2.64, "today": 0.4},
+    {"symbol": "CAMS", "holding": 410, "times_lot": 1.03, "lots_can_sell": 1.0, "cmp": 790, "call_strike": 853, "value": 323900, "to_sell": 440, "lot_size": 750, "gap_pct": 8, "put_down_pct": 41.3, "pe": 727, "week_52": -10.76, "one_year": -7.02, "month": 8.09, "week_1": 2.64, "today": 0.4},
     {"symbol": "CDSL", "holding": 410, "times_lot": 0.86, "lots_can_sell": 1.0, "cmp": 1245, "call_strike": 1345, "value": 510450, "to_sell": 522.5, "lot_size": 475, "gap_pct": 8, "put_down_pct": 57.06, "pe": 1145, "week_52": -46.90, "one_year": -30.01, "month": 0.54, "week_1": 2.27, "today": 0.1},
-    {"symbol": "MAZDOCK", "holding": 475, "times_lot": 1.58, "lots_can_sell": 1.0, "cmp": 2460, "call_strike": 2657, "value": 1168500, "to_sell": 330, "lot_size": 300, "gap_pct": 8, "put_down_pct": 38.41, "pe": 2263, "week_52": -53.46, "one_year": -28.28, "month": -5.8, "week_1": -0.41, "today": 0.2},
+    {"symbol": "MAZDOCK", "holding": 475, "times_lot": 1.58, "lots_can_sell": 1.0, "cmp": 2460, "call_strike": 2657, "value": 1168500, "to_sell": 330, "lot_size": 200, "gap_pct": 8, "put_down_pct": 38.41, "pe": 2263, "week_52": -53.46, "one_year": -28.28, "month": -5.8, "week_1": -0.41, "today": 0.2},
     {"symbol": "NUVAMA", "holding": 0, "times_lot": 0.0, "lots_can_sell": 0.0, "cmp": 1563, "call_strike": 1688, "value": 0, "to_sell": 550, "lot_size": 500, "gap_pct": 8, "put_down_pct": 27.88, "pe": 1438, "week_52": -8.87, "one_year": 8.34, "month": 17.58, "week_1": 3.87, "today": 1.7},
     {"symbol": "NTPC", "holding": 927, "times_lot": 0.62, "lots_can_sell": 1.0, "cmp": 389.5, "call_strike": 421, "value": 361066.5, "to_sell": 1650, "lot_size": 1500, "gap_pct": 8, "put_down_pct": 13.96, "pe": 358, "week_52": -6.39, "one_year": 18.52, "month": -2.64, "week_1": -0.14, "today": -2.2},
     {"symbol": "WAAREEENER", "holding": 130, "times_lot": 0.74, "lots_can_sell": 1.0, "cmp": 3129.1, "call_strike": 3379, "value": 406783, "to_sell": 192.5, "lot_size": 175, "gap_pct": 8, "put_down_pct": 24.29, "pe": 2879, "week_52": -23.52, "one_year": 9.7, "month": -0.23, "week_1": 4.86, "today": 0.0},
 ]
+INCOME_GROWTH_LOT_CAPS = {
+    str(item.get("symbol") or "").upper(): float(item.get("lots_can_sell") or 0)
+    for item in INCOME_GROWTH_SHEET
+}
+for income_growth_item in INCOME_GROWTH_SHEET:
+    income_growth_symbol = str(income_growth_item.get("symbol") or "").upper()
+    if income_growth_symbol in CURRENT_FNO_LOT_SIZES:
+        income_growth_item.update(
+            current_lot_metrics(
+                income_growth_symbol,
+                income_growth_item.get("holding"),
+                income_growth_item.get("lots_can_sell"),
+            )
+        )
 INCOME_GROWTH_BY_SYMBOL = {
     str(item["symbol"]).upper().replace("NSE:", "").replace("BSE:", ""): item
     for item in INCOME_GROWTH_SHEET
@@ -474,6 +539,34 @@ def app_db_connection() -> sqlite3.Connection:
                     now_text,
                 ),
             )
+    for symbol in INCOME_GROWTH_BY_SYMBOL:
+        if symbol not in CURRENT_FNO_LOT_SIZES:
+            continue
+        saved = conn.execute(
+            "SELECT holding FROM income_growth_holdings WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        if saved is None:
+            continue
+        metrics = current_lot_metrics(
+            symbol,
+            saved["holding"],
+            INCOME_GROWTH_LOT_CAPS.get(symbol),
+        )
+        conn.execute(
+            """
+            UPDATE income_growth_holdings
+            SET lot_size = ?, times_lot = ?, lots_can_sell = ?, to_sell = ?
+            WHERE symbol = ?
+            """,
+            (
+                metrics["lot_size"],
+                metrics["times_lot"],
+                metrics["lots_can_sell"],
+                metrics["to_sell"],
+                symbol,
+            ),
+        )
     conn.commit()
     return conn
 
@@ -997,6 +1090,9 @@ class PageState:
     analytics_symbol: str = ""
     analytics_data: dict[str, Any] | None = None
     trade_validations: list[dict[str, Any]] | None = None
+    ce_sell_top: list[dict[str, Any]] | None = None
+    ce_sell_watch: list[dict[str, Any]] | None = None
+    ce_sell_avoid: list[dict[str, Any]] | None = None
     research_rows: list[dict[str, Any]] | None = None
     positions_rows: list[dict[str, Any]] | None = None
     positions_summary: dict[str, Any] | None = None
@@ -1019,6 +1115,10 @@ class PageState:
     income_rows: list[dict[str, Any]] | None = None
     income_summary: dict[str, Any] | None = None
     income_results: list[dict[str, Any]] | None = None
+    income_pe_top: list[dict[str, Any]] | None = None
+    income_pe_watch: list[dict[str, Any]] | None = None
+    income_pe_avoid: list[dict[str, Any]] | None = None
+    income_positions: list[dict[str, Any]] | None = None
     income_error: str = ""
     kite_request_token: str = ""
     kite_ip_data: list[dict[str, str]] | None = None
@@ -2515,6 +2615,28 @@ def active_position_option_block_keys() -> set[str]:
     return active
 
 
+def active_pe_position_underlyings(force_refresh: bool = False) -> set[str]:
+    if kite_orders is None:
+        return set()
+    if force_refresh:
+        kite = kite_orders.kite_client()
+        positions = kite.positions().get("net", [])
+    else:
+        try:
+            kite = kite_orders.kite_client()
+            positions = cached_kite_positions(kite)
+        except Exception:
+            return set()
+    result: set[str] = set()
+    for position in positions:
+        if int(float(position.get("quantity") or 0)) == 0:
+            continue
+        parts = option_symbol_parts(str(position.get("tradingsymbol") or "").upper())
+        if parts and parts["option_type"] == "PE":
+            result.add(str(parts["underlying"]).upper())
+    return result
+
+
 EVENT_RISK_TERMS = {
     "board",
     "bonus",
@@ -2856,6 +2978,23 @@ def income_selected_expiry(expiries: list[date], today: date) -> tuple[date, dat
     return front_expiry, None, None
 
 
+def select_valid_pe_contract(
+    instruments: list[dict[str, Any]],
+    target_strike: float,
+) -> dict[str, Any]:
+    valid = [
+        item
+        for item in instruments
+        if str(item.get("instrument_type") or "").upper() == "PE"
+        and float(item.get("strike") or 0) > 0
+        and float(item.get("strike") or 0) <= target_strike
+        and str(item.get("tradingsymbol") or "").strip()
+    ]
+    if not valid:
+        raise ValueError("No valid PE strike available below target")
+    return max(valid, key=lambda item: float(item.get("strike") or 0))
+
+
 def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
     today = datetime.now().date()
     spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
@@ -2879,14 +3018,7 @@ def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
     )
     expiry_instruments = [item for item in instruments if item.get("expiry") == expiry]
     target_strike = spot * 0.90
-    below_target = [
-        item for item in expiry_instruments if float(item.get("strike") or 0) <= target_strike
-    ]
-    pool = below_target or expiry_instruments
-    selected = min(
-        pool,
-        key=lambda item: abs(float(item.get("strike") or 0) - target_strike),
-    )
+    selected = select_valid_pe_contract(expiry_instruments, target_strike)
     return {
         "symbol": str(selected["tradingsymbol"]).upper(),
         "spot": spot,
@@ -2896,6 +3028,63 @@ def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
         "rolled_from_trading_days": rolled_from_trading_days,
         "target_strike": target_strike,
         "lot_size": int(selected.get("lot_size") or 0),
+    }
+
+
+def income_pe_order_snapshot(underlying: str, target_strike: Any = None) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    clean_underlying = str(underlying or "").strip().upper()
+    if not clean_underlying:
+        raise ValueError("Select a PE candidate first.")
+    if clean_underlying in active_pe_position_underlyings(True):
+        raise PermissionError(
+            f"{clean_underlying} already has an active PE position. New PE SELL is blocked."
+        )
+    kite = kite_orders.kite_client()
+    candidate = next_monthly_pe_candidate(kite, clean_underlying)
+    requested_strike = float(target_strike or 0)
+    if requested_strike > 0:
+        instruments = [
+            item
+            for item in cached_kite_instruments(kite, "NFO")
+            if str(item.get("name") or "").upper() == clean_underlying
+            and str(item.get("instrument_type") or "").upper() == "PE"
+            and item.get("expiry") == candidate["expiry"]
+        ]
+        if instruments:
+            selected = select_valid_pe_contract(instruments, requested_strike)
+            candidate = {
+                **candidate,
+                "symbol": str(selected.get("tradingsymbol") or "").upper(),
+                "strike": float(selected.get("strike") or 0),
+                "lot_size": int(selected.get("lot_size") or 0),
+            }
+    quote_key = f"NFO:{candidate['symbol']}"
+    try:
+        quote = kite.quote([quote_key]).get(quote_key, {})
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, f"{candidate['symbol']} PE quote")) from exc
+    ltp = quote_ltp(quote)
+    if ltp <= 0:
+        raise ValueError(f"Could not read fresh PE premium for {candidate['symbol']}.")
+    lot_size = int(candidate.get("lot_size") or 0)
+    limit_price = ceil_to_tick(ltp * 1.20, 0.05)
+    assignment_value = float(candidate.get("strike") or 0) * lot_size
+    max_profit = limit_price * lot_size
+    return {
+        "underlying": clean_underlying,
+        "symbol": candidate["symbol"],
+        "strike": float(candidate.get("strike") or 0),
+        "expiry": candidate["expiry"].strftime("%d %b %Y"),
+        "quantity": lot_size,
+        "ltp": ltp,
+        "limit_price": limit_price,
+        "assignment_value": assignment_value,
+        "max_profit": max_profit,
+        "premium_yield_percent": (
+            max_profit / assignment_value * 100 if assignment_value > 0 else 0
+        ),
     }
 
 
@@ -3048,7 +3237,7 @@ def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
     }
 
 
-def place_income_cash_secured_put_order(underlying: str) -> dict[str, Any]:
+def place_income_cash_secured_put_order(underlying: str, target_strike: Any = None) -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
@@ -3056,23 +3245,17 @@ def place_income_cash_secured_put_order(underlying: str) -> dict[str, Any]:
             'Cash-secured PE order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
         )
     clean_underlying = underlying.strip().upper()
-    if clean_underlying not in {item["symbol"] for item in INCOME_UNDERLYINGS}:
-        raise ValueError(f"Unsupported INCOME underlying: {clean_underlying}")
     kite = kite_orders.kite_client()
-    candidate = next_monthly_pe_candidate(kite, clean_underlying)
-    lot_size = int(candidate.get("lot_size") or 0)
+    snapshot = income_pe_order_snapshot(clean_underlying, target_strike)
+    lot_size = int(snapshot.get("quantity") or 0)
     if lot_size <= 0:
-        raise ValueError(f"Could not read lot size for {candidate['symbol']}.")
-    quote_key = f"NFO:{candidate['symbol']}"
-    quote = cached_kite_quote(kite, [quote_key]).get(quote_key, {})
-    current_price = quote_ltp(quote)
-    if current_price <= 0:
-        raise ValueError(f"Could not read PE premium for {candidate['symbol']}.")
-    price = ceil_to_tick(current_price * 1.10, 0.05)
+        raise ValueError(f"Could not read lot size for {snapshot['symbol']}.")
+    current_price = float(snapshot.get("ltp") or 0)
+    price = float(snapshot.get("limit_price") or 0)
     order = {
         "variety": "regular",
         "exchange": "NFO",
-        "tradingsymbol": candidate["symbol"],
+        "tradingsymbol": snapshot["symbol"],
         "transaction_type": "SELL",
         "quantity": lot_size,
         "product": "NRML",
@@ -3083,14 +3266,14 @@ def place_income_cash_secured_put_order(underlying: str) -> dict[str, Any]:
     }
     order_id = kite_orders.place_order(kite, order)
     invalidate_kite_trade_cache()
-    assignment_value = float(candidate.get("strike") or 0) * lot_size
+    assignment_value = float(snapshot.get("assignment_value") or 0)
     return {
-        "tradingsymbol": candidate["symbol"],
+        "tradingsymbol": snapshot["symbol"],
         "status": "LIVE_SENT",
         "order_id": order_id,
         "detail": (
             f"SELL cash-secured PE {lot_size} qty at LIMIT {price:.2f}, "
-            f"10% above current premium {current_price:.2f}. "
+            f"20% above current premium {current_price:.2f}. "
             f"Assignment value about {assignment_value:.0f}."
         ),
     }
@@ -4105,6 +4288,15 @@ def commodity_moving_averages(symbol: str) -> dict[str, float | None]:
     )
 
 
+def commodity_below_200_dma(ltp: Any, dma_200: Any) -> bool:
+    try:
+        price = float(ltp or 0)
+        average = float(dma_200 or 0)
+    except (TypeError, ValueError):
+        return False
+    return price > 0 and average > 0 and price < average
+
+
 def fetch_commodity_etf_quotes_uncached() -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -4128,6 +4320,7 @@ def fetch_commodity_etf_quotes_uncached() -> dict[str, Any]:
         except Exception as exc:
             dma = {"dma_50": None, "dma_200": None}
             dma_error = str(exc)
+        below_200_dma = commodity_below_200_dma(ltp, dma.get("dma_200"))
         quotes.append(
             {
                 "key": item["key"],
@@ -4152,6 +4345,7 @@ def fetch_commodity_etf_quotes_uncached() -> dict[str, Any]:
                 "buy_amount": round(sizing["final_buy_amount"], 2),
                 "dma_50": dma.get("dma_50"),
                 "dma_200": dma.get("dma_200"),
+                "below_200_dma": below_200_dma,
                 "dma_error": dma_error,
             }
         )
@@ -4642,6 +4836,758 @@ def validate_income_growth_with_openai(
     result = generate_csv_with_openai(final_prompt, model, system_prompt)
     APP_CACHE[cache_key] = (now, copy.deepcopy(result))
     return result[0], result[1], result[2], False
+
+
+def load_pe_sell_settings() -> dict[str, Any]:
+    settings = dict(DEFAULT_PE_SELL_SETTINGS)
+    if PE_SELL_SETTINGS_PATH.exists():
+        try:
+            saved = json.loads(PE_SELL_SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                settings.update(saved)
+        except (OSError, ValueError, TypeError):
+            pass
+    return settings
+
+
+def quote_bid_ask(quote: dict[str, Any]) -> tuple[float | None, float | None, float | None]:
+    depth = quote.get("depth") or {}
+    buy = depth.get("buy") or []
+    sell = depth.get("sell") or []
+    bid = float((buy[0] if buy else {}).get("price") or 0) or None
+    ask = float((sell[0] if sell else {}).get("price") or 0) or None
+    if bid and ask and ask >= bid:
+        midpoint = (bid + ask) / 2
+        spread = ((ask - bid) / midpoint * 100) if midpoint > 0 else None
+    else:
+        spread = None
+    return bid, ask, spread
+
+
+def classify_pe_event_risk(symbol: str, news_cache: dict[str, list[dict[str, str]]]) -> tuple[str, str]:
+    underlying = underlying_for_symbol(symbol) or str(symbol or "").upper()
+    if underlying not in news_cache:
+        try:
+            news_cache[underlying] = fetch_stock_news([underlying])
+        except Exception as exc:
+            return "AMBER", f"News check unavailable: {friendly_external_error(exc, underlying)}"
+    titles = [str(item.get("title") or "").strip() for item in news_cache.get(underlying, [])]
+    if not titles:
+        return "GREEN", "No relevant company event found in recent news."
+    red_terms = {
+        "quarterly result",
+        "results today",
+        "board meeting",
+        "record date",
+        "ex-dividend",
+        "regulatory action",
+        "regulator",
+        "pledge",
+        "governance",
+        "order cancellation",
+        "earnings miss",
+        "downgrade",
+        "f&o ban",
+        "fo ban",
+    }
+    amber_terms = {"dividend", "analyst", "sector", "management", "interview", "rating"}
+    for title in titles:
+        lowered = title.lower()
+        if any(term in lowered for term in red_terms):
+            return "RED", f"Direct company event risk: {title[:150]}"
+    for title in titles:
+        lowered = title.lower()
+        if any(term in lowered for term in amber_terms) or classify_news_sentiment(title) == "negative":
+            return "AMBER", f"Review recent company/news context: {title[:150]}"
+    return "GREEN", "Only generic or non-adverse recent articles found."
+
+
+def score_pe_sell_candidate(
+    candidate: dict[str, Any],
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = {**DEFAULT_PE_SELL_SETTINGS, **(settings or {})}
+    result = dict(candidate)
+    cmp_value = float(result.get("cmp") or 0)
+    strike = float(result.get("strike") or 0)
+    lot_size = int(float(result.get("lot_size") or 0))
+    premium = float(result.get("premium") or 0)
+    sell_limit_price = float(result.get("sell_limit_price") or 0)
+    assignment_cash = strike * lot_size
+    max_profit = sell_limit_price * lot_size
+    premium_yield = (max_profit / assignment_cash * 100) if assignment_cash > 0 else 0
+    otm = ((cmp_value - strike) / cmp_value * 100) if cmp_value > 0 else 0
+    delta = abs(float(result.get("delta") or 0))
+    sell_pop = float(result.get("sell_pop") or 0)
+    iv = float(result.get("iv") or 0)
+    oi = int(float(result.get("oi") or 0))
+    volume = int(float(result.get("volume") or 0))
+    spread = result.get("bid_ask_spread_percent")
+    spread_value = float(spread) if isinstance(spread, (int, float)) else None
+    dte = int(float(result.get("dte") or 0))
+    event_risk = str(result.get("event_risk") or "AMBER").upper()
+    reject_reasons = [str(item) for item in result.get("reject_reasons", []) if str(item)]
+
+    if assignment_cash > float(settings["max_assignment_cash_per_stock"]):
+        reject_reasons.append("Assignment cash exceeds configured per-stock limit")
+    if not result.get("contract_valid"):
+        reject_reasons.append("Option contract not found in active Kite instrument list")
+    if premium <= 0 or sell_limit_price <= 0:
+        reject_reasons.append("Missing or invalid PE premium")
+    if spread_value is not None and spread_value > float(settings["max_bid_ask_spread_percent"]):
+        reject_reasons.append("Bid-ask spread exceeds configured maximum")
+    if oi < int(settings["min_option_oi"]):
+        reject_reasons.append("Option OI is below configured minimum")
+    if volume < int(settings["min_option_volume"]):
+        reject_reasons.append("Option volume is below configured minimum")
+    if event_risk == "RED":
+        reject_reasons.append("RED event risk")
+    if result.get("fno_ban"):
+        reject_reasons.append("Stock is in F&O ban period")
+    if premium_yield < float(settings["min_premium_yield_percent"]):
+        reject_reasons.append("Premium yield is below configured minimum")
+    if strike <= 0 or strike >= cmp_value:
+        reject_reasons.append("Selected PE strike is not below CMP")
+    if result.get("severe_breakdown"):
+        reject_reasons.append("Daily trend is a severe breakdown")
+    if result.get("has_active_pe_position"):
+        reject_reasons.append("Existing active PE position for this stock")
+
+    core = str(result.get("core") or "").upper() == "Y"
+    pe_value = result.get("stock_pe")
+    pct_52w = result.get("pct_to_52w_high")
+    one_year = result.get("one_year_return")
+    month = float(result.get("month_return") or 0)
+    week = float(result.get("week_return") or 0)
+    today = float(result.get("today_return") or 0)
+    business_quality_score = 10 if core else 7
+    valuation_score = 5
+    if isinstance(pe_value, (int, float)):
+        valuation_score = 8 if pe_value <= 30 else 6 if pe_value <= 50 else 3 if pe_value <= 70 else 1
+    financial_strength_score = 8 if core else 5
+    corrected_but_not_broken_score = (
+        6 if isinstance(pct_52w, (int, float)) and -50 < pct_52w <= -10 and month > -12
+        else 4 if month > -12 and week > -8
+        else 1
+    )
+    sector_quality_score = 4 if result.get("sector") else 2
+    portfolio_fit_score = 4 if int(float(result.get("holding") or 0)) > 0 else 2
+    stock_quality_score = min(
+        40,
+        business_quality_score
+        + valuation_score
+        + financial_strength_score
+        + corrected_but_not_broken_score
+        + sector_quality_score
+        + portfolio_fit_score,
+    )
+
+    otm_buffer_score = 12 if float(settings["min_otm_percent"]) <= otm <= float(settings["max_otm_percent"]) else 8 if otm > float(settings["max_otm_percent"]) else 3
+    delta_pop_score = 10 if sell_pop >= float(settings["min_sell_pop_percent"]) and delta <= float(settings["max_delta"]) else 7 if sell_pop >= 80 and delta <= 0.25 else 2
+    premium_yield_score = 10 if premium_yield >= 0.60 else 8 if premium_yield >= 0.45 else 6 if premium_yield >= float(settings["min_premium_yield_percent"]) else 0
+    liquidity_score = 10
+    if oi <= 0 and volume <= 0:
+        liquidity_score = 5
+    elif spread_value is not None and spread_value > 10:
+        liquidity_score = 6
+    iv_score = 6 if 15 <= iv <= 40 else 4 if 40 < iv <= 50 else 2
+    pcr = result.get("pcr")
+    support_score = 6 if isinstance(pcr, (int, float)) and pcr > 0.80 else 4 if isinstance(pcr, (int, float)) and pcr >= 0.60 else 2
+    market_sector_trend_score = 4 if month >= -5 and week >= -5 and today >= -4 else 2 if month >= -10 and week >= -8 else 0
+    dte_score = 2 if int(settings["preferred_dte_min"]) <= dte <= int(settings["preferred_dte_max"]) else 1
+    pe_trade_score = min(
+        60,
+        otm_buffer_score
+        + delta_pop_score
+        + premium_yield_score
+        + liquidity_score
+        + iv_score
+        + support_score
+        + market_sector_trend_score
+        + dte_score,
+    )
+    result.update(
+        {
+            "assignment_cash": assignment_cash,
+            "max_profit": max_profit,
+            "premium_yield_percent": premium_yield,
+            "otm_percent": otm,
+            "stock_quality_score": stock_quality_score,
+            "pe_trade_score": pe_trade_score,
+            "final_pe_score": min(100, stock_quality_score + pe_trade_score),
+            "reject_reason": "; ".join(dict.fromkeys(reject_reasons)),
+            "status": "AVOID_TODAY" if reject_reasons else "WATCH_REVIEW",
+            "explanation": (
+                f"{otm:.1f}% OTM, {sell_pop:.1f}% SELL POP, "
+                f"{premium_yield:.2f}% premium yield, event risk {event_risk}."
+            ),
+        }
+    )
+    return result
+
+
+def rank_pe_sell_candidates(
+    candidates: list[dict[str, Any]],
+    settings: dict[str, Any] | None = None,
+    limit: int = 3,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    scored = [score_pe_sell_candidate(candidate, settings) for candidate in candidates]
+    valid = [item for item in scored if item["status"] != "AVOID_TODAY"]
+    valid.sort(
+        key=lambda item: (
+            float(item.get("final_pe_score") or 0),
+            float(item.get("premium_yield_percent") or 0),
+            int(item.get("oi") or 0) + int(item.get("volume") or 0),
+            -float(item.get("assignment_cash") or 0),
+        ),
+        reverse=True,
+    )
+    top = valid[:limit]
+    for item in top:
+        item["status"] = "TOP_3"
+    watch = valid[limit:]
+    avoid = [item for item in scored if item["status"] == "AVOID_TODAY"]
+    return top, watch, avoid
+
+
+def build_live_pe_sell_rankings(
+    growth_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    settings = load_pe_sell_settings()
+    active_pe_underlyings = active_pe_position_underlyings(False)
+    news_cache: dict[str, list[dict[str, str]]] = {}
+    candidates: list[dict[str, Any]] = []
+    for row in growth_rows:
+        symbol = str(row.get("symbol") or "").upper()
+        cmp_value = float(row.get("cmp") or 0)
+        if not symbol or cmp_value <= 0:
+            continue
+        try:
+            contract = next_monthly_pe_candidate(kite, symbol)
+            quote_key = f"NFO:{contract['symbol']}"
+            quote = cached_kite_quote(kite, [quote_key]).get(quote_key, {})
+            premium = quote_ltp(quote)
+            bid, ask, spread = quote_bid_ask(quote)
+            analytics = option_analytics_for_symbol(contract["symbol"])
+            markup = float(settings["price_markup_percent"])
+            sell_limit = ceil_to_tick(premium * (1 + markup / 100), 0.05) if premium > 0 else 0
+            event_risk, event_detail = classify_pe_event_risk(contract["symbol"], news_cache)
+            month = float(row.get("input_month") or 0)
+            week = float(row.get("input_1w") or 0)
+            today = float(row.get("input_today") or 0)
+            candidates.append(
+                {
+                    "stock": symbol,
+                    "symbol": symbol,
+                    "option_symbol": contract["symbol"],
+                    "cmp": cmp_value,
+                    "target_strike": contract["target_strike"],
+                    "strike": contract["strike"],
+                    "expiry": contract["expiry"].strftime("%d %b %Y"),
+                    "dte": trading_days_remaining(contract["expiry"]),
+                    "lot_size": contract["lot_size"],
+                    "premium": premium,
+                    "sell_limit_price": sell_limit,
+                    "delta": abs(float(analytics.get("delta") or 0)),
+                    "sell_pop": float(analytics.get("sell_pop") or 0),
+                    "iv": float(analytics.get("iv_percent") or 0),
+                    "oi": quote_oi(quote),
+                    "volume": int(float(quote.get("volume") or 0)),
+                    "bid": bid,
+                    "ask": ask,
+                    "bid_ask_spread_percent": spread,
+                    "pcr": analytics.get("pcr"),
+                    "event_risk": event_risk,
+                    "event_risk_explanation": event_detail,
+                    "contract_valid": bool(contract.get("symbol")) and float(contract.get("strike") or 0) <= float(contract.get("target_strike") or 0),
+                    "fno_ban": False,
+                    "severe_breakdown": month < -12 or week < -8 or today < -6,
+                    "has_active_pe_position": symbol in active_pe_underlyings,
+                    "core": row.get("core"),
+                    "sector": row.get("sector"),
+                    "holding": row.get("quantity"),
+                    "stock_pe": row.get("input_pe"),
+                    "pct_to_52w_high": row.get("input_52w"),
+                    "one_year_return": row.get("input_1y"),
+                    "month_return": row.get("input_month"),
+                    "week_return": row.get("input_1w"),
+                    "today_return": row.get("input_today"),
+                }
+            )
+        except Exception as exc:
+            candidates.append(
+                {
+                    "stock": symbol,
+                    "symbol": symbol,
+                    "cmp": cmp_value,
+                    "contract_valid": False,
+                    "event_risk": "AMBER",
+                    "reject_reasons": [friendly_external_error(exc, f"{symbol} PE candidate")],
+                }
+            )
+    return rank_pe_sell_candidates(candidates, settings)
+
+
+def income_dashboard_snapshot(force_refresh: bool = False) -> dict[str, Any]:
+    profile = selected_kite_profile_name()
+    cache_key = f"income-dashboard:{profile}"
+    if force_refresh:
+        clear_app_cache((cache_key, "kite:positions", "kite:quote:"))
+
+    def load_snapshot() -> dict[str, Any]:
+        growth_rows, growth_summary = income_growth_candidates()
+        pe_top, pe_watch, pe_avoid = build_live_pe_sell_rankings(growth_rows)
+        positions = open_option_positions(use_cache=False)
+        if positions and kite_orders is not None:
+            positions = refresh_option_positions_with_live_ltp(
+                positions,
+                kite_orders.kite_client(),
+            )
+        short_positions = [
+            position for position in positions if int(position.get("quantity") or 0) < 0
+        ]
+        pe_positions = [
+            position
+            for position in short_positions
+            if str(position.get("tradingsymbol") or "").upper().endswith("PE")
+        ]
+        ce_positions = [
+            position
+            for position in short_positions
+            if str(position.get("tradingsymbol") or "").upper().endswith("CE")
+        ]
+        current_pnl = sum(float(position.get("pnl") or 0) for position in short_positions)
+        return {
+            "growth_rows": growth_rows,
+            "growth_summary": growth_summary,
+            "pe_top": pe_top,
+            "pe_watch": pe_watch,
+            "pe_avoid": pe_avoid,
+            "positions": short_positions,
+            "summary": {
+                "overall_pnl": current_pnl,
+                "active_short_positions": len(short_positions),
+                "active_pe_positions": len(pe_positions),
+                "active_ce_positions": len(ce_positions),
+                "profitable_positions": sum(
+                    1 for position in short_positions if float(position.get("pnl") or 0) > 0
+                ),
+                "review_positions": sum(
+                    1 for position in short_positions if float(position.get("pnl") or 0) < 0
+                ),
+            },
+            "calculated_at": datetime.now().strftime("%d %b %Y %H:%M:%S"),
+        }
+
+    return cached_value(cache_key, load_snapshot, INCOME_DASHBOARD_CACHE_SECONDS)
+
+
+def apply_income_dashboard_snapshot(
+    state: PageState,
+    force_refresh: bool = False,
+) -> str:
+    snapshot, console_log = call_with_console(income_dashboard_snapshot, force_refresh)
+    state.income_growth_rows = snapshot["growth_rows"]
+    state.income_growth_summary = snapshot["growth_summary"]
+    state.income_pe_top = snapshot["pe_top"]
+    state.income_pe_watch = snapshot["pe_watch"]
+    state.income_pe_avoid = snapshot["pe_avoid"]
+    state.income_positions = snapshot["positions"]
+    state.income_summary = snapshot["summary"]
+    state.console_log = console_log
+    return str(snapshot.get("calculated_at") or "")
+
+
+DEFAULT_CE_SELL_SETTINGS = {
+    "auto_reduce_lots_enabled": True,
+    "default_otm_percent": 10.0,
+    "core_otm_add_percent": 3.0,
+    "min_premium_yield_percent": 0.20,
+    "min_sell_pop_percent": 80.0,
+    "max_delta": 0.30,
+    "min_option_oi": 0,
+    "min_option_volume": 0,
+    "max_bid_ask_spread_percent": 35.0,
+    "price_markup_percent": 20.0,
+}
+
+
+def load_ce_sell_settings() -> dict[str, Any]:
+    settings = dict(DEFAULT_CE_SELL_SETTINGS)
+    if CE_SELL_SETTINGS_PATH.exists():
+        try:
+            saved = json.loads(CE_SELL_SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                settings.update(saved)
+        except (OSError, ValueError, TypeError):
+            pass
+    return settings
+
+
+def select_valid_ce_contract(
+    instruments: list[dict[str, Any]],
+    target_strike: float,
+) -> dict[str, Any]:
+    valid = [
+        item
+        for item in instruments
+        if str(item.get("instrument_type") or "").upper() == "CE"
+        and float(item.get("strike") or 0) >= float(target_strike)
+    ]
+    if not valid:
+        raise ValueError("No valid CE strike available above target")
+    return min(valid, key=lambda item: float(item.get("strike") or 0))
+
+
+def score_ce_sell_candidate(
+    candidate: dict[str, Any],
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = {**DEFAULT_CE_SELL_SETTINGS, **(settings or {})}
+    result = dict(candidate)
+    holding_qty = int(float(result.get("holding_qty") or 0))
+    lot_size = int(float(result.get("active_lot_size") or 0))
+    requested_lots = int(float(result.get("requested_lots") or 0))
+    covered_lots = holding_qty // lot_size if lot_size > 0 else 0
+    lots_to_sell = min(requested_lots, covered_lots) if settings["auto_reduce_lots_enabled"] else requested_lots
+    quantity = lots_to_sell * lot_size
+    cmp_value = float(result.get("cmp") or 0)
+    strike = float(result.get("selected_ce_strike") or 0)
+    premium = float(result.get("premium") or 0)
+    sell_limit = float(result.get("sell_limit_price") or 0)
+    max_profit = sell_limit * quantity
+    covered_notional = cmp_value * quantity
+    premium_yield = max_profit / covered_notional * 100 if covered_notional > 0 else 0
+    otm = (strike - cmp_value) / cmp_value * 100 if cmp_value > 0 else 0
+    delta = abs(float(result.get("delta") or 0))
+    sell_pop = float(result.get("sell_pop") or 0)
+    oi = int(float(result.get("oi") or 0))
+    volume = int(float(result.get("volume") or 0))
+    spread = result.get("bid_ask_spread_percent")
+    spread_value = float(spread) if isinstance(spread, (int, float)) else None
+    event_risk = str(result.get("event_risk") or "AMBER").upper()
+    breakout_risk = str(result.get("breakout_risk") or "AMBER").upper()
+    reject = [str(item) for item in result.get("reject_reasons", []) if str(item)]
+    if holding_qty <= 0:
+        reject.append("No share holding; naked CE not allowed")
+    if lot_size <= 0 or covered_lots <= 0:
+        reject.append("Insufficient holding for one covered lot")
+    if requested_lots > covered_lots and not settings["auto_reduce_lots_enabled"]:
+        reject.append("Requested lots exceed fully covered lots")
+    if quantity <= 0 or quantity > holding_qty:
+        reject.append("Naked CE risk: quantity is not fully covered")
+    if not result.get("contract_valid"):
+        reject.append("CE contract not found in active Kite instrument list")
+    if strike <= cmp_value:
+        reject.append("Selected CE strike must be above CMP")
+    if premium <= 0 or sell_limit <= 0:
+        reject.append("Missing or invalid CE premium")
+    if spread_value is not None and spread_value > float(settings["max_bid_ask_spread_percent"]):
+        reject.append("Bid-ask spread exceeds configured maximum")
+    if oi < int(settings["min_option_oi"]):
+        reject.append("Option OI below configured minimum")
+    if volume < int(settings["min_option_volume"]):
+        reject.append("Option volume below configured minimum")
+    if event_risk == "RED":
+        reject.append("RED company event risk")
+    if result.get("has_active_position"):
+        reject.append("Existing active option position for this stock")
+    if premium_yield < float(settings["min_premium_yield_percent"]):
+        reject.append("Premium yield below configured minimum")
+    if sell_pop < float(settings["min_sell_pop_percent"]):
+        reject.append("SELL POP below configured minimum")
+    if delta > float(settings["max_delta"]):
+        reject.append("CE delta exceeds configured maximum")
+    if breakout_risk == "RED" and otm < 12:
+        reject.append("RED breakout risk with CE strike too close")
+
+    coverage_score = min(30, (10 if covered_lots >= requested_lots > 0 else 5) + (5 if holding_qty - quantity >= lot_size else 3) + (5 if lots_to_sell <= 2 else 3) + (5 if result.get("core") != "Y" else 3) + 5)
+    call_away_score = min(30, (8 if otm >= 10 else 5 if otm >= 7 else 2) + (6 if float(result.get("one_year_return") or 0) <= 10 else 3) + (5 if float(result.get("week_return") or 0) <= 2 else 2) + (5 if breakout_risk == "GREEN" else 3 if breakout_risk == "AMBER" else 0) + (4 if result.get("core") != "Y" else 2) + 2)
+    trade_score = min(40, (8 if otm >= 10 else 5 if otm >= 7 else 2) + (7 if sell_pop >= 85 and delta <= 0.25 else 4 if sell_pop >= 75 else 1) + (8 if premium_yield >= 0.5 else 5 if premium_yield >= 0.25 else 1) + (7 if spread_value is None or spread_value <= 15 else 3) + (4 if 15 <= float(result.get("iv") or 0) <= 50 else 2) + (4 if breakout_risk == "GREEN" else 2) + 2)
+    if event_risk == "AMBER":
+        trade_score = max(0, trade_score - 4)
+    if breakout_risk == "AMBER":
+        trade_score = max(0, trade_score - 4)
+    final_score = min(100, coverage_score + call_away_score + trade_score)
+    result.update(
+        {
+            "covered_lots_available": covered_lots,
+            "lots_to_sell": lots_to_sell,
+            "quantity": quantity,
+            "max_profit": max_profit,
+            "notional_covered_value": covered_notional,
+            "premium_yield_percent": premium_yield,
+            "otm_percent": otm,
+            "holding_coverage_score": coverage_score,
+            "call_away_comfort_score": call_away_score,
+            "ce_trade_score": trade_score,
+            "final_ce_score": final_score,
+            "status": "AVOID_TODAY" if reject else "WATCH_REVIEW",
+            "reject_reason": "; ".join(dict.fromkeys(reject)),
+            "explanation": (
+                f"{otm:.1f}% OTM, {sell_pop:.1f}% SELL POP, "
+                f"{premium_yield:.2f}% covered-value yield, {breakout_risk} breakout risk."
+            ),
+        }
+    )
+    return result
+
+
+def rank_ce_sell_candidates(
+    candidates: list[dict[str, Any]],
+    settings: dict[str, Any] | None = None,
+    limit: int = 3,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    scored = [score_ce_sell_candidate(item, settings) for item in candidates]
+    valid = [item for item in scored if item["status"] != "AVOID_TODAY"]
+    valid.sort(
+        key=lambda item: (
+            float(item.get("final_ce_score") or 0),
+            float(item.get("premium_yield_percent") or 0),
+            float(item.get("otm_percent") or 0),
+        ),
+        reverse=True,
+    )
+    top = valid[:limit]
+    for item in top:
+        item["status"] = "TOP_3"
+    return top, valid[limit:], [item for item in scored if item["status"] == "AVOID_TODAY"]
+
+
+def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    growth_rows, _ = income_growth_candidates()
+    settings = load_ce_sell_settings()
+    active_underlyings = active_position_underlyings()
+    instruments = cached_kite_instruments(kite, "NFO")
+    by_symbol = {str(item.get("tradingsymbol") or "").upper(): item for item in instruments}
+    news_cache: dict[str, list[dict[str, str]]] = {}
+    candidates: list[dict[str, Any]] = []
+    for row in growth_rows:
+        symbol = str(row.get("symbol") or "").upper()
+        option_symbol = str(row.get("candidate_ce") or "").upper()
+        instrument = by_symbol.get(option_symbol)
+        holding = int(float(row.get("quantity") or 0))
+        cmp_value = float(row.get("cmp") or 0)
+        requested_lots = max(1, int(float(row.get("lots_can_sell_input") or row.get("covered_lots") or 1)))
+        if not instrument:
+            candidates.append({"stock": symbol, "holding_qty": holding, "requested_lots": requested_lots, "cmp": cmp_value, "contract_valid": False})
+            continue
+        lot_size = int(instrument.get("lot_size") or 0)
+        desired_otm = float(settings["default_otm_percent"])
+        if str(row.get("core") or "").upper() == "Y":
+            desired_otm += float(settings["core_otm_add_percent"])
+        target = cmp_value * (1 + desired_otm / 100)
+        expiry = instrument.get("expiry")
+        same_expiry = [
+            item for item in instruments
+            if str(item.get("name") or "").upper() == symbol
+            and str(item.get("instrument_type") or "").upper() == "CE"
+            and item.get("expiry") == expiry
+        ]
+        try:
+            selected = select_valid_ce_contract(same_expiry, target)
+            option_symbol = str(selected.get("tradingsymbol") or "").upper()
+            lot_size = int(selected.get("lot_size") or 0)
+            quote_key = f"NFO:{option_symbol}"
+            quote = cached_kite_quote(kite, [quote_key]).get(quote_key, {})
+            premium = quote_ltp(quote)
+            bid, ask, spread = quote_bid_ask(quote)
+            analytics = option_analytics_for_symbol(option_symbol)
+            event_risk, event_reason = classify_pe_event_risk(symbol, news_cache)
+            week = float(row.get("input_1w") or 0)
+            today = float(row.get("input_today") or 0)
+            month = float(row.get("input_month") or 0)
+            breakout = "RED" if today > 4 or week > 7 else "AMBER" if today > 2 or week > 4 or month > 10 else "GREEN"
+            sell_limit = ceil_to_tick(
+                premium * (1 + float(settings["price_markup_percent"]) / 100),
+                0.05,
+            ) if premium > 0 else 0
+            candidates.append(
+                {
+                    "stock": symbol, "holding_qty": holding, "active_lot_size": lot_size,
+                    "requested_lots": requested_lots, "cmp": cmp_value,
+                    "target_ce_strike_zone": target, "selected_ce_strike": float(selected.get("strike") or 0),
+                    "expiry": str(expiry), "option_symbol": option_symbol, "premium": premium,
+                    "sell_limit_price": sell_limit, "delta": abs(float(analytics.get("delta") or 0)),
+                    "sell_pop": float(analytics.get("sell_pop") or 0), "iv": float(analytics.get("iv_percent") or 0),
+                    "oi": quote_oi(quote), "volume": int(float(quote.get("volume") or 0)),
+                    "bid": bid, "ask": ask, "bid_ask_spread_percent": spread,
+                    "event_risk": event_risk, "event_risk_reason": event_reason,
+                    "breakout_risk": breakout, "contract_valid": True,
+                    "has_active_position": symbol in active_underlyings, "core": row.get("core"),
+                    "one_year_return": row.get("input_1y"), "week_return": week,
+                }
+            )
+        except Exception as exc:
+            candidates.append({"stock": symbol, "holding_qty": holding, "active_lot_size": lot_size, "requested_lots": requested_lots, "cmp": cmp_value, "contract_valid": False, "reject_reasons": [str(exc)]})
+    return rank_ce_sell_candidates(candidates, settings)
+
+
+def ce_sell_dashboard(force_refresh: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    cache_key = f"ce-sell-dashboard:{selected_kite_profile_name()}"
+    if force_refresh:
+        clear_app_cache((cache_key, "kite:positions", "kite:quote:"))
+    return cached_value(cache_key, build_live_ce_sell_rankings, CE_SELL_DASHBOARD_CACHE_SECONDS)
+
+
+def covered_ce_holding_source(kite: Any, underlying: str) -> dict[str, Any]:
+    clean_underlying = str(underlying or "").strip().upper()
+    kite_qty = 0
+    kite_average_price = 0.0
+    for holding in kite.holdings():
+        if str(holding.get("tradingsymbol") or "").upper() == clean_underlying:
+            kite_qty = int(float(holding.get("quantity") or 0))
+            kite_average_price = float(holding.get("average_price") or 0)
+            break
+    income_growth = load_income_growth_holding_map().get(clean_underlying, {})
+    income_growth_qty = int(float(income_growth.get("holding") or 0))
+    if kite_qty >= income_growth_qty:
+        effective_qty = kite_qty
+        holding_source = f"Kite profile: {selected_kite_profile_name()}"
+        average_price = kite_average_price
+    else:
+        effective_qty = income_growth_qty
+        holding_source = "Income Growth holding record"
+        average_price = 0.0
+    return {
+        "holding_qty": effective_qty,
+        "holding_source": holding_source,
+        "kite_holding_qty": kite_qty,
+        "income_growth_holding_qty": income_growth_qty,
+        "average_price": average_price,
+    }
+
+
+def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    clean_underlying = str(underlying or "").strip().upper()
+    if not clean_underlying:
+        raise ValueError("Select an approved covered CE candidate first.")
+
+    top, _, _ = ce_sell_dashboard(True)
+    candidate = next(
+        (item for item in top if str(item.get("stock") or "").upper() == clean_underlying),
+        None,
+    )
+    if not candidate:
+        raise PermissionError(
+            f"{clean_underlying} is no longer an approved Top 3 covered CE candidate. Recalculate and review."
+        )
+
+    kite = kite_orders.kite_client()
+    positions = kite.positions().get("net", [])
+    active_underlyings = {
+        underlying_for_symbol(str(item.get("tradingsymbol") or "").upper())
+        for item in positions
+        if int(float(item.get("quantity") or 0)) != 0
+    }
+    if clean_underlying in active_underlyings:
+        raise PermissionError(
+            f"{clean_underlying} already has an active option position. New covered CE SELL is blocked."
+        )
+
+    holding = covered_ce_holding_source(kite, clean_underlying)
+    holding_qty = int(holding["holding_qty"])
+    average_price = float(holding["average_price"])
+
+    symbol = str(candidate.get("option_symbol") or "").upper()
+    lot_size = int(float(candidate.get("active_lot_size") or 0))
+    requested_lots = int(float(candidate.get("lots_to_sell") or 0))
+    covered_lots = holding_qty // lot_size if lot_size > 0 else 0
+    lots_to_sell = min(requested_lots, covered_lots)
+    quantity = lots_to_sell * lot_size
+    if lot_size <= 0 or quantity <= 0 or quantity > holding_qty:
+        raise PermissionError(
+            f"{clean_underlying} is not fully covered now. Effective holding {holding_qty}; "
+            f"Kite profile {holding['kite_holding_qty']}; Income Growth {holding['income_growth_holding_qty']}; "
+            f"lot size {lot_size}."
+        )
+
+    quote_key = f"NFO:{symbol}"
+    try:
+        quote = kite.quote([quote_key]).get(quote_key, {})
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, f"{symbol} CE quote")) from exc
+    ltp = quote_ltp(quote)
+    if ltp <= 0:
+        raise ValueError(f"Could not read fresh CE premium for {symbol}.")
+    settings = load_ce_sell_settings()
+    limit_price = ceil_to_tick(
+        ltp * (1 + float(settings["price_markup_percent"]) / 100),
+        0.05,
+    )
+    cmp_value = float(candidate.get("cmp") or 0)
+    strike = float(candidate.get("selected_ce_strike") or 0)
+    max_profit = limit_price * quantity
+    covered_value = cmp_value * quantity
+    return {
+        "underlying": clean_underlying,
+        "symbol": symbol,
+        "holding_qty": holding_qty,
+        "holding_source": holding["holding_source"],
+        "kite_holding_qty": holding["kite_holding_qty"],
+        "income_growth_holding_qty": holding["income_growth_holding_qty"],
+        "average_price": average_price,
+        "lot_size": lot_size,
+        "covered_lots": covered_lots,
+        "lots_to_sell": lots_to_sell,
+        "quantity": quantity,
+        "cmp": cmp_value,
+        "strike": strike,
+        "expiry": str(candidate.get("expiry") or ""),
+        "ltp": ltp,
+        "limit_price": limit_price,
+        "max_profit": max_profit,
+        "covered_value": covered_value,
+        "premium_yield_percent": max_profit / covered_value * 100 if covered_value > 0 else 0,
+        "otm_percent": float(candidate.get("otm_percent") or 0),
+        "score": float(candidate.get("final_ce_score") or 0),
+        "event_risk": str(candidate.get("event_risk") or "N/A"),
+        "breakout_risk": str(candidate.get("breakout_risk") or "N/A"),
+    }
+
+
+def place_approved_ce_sell_order(underlying: str) -> dict[str, Any]:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
+        raise PermissionError(
+            'Covered CE order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
+        )
+    snapshot = ce_sell_order_snapshot(underlying)
+    kite = kite_orders.kite_client()
+    order = {
+        "variety": "regular",
+        "exchange": "NFO",
+        "tradingsymbol": snapshot["symbol"],
+        "transaction_type": "SELL",
+        "quantity": snapshot["quantity"],
+        "product": "NRML",
+        "order_type": "LIMIT",
+        "price": snapshot["limit_price"],
+        "validity": "DAY",
+        "tag": "TOP3_CE",
+    }
+    order_id = kite_orders.place_order(kite, order)
+    invalidate_kite_trade_cache()
+    clear_app_cache((f"ce-sell-dashboard:{selected_kite_profile_name()}",))
+    return {
+        "tradingsymbol": snapshot["symbol"],
+        "status": "LIVE_SENT",
+        "order_id": order_id,
+        "detail": (
+            f"SELL covered CE {snapshot['quantity']} qty at LIMIT {snapshot['limit_price']:.2f}. "
+            f"Fresh LTP {snapshot['ltp']:.2f}; effective holding {snapshot['holding_qty']} shares "
+            f"from {snapshot['holding_source']}."
+        ),
+    }
 
 
 def income_growth_pe_sell_candidates(rows: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
@@ -5592,6 +6538,55 @@ def build_orders(
     return orders
 
 
+def load_default_trade_preview(state: PageState) -> PageState:
+    if not DEFAULT_CSV_PATH.exists():
+        state.message = f"Load today's CSV file: {DEFAULT_CSV_PATH.name}"
+        return state
+    state.csv_path = str(DEFAULT_CSV_PATH)
+    state.csv_text = DEFAULT_CSV_PATH.read_text(encoding="utf-8-sig")
+    state.rows, state.csv_text = load_rows(state.csv_path, state.csv_text)
+    validate_kite_order_rows(state.rows)
+    state.orders, state.console_log = call_with_console(
+        build_orders,
+        state.rows,
+        state.no_ltp_price,
+        state.keep_existing_orders,
+    )
+    state.trade_validations = validate_trade_orders(state.orders)
+    state.selected_indexes = default_selected_order_indexes(
+        state.orders,
+        state.trade_validations,
+    )
+    state.message = f"Loaded and previewed today's CSV with {len(state.orders)} order(s)."
+    return state
+
+
+def load_ce_sell_dashboard(state: PageState, force_refresh: bool = False) -> None:
+    (
+        state.ce_sell_top,
+        state.ce_sell_watch,
+        state.ce_sell_avoid,
+    ), ce_log = call_with_console(ce_sell_dashboard, force_refresh)
+    state.console_log = f"{state.console_log}{ce_log}"
+
+
+def load_default_csv_research(state: PageState) -> PageState:
+    if not DEFAULT_CSV_PATH.exists():
+        state.message = f"Load today's CSV file: {DEFAULT_CSV_PATH.name}"
+        return state
+    state.csv_path = str(DEFAULT_CSV_PATH)
+    state.csv_text = DEFAULT_CSV_PATH.read_text(encoding="utf-8-sig")
+    state.research_rows, state.console_log = call_with_console(
+        research_csv_symbols,
+        state.csv_text,
+        state.csv_path,
+    )
+    state.message = (
+        f"Loaded today's CSV research for {len(state.research_rows)} symbol(s)."
+    )
+    return state
+
+
 def should_fallback_to_new_order(error: Exception) -> bool:
     text = str(error).lower()
     fallback_terms = [
@@ -6451,6 +7446,47 @@ def render_score_badge(score_pct: float | None) -> str:
     return f'<span class="score-badge {status.lower()}">{html.escape(text)}<small>{html.escape(status)}</small></span>'
 
 
+def render_ce_sell_dashboard(state: PageState) -> str:
+    def card(item: dict[str, Any], css_class: str, actionable: bool = False) -> str:
+        content = (
+            f'<div class="pe-rank-card-head"><strong>{html.escape(str(item.get("stock") or ""))}</strong>'
+            f'<span>Score {html.escape(fmt_number(item.get("final_ce_score"), 0))}/100</span></div>'
+            f'<div class="pe-score-split"><span>Coverage <strong>{html.escape(fmt_number(item.get("holding_coverage_score"), 0))}/30</strong></span>'
+            f'<span>Call-away <strong>{html.escape(fmt_number(item.get("call_away_comfort_score"), 0))}/30</strong></span>'
+            f'<span>CE trade <strong>{html.escape(fmt_number(item.get("ce_trade_score"), 0))}/40</strong></span></div>'
+            f'<div class="pe-rank-metrics"><span>Selected CE<strong>{html.escape(str(item.get("option_symbol") or "N/A"))}</strong></span>'
+            f'<span>Holding / lot<strong>{html.escape(str(item.get("holding_qty") or 0))} / {html.escape(str(item.get("active_lot_size") or 0))}</strong></span>'
+            f'<span>Covered / sell lots<strong>{html.escape(str(item.get("covered_lots_available") or 0))} / {html.escape(str(item.get("lots_to_sell") or 0))}</strong></span>'
+            f'<span>CMP / strike<strong>{html.escape(fmt_number(item.get("cmp")))} / {html.escape(fmt_number(item.get("selected_ce_strike")))}</strong></span>'
+            f'<span>OTM<strong>{html.escape(fmt_number(item.get("otm_percent"), 2))}%</strong></span>'
+            f'<span>Sell limit<strong>{html.escape(fmt_number(item.get("sell_limit_price")))}</strong></span>'
+            f'<span>Max profit<strong>{html.escape(format_buy_amount(item.get("max_profit")))}</strong></span>'
+            f'<span>Yield<strong>{html.escape(fmt_number(item.get("premium_yield_percent"), 2))}%</strong></span>'
+            f'<span>Event / breakout<strong>{html.escape(str(item.get("event_risk") or "N/A"))} / {html.escape(str(item.get("breakout_risk") or "N/A"))}</strong></span></div>'
+            f'<p>{html.escape(str(item.get("reject_reason") or item.get("explanation") or ""))}</p>'
+        )
+        if actionable:
+            return (
+                f'<button type="button" class="pe-rank-card ce-sell-order-button {css_class}" '
+                f'data-underlying="{html.escape(str(item.get("stock") or ""), quote=True)}">'
+                f'{content}<em>Review fresh quote, news, and covered SELL order</em></button>'
+            )
+        return f'<article class="pe-rank-card {css_class}">{content}</article>'
+
+    top = "".join(card(item, "validation-green", True) for item in state.ce_sell_top or [])
+    watch = "".join(card(item, "validation-yellow") for item in state.ce_sell_watch or [])
+    avoid = "".join(card(item, "validation-red") for item in state.ce_sell_avoid or [])
+    return (
+        '<section class="panel income-growth-pe-panel ce-sell-dashboard">'
+        '<div class="panel-title">Top 3 CE Sell Candidates For Today</div>'
+        '<div class="status pe-scoring-note">Covered CALL candidates are first filtered for full holding coverage, active F&amp;O contract, existing option positions, event risk, liquidity, premium yield, and breakout risk. Valid candidates are scored using 30 points for holding coverage, 30 points for call-away comfort, and 40 points for CE trade quality.</div>'
+        '<div class="actions"><button type="submit" formaction="/ce-scan/load">Recalculate Best 3 CE SELL</button></div>'
+        f'<div class="pe-candidate-grid">{top or "<div class=\"status\">No covered CE candidate passed every hard filter today.</div>"}</div></section>'
+        f'<details class="panel income-growth-pe-panel"><summary>CE Watch / Review <span>{len(state.ce_sell_watch or [])}</span></summary><div class="pe-candidate-grid">{watch or "<div class=\"status\">No additional valid CE candidates.</div>"}</div></details>'
+        f'<details class="panel income-growth-pe-panel avoid-today-panel"><summary>CE Avoid Today <span>{len(state.ce_sell_avoid or [])}</span></summary><div class="pe-candidate-grid">{avoid or "<div class=\"status\">No rejected CE candidates.</div>"}</div></details>'
+    )
+
+
 def default_selected_order_indexes(
     orders: list[dict[str, Any]],
     validations: list[dict[str, Any]] | None = None,
@@ -7249,20 +8285,6 @@ def render_income_growth_panel(state: PageState) -> str:
           <button type="submit" formaction="/income-growth/save-holding">Save Holding Data</button>
         </div>
       </section>"""
-    pe_candidates = income_growth_pe_sell_candidates(rows)
-    pe_cards = "".join(
-        f'<div class="pe-candidate-card {strength_class(item.get("color"))}">'
-        f'<div><strong>{render_symbol_value("tradingsymbol", item.get("symbol", ""))}</strong>'
-        f'<span>{html.escape(str(item.get("label", "")))} | Score {html.escape(fmt_number(item.get("score"), 0))}</span></div>'
-        f'<p>SELL PE near <strong>{html.escape(fmt_number(item.get("put_strike")))}</strong> | '
-        f'Buffer {html.escape(fmt_number(item.get("put_down_pct"), 1))}% | '
-        f'Cash {html.escape(format_buy_amount(item.get("cash_required")))}</p>'
-        f'<small>{html.escape(" | ".join(str(reason) for reason in item.get("reasons", [])))}</small>'
-        "</div>"
-        for item in pe_candidates
-    )
-    if not pe_cards:
-        pe_cards = '<div class="muted-cell">Refresh Income Growth to calculate PE sell candidates.</div>'
     headers = [
         "Stock",
         "Holding",
@@ -7312,11 +8334,6 @@ def render_income_growth_panel(state: PageState) -> str:
       </section>
       <section class="panel investing-summary-panel"><div class="summary-grid">{summary_cards}</div></section>
       {gpt_result}
-      <section class="panel income-growth-pe-panel">
-        <div class="panel-title">Top 3 PE Sell Candidates For Today</div>
-        <div class="status">Ranked by cash required, PUT strike buffer, valuation PE, 52-week position, and recent price trend. Only the three highest scores are shown.</div>
-        <div class="pe-candidate-grid">{pe_cards}</div>
-      </section>
       <section class="panel income-growth-table-panel">
         <div class="panel-title">Covered Call Capacity Score From Current Holding Sheet</div>
         <div class="status">Click a stock name to BUY or SELL equity through the selected Kite profile. Uses your holding shares, lot multiple, lots can be sold, CMP, call strike, PE, 52W, 1Y, monthly, weekly, and today move.</div>
@@ -7956,7 +8973,7 @@ def render_positions_panel(
           <p class="status">Analysis of current Positions | P&L, margin, premium capture and roll signals.</p>
         </div>
         <div class="actions">
-          <button type="submit" formaction="/positions-research/load">Load Active Positions</button>
+          <button type="submit" formaction="/positions-research/load">Refresh Active Positions</button>
           <button type="submit" formaction="/positions/load">Get Current Position / Preview BUY</button>
           {position_execute_button}
         </div>
@@ -7965,18 +8982,32 @@ def render_positions_panel(
       {table}
       {position_orders_table}
       {render_results(state.position_results)}
-      <section class="panel calm-options-panel">
-        <div class="panel-title">Position BUY Options</div>
-        {render_number_input("position_discount_percent", "Discount percent", state.position_discount_percent, "0.05")}
-        {render_input("position_exchange", "Exchange", state.position_exchange)}
-        {render_input("position_product", "Product filter", state.position_product)}
-        {render_input("position_symbols", "Symbol filter, comma-separated", state.position_symbols)}
-        {render_input("position_variety", "Variety", state.position_variety)}
-        {render_input("position_validity", "Validity", state.position_validity)}
-        {render_input("position_tag", "Tag", state.position_tag)}
-        {render_number_input("position_tick_size", "Tick size", state.position_tick_size, "0.01")}
-        {render_input("position_max_orders", "Max orders", state.position_max_orders)}
-      </section>
+      <details class="panel position-buy-settings">
+        <summary>
+          <span>
+            <strong>BUY Preview Settings</strong>
+            <small>Optional controls for filtering and pricing position close orders</small>
+          </span>
+          <span class="position-settings-toggle">Open settings</span>
+        </summary>
+        <div class="position-buy-settings-body">
+          <div class="position-settings-grid position-settings-primary">
+            {render_number_input("position_discount_percent", "Discount from price (%)", state.position_discount_percent, "0.05")}
+            {render_input("position_exchange", "Exchange", state.position_exchange)}
+            {render_input("position_product", "Product filter", state.position_product)}
+            {render_input("position_max_orders", "Maximum orders", state.position_max_orders)}
+          </div>
+          <div class="position-settings-grid position-settings-secondary">
+            <div class="position-settings-wide">
+              {render_input("position_symbols", "Symbol filter (comma-separated)", state.position_symbols)}
+            </div>
+            {render_input("position_variety", "Variety", state.position_variety)}
+            {render_input("position_validity", "Validity", state.position_validity)}
+            {render_input("position_tag", "Order tag", state.position_tag)}
+            {render_number_input("position_tick_size", "Tick size", state.position_tick_size, "0.01")}
+          </div>
+        </div>
+      </details>
       {render_console(state.console_log)}
     </form>"""
 
@@ -8105,25 +9136,31 @@ def render_commodity_panel(state: PageState) -> str:
 def render_income_panel(state: PageState) -> str:
     rows = state.income_rows or []
     summary = state.income_summary or {"overall_pnl": 0, "by_symbol": {}}
+    positions = state.income_positions or []
+    pe_top = state.income_pe_top or []
+    pe_watch = state.income_pe_watch or []
+    pe_avoid = state.income_pe_avoid or []
+    blocked_pe_symbols = {
+        str(item.get("symbol") or item.get("stock") or "").upper()
+        for item in pe_avoid
+        if "existing active pe position" in str(item.get("reject_reason") or "").lower()
+    }
     panel_style = "" if state.active_tab == "income" else ' style="display:none"'
+    overall_pnl = float(summary.get("overall_pnl") or 0)
     pnl_cards = [
+        ("Current option P&L", fmt_number(overall_pnl), "pnl-positive" if overall_pnl >= 0 else "pnl-negative"),
+        ("Active short positions", str(summary.get("active_short_positions") or 0), ""),
         (
-            "Overall monthly P&L",
-            fmt_number(summary.get("overall_pnl")),
-            "pnl-positive" if float(summary.get("overall_pnl") or 0) >= 0 else "pnl-negative",
-        )
+            "PE / CE exposure",
+            f"{summary.get('active_pe_positions') or 0} PE / {summary.get('active_ce_positions') or 0} CE",
+            "",
+        ),
+        (
+            "Profitable / Review",
+            f"{summary.get('profitable_positions') or 0} / {summary.get('review_positions') or 0}",
+            "pnl-positive" if int(summary.get("review_positions") or 0) == 0 else "pnl-negative",
+        ),
     ]
-    for item in INCOME_UNDERLYINGS:
-        symbol = item["symbol"]
-        symbol_summary = (summary.get("by_symbol") or {}).get(symbol, {})
-        total_pnl = float(symbol_summary.get("total_pnl") or 0)
-        pnl_cards.append(
-            (
-                f"{symbol} monthly P&L",
-                fmt_number(total_pnl),
-                "pnl-positive" if total_pnl >= 0 else "pnl-negative",
-            )
-        )
     pnl_summary_html = "".join(
         f'<div class="income-pnl-card"><span>{html.escape(label)}</span><strong class="{css_class}">{html.escape(value)}</strong></div>'
         for label, value, css_class in pnl_cards
@@ -8172,8 +9209,10 @@ def render_income_panel(state: PageState) -> str:
         f"<td>{html.escape(str(row.get('event_status', '')))}<small>{html.escape(str(row.get('event_detail', '')))}</small></td>"
         "<td>"
         + (
-            f'<button type="submit" class="book-profit-button" formaction="/income/sell-pe" name="income_underlying" value="{html.escape(str(row.get("symbol", "")), quote=True)}">SELL PE</button>'
-            if not row.get("error")
+            f'<button type="button" class="book-profit-button income-pe-order-button" data-underlying="{html.escape(str(row.get("symbol", "")), quote=True)}" data-strike="{html.escape(str(row.get("strike") or 0), quote=True)}">SELL PE</button>'
+            if not row.get("error") and str(row.get("symbol") or "").upper() not in blocked_pe_symbols
+            else '<span class="commodity-wait">Existing PE position - blocked</span>'
+            if str(row.get("symbol") or "").upper() in blocked_pe_symbols
             else '<span class="commodity-wait">Review error</span>'
         )
         + f'<small>{html.escape(str(row.get("action", "")))}</small>'
@@ -8181,6 +9220,23 @@ def render_income_panel(state: PageState) -> str:
         + "</td>"
         "</tr>"
         for row in rows
+    )
+    position_rows = "".join(
+        "<tr>"
+        f"<td>{render_symbol_value('tradingsymbol', position.get('tradingsymbol', ''))}</td>"
+        f"<td>{html.escape(str(position.get('quantity') or 0))}</td>"
+        f"<td>{html.escape(fmt_number(position.get('average_price')))}</td>"
+        f"<td>{html.escape(fmt_number(position.get('ltp')))}</td>"
+        f'<td class="{"pnl-positive" if float(position.get("pnl") or 0) >= 0 else "pnl-negative"}"><strong>{html.escape(fmt_number(position.get("pnl")))}</strong></td>'
+        "</tr>"
+        for position in positions
+    )
+    position_rows_html = position_rows or '<tr><td colspan="5">No active short option positions.</td></tr>'
+    positions_table = (
+        '<section class="panel income-current-positions"><div class="panel-title">Current Income Positions &amp; P&amp;L</div>'
+        '<div class="status">Live short-option exposure used by this decision dashboard.</div>'
+        '<div class="table-wrap"><table><thead><tr><th>Position</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&amp;L</th>'
+        f'</tr></thead><tbody>{position_rows_html}</tbody></table></div></section>'
     )
     candidate_table = (
         '<section class="panel income-candidates"><div class="panel-title">PFC / CAMS Monthly PE Candidates</div>'
@@ -8190,6 +9246,55 @@ def render_income_panel(state: PageState) -> str:
         f'</tr></thead><tbody>{candidate_rows}</tbody></table></div></section>'
         if rows
         else ""
+    )
+    def pe_candidate_card(item: dict[str, Any], actionable: bool) -> str:
+        symbol = str(item.get("symbol") or item.get("stock") or "")
+        status = str(item.get("status") or "")
+        event_risk = str(item.get("event_risk") or "AMBER")
+        card_class = (
+            "validation-green"
+            if status == "TOP_3"
+            else "validation-red"
+            if status == "AVOID_TODAY"
+            else "validation-yellow"
+        )
+        content = (
+            f'<div class="pe-rank-card-head"><strong>{html.escape(symbol)}</strong>'
+            f'<span>Score {html.escape(fmt_number(item.get("final_pe_score"), 0))}/100</span></div>'
+            f'<div class="pe-score-split"><span>Stock quality <strong>{html.escape(fmt_number(item.get("stock_quality_score"), 0))}/40</strong></span>'
+            f'<span>PE trade <strong>{html.escape(fmt_number(item.get("pe_trade_score"), 0))}/60</strong></span></div>'
+            f'<div class="pe-rank-metrics"><span>Selected PE<strong>{html.escape(str(item.get("option_symbol") or "N/A"))}</strong></span>'
+            f'<span>Target zone<strong>{html.escape(fmt_number(item.get("target_strike")))}</strong></span>'
+            f'<span>Tradable strike<strong>{html.escape(fmt_number(item.get("strike")))}</strong></span>'
+            f'<span>CMP<strong>{html.escape(fmt_number(item.get("cmp")))}</strong></span>'
+            f'<span>OTM<strong>{html.escape(fmt_number(item.get("otm_percent"), 2))}%</strong></span>'
+            f'<span>Sell limit<strong>{html.escape(fmt_number(item.get("sell_limit_price")))}</strong></span>'
+            f'<span>Max profit<strong>{html.escape(format_buy_amount(item.get("max_profit")))}</strong></span>'
+            f'<span>Assignment cash<strong>{html.escape(format_buy_amount(item.get("assignment_cash")))}</strong></span>'
+            f'<span>Yield<strong>{html.escape(fmt_number(item.get("premium_yield_percent"), 2))}%</strong></span>'
+            f'<span>Event risk<strong>{html.escape(event_risk)}</strong></span></div>'
+            f'<p>{html.escape(str(item.get("reject_reason") or item.get("explanation") or ""))}</p>'
+        )
+        if actionable:
+            return (
+                f'<button type="button" class="pe-rank-card income-pe-order-button {card_class}" '
+                f'data-underlying="{html.escape(symbol, quote=True)}" '
+                f'data-strike="{html.escape(str(item.get("strike") or 0), quote=True)}">{content}'
+                '<em>Open reviewed SELL order</em></button>'
+            )
+        return f'<article class="pe-rank-card {card_class}">{content}</article>'
+
+    top_cards = "".join(pe_candidate_card(item, True) for item in pe_top)
+    watch_cards = "".join(pe_candidate_card(item, False) for item in pe_watch)
+    avoid_cards = "".join(pe_candidate_card(item, False) for item in pe_avoid)
+    growth_pe_section = (
+        '<section class="panel income-growth-pe-panel"><div class="panel-title">Top 3 PE Sell Candidates For Today</div>'
+        '<div class="status pe-scoring-note">Candidates are first filtered for assignment size, existing PE positions, event risk, contract validity, liquidity, premium yield, and trend breakdown. Valid candidates are then scored using 40 points for assignment quality and 60 points for PE trade quality. Click an approved card to review a live SELL order.</div>'
+        f'<div class="pe-candidate-grid">{top_cards or "<div class=\"status\">No candidate passed every hard filter today.</div>"}</div></section>'
+        f'<details class="panel income-growth-pe-panel"><summary>Watch / Review <span>{len(pe_watch)}</span></summary>'
+        f'<div class="pe-candidate-grid">{watch_cards or "<div class=\"status\">No additional valid candidates.</div>"}</div></details>'
+        f'<details class="panel income-growth-pe-panel avoid-today-panel"><summary>Avoid Today <span>{len(pe_avoid)}</span></summary>'
+        f'<div class="pe-candidate-grid">{avoid_cards or "<div class=\"status\">No hard-rejected candidates.</div>"}</div></details>'
     )
     ce_rows = "".join(
         "<tr>"
@@ -8246,29 +9351,51 @@ def render_income_panel(state: PageState) -> str:
       <section class="panel income-hero">
         <div>
           <div class="panel-title">INCOME - Monthly PE Sell Strategy</div>
-          <p class="status">Low-stress cash-secured monthly PUT selling for PFC and CAMS. Built for disciplined theta income, assignment readiness, and monthly review.</p>
+          <p class="status">Cached decision dashboard for current option exposure and the strongest cash-secured PE opportunities. Recalculate only when you need a fresh market scan.</p>
         </div>
         <div class="actions">
-          <button type="submit" formaction="/income/load">Refresh PFC / CAMS Candidates</button>
+          <button type="submit" formaction="/income/load">Recalculate Best 3 PE SELL</button>
         </div>
       </section>
-      <section class="panel income-pnl-panel"><div class="panel-title">Monthly P&L Summary</div><div class="income-pnl-grid">{pnl_summary_html}</div></section>
-      {candidate_table}
+      <section class="panel income-pnl-panel"><div class="panel-title">Income Decision Summary</div><div class="income-pnl-grid">{pnl_summary_html}</div></section>
+      {positions_table}
+      {growth_pe_section}
       {render_results(state.income_results)}
-      <section class="panel income-guideline-panel"><div class="income-rule-grid">{rule_cards}</div></section>
-      <section class="panel income-stock-panel"><div class="panel-title">Strategy Stocks</div><div class="income-stock-grid">{stock_cards}</div></section>
-      {ce_table}
-      <section class="panel"><div class="panel-title">Entry / Exit Validation</div><div class="income-filter-grid">{filter_html}</div></section>
-      <section class="panel"><div class="panel-title">Expected Portfolio Behavior</div>
-        <div class="income-rule-grid">
-          <div class="income-rule"><span>PFC</span><strong>18-22% annualized, moderate stress</strong></div>
-          <div class="income-rule"><span>CAMS</span><strong>15-18% annualized, low stress</strong></div>
-          <div class="income-rule"><span>Combined</span><strong>~16-20% CAGR, ~1.3-1.7% monthly average</strong></div>
-          <div class="income-rule"><span>Best setups</span><strong>After 5-8% correction, IV spike, sideways market, panic week</strong></div>
+      <div class="live-modal-backdrop" id="income-pe-order-modal">
+        <div class="live-modal income-pe-order-modal-card">
+          <h2 id="income-pe-order-title">Cash-Secured PE SELL</h2>
+          <p class="status">Fresh Kite premium is loaded when the candidate opens. The limit order is set 20% above LTP.</p>
+          <div class="income-equity-metrics">
+            <div><span>Option</span><strong id="income-pe-option">--</strong></div>
+            <div><span>Fresh LTP</span><strong id="income-pe-ltp">--</strong></div>
+            <div><span>SELL limit +20%</span><strong id="income-pe-limit">--</strong></div>
+            <div><span>Quantity</span><strong id="income-pe-quantity">--</strong></div>
+            <div><span>Expiry</span><strong id="income-pe-expiry">--</strong></div>
+            <div><span>Assignment cash</span><strong id="income-pe-assignment">--</strong></div>
+            <div><span>Maximum profit</span><strong id="income-pe-max-profit">--</strong></div>
+            <div><span>Premium yield</span><strong id="income-pe-yield">--</strong></div>
+          </div>
+          <div class="income-equity-order-summary" id="income-pe-summary">Loading fresh PE contract and premium...</div>
+          <input type="hidden" name="income_underlying" id="income-pe-underlying">
+          <input type="hidden" name="income_target_strike" id="income-pe-target-strike">
+          <input type="hidden" name="income_pe_confirmed" id="income-pe-confirmed" value="0">
+          <div class="breath-circle income-pe-breath" id="income-pe-breath"></div>
+          <div class="breath-text" id="income-pe-breath-text">Review order first</div>
+          <div class="countdown" id="income-pe-countdown">10</div>
+          <div class="modal-actions">
+            <button type="button" class="secondary" id="income-pe-cancel">Cancel</button>
+            <button type="button" id="income-pe-review" disabled>Submit &amp; Start 10s</button>
+            <button type="submit" class="danger" formaction="/income/sell-pe" id="income-pe-go" disabled>GO</button>
+          </div>
         </div>
-      </section>
+      </div>
+      <details class="panel income-playbook">
+        <summary>Strategy Rules &amp; Entry / Exit Playbook</summary>
+        <div class="income-rule-grid">{rule_cards}</div>
+        <div class="income-filter-grid">{filter_html}</div>
+      </details>
       {('<section class="panel">' + render_graceful_error(state.income_error, "INCOME Error") + '</section>') if state.income_error else ''}
-      {render_console(state.console_log)}
+      {render_collapsed_console(state.console_log)}
     </form>"""
 
 
@@ -8288,6 +9415,15 @@ def render_console(console_log: str) -> str:
     return (
         '<section class="panel"><div class="panel-title">Kite Console</div>'
         f'<pre class="console">{html.escape(console_log)}</pre></section>'
+    )
+
+
+def render_collapsed_console(console_log: str) -> str:
+    if not console_log.strip():
+        return ""
+    return (
+        '<details class="panel console-details"><summary>View Kite Console</summary>'
+        f'<pre class="console">{html.escape(console_log)}</pre></details>'
     )
 
 
@@ -8435,20 +9571,17 @@ def render_market_topper(state: PageState) -> str:
         <div class="global-error" id="global-error"></div>
         <div class="global-grid" id="global-grid">{global_quote_cards}</div>
       </div>
-      <div class="expiry-strip">
-        {expiry_cards}
-        {warning_html}
-      </div>
-      <div class="ticker-panel">
-        <div class="ticker-title live-title">Kite LTP and Day Change | {quote_date} <button type="button" class="mini-refresh-button" id="refresh-market-quotes">Refresh</button></div>
-        <div class="quote-error" id="quote-error"></div>
-        <div class="quote-grid" id="quote-grid">{quote_cards}</div>
-      </div>
-      <div class="home-action-grid">
-        <a class="home-action-card" href="/research"><strong>Research new CSV trades</strong><span>Compare SELL CALL / SELL PUT scores before entry.</span></a>
-        <a class="home-action-card" href="/positions"><strong>Check active positions</strong><span>Review P&L, capture %, remaining premium, and roll signals.</span></a>
-        <a class="home-action-card" href="/income"><strong>PFC / CAMS income</strong><span>Use monthly PE/CE candidates with cash and coverage rules.</span></a>
-      </div>
+      <details class="ticker-disclosure" id="kite-ltp-disclosure">
+        <summary>
+          <span>Kite LTP and Day Change | {quote_date}</span>
+          <strong>Open details</strong>
+        </summary>
+        <div class="ticker-panel">
+          <div class="ticker-title live-title">Selected Kite watchlist <button type="button" class="mini-refresh-button" id="refresh-market-quotes">Refresh now</button></div>
+          <div class="quote-error" id="quote-error"></div>
+          <div class="quote-grid" id="quote-grid">{quote_cards}</div>
+        </div>
+      </details>
     </section>"""
 
 
@@ -9291,6 +10424,39 @@ def render_page(state: PageState) -> bytes:
       font-size: 10.5px;
       padding: 2px 6px;
     }}
+    .ticker-disclosure {{
+      margin-top: 10px;
+      border: 1px solid #bae6fd;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.72);
+      overflow: hidden;
+    }}
+    .ticker-disclosure summary {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 11px 14px;
+      color: #075985;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 900;
+      list-style: none;
+    }}
+    .ticker-disclosure summary::-webkit-details-marker {{ display: none; }}
+    .ticker-disclosure summary strong {{
+      padding: 4px 9px;
+      border-radius: 999px;
+      color: #0f766e;
+      background: #ccfbf1;
+      font-size: 10px;
+      text-transform: uppercase;
+    }}
+    .ticker-disclosure[open] summary {{
+      border-bottom: 1px solid #dbeafe;
+      background: #f0fdfa;
+    }}
+    .ticker-disclosure .ticker-panel {{ margin: 0; border: 0; border-radius: 0; box-shadow: none; }}
     .commodity-panel {{
       border-color: #fed7aa;
       background: linear-gradient(135deg, #ffffff 0%, #fff7ed 44%, #f0fdfa 100%);
@@ -9315,6 +10481,11 @@ def render_page(state: PageState) -> bytes:
       background: linear-gradient(135deg, #ecfdf5 0%, #dcfce7 100%);
       border-color: #22c55e;
       box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.20), 0 16px 36px rgba(21, 128, 61, 0.16);
+    }}
+    .commodity-card.below-200-dma {{
+      background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+      border-color: #4ade80;
+      box-shadow: 0 0 0 2px rgba(74, 222, 128, 0.16), 0 14px 30px rgba(21, 128, 61, 0.12);
     }}
     .commodity-meta {{
       display: flex;
@@ -9363,6 +10534,16 @@ def render_page(state: PageState) -> bytes:
       padding: 4px 7px;
       background: #f0f9ff;
       white-space: nowrap;
+    }}
+    .commodity-card.below-200-dma .commodity-dma .dma-200 {{
+      border-color: #22c55e;
+      background: #bbf7d0;
+      color: #166534;
+    }}
+    .commodity-card.below-200-dma:not(.buy-now) .commodity-action {{
+      background: #dcfce7;
+      color: #166534;
+      border: 1px solid #86efac;
     }}
     .commodity-threshold {{
       margin-top: 8px;
@@ -9470,6 +10651,42 @@ def render_page(state: PageState) -> bytes:
         radial-gradient(circle at top left, rgba(187, 247, 208, 0.45), transparent 32%),
         linear-gradient(135deg, #ffffff 0%, #f0fdf4 100%);
       margin-bottom: 10px;
+    }}
+    .income-current-positions {{
+      border-color: #99f6e4;
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
+    }}
+    .income-current-positions table {{
+      min-width: 620px;
+    }}
+    .income-current-positions th {{
+      background: linear-gradient(135deg, #0f4c5c, #0f766e);
+      color: #ffffff;
+    }}
+    .income-growth-pe-panel > summary,
+    .income-playbook > summary,
+    .console-details > summary {{
+      cursor: pointer;
+      color: #0f4c5c;
+      font-size: 15px;
+      font-weight: 900;
+      list-style-position: inside;
+    }}
+    .income-growth-pe-panel > summary span {{
+      display: inline-block;
+      min-width: 24px;
+      margin-left: 6px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: #ccfbf1;
+      color: #0f766e;
+      font-size: 11px;
+      text-align: center;
+    }}
+    .income-growth-pe-panel[open] > summary,
+    .income-playbook[open] > summary,
+    .console-details[open] > summary {{
+      margin-bottom: 12px;
     }}
     .income-rule-grid,
     .income-stock-grid,
@@ -9738,7 +10955,13 @@ def render_page(state: PageState) -> bytes:
       border-radius: 12px;
       padding: 11px 12px;
       box-shadow: 0 12px 28px rgba(15, 118, 110, 0.08);
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+      width: 100%;
     }}
+    .pe-candidate-card:hover {{ transform: translateY(-1px); box-shadow: 0 15px 32px rgba(15, 118, 110, 0.14); }}
     .pe-candidate-card div {{
       display: flex;
       align-items: flex-start;
@@ -9775,6 +10998,47 @@ def render_page(state: PageState) -> bytes:
       font-style: normal;
       font-weight: 850;
     }}
+    .pe-scoring-note {{
+      margin: 8px 0 12px;
+      padding: 10px 12px;
+      border: 1px solid #99f6e4;
+      border-radius: 8px;
+      background: #f0fdfa;
+      color: #134e4a;
+    }}
+    .pe-rank-card {{
+      appearance: none;
+      width: 100%;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 12px;
+      text-align: left;
+      color: #0f172a;
+      background: #fff;
+    }}
+    button.pe-rank-card {{ cursor: pointer; }}
+    button.pe-rank-card:hover {{ border-color: #0f766e; box-shadow: 0 8px 20px rgba(15, 118, 110, .12); }}
+    .pe-rank-card.validation-green {{ background: #ecfdf5; border-color: #86efac; }}
+    .pe-rank-card.validation-yellow {{ background: #fffbeb; border-color: #fde68a; }}
+    .pe-rank-card.validation-red {{ background: #fff1f2; border-color: #fecaca; }}
+    .pe-rank-card-head, .pe-score-split {{
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }}
+    .pe-rank-card-head strong {{ color: #006b5f; font-size: 17px; }}
+    .pe-rank-card-head span {{ font-weight: 800; }}
+    .pe-score-split {{ margin: 8px 0; font-size: 12px; color: #475569; }}
+    .pe-rank-metrics {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 5px 10px;
+    }}
+    .pe-rank-metrics span {{ color: #64748b; font-size: 11px; }}
+    .pe-rank-metrics strong {{ display: block; color: #0f172a; font-size: 13px; overflow-wrap: anywhere; }}
+    .pe-rank-card p {{ margin: 9px 0 0; font-size: 12px; color: #475569; }}
+    .pe-rank-card em {{ display: block; margin-top: 8px; font-style: normal; font-weight: 800; color: #047857; }}
     .income-growth-prompt-modal {{
       width: min(980px, calc(100vw - 32px));
     }}
@@ -9880,6 +11144,9 @@ def render_page(state: PageState) -> bytes:
     }}
     .income-equity-breath {{ display: none; }}
     .income-equity-breath.active {{ display: block; }}
+    .income-pe-order-modal-card {{ width: min(680px, calc(100vw - 24px)); }}
+    .income-pe-breath {{ display: none; }}
+    .income-pe-breath.active {{ display: block; }}
     .investing-core-pill {{
       display: inline-flex;
       border-radius: 999px;
@@ -11589,6 +12856,93 @@ def render_page(state: PageState) -> bytes:
       border-color: #ccfbf1;
       background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
     }}
+    .position-buy-settings {{
+      padding: 0;
+      overflow: hidden;
+      border-color: #b7e4da;
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
+    }}
+    .position-buy-settings summary {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 16px;
+      cursor: pointer;
+      list-style: none;
+      color: #0f3d56;
+      background: linear-gradient(90deg, #ecfeff 0%, #f0fdf4 100%);
+    }}
+    .position-buy-settings summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .position-buy-settings summary span:first-child {{
+      display: grid;
+      gap: 2px;
+    }}
+    .position-buy-settings summary strong {{
+      font-size: 14px;
+      font-weight: 950;
+    }}
+    .position-buy-settings summary small {{
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 600;
+    }}
+    .position-settings-toggle {{
+      padding: 6px 10px;
+      border: 1px solid #99f6e4;
+      border-radius: 999px;
+      color: #0f766e;
+      background: #ffffff;
+      font-size: 11px;
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+    .position-buy-settings[open] .position-settings-toggle {{
+      color: #475569;
+      border-color: #cbd5e1;
+    }}
+    .position-buy-settings[open] .position-settings-toggle::before {{
+      content: "Close ";
+    }}
+    .position-buy-settings[open] .position-settings-toggle {{
+      font-size: 0;
+    }}
+    .position-buy-settings[open] .position-settings-toggle::before {{
+      font-size: 11px;
+    }}
+    .position-buy-settings-body {{
+      display: grid;
+      gap: 10px;
+      padding: 12px 16px 16px;
+      border-top: 1px solid #ccfbf1;
+    }}
+    .position-settings-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(130px, 1fr));
+      gap: 10px;
+    }}
+    .position-settings-secondary {{
+      grid-template-columns: minmax(260px, 2fr) repeat(4, minmax(110px, 1fr));
+    }}
+    .position-settings-grid label {{
+      display: grid;
+      align-content: start;
+      gap: 4px;
+      margin: 0;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 800;
+    }}
+    .position-settings-grid input {{
+      width: 100%;
+      min-width: 0;
+      min-height: 34px;
+      padding: 7px 9px;
+      border-color: #cfe4df;
+      background: #ffffff;
+    }}
     .gpt-hero-panel {{
       display: flex;
       align-items: center;
@@ -11770,6 +13124,9 @@ def render_page(state: PageState) -> bytes:
       .equity-summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .position-summary-strip {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .position-summary-chip {{ align-items: flex-start; flex-direction: column; gap: 4px; }}
+      .position-settings-grid,
+      .position-settings-secondary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .position-settings-wide {{ grid-column: 1 / -1; }}
       .compact-rules {{ grid-template-columns: 1fr; }}
       .decision-tile {{ min-height: auto; }}
       .tab-button[data-tab="home"] {{ display: inline-flex; }}
@@ -11834,6 +13191,35 @@ def render_page(state: PageState) -> bytes:
         {trade_validation_table}
         <div class="actions">
           <button type="submit" formaction="/load">Load / Preview CSV</button>
+        </div>
+        {render_ce_sell_dashboard(state)}
+        <div class="live-modal-backdrop" id="ce-sell-order-modal">
+          <div class="live-modal income-pe-order-modal-card">
+            <h2 id="ce-sell-order-title">Covered CE SELL Review</h2>
+            <p class="status">Fresh Kite coverage and premium are revalidated before order placement. Review recent stock news, then complete the 10-second pause.</p>
+            <div class="income-equity-metrics">
+              <div><span>Option</span><strong id="ce-sell-option">--</strong></div>
+              <div><span>Fresh LTP</span><strong id="ce-sell-ltp">--</strong></div>
+              <div><span>SELL limit</span><strong id="ce-sell-limit">--</strong></div>
+              <div><span>Holding / quantity</span><strong id="ce-sell-coverage">--</strong><small id="ce-sell-holding-source">--</small></div>
+              <div><span>CMP / strike</span><strong id="ce-sell-strike">--</strong></div>
+              <div><span>Maximum profit</span><strong id="ce-sell-max-profit">--</strong></div>
+              <div><span>OTM / yield</span><strong id="ce-sell-yield">--</strong></div>
+              <div><span>Score / risk</span><strong id="ce-sell-risk">--</strong></div>
+            </div>
+            <div class="income-equity-order-summary" id="ce-sell-summary">Loading fresh covered CE order...</div>
+            <div class="trade-news-panel"><strong>Recent stock news</strong><div id="ce-sell-news">Loading news...</div></div>
+            <input type="hidden" name="ce_sell_underlying" id="ce-sell-underlying">
+            <input type="hidden" name="ce_sell_confirmed" id="ce-sell-confirmed" value="0">
+            <div class="breath-circle income-pe-breath" id="ce-sell-breath"></div>
+            <div class="breath-text" id="ce-sell-breath-text">Review order first</div>
+            <div class="countdown" id="ce-sell-countdown">10</div>
+            <div class="modal-actions">
+              <button type="button" class="secondary" id="ce-sell-cancel">Cancel</button>
+              <button type="button" id="ce-sell-review" disabled>Review &amp; Start 10s</button>
+              <button type="submit" class="danger" formaction="/ce-scan/sell" id="ce-sell-go" disabled>GO</button>
+            </div>
+          </div>
         </div>
         {render_results(state.results)}
       </section>
@@ -12238,6 +13624,47 @@ def render_page(state: PageState) -> bytes:
     const incomeGrowthGptCancel = document.getElementById('income-growth-gpt-cancel');
     const incomeGrowthGptRefresh = document.getElementById('income-growth-gpt-refresh');
     const incomeGrowthForceGpt = document.getElementById('income-growth-force-gpt');
+    const incomePeModal = document.getElementById('income-pe-order-modal');
+    const incomePeTitle = document.getElementById('income-pe-order-title');
+    const incomePeOption = document.getElementById('income-pe-option');
+    const incomePeLtp = document.getElementById('income-pe-ltp');
+    const incomePeLimit = document.getElementById('income-pe-limit');
+    const incomePeQuantity = document.getElementById('income-pe-quantity');
+    const incomePeExpiry = document.getElementById('income-pe-expiry');
+    const incomePeAssignment = document.getElementById('income-pe-assignment');
+    const incomePeMaxProfit = document.getElementById('income-pe-max-profit');
+    const incomePeYield = document.getElementById('income-pe-yield');
+    const incomePeSummary = document.getElementById('income-pe-summary');
+    const incomePeUnderlying = document.getElementById('income-pe-underlying');
+    const incomePeTargetStrike = document.getElementById('income-pe-target-strike');
+    const incomePeConfirmed = document.getElementById('income-pe-confirmed');
+    const incomePeReview = document.getElementById('income-pe-review');
+    const incomePeGo = document.getElementById('income-pe-go');
+    const incomePeCancel = document.getElementById('income-pe-cancel');
+    const incomePeCountdown = document.getElementById('income-pe-countdown');
+    const incomePeBreathText = document.getElementById('income-pe-breath-text');
+    const incomePeBreath = document.getElementById('income-pe-breath');
+    const ceSellModal = document.getElementById('ce-sell-order-modal');
+    const ceSellTitle = document.getElementById('ce-sell-order-title');
+    const ceSellOption = document.getElementById('ce-sell-option');
+    const ceSellLtp = document.getElementById('ce-sell-ltp');
+    const ceSellLimit = document.getElementById('ce-sell-limit');
+    const ceSellCoverage = document.getElementById('ce-sell-coverage');
+    const ceSellHoldingSource = document.getElementById('ce-sell-holding-source');
+    const ceSellStrike = document.getElementById('ce-sell-strike');
+    const ceSellMaxProfit = document.getElementById('ce-sell-max-profit');
+    const ceSellYield = document.getElementById('ce-sell-yield');
+    const ceSellRisk = document.getElementById('ce-sell-risk');
+    const ceSellSummary = document.getElementById('ce-sell-summary');
+    const ceSellNews = document.getElementById('ce-sell-news');
+    const ceSellUnderlying = document.getElementById('ce-sell-underlying');
+    const ceSellConfirmed = document.getElementById('ce-sell-confirmed');
+    const ceSellReview = document.getElementById('ce-sell-review');
+    const ceSellGo = document.getElementById('ce-sell-go');
+    const ceSellCancel = document.getElementById('ce-sell-cancel');
+    const ceSellCountdown = document.getElementById('ce-sell-countdown');
+    const ceSellBreathText = document.getElementById('ce-sell-breath-text');
+    const ceSellBreath = document.getElementById('ce-sell-breath');
     const equityOrderModal = document.getElementById('equity-order-modal');
     const equityOrderTitle = document.getElementById('equity-order-title');
     const equityOrderSymbol = document.getElementById('equity-order-symbol');
@@ -12281,10 +13708,159 @@ def render_page(state: PageState) -> bytes:
     let commodityCountdownTimer = null;
     let pendingPositionSubmit = false;
     let positionCountdownTimer = null;
+    let incomePeCountdownTimer = null;
+    let ceSellCountdownTimer = null;
     let equityOrderCountdownTimer = null;
     let equityOrderSnapshot = null;
     let incomeEquityCountdownTimer = null;
     let incomeEquitySnapshot = null;
+    function resetIncomePeConfirmation() {{
+      if (incomePeCountdownTimer) clearInterval(incomePeCountdownTimer);
+      incomePeCountdownTimer = null;
+      if (incomePeConfirmed) incomePeConfirmed.value = '0';
+      if (incomePeGo) incomePeGo.disabled = true;
+      if (incomePeReview) incomePeReview.disabled = true;
+      if (incomePeCountdown) incomePeCountdown.textContent = '10';
+      if (incomePeBreathText) incomePeBreathText.textContent = 'Review order first';
+      if (incomePeBreath) incomePeBreath.classList.remove('active');
+    }}
+    async function openIncomePeModal(button) {{
+      if (!incomePeModal) return;
+      resetIncomePeConfirmation();
+      const underlying = button.dataset.underlying || '';
+      const strike = button.dataset.strike || '';
+      incomePeModal.style.display = 'flex';
+      if (incomePeTitle) incomePeTitle.textContent = `${{underlying}} Cash-Secured PE SELL`;
+      if (incomePeUnderlying) incomePeUnderlying.value = underlying;
+      if (incomePeTargetStrike) incomePeTargetStrike.value = strike;
+      if (incomePeSummary) incomePeSummary.textContent = 'Loading fresh monthly PE contract and premium from Kite...';
+      try {{
+        const response = await fetch(`/income/pe-quote?underlying=${{encodeURIComponent(underlying)}}&strike=${{encodeURIComponent(strike)}}`, {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load PE quote');
+        if (incomePeOption) incomePeOption.textContent = data.symbol || '--';
+        if (incomePeLtp) incomePeLtp.textContent = Number(data.ltp || 0).toFixed(2);
+        if (incomePeLimit) incomePeLimit.textContent = Number(data.limit_price || 0).toFixed(2);
+        if (incomePeQuantity) incomePeQuantity.textContent = String(data.quantity || 0);
+        if (incomePeExpiry) incomePeExpiry.textContent = data.expiry || '--';
+        if (incomePeAssignment) incomePeAssignment.textContent = Number(data.assignment_value || 0).toFixed(0);
+        if (incomePeMaxProfit) incomePeMaxProfit.textContent = Number(data.max_profit || 0).toFixed(0);
+        if (incomePeYield) incomePeYield.textContent = `${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
+        if (incomePeSummary) incomePeSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | Fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Assignment value ${{Number(data.assignment_value || 0).toFixed(0)}} | Maximum profit ${{Number(data.max_profit || 0).toFixed(0)}}`;
+        if (incomePeReview) incomePeReview.disabled = false;
+      }} catch (error) {{
+        if (incomePeSummary) incomePeSummary.textContent = compactClientError(error.message, 'Could not load PE quote');
+      }}
+    }}
+    for (const button of document.querySelectorAll('.income-pe-order-button')) {{
+      button.addEventListener('click', () => openIncomePeModal(button));
+    }}
+    incomePeCancel && incomePeCancel.addEventListener('click', () => {{
+      resetIncomePeConfirmation();
+      if (incomePeModal) incomePeModal.style.display = 'none';
+    }});
+    incomePeReview && incomePeReview.addEventListener('click', () => {{
+      resetIncomePeConfirmation();
+      let remaining = 10;
+      if (incomePeReview) incomePeReview.disabled = true;
+      if (incomePeBreath) incomePeBreath.classList.add('active');
+      if (incomePeBreathText) incomePeBreathText.textContent = 'Breathe in';
+      incomePeCountdownTimer = setInterval(() => {{
+        remaining -= 1;
+        if (incomePeCountdown) incomePeCountdown.textContent = String(Math.max(remaining, 0));
+        if (incomePeBreathText) incomePeBreathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          clearInterval(incomePeCountdownTimer);
+          incomePeCountdownTimer = null;
+          if (incomePeBreathText) incomePeBreathText.textContent = 'Ready. Cancel or GO.';
+          if (incomePeConfirmed) incomePeConfirmed.value = '1';
+          if (incomePeGo) incomePeGo.disabled = false;
+        }}
+      }}, 1000);
+    }});
+    function resetCeSellConfirmation() {{
+      if (ceSellCountdownTimer) clearInterval(ceSellCountdownTimer);
+      ceSellCountdownTimer = null;
+      if (ceSellConfirmed) ceSellConfirmed.value = '0';
+      if (ceSellGo) ceSellGo.disabled = true;
+      if (ceSellReview) ceSellReview.disabled = true;
+      if (ceSellCountdown) ceSellCountdown.textContent = '10';
+      if (ceSellBreathText) ceSellBreathText.textContent = 'Review order first';
+      if (ceSellBreath) ceSellBreath.classList.remove('active');
+    }}
+    async function loadCeSellNews(underlying) {{
+      if (!ceSellNews) return;
+      ceSellNews.textContent = 'Loading recent stock news...';
+      try {{
+        const response = await fetch(`/trade-news?stocks=${{encodeURIComponent(underlying)}}`, {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load news');
+        const news = (data.news || []).slice(0, 3);
+        ceSellNews.innerHTML = news.length ? '<ol>' + news.map((item) => {{
+          const sentiment = ['positive', 'negative', 'neutral'].includes(item.sentiment) ? item.sentiment : 'neutral';
+          const title = escapeHtml(item.title || 'News item');
+          const date = item.published_date ? `<span class="news-date">${{escapeHtml(item.published_date)}}</span>` : '';
+          const content = item.link ? `<a href="${{escapeHtml(item.link)}}" target="_blank" rel="noopener">${{title}}</a>` : title;
+          return `<li class="news-sentiment-${{sentiment}}">${{content}}<span class="news-tag">${{sentiment}}</span>${{date}}</li>`;
+        }}).join('') + '</ol>' : 'No recent news found.';
+      }} catch (error) {{
+        ceSellNews.textContent = compactClientError(error.message, 'Could not load stock news');
+      }}
+    }}
+    async function openCeSellModal(button) {{
+      if (!ceSellModal) return;
+      resetCeSellConfirmation();
+      const underlying = button.dataset.underlying || '';
+      ceSellModal.style.display = 'flex';
+      if (ceSellTitle) ceSellTitle.textContent = `${{underlying}} Covered CE SELL Review`;
+      if (ceSellUnderlying) ceSellUnderlying.value = underlying;
+      if (ceSellSummary) ceSellSummary.textContent = 'Revalidating Top 3 status, coverage, positions, and fresh CE premium...';
+      loadCeSellNews(underlying);
+      try {{
+        const response = await fetch(`/ce-scan/quote?underlying=${{encodeURIComponent(underlying)}}`, {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load covered CE quote');
+        if (ceSellOption) ceSellOption.textContent = data.symbol || '--';
+        if (ceSellLtp) ceSellLtp.textContent = Number(data.ltp || 0).toFixed(2);
+        if (ceSellLimit) ceSellLimit.textContent = Number(data.limit_price || 0).toFixed(2);
+        if (ceSellCoverage) ceSellCoverage.textContent = `${{data.holding_qty || 0}} / ${{data.quantity || 0}}`;
+        if (ceSellHoldingSource) ceSellHoldingSource.textContent = `${{data.holding_source || 'Unknown source'}} | Kite ${{data.kite_holding_qty || 0}} | Income Growth ${{data.income_growth_holding_qty || 0}}`;
+        if (ceSellStrike) ceSellStrike.textContent = `${{Number(data.cmp || 0).toFixed(2)}} / ${{Number(data.strike || 0).toFixed(2)}}`;
+        if (ceSellMaxProfit) ceSellMaxProfit.textContent = Number(data.max_profit || 0).toFixed(0);
+        if (ceSellYield) ceSellYield.textContent = `${{Number(data.otm_percent || 0).toFixed(2)}}% / ${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
+        if (ceSellRisk) ceSellRisk.textContent = `${{Number(data.score || 0).toFixed(0)}} / ${{data.event_risk || 'N/A'}} event / ${{data.breakout_risk || 'N/A'}} breakout`;
+        if (ceSellSummary) ceSellSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | Fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Effective holding ${{data.holding_qty}} from ${{data.holding_source || 'holding record'}}`;
+        if (ceSellReview) ceSellReview.disabled = false;
+      }} catch (error) {{
+        if (ceSellSummary) ceSellSummary.textContent = compactClientError(error.message, 'Could not load covered CE order');
+      }}
+    }}
+    for (const button of document.querySelectorAll('.ce-sell-order-button')) {{
+      button.addEventListener('click', () => openCeSellModal(button));
+    }}
+    ceSellCancel && ceSellCancel.addEventListener('click', () => {{
+      resetCeSellConfirmation();
+      if (ceSellModal) ceSellModal.style.display = 'none';
+    }});
+    ceSellReview && ceSellReview.addEventListener('click', () => {{
+      resetCeSellConfirmation();
+      let remaining = 10;
+      if (ceSellReview) ceSellReview.disabled = true;
+      if (ceSellBreath) ceSellBreath.classList.add('active');
+      if (ceSellBreathText) ceSellBreathText.textContent = 'Breathe in';
+      ceSellCountdownTimer = setInterval(() => {{
+        remaining -= 1;
+        if (ceSellCountdown) ceSellCountdown.textContent = String(Math.max(remaining, 0));
+        if (ceSellBreathText) ceSellBreathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          clearInterval(ceSellCountdownTimer);
+          ceSellCountdownTimer = null;
+          if (ceSellBreathText) ceSellBreathText.textContent = 'Ready. Cancel or GO.';
+          if (ceSellConfirmed) ceSellConfirmed.value = '1';
+          if (ceSellGo) ceSellGo.disabled = false;
+        }}
+      }}, 1000);
+    }});
     function stopEquityOrderCountdown() {{
       if (equityOrderCountdownTimer) {{
         clearInterval(equityOrderCountdownTimer);
@@ -13042,10 +14618,14 @@ def render_page(state: PageState) -> bytes:
     }}
     const refreshMarketButton = document.getElementById('refresh-market-quotes');
     refreshMarketButton && refreshMarketButton.addEventListener('click', refreshQuotes);
-    if (isHomePage) {{
-      refreshQuotes();
-      setInterval(refreshQuotes, {TOP_QUOTE_REFRESH_MS});
-    }}
+    const kiteLtpDisclosure = document.getElementById('kite-ltp-disclosure');
+    let kiteLtpLoaded = false;
+    kiteLtpDisclosure && kiteLtpDisclosure.addEventListener('toggle', () => {{
+      if (kiteLtpDisclosure.open && !kiteLtpLoaded) {{
+        kiteLtpLoaded = true;
+        refreshQuotes();
+      }}
+    }});
     async function refreshCommodityQuotes() {{
       const cards = Array.from(document.querySelectorAll('.commodity-card[data-symbol]'));
       if (!cards.length) return;
@@ -13076,6 +14656,7 @@ def render_page(state: PageState) -> bytes:
             action.textContent = 'Wait';
             if (buyButton) buyButton.textContent = `Add more ${{assetName}}`;
             card.classList.remove('buy-now');
+            card.classList.remove('below-200-dma');
             continue;
           }}
           price.textContent = Number(quote.ltp).toFixed(2);
@@ -13093,11 +14674,15 @@ def render_page(state: PageState) -> bytes:
           if (dma) {{
             const dma50 = quote.dma_50 === null || quote.dma_50 === undefined ? '--' : Number(quote.dma_50).toFixed(2);
             const dma200 = quote.dma_200 === null || quote.dma_200 === undefined ? '--' : Number(quote.dma_200).toFixed(2);
-            dma.innerHTML = `<span>50 DMA ${{dma50}}</span><span>200 DMA ${{dma200}}</span>`;
+            dma.innerHTML = `<span>50 DMA ${{dma50}}</span><span class="dma-200">200 DMA ${{dma200}}</span>`;
           }}
+          const below200Dma = Boolean(quote.below_200_dma);
+          card.classList.toggle('below-200-dma', below200Dma);
           card.classList.toggle('buy-now', Boolean(quote.buy_signal));
           action.innerHTML = quote.buy_signal
             ? `<strong>BUY NOW</strong> | ${{escapeHtml(quote.action || 'buy the ETF today')}} (${{quote.multiplier}}x)`
+            : below200Dma
+            ? `<strong>BELOW 200 DMA</strong> | Review accumulation`
             : `Wait | fall ${{Number(quote.daily_fall_pct || 0).toFixed(2)}}%`;
           if (buyButton) {{
             buyButton.textContent = `Add more ${{assetName}}`;
@@ -13214,16 +14799,75 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             self.send_page(PageState(active_tab="commodity"))
             return
         if parsed_url.path == "/positions":
-            self.send_page(PageState(active_tab="positions"))
+            state = PageState(active_tab="positions")
+            try:
+                (
+                    state.positions_rows,
+                    state.positions_summary,
+                ), state.console_log = call_with_console(positions_research, True)
+                state.message = (
+                    f"Loaded fresh Kite analytics for {len(state.positions_rows)} active option position(s)."
+                )
+            except Exception as exc:
+                state.error = f"{friendly_external_error(exc, 'Kite positions')}\n\n{traceback.format_exc()}"
+            self.send_page(state)
             return
         if parsed_url.path == "/home":
             self.send_page(PageState(active_tab="home"))
             return
         if parsed_url.path == "/orders":
-            self.send_page(PageState(active_tab="order-management"))
+            state = PageState(active_tab="order-management")
+            try:
+                state.order_book, state.console_log = call_with_console(
+                    kite_order_book,
+                    True,
+                )
+                state.message = f"Loaded {len(state.order_book)} current Kite order(s)."
+            except Exception as exc:
+                state.order_book_error = friendly_external_error(exc, "Kite orders")
+                state.error = f"{state.order_book_error}\n\n{traceback.format_exc()}"
+            self.send_page(state)
             return
         if parsed_url.path == "/income":
-            self.send_page(PageState(active_tab="income"))
+            state = PageState(active_tab="income")
+            try:
+                calculated_at = apply_income_dashboard_snapshot(state)
+                state.message = (
+                    f"Loaded cached INCOME decision dashboard calculated at {calculated_at}. "
+                    "Use Recalculate Best 3 PE SELL for a fresh scan."
+                )
+            except Exception as exc:
+                state.income_error = f"{friendly_external_error(exc, 'INCOME PE ranking')}\n\n{traceback.format_exc()}"
+            self.send_page(state)
+            return
+        if parsed_url.path == "/income/pe-quote":
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            try:
+                snapshot = income_pe_order_snapshot(
+                    first(query, "underlying"),
+                    first(query, "strike"),
+                )
+                self.send_json({"ok": True, **snapshot})
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": friendly_external_error(exc, "Income PE quote"),
+                    }
+                )
+            return
+        if parsed_url.path == "/ce-scan/quote":
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            try:
+                snapshot = ce_sell_order_snapshot(first(query, "underlying"))
+                self.send_json({"ok": True, **snapshot})
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": friendly_external_error(exc, "Covered CE quote"),
+                    }
+                )
             return
         if parsed_url.path == "/investing":
             self.send_page(PageState(active_tab="investing"))
@@ -13264,7 +14908,32 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             return
         if parsed_url.path == "/research":
-            self.send_page(PageState(active_tab="research"))
+            state = PageState(active_tab="research")
+            try:
+                load_default_csv_research(state)
+            except Exception as exc:
+                state.error = (
+                    f"{friendly_external_error(exc, 'CSV research')}\n\n"
+                    f"{traceback.format_exc()}"
+                )
+                state.message = f"Load today's CSV file: {DEFAULT_CSV_PATH.name}"
+            self.send_page(state)
+            return
+        if parsed_url.path == "/execute":
+            state = PageState(active_tab="place")
+            try:
+                load_default_trade_preview(state)
+            except Exception as exc:
+                state.error = (
+                    f"{friendly_external_error(exc, 'CSV trade preview')}\n\n"
+                    f"{traceback.format_exc()}"
+                )
+                state.message = f"Load today's CSV file: {DEFAULT_CSV_PATH.name}"
+            try:
+                load_ce_sell_dashboard(state)
+            except Exception as exc:
+                state.console_log = f"{state.console_log}\nCE scan unavailable: {friendly_external_error(exc, 'CE scan')}"
+            self.send_page(state)
             return
         if parsed_url.path.startswith("/gpt"):
             self.send_page(PageState(active_tab="gpt"))
@@ -13338,12 +15007,24 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             return
         setup_issue = kite_setup_issue()
-        self.send_page(
-            PageState(
-                active_tab=default_active_tab(),
-                error=setup_issue,
-            )
+        state = PageState(
+            active_tab=default_active_tab(),
+            error=setup_issue,
         )
+        if parsed_url.path == "/" and not setup_issue:
+            try:
+                load_default_trade_preview(state)
+            except Exception as exc:
+                state.error = (
+                    f"{friendly_external_error(exc, 'CSV trade preview')}\n\n"
+                    f"{traceback.format_exc()}"
+                )
+                state.message = f"Load today's CSV file: {DEFAULT_CSV_PATH.name}"
+            try:
+                load_ce_sell_dashboard(state)
+            except Exception as exc:
+                state.console_log = f"{state.console_log}\nCE scan unavailable: {friendly_external_error(exc, 'CE scan')}"
+        self.send_page(state)
 
     def do_POST(self) -> None:
         request_path = urlparse(self.path).path
@@ -13398,6 +15079,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/analytics")
                 else "research"
                 if request_path.startswith("/research")
+                else "place"
+                if request_path.startswith("/ce-scan")
                 else default_active_tab()
             ),
             csv_path=first(form, "csv_path", str(DEFAULT_CSV_PATH)),
@@ -13462,6 +15145,28 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.trade_validations,
                 )
                 state.message = f"{persist_message} Loaded {len(state.orders)} order(s).".strip()
+                try:
+                    load_ce_sell_dashboard(state)
+                except Exception as exc:
+                    state.console_log = f"{state.console_log}\nCE scan unavailable: {friendly_external_error(exc, 'CE scan')}"
+            elif request_path == "/ce-scan/load":
+                load_ce_sell_dashboard(state, True)
+                state.message = (
+                    f"Fresh CE scan completed. Top {len(state.ce_sell_top or [])}; "
+                    f"Watch {len(state.ce_sell_watch or [])}; Avoid {len(state.ce_sell_avoid or [])}."
+                )
+            elif request_path == "/ce-scan/sell":
+                if first(form, "ce_sell_confirmed") != "1":
+                    raise PermissionError("Covered CE SELL order needs 10-second breathe confirmation.")
+                underlying = first(form, "ce_sell_underlying")
+                result, order_log = call_with_console(
+                    place_approved_ce_sell_order,
+                    underlying,
+                )
+                state.results = [result]
+                state.console_log = f"{order_log}{state.console_log}"
+                load_ce_sell_dashboard(state, True)
+                state.message = f"Submitted approved covered CE order for {underlying.upper()}."
             elif request_path == "/csv/save-today":
                 state.csv_path, state.message = save_today_csv_text(state.csv_text)
                 state.csv_text = Path(state.csv_path).read_text(encoding="utf-8-sig")
@@ -13736,11 +15441,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 state.message = f"Research completed for {len(state.research_rows)} CSV symbol(s)."
             elif request_path == "/income/load":
-                (
-                    state.income_rows,
-                    state.income_summary,
-                ), state.console_log = call_with_console(income_strategy_candidates)
-                state.message = f"Income strategy refreshed for {len(state.income_rows)} stock(s)."
+                calculated_at = apply_income_dashboard_snapshot(state, True)
+                state.message = (
+                    f"Fresh INCOME scan completed at {calculated_at}. "
+                    f"Ranked {len(state.income_pe_top or [])} Top PE candidate(s); "
+                    f"{len(state.income_pe_avoid or [])} blocked today."
+                )
             elif request_path == "/investing/load":
                 (
                     state.investing_rows,
@@ -13842,29 +15548,28 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             elif request_path == "/income/sell-ce":
                 underlying = first(form, "income_underlying")
-                result, state.console_log = call_with_console(
+                result, order_log = call_with_console(
                     place_income_covered_call_order,
                     underlying,
                 )
                 state.income_results = [result]
-                (
-                    state.income_rows,
-                    state.income_summary,
-                ), refresh_log = call_with_console(income_strategy_candidates)
-                state.console_log = f"{state.console_log}{refresh_log}"
+                invalidate_kite_trade_cache()
+                refresh_at = apply_income_dashboard_snapshot(state, True)
+                state.console_log = f"{order_log}{state.console_log}\nDashboard refreshed at {refresh_at}."
                 state.message = f"Submitted covered CE order for {underlying.upper()}."
             elif request_path == "/income/sell-pe":
+                if first(form, "income_pe_confirmed") != "1":
+                    raise PermissionError("Income PE SELL order needs 10-second breathe confirmation.")
                 underlying = first(form, "income_underlying")
-                result, state.console_log = call_with_console(
+                result, order_log = call_with_console(
                     place_income_cash_secured_put_order,
                     underlying,
+                    first(form, "income_target_strike"),
                 )
                 state.income_results = [result]
-                (
-                    state.income_rows,
-                    state.income_summary,
-                ), refresh_log = call_with_console(income_strategy_candidates)
-                state.console_log = f"{state.console_log}{refresh_log}"
+                invalidate_kite_trade_cache()
+                refresh_at = apply_income_dashboard_snapshot(state, True)
+                state.console_log = f"{order_log}{state.console_log}\nDashboard refreshed at {refresh_at}."
                 state.message = f"Submitted cash-secured PE order for {underlying.upper()}."
             elif request_path == "/positions-research/load":
                 (

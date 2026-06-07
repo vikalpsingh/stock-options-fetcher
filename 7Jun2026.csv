@@ -1,0 +1,3 @@
+exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity
+NFO,HAVELLS26JUN1290CE,500,SELL,NRML,LIMIT,62.6,DAY
+NFO,BAJFINANCE26JUN990CE,750,SELL,NRML,LIMIT,7.3,DAY

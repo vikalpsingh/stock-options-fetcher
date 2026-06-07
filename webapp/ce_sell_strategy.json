@@ -1,0 +1,12 @@
+{
+  "auto_reduce_lots_enabled": true,
+  "default_otm_percent": 10.0,
+  "core_otm_add_percent": 3.0,
+  "min_premium_yield_percent": 0.2,
+  "min_sell_pop_percent": 80.0,
+  "max_delta": 0.3,
+  "min_option_oi": 0,
+  "min_option_volume": 0,
+  "max_bid_ask_spread_percent": 35.0,
+  "price_markup_percent": 20.0
+}
