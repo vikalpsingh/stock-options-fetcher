@@ -58,6 +58,32 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(e2e["quantity"], 4630)
         self.assertEqual(e2e["avg_price"], 213.00)
 
+    def test_option_sell_markup_setting_feeds_pe_and_ce_settings(self):
+        with patch.object(app, "load_app_settings", return_value={"option_sell_markup_percent": 25}):
+            self.assertEqual(app.load_pe_sell_settings()["price_markup_percent"], 25)
+            self.assertEqual(app.load_ce_sell_settings()["price_markup_percent"], 25)
+
+    def test_autoslice_order_retries_without_autoslice_for_old_sdk(self):
+        calls = []
+
+        class Kite:
+            pass
+
+        def fake_place_order(_kite, order):
+            calls.append(dict(order))
+            if "autoslice" in order:
+                raise TypeError("got an unexpected keyword argument 'autoslice'")
+            return "ORDER123"
+
+        with patch.object(app.kite_orders, "place_order", side_effect=fake_place_order):
+            order_id = app.place_order_allowing_autoslice(
+                Kite(),
+                {"variety": "regular", "tradingsymbol": "TEST", "autoslice": True},
+            )
+        self.assertEqual(order_id, "ORDER123")
+        self.assertIn("autoslice", calls[0])
+        self.assertNotIn("autoslice", calls[1])
+
     def test_ce_selected_strike_is_valid_and_above_target(self):
         instruments = [
             {"instrument_type": "CE", "strike": 1240, "tradingsymbol": "TEST1240CE"},

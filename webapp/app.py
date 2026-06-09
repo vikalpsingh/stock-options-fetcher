@@ -74,6 +74,7 @@ CE_SELL_SETTINGS_PATH = APP_ROOT / "ce_sell_strategy.json"
 APP_DB_PATH = APP_ROOT / "vikalp_income.db"
 OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
+DEFAULT_OPTION_SELL_MARKUP_PERCENT = 20.0
 DEFAULT_KITE_ENV = {
     "KITE_CONFIRM_LIVE_ORDER": "YES",
     "KITE_API_KEY": "vr6yz47r650vum8p",
@@ -207,7 +208,7 @@ DEFAULT_PE_SELL_SETTINGS = {
     "event_lookahead_trading_days": 5,
     "preferred_dte_min": 12,
     "preferred_dte_max": 28,
-    "price_markup_percent": 20,
+    "price_markup_percent": DEFAULT_OPTION_SELL_MARKUP_PERCENT,
 }
 STOCK_NEWS_NAMES = {
     "BAJFINANCE": "Bajaj Finance",
@@ -677,6 +678,18 @@ def monthly_booked_pnl_summary(day: date | None = None) -> dict[str, Any]:
     return summary
 
 
+def place_order_allowing_autoslice(kite: Any, order: dict[str, Any]) -> str:
+    try:
+        return kite_orders.place_order(kite, order)
+    except Exception as exc:
+        message = str(exc).lower()
+        if "autoslice" in order and "autoslice" in message and "unexpected" in message:
+            fallback = dict(order)
+            fallback.pop("autoslice", None)
+            return kite_orders.place_order(kite, fallback)
+        raise
+
+
 def load_app_settings() -> dict[str, Any]:
     if not SETTINGS_PATH.exists():
         return {}
@@ -817,6 +830,18 @@ def etf_buy_amount_setting() -> float:
     return amount if amount > 0 else DEFAULT_ETF_BUY_AMOUNT
 
 
+def option_sell_markup_percent_setting() -> float:
+    value = load_app_settings().get(
+        "option_sell_markup_percent",
+        DEFAULT_OPTION_SELL_MARKUP_PERCENT,
+    )
+    try:
+        markup = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_OPTION_SELL_MARKUP_PERCENT
+    return markup if markup >= 0 else DEFAULT_OPTION_SELL_MARKUP_PERCENT
+
+
 def normalize_home_tickers(value: Any) -> list[str]:
     if isinstance(value, str):
         raw_items = re.split(r"[\s,]+", value)
@@ -861,6 +886,12 @@ def format_buy_amount(value: Any) -> str:
 def etf_buy_action_text(amount: Any | None = None) -> str:
     value = etf_buy_amount_setting() if amount is None else amount
     return f"Buy the ETF of amount {format_buy_amount(value)} today"
+
+
+def apply_option_sell_markup_setting(settings: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(settings)
+    merged["price_markup_percent"] = option_sell_markup_percent_setting()
+    return merged
 
 
 def commodity_yearly_base_amount(year: int | None = None) -> float:
@@ -1123,6 +1154,7 @@ class PageState:
     kite_request_token: str = ""
     kite_ip_data: list[dict[str, str]] | None = None
     etf_buy_amount: float = field(default_factory=etf_buy_amount_setting)
+    option_sell_markup_percent: float = field(default_factory=option_sell_markup_percent_setting)
     home_tickers: str = field(default_factory=home_tickers_text)
 
 
@@ -3069,7 +3101,8 @@ def income_pe_order_snapshot(underlying: str, target_strike: Any = None) -> dict
     if ltp <= 0:
         raise ValueError(f"Could not read fresh PE premium for {candidate['symbol']}.")
     lot_size = int(candidate.get("lot_size") or 0)
-    limit_price = ceil_to_tick(ltp * 1.20, 0.05)
+    markup = option_sell_markup_percent_setting()
+    limit_price = ceil_to_tick(ltp * (1 + markup / 100), 0.05)
     assignment_value = float(candidate.get("strike") or 0) * lot_size
     max_profit = limit_price * lot_size
     return {
@@ -3080,6 +3113,7 @@ def income_pe_order_snapshot(underlying: str, target_strike: Any = None) -> dict
         "quantity": lot_size,
         "ltp": ltp,
         "limit_price": limit_price,
+        "markup_percent": markup,
         "assignment_value": assignment_value,
         "max_profit": max_profit,
         "premium_yield_percent": (
@@ -3211,7 +3245,8 @@ def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
     current_price = quote_ltp(quote)
     if current_price <= 0:
         raise ValueError(f"Could not read CE premium for {candidate['symbol']}.")
-    price = ceil_to_tick(current_price * 1.10, 0.05)
+    markup = option_sell_markup_percent_setting()
+    price = ceil_to_tick(current_price * (1 + markup / 100), 0.05)
     order = {
         "variety": "regular",
         "exchange": "NFO",
@@ -3223,6 +3258,7 @@ def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
         "price": price,
         "validity": "DAY",
         "tag": "INCOME_CC",
+        "autoslice": True,
     }
     order_id = kite_orders.place_order(kite, order)
     return {
@@ -3231,7 +3267,7 @@ def place_income_covered_call_order(underlying: str) -> dict[str, Any]:
         "order_id": order_id,
         "detail": (
             f"SELL covered CE {covered_qty} qty at LIMIT {price:.2f}. "
-            f"10% above current premium {current_price:.2f}. "
+            f"{markup:.2f}% above current premium {current_price:.2f}. "
             f"Holding {held_qty} shares of {clean_underlying}."
         ),
     }
@@ -3263,8 +3299,12 @@ def place_income_cash_secured_put_order(underlying: str, target_strike: Any = No
         "price": price,
         "validity": "DAY",
         "tag": "INCOME_CSP",
+        "autoslice": True,
     }
-    order_id = kite_orders.place_order(kite, order)
+    try:
+        order_id = kite_orders.place_order(kite, order)
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, f"{snapshot['symbol']} PE SELL")) from exc
     invalidate_kite_trade_cache()
     assignment_value = float(snapshot.get("assignment_value") or 0)
     return {
@@ -3273,7 +3313,7 @@ def place_income_cash_secured_put_order(underlying: str, target_strike: Any = No
         "order_id": order_id,
         "detail": (
             f"SELL cash-secured PE {lot_size} qty at LIMIT {price:.2f}, "
-            f"20% above current premium {current_price:.2f}. "
+            f"{float(snapshot.get('markup_percent') or option_sell_markup_percent_setting()):.2f}% above current premium {current_price:.2f}. "
             f"Assignment value about {assignment_value:.0f}."
         ),
     }
@@ -3617,7 +3657,7 @@ def place_position_close_buy_order(symbol: str) -> dict[str, Any]:
         )
     order = build_position_close_buy_order(symbol)
     kite = kite_orders.kite_client()
-    order_id = kite_orders.place_order(kite, order)
+    order_id = place_order_allowing_autoslice(kite, order)
     invalidate_kite_trade_cache()
     return {
         "tradingsymbol": order["tradingsymbol"],
@@ -4847,7 +4887,7 @@ def load_pe_sell_settings() -> dict[str, Any]:
                 settings.update(saved)
         except (OSError, ValueError, TypeError):
             pass
-    return settings
+    return apply_option_sell_markup_setting(settings)
 
 
 def quote_bid_ask(quote: dict[str, Any]) -> tuple[float | None, float | None, float | None]:
@@ -5211,7 +5251,7 @@ DEFAULT_CE_SELL_SETTINGS = {
     "min_option_oi": 0,
     "min_option_volume": 0,
     "max_bid_ask_spread_percent": 35.0,
-    "price_markup_percent": 20.0,
+    "price_markup_percent": DEFAULT_OPTION_SELL_MARKUP_PERCENT,
 }
 
 
@@ -5224,7 +5264,7 @@ def load_ce_sell_settings() -> dict[str, Any]:
                 settings.update(saved)
         except (OSError, ValueError, TypeError):
             pass
-    return settings
+    return apply_option_sell_markup_setting(settings)
 
 
 def select_valid_ce_contract(
@@ -5544,6 +5584,7 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
         "expiry": str(candidate.get("expiry") or ""),
         "ltp": ltp,
         "limit_price": limit_price,
+        "markup_percent": float(settings["price_markup_percent"]),
         "max_profit": max_profit,
         "covered_value": covered_value,
         "premium_yield_percent": max_profit / covered_value * 100 if covered_value > 0 else 0,
@@ -5574,8 +5615,20 @@ def place_approved_ce_sell_order(underlying: str) -> dict[str, Any]:
         "price": snapshot["limit_price"],
         "validity": "DAY",
         "tag": "TOP3_CE",
+        "autoslice": True,
     }
-    order_id = kite_orders.place_order(kite, order)
+    try:
+        order_id = place_order_allowing_autoslice(kite, order)
+    except Exception as exc:
+        detail = friendly_external_error(exc, f"{snapshot['symbol']} CE SELL")
+        if int(snapshot.get("kite_holding_qty") or 0) < int(snapshot.get("quantity") or 0):
+            detail = (
+                f"{detail} Note: selected Kite profile has only "
+                f"{snapshot['kite_holding_qty']} shares, while this order uses "
+                f"{snapshot['holding_qty']} shares from {snapshot['holding_source']}. "
+                "Zerodha may reject or margin this as uncovered in this profile."
+            )
+        raise RuntimeError(detail) from exc
     invalidate_kite_trade_cache()
     clear_app_cache((f"ce-sell-dashboard:{selected_kite_profile_name()}",))
     return {
@@ -5584,7 +5637,8 @@ def place_approved_ce_sell_order(underlying: str) -> dict[str, Any]:
         "order_id": order_id,
         "detail": (
             f"SELL covered CE {snapshot['quantity']} qty at LIMIT {snapshot['limit_price']:.2f}. "
-            f"Fresh LTP {snapshot['ltp']:.2f}; effective holding {snapshot['holding_qty']} shares "
+            f"{float(snapshot.get('markup_percent') or option_sell_markup_percent_setting()):.2f}% above fresh LTP {snapshot['ltp']:.2f}; "
+            f"effective holding {snapshot['holding_qty']} shares "
             f"from {snapshot['holding_source']}."
         ),
     }
@@ -6631,7 +6685,7 @@ def modify_or_place_order_with_new_fallback(kite: Any, order: dict[str, Any]) ->
     order = kite_order_payload(order)
     similar_orders = kite_orders.find_similar_open_orders(kite, order)
     if not similar_orders:
-        order_id = kite_orders.place_order(kite, order)
+        order_id = place_order_allowing_autoslice(kite, order)
         return order_id, "placed_new_no_similar_open_order"
     try:
         order_id = kite_orders.modify_order(kite, similar_orders[-1], order)
@@ -9136,6 +9190,7 @@ def render_commodity_panel(state: PageState) -> str:
 def render_income_panel(state: PageState) -> str:
     rows = state.income_rows or []
     summary = state.income_summary or {"overall_pnl": 0, "by_symbol": {}}
+    option_sell_markup = option_sell_markup_percent_setting()
     positions = state.income_positions or []
     pe_top = state.income_pe_top or []
     pe_watch = state.income_pe_watch or []
@@ -9364,11 +9419,11 @@ def render_income_panel(state: PageState) -> str:
       <div class="live-modal-backdrop" id="income-pe-order-modal">
         <div class="live-modal income-pe-order-modal-card">
           <h2 id="income-pe-order-title">Cash-Secured PE SELL</h2>
-          <p class="status">Fresh Kite premium is loaded when the candidate opens. The limit order is set 20% above LTP.</p>
+          <p class="status">Fresh Kite premium is loaded when the candidate opens. The limit order is set {option_sell_markup:.2f}% above LTP.</p>
           <div class="income-equity-metrics">
             <div><span>Option</span><strong id="income-pe-option">--</strong></div>
             <div><span>Fresh LTP</span><strong id="income-pe-ltp">--</strong></div>
-            <div><span>SELL limit +20%</span><strong id="income-pe-limit">--</strong></div>
+            <div><span>SELL limit +{option_sell_markup:.2f}%</span><strong id="income-pe-limit">--</strong></div>
             <div><span>Quantity</span><strong id="income-pe-quantity">--</strong></div>
             <div><span>Expiry</span><strong id="income-pe-expiry">--</strong></div>
             <div><span>Assignment cash</span><strong id="income-pe-assignment">--</strong></div>
@@ -9740,6 +9795,8 @@ def render_page(state: PageState) -> bytes:
             <div class="setup-card-kicker">03</div>
             <div class="panel-title">ETF Buy Setup</div>
             {render_number_input("etf_buy_amount", "ETF buy amount", etf_buy_amount, "100")}
+            {render_number_input("option_sell_markup_percent", "Option SELL limit markup %", state.option_sell_markup_percent, "0.05")}
+            <p class="status">Used by Trading Top 3 CE SELL and INCOME PE SELL cards. Default is 20% above fresh option LTP.</p>
             <div class="kite-action-preview">{html.escape(etf_buy_action)}</div>
             <p class="status">Saved in <code>{html.escape(str(SETTINGS_PATH.name))}</code>.</p>
           </section>
@@ -13746,7 +13803,7 @@ def render_page(state: PageState) -> bytes:
         if (incomePeAssignment) incomePeAssignment.textContent = Number(data.assignment_value || 0).toFixed(0);
         if (incomePeMaxProfit) incomePeMaxProfit.textContent = Number(data.max_profit || 0).toFixed(0);
         if (incomePeYield) incomePeYield.textContent = `${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
-        if (incomePeSummary) incomePeSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | Fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Assignment value ${{Number(data.assignment_value || 0).toFixed(0)}} | Maximum profit ${{Number(data.max_profit || 0).toFixed(0)}}`;
+        if (incomePeSummary) incomePeSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | ${{Number(data.markup_percent || 0).toFixed(2)}}% above fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Assignment value ${{Number(data.assignment_value || 0).toFixed(0)}} | Maximum profit ${{Number(data.max_profit || 0).toFixed(0)}}`;
         if (incomePeReview) incomePeReview.disabled = false;
       }} catch (error) {{
         if (incomePeSummary) incomePeSummary.textContent = compactClientError(error.message, 'Could not load PE quote');
@@ -13777,6 +13834,27 @@ def render_page(state: PageState) -> bytes:
           if (incomePeGo) incomePeGo.disabled = false;
         }}
       }}, 1000);
+    }});
+    function closeOrderModalForSubmit(modal, reviewButton, goButton) {{
+      if (modal) {{
+        modal.setAttribute('aria-busy', 'true');
+        for (const button of modal.querySelectorAll('button')) button.disabled = true;
+        modal.style.display = 'none';
+      }}
+      if (reviewButton) reviewButton.disabled = true;
+      if (goButton) {{
+        goButton.disabled = true;
+        goButton.textContent = 'Submitting...';
+      }}
+      document.body.classList.add('order-submit-in-progress');
+      window.setTimeout(() => {{
+        for (const button of document.querySelectorAll('button, input[type="submit"]')) {{
+          button.disabled = true;
+        }}
+      }}, 0);
+    }}
+    incomePeGo && incomePeGo.addEventListener('click', () => {{
+      closeOrderModalForSubmit(incomePeModal, incomePeReview, incomePeGo);
     }});
     function resetCeSellConfirmation() {{
       if (ceSellCountdownTimer) clearInterval(ceSellCountdownTimer);
@@ -13829,7 +13907,7 @@ def render_page(state: PageState) -> bytes:
         if (ceSellMaxProfit) ceSellMaxProfit.textContent = Number(data.max_profit || 0).toFixed(0);
         if (ceSellYield) ceSellYield.textContent = `${{Number(data.otm_percent || 0).toFixed(2)}}% / ${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
         if (ceSellRisk) ceSellRisk.textContent = `${{Number(data.score || 0).toFixed(0)}} / ${{data.event_risk || 'N/A'}} event / ${{data.breakout_risk || 'N/A'}} breakout`;
-        if (ceSellSummary) ceSellSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | Fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Effective holding ${{data.holding_qty}} from ${{data.holding_source || 'holding record'}}`;
+        if (ceSellSummary) ceSellSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | ${{Number(data.markup_percent || 0).toFixed(2)}}% above fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Effective holding ${{data.holding_qty}} from ${{data.holding_source || 'holding record'}}`;
         if (ceSellReview) ceSellReview.disabled = false;
       }} catch (error) {{
         if (ceSellSummary) ceSellSummary.textContent = compactClientError(error.message, 'Could not load covered CE order');
@@ -13860,6 +13938,9 @@ def render_page(state: PageState) -> bytes:
           if (ceSellGo) ceSellGo.disabled = false;
         }}
       }}, 1000);
+    }});
+    ceSellGo && ceSellGo.addEventListener('click', () => {{
+      closeOrderModalForSubmit(ceSellModal, ceSellReview, ceSellGo);
     }});
     function stopEquityOrderCountdown() {{
       if (equityOrderCountdownTimer) {{
@@ -15125,6 +15206,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
+            option_sell_markup_percent=float(
+                first(
+                    form,
+                    "option_sell_markup_percent",
+                    str(option_sell_markup_percent_setting()),
+                )
+                or option_sell_markup_percent_setting()
+            ),
             home_tickers=first(form, "home_tickers", home_tickers_text()),
         )
 
@@ -15378,14 +15467,16 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 save_app_settings(
                     {
                         "etf_buy_amount": state.etf_buy_amount,
+                        "option_sell_markup_percent": state.option_sell_markup_percent,
                         "home_tickers": normalized_home_tickers,
                         "selected_kite_profile": profile_name,
                     }
                 )
                 state.home_tickers = "\n".join(normalized_home_tickers)
-                clear_app_cache(("market-quotes", "kite:quote"))
+                clear_app_cache(("market-quotes", "kite:quote", "income-dashboard", "ce-sell-dashboard"))
                 state.message = (
                     f"Kite setup saved for {profile_name}. ETF buy amount {format_buy_amount(state.etf_buy_amount)}. "
+                    f"Option SELL markup {state.option_sell_markup_percent:.2f}%. "
                     f"Home watchlist has {len(normalized_home_tickers)} ticker(s)."
                 )
             elif request_path == "/kite-token/generate":
