@@ -139,12 +139,82 @@ class PeSellStrategyTests(unittest.TestCase):
             "validity": "DAY",
             "tag": "GPT_CSP",
         }
-        with patch.object(app, "active_position_option_block_keys", return_value=set()):
+        with (
+            patch.object(app, "active_position_option_block_keys", return_value=set()),
+            patch.object(app, "active_open_order_option_block_keys", return_value=set()),
+        ):
             output = app.render_orders_table([order], selected={0})
         self.assertIn("<th>option LTP</th>", output)
         self.assertIn("<th>markup %</th>", output)
         self.assertIn("<th>max gain opportunity</th>", output)
         self.assertIn("<td>3705.00</td>", output)
+
+    def test_trading_open_order_duplicate_blocks_same_symbol_and_side_only(self):
+        sell_order = {
+            "tradingsymbol": "BAJFINANCE26JUN1000CE",
+            "transaction_type": "SELL",
+        }
+        buy_order = {
+            "tradingsymbol": "BAJFINANCE26JUN1000CE",
+            "transaction_type": "BUY",
+        }
+        active = {"BAJFINANCE26JUN1000CE:SELL"}
+        self.assertTrue(app.order_has_open_duplicate(sell_order, active))
+        self.assertFalse(app.order_has_open_duplicate(buy_order, active))
+
+    def test_trading_table_disables_existing_open_order(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "BAJFINANCE26JUN1000CE",
+            "transaction_type": "SELL",
+            "quantity": 750,
+            "product": "NRML",
+            "order_type": "LIMIT",
+            "price": 8.0,
+            "validity": "DAY",
+        }
+        with (
+            patch.object(app, "active_position_option_block_keys", return_value=set()),
+            patch.object(
+                app,
+                "active_open_order_option_block_keys",
+                return_value={"BAJFINANCE26JUN1000CE:SELL"},
+            ),
+        ):
+            output = app.render_orders_table([order], selected={0})
+        self.assertIn("Existing open Kite SELL order found", output)
+        self.assertIn('value="0" disabled', output)
+
+    def test_live_trading_execution_rechecks_and_blocks_existing_open_order(self):
+        row = {
+            "exchange": "NFO",
+            "tradingsymbol": "BAJFINANCE26JUN1000CE",
+            "transaction_type": "SELL",
+            "quantity": "750",
+            "price": "8",
+        }
+        built = {
+            "exchange": "NFO",
+            "tradingsymbol": "BAJFINANCE26JUN1000CE",
+            "transaction_type": "SELL",
+            "quantity": 750,
+            "price": 8.0,
+        }
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app, "build_orders", return_value=[built]),
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "active_position_option_block_keys", return_value=set()),
+            patch.object(
+                app,
+                "active_open_order_option_block_keys",
+                return_value={"BAJFINANCE26JUN1000CE:SELL"},
+            ),
+            patch.object(app.kite_orders, "place_order") as place_order,
+        ):
+            with self.assertRaisesRegex(ValueError, "same open/pending Kite order already exists"):
+                app.execute_orders([row], {0}, False, True, True)
+        place_order.assert_not_called()
 
     def test_far_otm_ce_is_adjusted_to_highest_active_strike_within_cap(self):
         row = {
@@ -308,6 +378,86 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("unexpected keyword argument", message)
         self.assertNotIn("unreachable", message)
 
+    def test_open_option_buy_orders_detects_only_pending_buy_orders(self):
+        orders = [
+            {
+                "order_id": "BUY1",
+                "tradingsymbol": "PFC26JUN400PE",
+                "transaction_type": "BUY",
+                "status": "OPEN",
+                "pending_quantity": 1300,
+                "price": 2.60,
+            },
+            {
+                "order_id": "SELL1",
+                "tradingsymbol": "PFC26JUN400PE",
+                "transaction_type": "SELL",
+                "status": "OPEN",
+                "pending_quantity": 1300,
+                "price": 4.00,
+            },
+            {
+                "order_id": "DONE1",
+                "tradingsymbol": "CAMS26JUN760PE",
+                "transaction_type": "BUY",
+                "status": "COMPLETE",
+                "pending_quantity": 0,
+                "price": 8.30,
+            },
+        ]
+        with patch.object(app, "cached_kite_orders", return_value=orders):
+            result = app.open_option_buy_orders_by_symbol(object())
+        self.assertEqual(list(result), ["PFC26JUN400PE"])
+        self.assertEqual(result["PFC26JUN400PE"]["quantity"], 1300)
+        self.assertEqual(result["PFC26JUN400PE"]["price"], 2.60)
+
+    def test_position_close_buy_refuses_duplicate_open_buy_order(self):
+        position = {
+            "tradingsymbol": "PFC26JUN400PE",
+            "exchange": "NFO",
+            "quantity": -1300,
+            "product": "NRML",
+            "ltp": 2.85,
+        }
+        with (
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "open_option_positions", return_value=[position]),
+            patch.object(
+                app,
+                "open_option_buy_orders_by_symbol",
+                return_value={
+                    "PFC26JUN400PE": {
+                        "quantity": 1300,
+                        "price": 2.60,
+                        "status": "OPEN",
+                    }
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "BUY close order already placed"):
+                app.build_position_close_buy_order("PFC26JUN400PE")
+
+    def test_positions_table_marks_existing_buy_close_order(self):
+        state = app.PageState(active_tab="positions")
+        state.positions_rows = [
+            {
+                "symbol": "PFC26JUN400PE",
+                "product": "NRML",
+                "quantity": -1300,
+                "existing_buy_order": {
+                    "quantity": 1300,
+                    "price": 2.60,
+                    "status": "OPEN",
+                },
+            }
+        ]
+        state.positions_summary = {"count": 1}
+        output = app.render_positions_panel(state)
+        self.assertIn("BUY ORDER PLACED", output)
+        self.assertIn("BUY Qty 1300 | Limit 2.60", output)
+        self.assertIn("Close BUY pending", output)
+        self.assertNotIn(">BUY -10%</button>", output)
+
     def test_ce_selected_strike_is_valid_and_above_target(self):
         instruments = [
             {"instrument_type": "CE", "strike": 1240, "tradingsymbol": "TEST1240CE"},
@@ -429,6 +579,27 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertFalse(app.commodity_below_200_dma(100, 100))
         self.assertFalse(app.commodity_below_200_dma(105, 100))
         self.assertFalse(app.commodity_below_200_dma(95, None))
+
+    def test_commodity_holdings_table_shows_average_buy_price(self):
+        state = app.PageState(active_tab="commodity")
+        state.commodity_holdings = [
+            {
+                "symbol": "SILVERBEES",
+                "label": "Nippon India Silver ETF",
+                "quantity": 125,
+                "average_price": 238.96,
+                "source": "holding",
+                "investment": 29870.0,
+                "market_value": 27500.0,
+                "pnl": -2370.0,
+                "profit_pct": -7.93,
+                "profit_target_pct": 20,
+                "book_profit": False,
+            }
+        ]
+        output = app.render_commodity_panel(state)
+        self.assertIn("<th>Avg Buy Price</th>", output)
+        self.assertIn("<td>238.96</td>", output)
 
     def test_score_is_capped_at_100(self):
         result = app.score_pe_sell_candidate(candidate())

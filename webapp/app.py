@@ -2622,15 +2622,21 @@ def active_position_underlyings() -> set[str]:
     return {item for item in active if item}
 
 
-def active_position_option_block_keys() -> set[str]:
+def active_position_option_block_keys(
+    force_refresh: bool = False, strict: bool = False
+) -> set[str]:
     if kite_orders is None:
         return set()
     try:
         stream = io.StringIO()
         with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
             kite = kite_orders.kite_client()
+            if force_refresh:
+                clear_app_cache(("kite:positions",))
             positions = cached_kite_positions(kite)
     except Exception:
+        if strict:
+            raise
         return set()
     active: set[str] = set()
     for position in positions:
@@ -2646,6 +2652,41 @@ def active_position_option_block_keys() -> set[str]:
             continue
         active.add(symbol)
         active.add(f"{parts['underlying']}:{parts['option_type']}")
+    return active
+
+
+def active_open_order_option_block_keys(
+    force_refresh: bool = False, strict: bool = False
+) -> set[str]:
+    if kite_orders is None:
+        return set()
+    try:
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            kite = kite_orders.kite_client()
+            if force_refresh:
+                clear_app_cache(("kite:orders",))
+            orders = cached_kite_orders(kite)
+    except Exception:
+        if strict:
+            raise
+        return set()
+    active: set[str] = set()
+    for order in orders:
+        symbol = str(order.get("tradingsymbol") or "").strip().upper()
+        side = str(order.get("transaction_type") or "").strip().upper()
+        status = str(order.get("status") or "").strip().upper()
+        try:
+            pending = int(float(order.get("pending_quantity") or order.get("quantity") or 0))
+        except (TypeError, ValueError):
+            pending = 0
+        if (
+            symbol
+            and side in {"BUY", "SELL"}
+            and status in CANCELLABLE_ORDER_STATUSES
+            and pending > 0
+        ):
+            active.add(f"{symbol}:{side}")
     return active
 
 
@@ -3609,6 +3650,28 @@ def premium_capture_for_position(position: dict[str, Any], data: dict[str, Any])
     }
 
 
+def open_option_buy_orders_by_symbol(kite: Any, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    if force_refresh:
+        clear_app_cache(("kite:orders",))
+    matches: dict[str, dict[str, Any]] = {}
+    for order in cached_kite_orders(kite):
+        symbol = str(order.get("tradingsymbol") or "").strip().upper()
+        status = str(order.get("status") or "").strip().upper()
+        side = str(order.get("transaction_type") or "").strip().upper()
+        if not symbol or side != "BUY" or status not in CANCELLABLE_ORDER_STATUSES:
+            continue
+        pending_quantity = int(float(order.get("pending_quantity") or order.get("quantity") or 0))
+        if pending_quantity <= 0:
+            continue
+        matches[symbol] = {
+            "order_id": str(order.get("order_id") or ""),
+            "quantity": pending_quantity,
+            "price": float(order.get("price") or 0),
+            "status": status,
+        }
+    return matches
+
+
 def build_position_close_buy_order(symbol: str) -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -3625,6 +3688,13 @@ def build_position_close_buy_order(symbol: str) -> dict[str, Any]:
     if not matches:
         raise ValueError(f"No open sold option position found for {clean_symbol}.")
     position = matches[0]
+    existing_buy = open_option_buy_orders_by_symbol(kite, True).get(clean_symbol)
+    if existing_buy:
+        raise ValueError(
+            f"BUY close order already placed for {clean_symbol}: "
+            f"{existing_buy['quantity']} qty at LIMIT {existing_buy['price']:.2f} "
+            f"({existing_buy['status']})."
+        )
     quantity = abs(int(position.get("quantity") or 0))
     ltp = float(position.get("ltp") or 0)
     if ltp <= 0:
@@ -3686,6 +3756,12 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
     positions = open_option_positions(use_cache=not force_refresh)
     if force_refresh:
         positions = refresh_option_positions_with_live_ltp(positions, kite)
+    order_lookup_error = ""
+    try:
+        open_buy_orders = open_option_buy_orders_by_symbol(kite, force_refresh)
+    except Exception as exc:
+        open_buy_orders = {}
+        order_lookup_error = friendly_external_error(exc, "Open BUY order check")
     rows: list[dict[str, Any]] = []
     total_pnl = 0.0
     total_deployed = 0.0
@@ -3701,6 +3777,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
             pnl = float(position.get("pnl") or 0)
             total_pnl += pnl
             total_deployed += deployed
+            existing_buy_order = open_buy_orders.get(symbol.upper())
             rows.append(
                 {
                     "symbol": symbol,
@@ -3726,9 +3803,11 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "pcr": data.get("pcr"),
                     "support": data.get("support"),
                     "resistance": data.get("resistance"),
+                    "existing_buy_order": existing_buy_order,
                 }
             )
         except Exception as exc:
+            existing_buy_order = open_buy_orders.get(symbol.upper())
             rows.append(
                 {
                     "symbol": symbol,
@@ -3740,6 +3819,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "error": str(exc),
                     "strategy_strength": "ERROR",
                     "strategy_color": "lightcoral",
+                    "existing_buy_order": existing_buy_order,
                 }
             )
     summary = {
@@ -3749,6 +3829,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
         "return_pct": (total_pnl / total_deployed * 100) if total_deployed > 0 else None,
         "as_of": app_now().strftime("%d %b %Y %H:%M:%S"),
         "fresh": force_refresh,
+        "order_lookup_error": order_lookup_error,
     }
     result = (rows, summary)
     APP_CACHE["positions-research"] = (now, copy.deepcopy(result))
@@ -6928,6 +7009,25 @@ def execute_orders(
         )
 
     kite = kite_orders.kite_client()
+    active_position_keys = active_position_option_block_keys(True, True)
+    active_order_keys = active_open_order_option_block_keys(True, True)
+    duplicate_messages: list[str] = []
+    for order in orders:
+        symbol = str(order.get("tradingsymbol") or "").strip().upper()
+        side = str(order.get("transaction_type") or "").strip().upper()
+        if order_has_active_position(order, active_position_keys):
+            duplicate_messages.append(
+                f"{symbol} {side}: an active position already exists for this underlying and option side"
+            )
+        if order_has_open_duplicate(order, active_order_keys):
+            duplicate_messages.append(
+                f"{symbol} {side}: the same open/pending Kite order already exists"
+            )
+    if duplicate_messages:
+        raise ValueError(
+            "Duplicate order protection blocked live execution:\n"
+            + "\n".join(dict.fromkeys(duplicate_messages))
+        )
     kite_orders.attach_position_info(kite, orders)
     results: list[dict[str, Any]] = []
     for order in orders:
@@ -7485,14 +7585,19 @@ def build_position_buy_orders(state: PageState) -> list[dict[str, Any]]:
     kite = kite_buy_positions.kite_client()
     positions = kite_buy_positions.current_positions(kite, args)
     positions = refresh_option_positions_with_live_ltp(positions, kite)
+    open_buy_orders = open_option_buy_orders_by_symbol(kite, True)
     orders = [
         order
         for position in positions
         if (order := kite_buy_positions.build_buy_order(position, args, kite)) is not None
+        and str(order.get("tradingsymbol") or "").upper() not in open_buy_orders
     ]
     orders = refresh_position_buy_order_prices(orders, kite, args)
     if not orders:
-        raise ValueError("No matching positions found after filters.")
+        raise ValueError(
+            "No matching positions need a new BUY order after filters. "
+            "Options with an existing open BUY close order were skipped."
+        )
     if args.max_orders is not None and len(orders) > args.max_orders:
         raise ValueError(
             f"Refusing to create {len(orders)} orders because max-orders is {args.max_orders}."
@@ -7658,6 +7763,12 @@ def order_has_active_position(order: dict[str, Any], active_option_keys: set[str
     return symbol in active_option_keys or option_key in active_option_keys
 
 
+def order_has_open_duplicate(order: dict[str, Any], active_order_keys: set[str]) -> bool:
+    symbol = str(order.get("tradingsymbol") or "").strip().upper()
+    side = str(order.get("transaction_type") or "").strip().upper()
+    return bool(symbol and side and f"{symbol}:{side}" in active_order_keys)
+
+
 def validation_score_percent(validation: dict[str, Any] | None) -> float | None:
     if not validation:
         return None
@@ -7738,9 +7849,16 @@ def default_selected_order_indexes(
         active_option_keys = active_position_option_block_keys()
     except Exception:
         active_option_keys = set()
+    try:
+        active_order_keys = active_open_order_option_block_keys()
+    except Exception:
+        active_order_keys = set()
     selected: set[int] = set()
     for index, order in enumerate(orders):
-        if order_has_active_position(order, active_option_keys):
+        if (
+            order_has_active_position(order, active_option_keys)
+            or order_has_open_duplicate(order, active_order_keys)
+        ):
             continue
         validation = validations[index] if validations and index < len(validations) else None
         score_pct = validation_score_percent(validation)
@@ -7762,6 +7880,10 @@ def render_orders_table(
         active_option_keys = active_position_option_block_keys()
     except Exception:
         active_option_keys = set()
+    try:
+        active_order_keys = active_open_order_option_block_keys()
+    except Exception:
+        active_order_keys = set()
     display_fields = [
         "exchange",
         "tradingsymbol",
@@ -7797,18 +7919,34 @@ def render_orders_table(
         underlying = parts["underlying"] if parts else underlying_for_symbol(symbol) if symbol else ""
         option_type = parts["option_type"] if parts else ""
         has_active_position = order_has_active_position(order, active_option_keys)
+        has_open_duplicate = order_has_open_duplicate(order, active_order_keys)
         validation = validations[index] if validations and index < len(validations) else None
         score_pct = validation_score_percent(validation)
-        disable_checkbox = has_active_position or (score_pct is not None and score_pct < 50)
+        disable_checkbox = (
+            has_active_position
+            or has_open_duplicate
+            or (score_pct is not None and score_pct < 50)
+        )
         checked_attr = " checked" if index in selected and not disable_checkbox else ""
         disabled_attr = " disabled" if disable_checkbox else ""
-        row_class = ' class="order-existing-position active-position-row"' if has_active_position else ""
-        option_label = option_type or "option"
-        row_title = (
-            f' title="Existing Kite {html.escape(option_label, quote=True)} position found for {html.escape(underlying or symbol, quote=True)}"'
-            if has_active_position
+        row_class = (
+            ' class="order-existing-position active-position-row"'
+            if has_active_position or has_open_duplicate
             else ""
         )
+        option_label = option_type or "option"
+        if has_open_duplicate:
+            row_title = (
+                f' title="Existing open Kite {html.escape(str(order.get("transaction_type") or ""), quote=True)} '
+                f'order found for {html.escape(symbol, quote=True)}"'
+            )
+        elif has_active_position:
+            row_title = (
+                f' title="Existing Kite {html.escape(option_label, quote=True)} position found for '
+                f'{html.escape(underlying or symbol, quote=True)}"'
+            )
+        else:
+            row_title = ""
         cells = []
         for field in display_fields:
             value = order.get(field, "")
@@ -7833,7 +7971,7 @@ def render_orders_table(
         )
     return (
         '<section class="panel"><div class="panel-title">Orders</div>'
-        '<div class="status order-position-note">Rows in light red already have an active Kite position for the same underlying and same option side. Opposite side CE/PE remains selectable.</div>'
+        '<div class="status order-position-note">Rows in light red already have an active Kite position for the same underlying and option side, or an open/pending Kite order for the exact symbol and transaction side. Duplicate rows cannot be selected.</div>'
         '<div class="table-wrap"><table><thead><tr><th>Select</th><th>Score</th>'
         f"{header}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
     )
@@ -9186,6 +9324,35 @@ def render_positions_panel(
         except (TypeError, ValueError):
             return ""
 
+    def position_identity(row: dict[str, Any]) -> str:
+        existing = row.get("existing_buy_order") or {}
+        marker = ""
+        if existing:
+            marker = (
+                '<span class="existing-buy-order">BUY ORDER PLACED</span>'
+                f'<span>BUY Qty {html.escape(str(existing.get("quantity", "")))}'
+                f' | Limit {html.escape(fmt_number(existing.get("price")))}</span>'
+            )
+        return (
+            f'{render_symbol_value("tradingsymbol", row.get("symbol", ""))}'
+            f'<span>{html.escape(str(row.get("product", "")))} | Qty {html.escape(str(row.get("quantity", "")))}</span>'
+            f"{marker}"
+        )
+
+    def position_action(row: dict[str, Any]) -> str:
+        if row.get("existing_buy_order"):
+            return '<span class="existing-buy-action">Close BUY pending</span>'
+        if int(row.get("quantity") or 0) < 0 and (
+            (row.get("captured_pct") is not None and abs(float(row.get("captured_pct") or 0)) >= 50)
+            or float(row.get("return_pct") or 0) <= -40
+        ):
+            return (
+                f'<button type="submit" class="book-profit-button compact-action-button" '
+                f'formaction="/positions/close-buy" name="close_symbol" '
+                f'value="{html.escape(str(row.get("symbol", "")), quote=True)}">BUY -10%</button>'
+            )
+        return '<span class="commodity-wait">Wait</span>'
+
     summary_cards = "".join(
         f'<div class="position-summary-chip"><span>{html.escape(label)}</span>'
         f'<strong>{html.escape(value)}</strong></div>'
@@ -9199,24 +9366,14 @@ def render_positions_panel(
     table_rows = "".join(
         (
         "<tr>"
-        f"<td class=\"position-symbol-cell\">{render_symbol_value('tradingsymbol', row.get('symbol', ''))}<span>{html.escape(str(row.get('product', '')))} | Qty {html.escape(str(row.get('quantity', '')))}</span></td>"
+        f'<td class="position-symbol-cell">{position_identity(row)}</td>'
         f"<td><strong>{html.escape(fmt_number(row.get('stock_cmp')))}</strong><span>Stock CMP</span></td>"
         f"<td><strong>{html.escape(fmt_number(row.get('ltp')))}</strong><span>Avg {html.escape(fmt_number(row.get('average_price')))}</span></td>"
         f'<td class="{metric_class(row.get("pnl"))}"><strong>{html.escape(display_cell("pnl", row.get("pnl", "")))}</strong><span>{html.escape(fmt_number(row.get("return_pct")))}% on margin</span></td>'
         f'<td class="{strength_class("green" if (row.get("captured_pct") is not None and float(row.get("captured_pct") or 0) >= 50) else row.get("capture_color"))}"><strong>{html.escape(fmt_number(row.get("captured_pct")))}%</strong><span>Captured</span></td>'
         f"<td><strong>{html.escape(fmt_number(row.get('remaining_premium')))}</strong><span>{html.escape(fmt_number(row.get('remaining_pct')))}% remaining</span></td>"
         f'<td class="{strength_class(row.get("capture_color"))}"><strong>{html.escape(str(row.get("capture_action", "")))}</strong><span>{html.escape(str(row.get("capture_detail", "")))}</span></td>'
-        "<td>"
-        + (
-            f'<button type="submit" class="book-profit-button compact-action-button" formaction="/positions/close-buy" name="close_symbol" value="{html.escape(str(row.get("symbol", "")), quote=True)}">BUY -10%</button>'
-            if int(row.get("quantity") or 0) < 0
-            and (
-                (row.get("captured_pct") is not None and abs(float(row.get("captured_pct") or 0)) >= 50)
-                or float(row.get("return_pct") or 0) <= -40
-            )
-            else '<span class="commodity-wait">Wait</span>'
-        )
-        + "</td>"
+        f"<td>{position_action(row)}</td>"
         f"<td><strong>{html.escape(fmt_number(row.get('deployed')))}</strong><span>Required</span></td>"
         f'<td class="{strength_class(row.get("buy_color"))}"><strong>{html.escape(compact_signal(row.get("buy_signal")))}</strong><span>{html.escape(str(row.get("buy_signal", "")))}</span></td>'
         f'<td><strong>{html.escape(fmt_number(row.get("sell_pop")))}%</strong><span>SELL POP</span></td>'
@@ -9235,7 +9392,13 @@ def render_positions_panel(
     table = (
         '<section class="panel positions-analytics-panel"><div class="panel-title">Active Position Analytics</div>'
         '<div class="research-table-hint">Premium capture: book sold options at 50-70% decay; roll near expiry if capture is not enough.</div>'
-        f'<div class="status">Market data as of: <strong>{html.escape(str(summary.get("as_of") or "Not loaded"))}</strong>. Use Load Active Positions for a fresh Kite pull.</div>'
+        f'<div class="status">Market data as of: <strong>{html.escape(str(summary.get("as_of") or "Not loaded"))}</strong>. Use Load Active Positions for a fresh Kite pull.'
+        + (
+            f' <span class="pnl-negative">Open BUY order check unavailable: {html.escape(str(summary.get("order_lookup_error")))}</span>'
+            if summary.get("order_lookup_error")
+            else ""
+        )
+        + "</div>"
         '<div class="table-wrap positions-table-wrap"><table class="positions-table"><thead><tr>'
         '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>Buy</th>'
         '<th>POP</th><th>OTM</th><th>Sell</th><th>Strength</th><th>Delta</th>'
@@ -9308,6 +9471,7 @@ def render_commodity_panel(state: PageState) -> str:
         "<tr>"
         f"<td><strong>{html.escape(str(row.get('symbol', '')))}</strong><span>{html.escape(str(row.get('label', '')))}</span></td>"
         f"<td>{html.escape(str(row.get('quantity', 0)))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('average_price')))}</td>"
         f"<td>{html.escape(str(row.get('source', '')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('investment')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('market_value')))}</td>"
@@ -9338,7 +9502,7 @@ def render_commodity_panel(state: PageState) -> str:
     )
     holdings_error_html = f'<div class="status">{html.escape(holdings_error)}</div>' if holdings_error else ""
     holdings_empty_html = (
-        '<tr><td colspan="8" class="status">No commodity ETF holdings found.</td></tr>'
+        '<tr><td colspan="9" class="status">No commodity ETF holdings found.</td></tr>'
         if not holding_rows and not holdings_error
         else ""
     )
@@ -9350,7 +9514,7 @@ def render_commodity_panel(state: PageState) -> str:
         '<div class="actions"><button type="submit">Refresh Current Holdings</button></div>'
         '</form>'
         '<div class="table-wrap"><table class="commodity-holdings-table"><thead><tr>'
-        '<th>ETF</th><th>Unit</th><th>Source</th><th>Investment Amount</th><th>Market Value</th><th>Profit</th><th>% Profit</th><th>Action</th>'
+        '<th>ETF</th><th>Unit</th><th>Avg Buy Price</th><th>Source</th><th>Investment Amount</th><th>Market Value</th><th>Profit</th><th>% Profit</th><th>Action</th>'
         f'</tr></thead><tbody>{holding_rows}{holdings_empty_html}</tbody></table></div>'
         f"{holdings_error_html}"
         "</section>"
@@ -12781,6 +12945,28 @@ def render_page(state: PageState) -> bytes:
       font-size: 10px;
       font-weight: 900;
       text-decoration: underline;
+    }}
+    .position-symbol-cell .existing-buy-order {{
+      display: inline-block;
+      width: fit-content;
+      margin-top: 5px;
+      padding: 3px 6px;
+      border: 1px solid #86efac;
+      border-radius: 5px;
+      background: #dcfce7;
+      color: #166534;
+      font-size: 9px;
+      font-weight: 950;
+    }}
+    .existing-buy-action {{
+      display: inline-block;
+      padding: 4px 7px;
+      border-radius: 999px;
+      background: #dcfce7;
+      color: #166534;
+      font-size: 9px;
+      font-weight: 900;
+      white-space: nowrap;
     }}
     .positions-table .pnl-positive {{
       background: #ecfdf5;

@@ -1,5 +1,0 @@
-exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity
-
-NFO,PFC26JUN350PE,3750,SELL,NRML,LIMIT,1,DAY
-
-NFO,CAMS26JUN3600PE,400,SELL,NRML,LIMIT,1,DAY

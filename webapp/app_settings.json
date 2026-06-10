@@ -25,13 +25,13 @@
       "KITE_CONFIRM_LIVE_ORDER": "YES"
     },
     "Monika": {
-      "KITE_ACCESS_TOKEN": "MO7Uf8GelP4JilqjLo8xy494QzAZBwls",
+      "KITE_ACCESS_TOKEN": "ue6ICE1ZYPR3CJwQnAnVt0NZQiYKN0bM",
       "KITE_API_KEY": "tnaa26kee3iza58w",
       "KITE_API_SECRET": "pk55c56ih0ak3pd6cfmk24z14yt22946",
       "KITE_CONFIRM_LIVE_ORDER": "YES"
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "MO7Uf8GelP4JilqjLo8xy494QzAZBwls",
+      "KITE_ACCESS_TOKEN": "ue6ICE1ZYPR3CJwQnAnVt0NZQiYKN0bM",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES"
@@ -43,5 +43,5 @@
       "KITE_CONFIRM_LIVE_ORDER": "YES"
     }
   },
-  "selected_kite_profile": "Monika"
+  "selected_kite_profile": "Shanti"
 }
