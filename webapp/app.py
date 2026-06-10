@@ -114,6 +114,8 @@ DISPLAY_FIELDS = [
     "validity",
     "tag",
 ]
+MAX_TRADING_ORDER_OTM_PERCENT = 12.5
+MAX_TOP3_CE_SELL_LOTS = 1
 MMI_URL = "https://www.tickertape.in/market-mood-index"
 DEFAULT_GPT_SHARE_URL = "https://chatgpt.com/share/6a058d56-7558-83a4-ac3d-d4ea9058b663"
 DEFAULT_OPENAI_MODEL = "gpt-5.5"
@@ -3302,7 +3304,7 @@ def place_income_cash_secured_put_order(underlying: str, target_strike: Any = No
         "autoslice": True,
     }
     try:
-        order_id = kite_orders.place_order(kite, order)
+        order_id = place_order_allowing_autoslice(kite, order)
     except Exception as exc:
         raise RuntimeError(friendly_external_error(exc, f"{snapshot['symbol']} PE SELL")) from exc
     invalidate_kite_trade_cache()
@@ -3882,6 +3884,11 @@ def mmi_zone(value: float) -> str:
 def friendly_external_error(exc: Exception, service: str = "Market data") -> str:
     raw = str(exc or "").strip()
     lower = raw.lower()
+    if "api_key" in lower or "access_token" in lower or "invalid session" in lower:
+        return (
+            f"{service} authentication failed: open Kite Setup, confirm the active profile, "
+            "and regenerate today's access token."
+        )
     if (
         "getaddrinfo failed" in lower
         or "name resolution" in lower
@@ -3893,15 +3900,18 @@ def friendly_external_error(exc: Exception, service: str = "Market data") -> str
             f"{service} connection failed: DNS could not resolve the market-data host. "
             "Check internet/DNS on this laptop/server, then refresh."
         )
-    if "api.kite.trade" in lower or "kiteconnect" in lower:
+    if (
+        "api.kite.trade" in lower
+        and (
+            "connection" in lower
+            or "failed to establish" in lower
+            or "max retries exceeded" in lower
+            or "network is unreachable" in lower
+        )
+    ):
         return (
             f"{service} connection failed: Kite API is unreachable from this machine. "
             "Verify network, DNS, firewall, and the selected Kite profile token."
-        )
-    if "api_key" in lower or "access_token" in lower or "invalid session" in lower:
-        return (
-            f"{service} authentication failed: open Kite Setup, confirm the active profile, "
-            "and regenerate today's access token."
         )
     if "timed out" in lower or "timeout" in lower:
         return f"{service} connection timed out. Retry after a few seconds."
@@ -5290,9 +5300,15 @@ def score_ce_sell_candidate(
     result = dict(candidate)
     holding_qty = int(float(result.get("holding_qty") or 0))
     lot_size = int(float(result.get("active_lot_size") or 0))
-    requested_lots = int(float(result.get("requested_lots") or 0))
+    requested_lots = min(
+        MAX_TOP3_CE_SELL_LOTS,
+        int(float(result.get("requested_lots") or 0)),
+    )
     covered_lots = holding_qty // lot_size if lot_size > 0 else 0
-    lots_to_sell = min(requested_lots, covered_lots) if settings["auto_reduce_lots_enabled"] else requested_lots
+    lots_to_sell = min(
+        MAX_TOP3_CE_SELL_LOTS,
+        min(requested_lots, covered_lots) if settings["auto_reduce_lots_enabled"] else requested_lots,
+    )
     quantity = lots_to_sell * lot_size
     cmp_value = float(result.get("cmp") or 0)
     strike = float(result.get("selected_ce_strike") or 0)
@@ -5414,7 +5430,7 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
         instrument = by_symbol.get(option_symbol)
         holding = int(float(row.get("quantity") or 0))
         cmp_value = float(row.get("cmp") or 0)
-        requested_lots = max(1, int(float(row.get("lots_can_sell_input") or row.get("covered_lots") or 1)))
+        requested_lots = MAX_TOP3_CE_SELL_LOTS
         if not instrument:
             candidates.append({"stock": symbol, "holding_qty": holding, "requested_lots": requested_lots, "cmp": cmp_value, "contract_valid": False})
             continue
@@ -5539,9 +5555,12 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
 
     symbol = str(candidate.get("option_symbol") or "").upper()
     lot_size = int(float(candidate.get("active_lot_size") or 0))
-    requested_lots = int(float(candidate.get("lots_to_sell") or 0))
+    requested_lots = min(
+        MAX_TOP3_CE_SELL_LOTS,
+        int(float(candidate.get("lots_to_sell") or 0)),
+    )
     covered_lots = holding_qty // lot_size if lot_size > 0 else 0
-    lots_to_sell = min(requested_lots, covered_lots)
+    lots_to_sell = min(MAX_TOP3_CE_SELL_LOTS, requested_lots, covered_lots)
     quantity = lots_to_sell * lot_size
     if lot_size <= 0 or quantity <= 0 or quantity > holding_qty:
         raise PermissionError(
@@ -6561,20 +6580,133 @@ def default_args(no_ltp_price: bool, keep_existing_orders: bool) -> argparse.Nam
     )
 
 
+def cap_trading_option_rows_by_otm(
+    rows: list[dict[str, str]],
+    kite: Any,
+    max_otm_percent: float = MAX_TRADING_ORDER_OTM_PERCENT,
+) -> tuple[list[dict[str, str]], dict[int, dict[str, Any]]]:
+    adjusted_rows = [dict(row) for row in rows]
+    parsed_rows: list[tuple[int, dict[str, Any]]] = []
+    for index, row in enumerate(adjusted_rows):
+        exchange = str(row.get("exchange") or "NFO").strip().upper()
+        symbol = str(row.get("tradingsymbol") or row.get("symbol") or "").strip().upper()
+        parts = option_symbol_parts(symbol)
+        if exchange == "NFO" and parts:
+            parsed_rows.append((index, parts))
+    if not parsed_rows:
+        return adjusted_rows, {}
+
+    spot_keys = sorted({f"NSE:{parts['underlying']}" for _, parts in parsed_rows})
+    spot_quotes = cached_kite_quote(kite, spot_keys, ttl_seconds=5)
+    instruments = cached_kite_instruments(kite, "NFO")
+    instruments_by_contract: dict[tuple[str, str, date], list[dict[str, Any]]] = {}
+    for instrument in instruments:
+        underlying = str(instrument.get("name") or "").strip().upper()
+        option_type = str(instrument.get("instrument_type") or "").strip().upper()
+        expiry = instrument.get("expiry")
+        if underlying and option_type in {"CE", "PE"} and isinstance(expiry, date):
+            instruments_by_contract.setdefault((underlying, option_type, expiry), []).append(instrument)
+
+    adjustments: dict[int, dict[str, Any]] = {}
+    for index, parts in parsed_rows:
+        row = adjusted_rows[index]
+        original_symbol = str(row.get("tradingsymbol") or row.get("symbol") or "").strip().upper()
+        underlying = str(parts["underlying"]).upper()
+        option_type = str(parts["option_type"]).upper()
+        strike = float(parts["strike"])
+        spot = quote_ltp(spot_quotes.get(f"NSE:{underlying}", {}))
+        if spot <= 0:
+            raise ValueError(f"Could not read {underlying} spot price to validate the 12.5% OTM cap.")
+        otm_percent = (
+            ((strike - spot) / spot) * 100
+            if option_type == "CE"
+            else ((spot - strike) / spot) * 100
+        )
+        if otm_percent <= max_otm_percent:
+            adjustments[index] = {
+                "original_symbol": original_symbol,
+                "spot": spot,
+                "strike": strike,
+                "otm_percent": otm_percent,
+                "adjusted": False,
+            }
+            continue
+
+        expiry = expiry_date_for_parts(parts)
+        contracts = instruments_by_contract.get((underlying, option_type, expiry), [])
+        if option_type == "CE":
+            strike_limit = spot * (1 + max_otm_percent / 100)
+            valid = [
+                item
+                for item in contracts
+                if spot < float(item.get("strike") or 0) <= strike_limit
+            ]
+            selected = max(valid, key=lambda item: float(item.get("strike") or 0)) if valid else None
+        else:
+            strike_limit = spot * (1 - max_otm_percent / 100)
+            valid = [
+                item
+                for item in contracts
+                if strike_limit <= float(item.get("strike") or 0) < spot
+            ]
+            selected = min(valid, key=lambda item: float(item.get("strike") or 0)) if valid else None
+        if not selected:
+            raise ValueError(
+                f"{original_symbol} is {otm_percent:.2f}% OTM, above the {max_otm_percent:.1f}% cap, "
+                f"and no active {option_type} contract within the cap was found for the same expiry."
+            )
+
+        selected_symbol = str(selected.get("tradingsymbol") or "").strip().upper()
+        selected_strike = float(selected.get("strike") or 0)
+        selected_otm = (
+            ((selected_strike - spot) / spot) * 100
+            if option_type == "CE"
+            else ((spot - selected_strike) / spot) * 100
+        )
+        row["tradingsymbol"] = selected_symbol
+        if "symbol" in row:
+            row["symbol"] = selected_symbol
+        adjustments[index] = {
+            "original_symbol": original_symbol,
+            "spot": spot,
+            "strike": selected_strike,
+            "otm_percent": selected_otm,
+            "adjusted": True,
+        }
+    return adjusted_rows, adjustments
+
+
 def build_orders(
     rows: list[dict[str, str]], no_ltp_price: bool, keep_existing_orders: bool
 ) -> list[dict[str, Any]]:
+    has_option_rows = any(
+        str(row.get("exchange") or "NFO").strip().upper() == "NFO"
+        and option_symbol_parts(str(row.get("tradingsymbol") or row.get("symbol") or "").strip().upper())
+        for row in rows
+    )
+    kite = kite_orders.kite_client() if has_option_rows else None
+    working_rows, strike_adjustments = (
+        cap_trading_option_rows_by_otm(rows, kite) if kite is not None else ([dict(row) for row in rows], {})
+    )
     base_args = default_args(no_ltp_price, keep_existing_orders)
-    row_args = [kite_orders.args_for_csv_row(base_args, row) for row in rows]
+    row_args = [kite_orders.args_for_csv_row(base_args, row) for row in working_rows]
     needs_kite = any(not item.no_ltp_price for item in row_args)
-    kite = kite_orders.kite_client() if needs_kite else None
+    kite = kite or (kite_orders.kite_client() if needs_kite else None)
     orders: list[dict[str, Any]] = []
     errors: list[str] = []
     for index, item in enumerate(row_args, start=1):
-        symbol = str(getattr(item, "symbol", "") or rows[index - 1].get("tradingsymbol", "")).upper()
-        exchange = str(getattr(item, "exchange", "") or rows[index - 1].get("exchange", "NFO")).upper()
+        symbol = str(getattr(item, "symbol", "") or working_rows[index - 1].get("tradingsymbol", "")).upper()
+        exchange = str(getattr(item, "exchange", "") or working_rows[index - 1].get("exchange", "NFO")).upper()
         try:
-            orders.append(kite_orders.build_order(item, kite))
+            order = kite_orders.build_order(item, kite)
+            adjustment = strike_adjustments.get(index - 1)
+            if adjustment:
+                order["spot"] = round(float(adjustment["spot"]), 2)
+                order["strike"] = round(float(adjustment["strike"]), 2)
+                order["otm_percent"] = round(float(adjustment["otm_percent"]), 2)
+                if adjustment["adjusted"]:
+                    order["adjusted_from_symbol"] = adjustment["original_symbol"]
+            orders.append(order)
         except KeyError as exc:
             missing_key = str(exc).strip("'\"") or f"{exchange}:{symbol}"
             errors.append(
@@ -6589,6 +6721,63 @@ def build_orders(
             errors.append(f"Row {index}: {symbol} could not be previewed. {exc}")
     if errors:
         raise ValueError("Order preview could not be completed:\n" + "\n".join(errors))
+
+    option_quote_keys: list[str] = []
+    for order in orders:
+        symbol = str(order.get("tradingsymbol") or "").strip().upper()
+        exchange = str(order.get("exchange") or "NFO").strip().upper()
+        if exchange == "NFO" and option_symbol_parts(symbol):
+            option_quote_keys.append(f"{exchange}:{symbol}")
+
+    if option_quote_keys:
+        try:
+            kite = kite or kite_orders.kite_client()
+            option_quotes = cached_kite_quote(kite, option_quote_keys, ttl_seconds=5)
+        except Exception as exc:
+            missing_price_symbols = [
+                str(order.get("tradingsymbol") or "")
+                for row, order in zip(working_rows, orders)
+                if float(row.get("price") or 0) <= 0
+            ]
+            if missing_price_symbols:
+                raise ValueError(
+                    "Could not load fresh option LTP for zero-price order(s): "
+                    f"{', '.join(missing_price_symbols)}. {exc}"
+                ) from exc
+            option_quotes = {}
+
+        for row, item, order in zip(working_rows, row_args, orders):
+            symbol = str(order.get("tradingsymbol") or "").strip().upper()
+            exchange = str(order.get("exchange") or "NFO").strip().upper()
+            quote = option_quotes.get(f"{exchange}:{symbol}", {})
+            ltp = quote_ltp(quote)
+            source_price = float(row.get("price") or 0)
+            transaction_type = str(order.get("transaction_type") or "").upper()
+            if transaction_type == "SELL":
+                if ltp <= 0:
+                    raise ValueError(
+                        f"Could not read fresh option LTP for {exchange}:{symbol}. "
+                        "SELL limit price could not be calculated."
+                    )
+                tick_size = float(getattr(item, "tick_size", 0.05) or 0.05)
+                markup_percent = option_sell_markup_percent_setting()
+                order["price"] = ceil_to_tick(ltp * (1 + markup_percent / 100), tick_size)
+                order["price_basis"] = "fresh_ltp_plus_markup"
+                order["price_markup_percent"] = markup_percent
+            elif source_price <= 0:
+                if ltp <= 0:
+                    raise ValueError(
+                        f"Could not read fresh option LTP for {exchange}:{symbol}. "
+                        "The zero CSV price was not replaced."
+                    )
+                tick_size = float(getattr(item, "tick_size", 0.05) or 0.05)
+                order["price"] = ceil_to_tick(ltp, tick_size)
+                order["price_basis"] = "fresh_ltp"
+            if ltp > 0:
+                order["ltp"] = round(ltp, 2)
+            quantity = abs(int(order.get("quantity") or 0))
+            if transaction_type == "SELL":
+                order["max_gain"] = round(float(order.get("price") or 0) * quantity, 2)
     return orders
 
 
@@ -7533,7 +7722,7 @@ def render_ce_sell_dashboard(state: PageState) -> str:
     return (
         '<section class="panel income-growth-pe-panel ce-sell-dashboard">'
         '<div class="panel-title">Top 3 CE Sell Candidates For Today</div>'
-        '<div class="status pe-scoring-note">Covered CALL candidates are first filtered for full holding coverage, active F&amp;O contract, existing option positions, event risk, liquidity, premium yield, and breakout risk. Valid candidates are scored using 30 points for holding coverage, 30 points for call-away comfort, and 40 points for CE trade quality.</div>'
+        '<div class="status pe-scoring-note">Covered CALL candidates are first filtered for full holding coverage, active F&amp;O contract, existing option positions, event risk, liquidity, premium yield, and breakout risk. Valid candidates are scored using 30 points for holding coverage, 30 points for call-away comfort, and 40 points for CE trade quality. Suggested and submitted Top 3 CE orders are capped at one lot each.</div>'
         '<div class="actions"><button type="submit" formaction="/ce-scan/load">Recalculate Best 3 CE SELL</button></div>'
         f'<div class="pe-candidate-grid">{top or "<div class=\"status\">No covered CE candidate passed every hard filter today.</div>"}</div></section>'
         f'<details class="panel income-growth-pe-panel"><summary>CE Watch / Review <span>{len(state.ce_sell_watch or [])}</span></summary><div class="pe-candidate-grid">{watch or "<div class=\"status\">No additional valid CE candidates.</div>"}</div></details>'
@@ -7573,7 +7762,34 @@ def render_orders_table(
         active_option_keys = active_position_option_block_keys()
     except Exception:
         active_option_keys = set()
-    header = "".join(f"<th>{html.escape(field)}</th>" for field in DISPLAY_FIELDS)
+    display_fields = [
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "price",
+        "ltp",
+        "price_markup_percent",
+        "otm_percent",
+        "adjusted_from_symbol",
+        "max_gain",
+        "validity",
+        "tag",
+    ]
+    header_labels = {
+        "price": "limit price",
+        "ltp": "option LTP",
+        "price_markup_percent": "markup %",
+        "otm_percent": "OTM %",
+        "adjusted_from_symbol": "adjusted from",
+        "max_gain": "max gain opportunity",
+    }
+    header = "".join(
+        f"<th>{html.escape(header_labels.get(field, field))}</th>"
+        for field in display_fields
+    )
     rows = []
     for index, order in enumerate(orders):
         symbol = str(order.get("tradingsymbol") or "").strip().upper()
@@ -7593,15 +7809,27 @@ def render_orders_table(
             if has_active_position
             else ""
         )
-        cells = "".join(
-            f"<td>{render_symbol_value(field, order.get(field, ''))}</td>"
-            for field in DISPLAY_FIELDS
-        )
+        cells = []
+        for field in display_fields:
+            value = order.get(field, "")
+            if field == "max_gain":
+                rendered = html.escape(fmt_number(value, 2) if value != "" else "N/A")
+            elif field in {"price", "ltp"}:
+                rendered = html.escape(fmt_number(value, 2) if value != "" else "N/A")
+            elif field == "otm_percent":
+                rendered = html.escape(f"{fmt_number(value, 2)}%" if value != "" else "N/A")
+            elif field == "price_markup_percent":
+                rendered = html.escape(f"{fmt_number(value, 2)}%" if value != "" else "-")
+            elif field == "adjusted_from_symbol":
+                rendered = html.escape(str(value) if value else "-")
+            else:
+                rendered = render_symbol_value(field, value)
+            cells.append(f"<td>{rendered}</td>")
         rows.append(
             f"<tr{row_class}{row_title}>"
             f'<td><input type="checkbox" name="selected" value="{index}"{checked_attr}{disabled_attr}></td>'
             f"<td>{render_score_badge(score_pct)}</td>"
-            f"{cells}</tr>"
+            f"{''.join(cells)}</tr>"
         )
     return (
         '<section class="panel"><div class="panel-title">Orders</div>'
@@ -9420,6 +9648,10 @@ def render_income_panel(state: PageState) -> str:
         <div class="live-modal income-pe-order-modal-card">
           <h2 id="income-pe-order-title">Cash-Secured PE SELL</h2>
           <p class="status">Fresh Kite premium is loaded when the candidate opens. The limit order is set {option_sell_markup:.2f}% above LTP.</p>
+          <div class="quote-loading-state active" id="income-pe-loading" role="status" aria-live="polite">
+            <span class="backend-spinner" aria-hidden="true"></span>
+            <strong>Recalculating PE contract, premium, cash requirement, and risk...</strong>
+          </div>
           <div class="income-equity-metrics">
             <div><span>Option</span><strong id="income-pe-option">--</strong></div>
             <div><span>Fresh LTP</span><strong id="income-pe-ltp">--</strong></div>
@@ -11204,6 +11436,32 @@ def render_page(state: PageState) -> bytes:
     .income-pe-order-modal-card {{ width: min(680px, calc(100vw - 24px)); }}
     .income-pe-breath {{ display: none; }}
     .income-pe-breath.active {{ display: block; }}
+    .quote-loading-state {{
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      margin: 12px 0;
+      padding: 12px 14px;
+      border: 1px solid #7dd3fc;
+      border-radius: 8px;
+      background: #f0f9ff;
+      color: #075985;
+      text-align: left;
+    }}
+    .quote-loading-state.active {{ display: flex; }}
+    .backend-spinner {{
+      width: 24px;
+      height: 24px;
+      flex: 0 0 24px;
+      border: 3px solid #bae6fd;
+      border-top-color: #0284c7;
+      border-radius: 50%;
+      animation: backendSpin 0.8s linear infinite;
+    }}
+    @keyframes backendSpin {{
+      to {{ transform: rotate(360deg); }}
+    }}
     .investing-core-pill {{
       display: inline-flex;
       border-radius: 999px;
@@ -11937,6 +12195,46 @@ def render_page(state: PageState) -> bytes:
       background: rgba(15, 23, 42, 0.58);
       z-index: 50;
       padding: 20px;
+    }}
+    .global-work-overlay {{
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(15, 23, 42, 0.72);
+      backdrop-filter: blur(3px);
+      z-index: 200;
+      cursor: wait;
+    }}
+    .global-work-overlay.active {{ display: flex; }}
+    .global-work-card {{
+      width: min(440px, calc(100vw - 32px));
+      display: grid;
+      justify-items: center;
+      gap: 10px;
+      padding: 24px;
+      border: 1px solid #7dd3fc;
+      border-radius: 8px;
+      background: #f8fafc;
+      box-shadow: 0 24px 80px rgba(15, 23, 42, 0.42);
+      color: #0f4c5c;
+      text-align: center;
+    }}
+    .global-work-card strong {{ font-size: 19px; }}
+    .global-work-card span:last-child {{ color: #52627a; font-size: 13px; }}
+    .global-work-spinner {{
+      width: 42px;
+      height: 42px;
+      border: 5px solid #bae6fd;
+      border-top-color: #0f766e;
+      border-radius: 50%;
+      animation: backendSpin 0.8s linear infinite;
+    }}
+    body.global-work-active {{
+      overflow: hidden;
+      cursor: wait;
     }}
     .live-modal {{
       width: min(520px, 100%);
@@ -13254,6 +13552,10 @@ def render_page(state: PageState) -> bytes:
           <div class="live-modal income-pe-order-modal-card">
             <h2 id="ce-sell-order-title">Covered CE SELL Review</h2>
             <p class="status">Fresh Kite coverage and premium are revalidated before order placement. Review recent stock news, then complete the 10-second pause.</p>
+            <div class="quote-loading-state active" id="ce-sell-loading" role="status" aria-live="polite">
+              <span class="backend-spinner" aria-hidden="true"></span>
+              <strong>Revalidating coverage, position risk, quote, analytics, and news...</strong>
+            </div>
             <div class="income-equity-metrics">
               <div><span>Option</span><strong id="ce-sell-option">--</strong></div>
               <div><span>Fresh LTP</span><strong id="ce-sell-ltp">--</strong></div>
@@ -13359,6 +13661,13 @@ def render_page(state: PageState) -> bytes:
     {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
   </main>
+  <div class="global-work-overlay" id="global-work-overlay" role="status" aria-live="assertive" aria-hidden="true">
+    <div class="global-work-card">
+      <span class="global-work-spinner" aria-hidden="true"></span>
+      <strong id="global-work-title">Working securely...</strong>
+      <span id="global-work-detail">Refreshing Kite data and validating the action. Please wait.</span>
+    </div>
+  </div>
   <div class="live-modal-backdrop" id="live-confirm-modal">
     <div class="live-modal">
       <h2>Pause Before Live Trade</h2>
@@ -13651,6 +13960,61 @@ def render_page(state: PageState) -> bytes:
       }}
       return text.length > 240 ? text.slice(0, 240) + '...' : text;
     }}
+    const globalWorkOverlay = document.getElementById('global-work-overlay');
+    const globalWorkTitle = document.getElementById('global-work-title');
+    const globalWorkDetail = document.getElementById('global-work-detail');
+    let globalWorkDepth = 0;
+    function beginGlobalWork(title, detail) {{
+      globalWorkDepth += 1;
+      if (globalWorkTitle) globalWorkTitle.textContent = title || 'Working securely...';
+      if (globalWorkDetail) globalWorkDetail.textContent = detail || 'Refreshing Kite data and validating the action. Please wait.';
+      if (globalWorkOverlay) {{
+        globalWorkOverlay.classList.add('active');
+        globalWorkOverlay.setAttribute('aria-hidden', 'false');
+      }}
+      document.body.classList.add('global-work-active');
+    }}
+    function endGlobalWork() {{
+      globalWorkDepth = Math.max(0, globalWorkDepth - 1);
+      if (globalWorkDepth > 0) return;
+      if (globalWorkOverlay) {{
+        globalWorkOverlay.classList.remove('active');
+        globalWorkOverlay.setAttribute('aria-hidden', 'true');
+      }}
+      document.body.classList.remove('global-work-active');
+    }}
+    const heavyActionLabels = {{
+      '/load': 'Loading and validating today\\'s CSV...',
+      '/research/load': 'Researching CSV option symbols...',
+      '/positions/load': 'Loading fresh active positions...',
+      '/positions-research/load': 'Calculating position analytics...',
+      '/orders/refresh': 'Loading current Kite orders...',
+      '/analytics/load': 'Calculating option analytics...',
+      '/income/load': 'Calculating income candidates...',
+      '/income-growth/load': 'Refreshing income-growth analysis...',
+      '/investing/load': 'Refreshing investing portfolio...',
+      '/equity/load': 'Loading equity holdings...',
+      '/commodity/refresh': 'Refreshing ETF quotes and averages...',
+      '/ce-scan/load': 'Recalculating covered CALL candidates...',
+      '/gpt/generate': 'Waiting for OpenAI analysis...',
+      '/income-growth/gpt': 'Waiting for OpenAI validation...',
+      '/execute': 'Submitting selected trading orders...',
+      '/positions/execute': 'Submitting selected position BUY orders...',
+      '/orders/modify-selected': 'Modifying selected Kite orders...',
+      '/orders/cancel-selected': 'Cancelling selected Kite orders...',
+      '/orders/cancel-all': 'Cancelling all open Kite orders...'
+    }};
+    document.addEventListener('submit', (event) => {{
+      window.setTimeout(() => {{
+        if (event.defaultPrevented) return;
+        const submitter = event.submitter;
+        const actionUrl = submitter && submitter.formAction
+          ? new URL(submitter.formAction, window.location.href)
+          : new URL(event.target.action || window.location.href, window.location.href);
+        const label = heavyActionLabels[actionUrl.pathname];
+        if (label) beginGlobalWork(label, 'The page is locked until the backend action completes.');
+      }}, 0);
+    }});
     const isHomePage = window.location.pathname === '/home';
     const executeButton = document.getElementById('execute-selected-button');
     const placeForm = document.getElementById('place-panel');
@@ -13701,6 +14065,7 @@ def render_page(state: PageState) -> bytes:
     const incomePeCountdown = document.getElementById('income-pe-countdown');
     const incomePeBreathText = document.getElementById('income-pe-breath-text');
     const incomePeBreath = document.getElementById('income-pe-breath');
+    const incomePeLoading = document.getElementById('income-pe-loading');
     const ceSellModal = document.getElementById('ce-sell-order-modal');
     const ceSellTitle = document.getElementById('ce-sell-order-title');
     const ceSellOption = document.getElementById('ce-sell-option');
@@ -13722,6 +14087,7 @@ def render_page(state: PageState) -> bytes:
     const ceSellCountdown = document.getElementById('ce-sell-countdown');
     const ceSellBreathText = document.getElementById('ce-sell-breath-text');
     const ceSellBreath = document.getElementById('ce-sell-breath');
+    const ceSellLoading = document.getElementById('ce-sell-loading');
     const equityOrderModal = document.getElementById('equity-order-modal');
     const equityOrderTitle = document.getElementById('equity-order-title');
     const equityOrderSymbol = document.getElementById('equity-order-symbol');
@@ -13771,6 +14137,12 @@ def render_page(state: PageState) -> bytes:
     let equityOrderSnapshot = null;
     let incomeEquityCountdownTimer = null;
     let incomeEquitySnapshot = null;
+    function setQuoteLoading(modal, loadingElement, active, title) {{
+      if (loadingElement) loadingElement.classList.toggle('active', active);
+      if (modal) modal.setAttribute('aria-busy', active ? 'true' : 'false');
+      if (active) beginGlobalWork(title || 'Revalidating fresh market data...', 'Quotes, positions, risk, and order details are being checked.');
+      else endGlobalWork();
+    }}
     function resetIncomePeConfirmation() {{
       if (incomePeCountdownTimer) clearInterval(incomePeCountdownTimer);
       incomePeCountdownTimer = null;
@@ -13791,6 +14163,7 @@ def render_page(state: PageState) -> bytes:
       if (incomePeUnderlying) incomePeUnderlying.value = underlying;
       if (incomePeTargetStrike) incomePeTargetStrike.value = strike;
       if (incomePeSummary) incomePeSummary.textContent = 'Loading fresh monthly PE contract and premium from Kite...';
+      setQuoteLoading(incomePeModal, incomePeLoading, true, 'Recalculating PE SELL candidate...');
       try {{
         const response = await fetch(`/income/pe-quote?underlying=${{encodeURIComponent(underlying)}}&strike=${{encodeURIComponent(strike)}}`, {{ cache: 'no-store' }});
         const data = await response.json();
@@ -13807,6 +14180,8 @@ def render_page(state: PageState) -> bytes:
         if (incomePeReview) incomePeReview.disabled = false;
       }} catch (error) {{
         if (incomePeSummary) incomePeSummary.textContent = compactClientError(error.message, 'Could not load PE quote');
+      }} finally {{
+        setQuoteLoading(incomePeModal, incomePeLoading, false);
       }}
     }}
     for (const button of document.querySelectorAll('.income-pe-order-button')) {{
@@ -13853,8 +14228,20 @@ def render_page(state: PageState) -> bytes:
         }}
       }}, 0);
     }}
-    incomePeGo && incomePeGo.addEventListener('click', () => {{
-      closeOrderModalForSubmit(incomePeModal, incomePeReview, incomePeGo);
+    function submitOrderModal(event, modal, reviewButton, goButton) {{
+      event.preventDefault();
+      if (!goButton || !goButton.form) return;
+      const form = goButton.form;
+      const submitAction = goButton.formAction;
+      const submitMethod = goButton.formMethod || form.method || 'post';
+      closeOrderModalForSubmit(modal, reviewButton, goButton);
+      beginGlobalWork('Submitting order to Kite...', 'Please wait for Zerodha to accept or reject the order.');
+      form.action = submitAction;
+      form.method = submitMethod;
+      HTMLFormElement.prototype.submit.call(form);
+    }}
+    incomePeGo && incomePeGo.addEventListener('click', (event) => {{
+      submitOrderModal(event, incomePeModal, incomePeReview, incomePeGo);
     }});
     function resetCeSellConfirmation() {{
       if (ceSellCountdownTimer) clearInterval(ceSellCountdownTimer);
@@ -13893,7 +14280,8 @@ def render_page(state: PageState) -> bytes:
       if (ceSellTitle) ceSellTitle.textContent = `${{underlying}} Covered CE SELL Review`;
       if (ceSellUnderlying) ceSellUnderlying.value = underlying;
       if (ceSellSummary) ceSellSummary.textContent = 'Revalidating Top 3 status, coverage, positions, and fresh CE premium...';
-      loadCeSellNews(underlying);
+      setQuoteLoading(ceSellModal, ceSellLoading, true, 'Revalidating covered CE SELL candidate...');
+      const newsPromise = loadCeSellNews(underlying);
       try {{
         const response = await fetch(`/ce-scan/quote?underlying=${{encodeURIComponent(underlying)}}`, {{ cache: 'no-store' }});
         const data = await response.json();
@@ -13908,9 +14296,12 @@ def render_page(state: PageState) -> bytes:
         if (ceSellYield) ceSellYield.textContent = `${{Number(data.otm_percent || 0).toFixed(2)}}% / ${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
         if (ceSellRisk) ceSellRisk.textContent = `${{Number(data.score || 0).toFixed(0)}} / ${{data.event_risk || 'N/A'}} event / ${{data.breakout_risk || 'N/A'}} breakout`;
         if (ceSellSummary) ceSellSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | ${{Number(data.markup_percent || 0).toFixed(2)}}% above fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Effective holding ${{data.holding_qty}} from ${{data.holding_source || 'holding record'}}`;
+        await newsPromise;
         if (ceSellReview) ceSellReview.disabled = false;
       }} catch (error) {{
         if (ceSellSummary) ceSellSummary.textContent = compactClientError(error.message, 'Could not load covered CE order');
+      }} finally {{
+        setQuoteLoading(ceSellModal, ceSellLoading, false);
       }}
     }}
     for (const button of document.querySelectorAll('.ce-sell-order-button')) {{
@@ -13939,8 +14330,8 @@ def render_page(state: PageState) -> bytes:
         }}
       }}, 1000);
     }});
-    ceSellGo && ceSellGo.addEventListener('click', () => {{
-      closeOrderModalForSubmit(ceSellModal, ceSellReview, ceSellGo);
+    ceSellGo && ceSellGo.addEventListener('click', (event) => {{
+      submitOrderModal(event, ceSellModal, ceSellReview, ceSellGo);
     }});
     function stopEquityOrderCountdown() {{
       if (equityOrderCountdownTimer) {{

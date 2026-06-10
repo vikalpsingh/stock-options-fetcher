@@ -1,4 +1,6 @@
 import unittest
+from argparse import Namespace
+from datetime import date
 from unittest.mock import patch
 
 import app
@@ -41,6 +43,190 @@ def candidate(**overrides):
 
 
 class PeSellStrategyTests(unittest.TestCase):
+    def test_zero_price_trading_sell_uses_fresh_option_ltp_plus_markup_and_max_gain(self):
+        row = {
+            "exchange": "NFO",
+            "tradingsymbol": "PFC26JUN400PE",
+            "quantity": "1300",
+            "transaction_type": "SELL",
+            "product": "NRML",
+            "order_type": "LIMIT",
+            "price": "0",
+            "validity": "DAY",
+        }
+        args = Namespace(
+            symbol=row["tradingsymbol"],
+            exchange="NFO",
+            no_ltp_price=True,
+            tick_size=0.05,
+        )
+        built = {
+            "exchange": "NFO",
+            "tradingsymbol": row["tradingsymbol"],
+            "transaction_type": "SELL",
+            "quantity": 1300,
+            "price": 18.5,
+        }
+        with (
+            patch.object(app, "cap_trading_option_rows_by_otm", return_value=([row], {})),
+            patch.object(app.kite_orders, "args_for_csv_row", return_value=args),
+            patch.object(app.kite_orders, "build_order", return_value=built),
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "option_sell_markup_percent_setting", return_value=20.0),
+            patch.object(
+                app,
+                "cached_kite_quote",
+                return_value={"NFO:PFC26JUN400PE": {"last_price": 2.85}},
+            ),
+        ):
+            orders = app.build_orders([row], True, False)
+        self.assertEqual(orders[0]["price"], 3.45)
+        self.assertEqual(orders[0]["ltp"], 2.85)
+        self.assertEqual(orders[0]["max_gain"], 4485.0)
+        self.assertEqual(orders[0]["price_basis"], "fresh_ltp_plus_markup")
+        self.assertEqual(orders[0]["price_markup_percent"], 20.0)
+
+    def test_explicit_trading_sell_price_is_replaced_by_fresh_ltp_plus_markup(self):
+        row = {
+            "exchange": "NFO",
+            "tradingsymbol": "PFC26JUN400PE",
+            "quantity": "1300",
+            "transaction_type": "SELL",
+            "price": "3.20",
+        }
+        args = Namespace(
+            symbol=row["tradingsymbol"],
+            exchange="NFO",
+            no_ltp_price=True,
+            tick_size=0.05,
+        )
+        built = {
+            "exchange": "NFO",
+            "tradingsymbol": row["tradingsymbol"],
+            "transaction_type": "SELL",
+            "quantity": 1300,
+            "price": 3.20,
+        }
+        with (
+            patch.object(app, "cap_trading_option_rows_by_otm", return_value=([row], {})),
+            patch.object(app.kite_orders, "args_for_csv_row", return_value=args),
+            patch.object(app.kite_orders, "build_order", return_value=built),
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "option_sell_markup_percent_setting", return_value=20.0),
+            patch.object(
+                app,
+                "cached_kite_quote",
+                return_value={"NFO:PFC26JUN400PE": {"last_price": 2.85}},
+            ),
+        ):
+            orders = app.build_orders([row], True, False)
+        self.assertEqual(orders[0]["price"], 3.45)
+        self.assertEqual(orders[0]["ltp"], 2.85)
+        self.assertEqual(orders[0]["max_gain"], 4485.0)
+
+    def test_trading_orders_table_shows_option_ltp_and_maximum_gain(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "PFC26JUN400PE",
+            "transaction_type": "SELL",
+            "quantity": 1300,
+            "product": "NRML",
+            "order_type": "LIMIT",
+            "price": 2.85,
+            "ltp": 2.85,
+            "price_markup_percent": 20.0,
+            "max_gain": 3705.0,
+            "validity": "DAY",
+            "tag": "GPT_CSP",
+        }
+        with patch.object(app, "active_position_option_block_keys", return_value=set()):
+            output = app.render_orders_table([order], selected={0})
+        self.assertIn("<th>option LTP</th>", output)
+        self.assertIn("<th>markup %</th>", output)
+        self.assertIn("<th>max gain opportunity</th>", output)
+        self.assertIn("<td>3705.00</td>", output)
+
+    def test_far_otm_ce_is_adjusted_to_highest_active_strike_within_cap(self):
+        row = {
+            "exchange": "NFO",
+            "tradingsymbol": "TEST26JUN130CE",
+            "quantity": "500",
+            "transaction_type": "SELL",
+            "price": "0",
+        }
+        instruments = [
+            {
+                "name": "TEST",
+                "instrument_type": "CE",
+                "expiry": date(2026, 6, 30),
+                "strike": 110,
+                "tradingsymbol": "TEST26JUN110CE",
+            },
+            {
+                "name": "TEST",
+                "instrument_type": "CE",
+                "expiry": date(2026, 6, 30),
+                "strike": 112,
+                "tradingsymbol": "TEST26JUN112CE",
+            },
+            {
+                "name": "TEST",
+                "instrument_type": "CE",
+                "expiry": date(2026, 6, 30),
+                "strike": 115,
+                "tradingsymbol": "TEST26JUN115CE",
+            },
+        ]
+        with (
+            patch.object(app, "cached_kite_quote", return_value={"NSE:TEST": {"last_price": 100}}),
+            patch.object(app, "cached_kite_instruments", return_value=instruments),
+        ):
+            rows, adjustments = app.cap_trading_option_rows_by_otm([row], object())
+        self.assertEqual(rows[0]["tradingsymbol"], "TEST26JUN112CE")
+        self.assertTrue(adjustments[0]["adjusted"])
+        self.assertEqual(adjustments[0]["original_symbol"], "TEST26JUN130CE")
+        self.assertEqual(adjustments[0]["otm_percent"], 12.0)
+
+    def test_far_otm_pe_is_adjusted_to_lowest_active_strike_within_cap(self):
+        row = {
+            "exchange": "NFO",
+            "tradingsymbol": "TEST26JUN70PE",
+            "quantity": "500",
+            "transaction_type": "SELL",
+            "price": "0",
+        }
+        instruments = [
+            {
+                "name": "TEST",
+                "instrument_type": "PE",
+                "expiry": date(2026, 6, 30),
+                "strike": 85,
+                "tradingsymbol": "TEST26JUN85PE",
+            },
+            {
+                "name": "TEST",
+                "instrument_type": "PE",
+                "expiry": date(2026, 6, 30),
+                "strike": 88,
+                "tradingsymbol": "TEST26JUN88PE",
+            },
+            {
+                "name": "TEST",
+                "instrument_type": "PE",
+                "expiry": date(2026, 6, 30),
+                "strike": 90,
+                "tradingsymbol": "TEST26JUN90PE",
+            },
+        ]
+        with (
+            patch.object(app, "cached_kite_quote", return_value={"NSE:TEST": {"last_price": 100}}),
+            patch.object(app, "cached_kite_instruments", return_value=instruments),
+        ):
+            rows, adjustments = app.cap_trading_option_rows_by_otm([row], object())
+        self.assertEqual(rows[0]["tradingsymbol"], "TEST26JUN88PE")
+        self.assertTrue(adjustments[0]["adjusted"])
+        self.assertEqual(adjustments[0]["otm_percent"], 12.0)
+
     def test_current_fno_lot_sizes_and_coverage_are_applied(self):
         expected = {
             "ETERNAL": 2425, "CAMS": 750, "PGEL": 950, "PFC": 1300,
@@ -84,6 +270,44 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("autoslice", calls[0])
         self.assertNotIn("autoslice", calls[1])
 
+    def test_income_pe_live_order_retries_without_autoslice_for_old_sdk(self):
+        calls = []
+        snapshot = {
+            "symbol": "PGEL26JUN420PE",
+            "quantity": 950,
+            "ltp": 5.0,
+            "limit_price": 6.0,
+            "assignment_value": 399000,
+            "markup_percent": 20.0,
+        }
+
+        def fake_place_order(_kite, order):
+            calls.append(dict(order))
+            if "autoslice" in order:
+                raise TypeError("KiteConnect.place_order() got an unexpected keyword argument 'autoslice'")
+            return "PE_ORDER_123"
+
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app.kite_orders, "place_order", side_effect=fake_place_order),
+            patch.object(app, "income_pe_order_snapshot", return_value=snapshot),
+            patch.object(app, "invalidate_kite_trade_cache"),
+        ):
+            result = app.place_income_cash_secured_put_order("PGEL", 420)
+
+        self.assertEqual(result["status"], "LIVE_SENT")
+        self.assertEqual(result["order_id"], "PE_ORDER_123")
+        self.assertEqual(result["tradingsymbol"], "PGEL26JUN420PE")
+        self.assertIn("autoslice", calls[0])
+        self.assertNotIn("autoslice", calls[1])
+
+    def test_kiteconnect_payload_error_is_not_reported_as_network_failure(self):
+        error = TypeError("KiteConnect.place_order() got an unexpected keyword argument 'autoslice'")
+        message = app.friendly_external_error(error, "PGEL26JUN420PE PE SELL")
+        self.assertIn("unexpected keyword argument", message)
+        self.assertNotIn("unreachable", message)
+
     def test_ce_selected_strike_is_valid_and_above_target(self):
         instruments = [
             {"instrument_type": "CE", "strike": 1240, "tradingsymbol": "TEST1240CE"},
@@ -118,7 +342,7 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(result["status"], "AVOID_TODAY")
         self.assertIn("Existing active option position", result["reject_reason"])
 
-    def test_ce_max_profit_and_quantity_use_covered_lots(self):
+    def test_ce_max_profit_and_quantity_are_capped_at_one_lot(self):
         result = app.score_ce_sell_candidate(
             {
                 "stock": "TEST", "holding_qty": 1200, "active_lot_size": 500,
@@ -127,9 +351,10 @@ class PeSellStrategyTests(unittest.TestCase):
                 "event_risk": "GREEN", "breakout_risk": "GREEN", "sell_pop": 90,
             }
         )
-        self.assertEqual(result["lots_to_sell"], 2)
-        self.assertEqual(result["quantity"], 1000)
-        self.assertEqual(result["max_profit"], 12000)
+        self.assertEqual(result["covered_lots_available"], 2)
+        self.assertEqual(result["lots_to_sell"], 1)
+        self.assertEqual(result["quantity"], 500)
+        self.assertEqual(result["max_profit"], 6000)
         self.assertLessEqual(result["final_ce_score"], 100)
 
     def test_naked_ce_never_appears_in_top_three(self):
@@ -331,6 +556,33 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("<summary>View Kite Console", output)
         self.assertNotIn("PFC monthly P&amp;L", output)
         self.assertNotIn("Expected Portfolio Behavior", output)
+
+    def test_ce_and_pe_review_modals_show_backend_loading_spinners(self):
+        state = app.PageState(active_tab="income")
+        income_html = app.render_income_panel(state)
+        self.assertIn('id="income-pe-loading"', income_html)
+        self.assertIn("backend-spinner", income_html)
+        page_html = app.render_page(app.PageState(active_tab="trading")).decode("utf-8")
+        self.assertIn('id="ce-sell-loading"', page_html)
+        self.assertIn("Revalidating coverage, position risk, quote, analytics, and news", page_html)
+
+    def test_ce_and_pe_go_buttons_submit_to_their_explicit_order_routes(self):
+        page_html = app.render_page(app.PageState(active_tab="trading")).decode("utf-8")
+        self.assertIn("function submitOrderModal(event, modal, reviewButton, goButton)", page_html)
+        self.assertIn("const submitAction = goButton.formAction;", page_html)
+        self.assertIn("HTMLFormElement.prototype.submit.call(form);", page_html)
+        self.assertIn("submitOrderModal(event, ceSellModal, ceSellReview, ceSellGo);", page_html)
+        self.assertIn("submitOrderModal(event, incomePeModal, incomePeReview, incomePeGo);", page_html)
+
+    def test_heavy_actions_use_global_blocking_work_overlay(self):
+        page_html = app.render_page(app.PageState(active_tab="trading")).decode("utf-8")
+        self.assertIn('id="global-work-overlay"', page_html)
+        self.assertIn("function beginGlobalWork(title, detail)", page_html)
+        self.assertIn("const heavyActionLabels", page_html)
+        self.assertIn("'/positions-research/load': 'Calculating position analytics...'", page_html)
+        self.assertIn("beginGlobalWork('Submitting order to Kite...'", page_html)
+        self.assertIn("setQuoteLoading(ceSellModal, ceSellLoading, true, 'Revalidating covered CE SELL candidate...')", page_html)
+        self.assertIn("setQuoteLoading(incomePeModal, incomePeLoading, true, 'Recalculating PE SELL candidate...')", page_html)
 
 
 if __name__ == "__main__":
