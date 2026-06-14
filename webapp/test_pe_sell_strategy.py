@@ -383,22 +383,52 @@ class PeSellStrategyTests(unittest.TestCase):
             error="Could not find a valid Kite order CSV.",
         )
 
-        with patch.object(app, "kite_setup_issue", return_value=""):
+        with patch.object(
+            app,
+            "kite_setup_issue",
+            return_value="Missing Kite setup value(s): KITE_ACCESS_TOKEN",
+        ):
             redirected = app.redirect_state_to_kite_setup_on_error(state)
 
         self.assertFalse(redirected)
         self.assertEqual(state.active_tab, "research")
 
-    def test_nested_kite_order_error_redirects_to_kite_setup(self):
+    def test_missing_setup_without_setup_exception_does_not_hijack_current_tab(self):
+        state = app.PageState(active_tab="income")
+
+        with patch.object(
+            app,
+            "kite_setup_issue",
+            return_value="Missing Kite setup value(s): KITE_ACCESS_TOKEN",
+        ):
+            redirected = app.redirect_state_to_kite_setup_on_error(state)
+
+        self.assertFalse(redirected)
+        self.assertEqual(state.active_tab, "income")
+
+    def test_kite_network_error_stays_on_current_tab(self):
         state = app.PageState(
             active_tab="order-management",
             order_book_error="Kite API is unreachable from this machine.",
         )
 
-        redirected = app.redirect_state_to_kite_setup_on_error(state)
+        with patch.object(app, "kite_setup_issue", return_value=""):
+            redirected = app.redirect_state_to_kite_setup_on_error(state)
 
-        self.assertTrue(redirected)
-        self.assertEqual(state.active_tab, "kite-setup")
+        self.assertFalse(redirected)
+        self.assertEqual(state.active_tab, "order-management")
+
+    def test_kite_business_error_stays_on_current_tab(self):
+        state = app.PageState(
+            active_tab="income",
+            income_error="Kite order rejected: insufficient margin.",
+        )
+
+        with patch.object(app, "kite_setup_issue", return_value=""):
+            redirected = app.redirect_state_to_kite_setup_on_error(state)
+
+        self.assertFalse(redirected)
+        self.assertEqual(state.active_tab, "income")
 
     def test_zero_price_trading_sell_uses_fresh_option_ltp_plus_markup_and_max_gain(self):
         row = {
@@ -864,6 +894,172 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(result["max_profit"], 6000)
         self.assertLessEqual(result["final_ce_score"], 100)
 
+    def test_ce_corporate_action_inside_cycle_is_rejected(self):
+        result = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "GREEN", "corporate_action_risk": "RED",
+                "breakout_risk": "GREEN", "sell_pop": 90,
+            }
+        )
+        self.assertEqual(result["status"], "AVOID_TODAY")
+        self.assertIn("Corporate action", result["reject_reason"])
+
+    def test_ce_low_iv_percentile_reduces_score_without_becoming_hard_filter(self):
+        low_iv = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "GREEN", "breakout_risk": "GREEN", "sell_pop": 90,
+                "iv_percentile": 20,
+            }
+        )
+        high_iv = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "GREEN", "breakout_risk": "GREEN", "sell_pop": 90,
+                "iv_percentile": 70,
+            }
+        )
+        self.assertNotEqual(low_iv["status"], "AVOID_TODAY")
+        self.assertLess(low_iv["ce_trade_score"], high_iv["ce_trade_score"])
+
+    def test_ce_macro_beta_buffer_rejects_strike_that_is_too_close(self):
+        result = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1100,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "GREEN", "breakout_risk": "GREEN", "sell_pop": 90,
+                "macro_risk": "RED", "beta": 1.4,
+            }
+        )
+        self.assertEqual(result["required_otm_percent"], 15)
+        self.assertNotEqual(result["status"], "AVOID_TODAY")
+        self.assertLess(result["ce_trade_components"]["otm_buffer_score"], 4)
+
+    def test_ce_score_exposes_new_pipeline_checks(self):
+        result = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "GREEN", "corporate_action_risk": "CHECK",
+                "breakout_risk": "GREEN", "sell_pop": 90, "iv_percentile": 65,
+                "macro_risk": "GREEN", "next_leg_put_strike": 900,
+                "next_leg_put_premium": 6, "dte": 30,
+            }
+        )
+        self.assertEqual(result["iv_percentile_risk"], "GREEN")
+        self.assertEqual(result["redeployment_risk"], "GREEN")
+        self.assertGreater(result["annualized_premium_yield_percent"], 0)
+        self.assertEqual(result["coverage_ratio_percent"], 50)
+        self.assertLessEqual(result["holding_coverage_score"], 25)
+        self.assertLessEqual(result["call_away_comfort_score"], 25)
+        self.assertLessEqual(result["ce_trade_score"], 35)
+        self.assertLessEqual(result["reinvestment_score"], 15)
+
+    def test_ce_corporate_action_classifier_handles_dividend_and_major_actions(self):
+        trade_day = date(2026, 6, 1)
+        expiry = date(2026, 6, 30)
+        no_action = app.classify_ce_corporate_action({}, 100, trade_day, expiry)
+        small_dividend = app.classify_ce_corporate_action(
+            {"type": "dividend", "ex_date": "2026-06-15", "dividend_amount": 1},
+            100, trade_day, expiry,
+        )
+        large_dividend = app.classify_ce_corporate_action(
+            {"type": "dividend", "ex_date": "2026-06-15", "dividend_amount": 2},
+            100, trade_day, expiry,
+        )
+        split = app.classify_ce_corporate_action(
+            {"type": "split", "record_date": "2026-06-20"}, 100, trade_day, expiry
+        )
+        self.assertEqual(no_action["corporate_action_risk"], "GREEN")
+        self.assertEqual(small_dividend["corporate_action_risk"], "AMBER")
+        self.assertEqual(large_dividend["corporate_action_risk"], "RED")
+        self.assertEqual(split["corporate_action_risk"], "RED")
+        for action_type in ("bonus", "rights", "merger", "demerger", "buyback"):
+            with self.subTest(action_type=action_type):
+                action = app.classify_ce_corporate_action(
+                    {"type": action_type, "record_date": "2026-06-20"},
+                    100, trade_day, expiry,
+                )
+                self.assertEqual(action["corporate_action_risk"], "RED")
+
+    def test_ce_red_event_risk_is_hard_reject(self):
+        result = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "RED", "breakout_risk": "GREEN", "sell_pop": 90,
+            }
+        )
+        self.assertEqual(result["status"], "AVOID_TODAY")
+        self.assertIn("RED company event risk", result["reject_reason"])
+
+    def test_ce_iv_metrics_unknown_does_not_crash(self):
+        metrics = app.classify_ce_iv_metrics(None, None, 30, 0.4, 0.2)
+        self.assertEqual(metrics["iv_status"], "UNKNOWN")
+        self.assertEqual(metrics["iv_score"], 2.5)
+
+    def test_ce_tax_and_reinvestment_change_final_score(self):
+        base = {
+            "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+            "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+            "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+            "event_risk": "GREEN", "breakout_risk": "GREEN", "sell_pop": 90,
+            "average_buy_price": 600, "holding_period_days": 500,
+        }
+        strong = app.score_ce_sell_candidate({
+            **base, "next_leg_put_strike": 900, "next_leg_put_premium": 8,
+            "best_alternate_csp_score": 90, "best_alternate_csp_yield_percent": 0.8,
+        })
+        weak = app.score_ce_sell_candidate({**base, "holding_period_days": 100})
+        self.assertGreater(strong["reinvestment_score"], weak["reinvestment_score"])
+        self.assertGreater(strong["final_ce_score"], weak["final_ce_score"])
+        self.assertEqual(strong["tax_type"], "LTCG")
+        self.assertEqual(weak["tax_type"], "STCG")
+
+    def test_ce_do_not_call_away_is_hard_reject(self):
+        result = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "GREEN", "breakout_risk": "GREEN", "sell_pop": 90,
+                "do_not_call_away": True,
+            }
+        )
+        self.assertEqual(result["status"], "AVOID_TODAY")
+        self.assertIn("do not call away", result["reject_reason"])
+
+    def test_high_momentum_full_coverage_is_penalized(self):
+        partial = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 1000, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "GREEN", "breakout_risk": "RED", "sell_pop": 90,
+                "week_return": 8,
+            }
+        )
+        full = app.score_ce_sell_candidate(
+            {
+                "stock": "TEST", "holding_qty": 500, "active_lot_size": 500,
+                "requested_lots": 1, "cmp": 1000, "selected_ce_strike": 1150,
+                "premium": 10, "sell_limit_price": 12, "contract_valid": True,
+                "event_risk": "GREEN", "breakout_risk": "RED", "sell_pop": 90,
+                "week_return": 8,
+            }
+        )
+        self.assertGreater(partial["holding_coverage_score"], full["holding_coverage_score"])
+
     def test_naked_ce_never_appears_in_top_three(self):
         naked = {
             "stock": "NAKED", "holding_qty": 0, "active_lot_size": 500,
@@ -878,7 +1074,11 @@ class PeSellStrategyTests(unittest.TestCase):
 
     def test_only_top_ce_cards_are_actionable(self):
         state = app.PageState(
-            ce_sell_top=[{"stock": "TOP", "final_ce_score": 90}],
+            ce_sell_top=[{
+                "stock": "TOP", "final_ce_score": 90,
+                "corporate_action_risk": "CHECK", "iv_percentile_risk": "GREEN",
+                "macro_risk": "AMBER", "redeployment_risk": "GREEN",
+            }],
             ce_sell_watch=[{"stock": "WATCH", "final_ce_score": 70}],
             ce_sell_avoid=[{"stock": "AVOID", "final_ce_score": 20}],
         )
@@ -887,6 +1087,10 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn('data-underlying="TOP"', rendered)
         self.assertNotIn('data-underlying="WATCH"', rendered)
         self.assertNotIn('data-underlying="AVOID"', rendered)
+        self.assertIn("Corporate action", rendered)
+        self.assertIn("IV percentile", rendered)
+        self.assertIn("Macro / beta buffer", rendered)
+        self.assertIn("Next-leg yield", rendered)
 
     @patch("app.ce_sell_dashboard", return_value=([], [], []))
     def test_ce_snapshot_blocks_candidate_that_is_not_top_three(self, _dashboard):
@@ -961,8 +1165,9 @@ class PeSellStrategyTests(unittest.TestCase):
     def test_score_is_capped_at_100(self):
         result = app.score_pe_sell_candidate(candidate())
         self.assertLessEqual(result["final_pe_score"], 100)
-        self.assertLessEqual(result["stock_quality_score"], 40)
-        self.assertLessEqual(result["pe_trade_score"], 60)
+        self.assertLessEqual(result["stock_quality_score"], 35)
+        self.assertLessEqual(result["pe_trade_score"], 45)
+        self.assertLessEqual(result["assignment_recovery_score"], 20)
 
     def test_hard_reject_never_appears_in_top_three(self):
         rejected = candidate(symbol="BLOCKED", event_risk="RED")
@@ -989,6 +1194,94 @@ class PeSellStrategyTests(unittest.TestCase):
         result = app.score_pe_sell_candidate(candidate(has_active_pe_position=True))
         self.assertEqual(result["status"], "AVOID_TODAY")
         self.assertIn("Existing active PE position", result["reject_reason"])
+
+    def test_red_corporate_action_is_rejected(self):
+        result = app.score_pe_sell_candidate(candidate(corporate_action_risk="RED"))
+        self.assertEqual(result["status"], "AVOID_TODAY")
+        self.assertIn("RED corporate action", result["reject_reason"])
+
+    def test_falling_knife_below_200_dma_is_rejected(self):
+        result = app.score_pe_sell_candidate(
+            candidate(dma_200=1100, high_52w=1500, trend_falling=True)
+        )
+        self.assertEqual(result["falling_knife_risk"], "RED")
+        self.assertEqual(result["status"], "AVOID_TODAY")
+
+    def test_corrected_not_broken_above_dma_scores_high(self):
+        result = app.calculate_corrected_not_broken_score(800, 700, 1000, False)
+        self.assertEqual(result["corrected_not_broken_score"], 6)
+        self.assertEqual(result["falling_knife_risk"], "GREEN")
+
+    def test_more_than_45_percent_correction_scores_low(self):
+        result = app.calculate_corrected_not_broken_score(500, 450, 1000, False)
+        self.assertLessEqual(result["corrected_not_broken_score"], 1)
+
+    def test_good_ce_recovery_data_improves_assignment_score(self):
+        weak = app.score_pe_sell_candidate(candidate())
+        strong = app.score_pe_sell_candidate(
+            candidate(
+                same_stock_ce_available=True,
+                same_stock_ce_oi=5000,
+                same_stock_ce_volume=500,
+                same_stock_ce_spread_percent=5,
+                post_assignment_ce_yield_percent=0.7,
+            )
+        )
+        self.assertGreater(strong["assignment_recovery_score"], weak["assignment_recovery_score"])
+        self.assertGreater(strong["final_pe_score"], weak["final_pe_score"])
+
+    def test_no_ce_liquidity_caps_assignment_recovery_score(self):
+        result = app.score_pe_sell_candidate(candidate(same_stock_ce_available=False))
+        self.assertLessEqual(result["assignment_recovery_score"], 10)
+
+    def test_high_concentration_reduces_assignment_recovery_score(self):
+        low = app.score_pe_sell_candidate(
+            candidate(same_stock_ce_available=True, portfolio_after_assignment_percent=10)
+        )
+        high = app.score_pe_sell_candidate(
+            candidate(same_stock_ce_available=True, portfolio_after_assignment_percent=30)
+        )
+        self.assertGreater(low["portfolio_concentration_score"], high["portfolio_concentration_score"])
+
+    def test_high_iv_in_severe_breakdown_is_rejected(self):
+        result = app.score_pe_sell_candidate(
+            candidate(iv_percentile=80, severe_breakdown=True)
+        )
+        self.assertEqual(result["status"], "AVOID_TODAY")
+        self.assertEqual(result["iv_status"], "RED")
+
+    def test_unknown_iv_history_is_safe(self):
+        result = app.score_pe_sell_candidate(candidate(iv_percentile=None, iv_rank=None))
+        self.assertEqual(result["iv_status"], "UNKNOWN")
+        self.assertNotEqual(result["status"], "AVOID_TODAY")
+
+    def test_macro_red_below_200_dma_is_rejected(self):
+        result = app.score_pe_sell_candidate(
+            candidate(macro_risk="RED", dma_200=1100, high_52w=1300)
+        )
+        self.assertEqual(result["status"], "AVOID_TODAY")
+        self.assertIn("Macro risk is RED", result["reject_reason"])
+
+    def test_stock_below_200_dma_cannot_rank_top_three(self):
+        top, watch, avoid = app.rank_pe_sell_candidates(
+            [candidate(dma_200=1100, high_52w=1200, trend_falling=False)]
+        )
+        self.assertEqual(top, [])
+        self.assertEqual(len(watch), 1)
+        self.assertEqual(avoid, [])
+
+    def test_amber_corporate_action_stays_in_watch_review(self):
+        top, watch, _ = app.rank_pe_sell_candidates(
+            [candidate(corporate_action_risk="AMBER")]
+        )
+        self.assertEqual(top, [])
+        self.assertEqual(watch[0]["status"], "WATCH_REVIEW")
+
+    def test_pe_macro_beta_buffer_widens_high_beta_more(self):
+        self.assertGreater(
+            app.pe_macro_beta_buffer("RED", 1.5),
+            app.pe_macro_beta_buffer("RED", 0.7),
+        )
 
     def test_selected_strike_is_active_and_below_target(self):
         instruments = [
@@ -1082,6 +1375,7 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("<summary>Watch / Review", output)
         self.assertIn("<summary>Avoid Today", output)
         self.assertIn("<summary>View Kite Console", output)
+        self.assertIn("20 points for assignment recovery", output)
         self.assertNotIn("PFC monthly P&amp;L", output)
         self.assertNotIn("Expected Portfolio Behavior", output)
 
@@ -1100,6 +1394,14 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("const submitAction = goButton.formAction;", page_html)
         self.assertIn("HTMLFormElement.prototype.submit.call(form);", page_html)
         self.assertIn("submitOrderModal(event, ceSellModal, ceSellReview, ceSellGo);", page_html)
+
+    def test_ce_sell_review_modal_keeps_go_actions_visible(self):
+        page_html = app.render_page(app.PageState(active_tab="trading")).decode("utf-8")
+        self.assertIn("max-height: calc(100vh - 32px);", page_html)
+        self.assertIn(".income-pe-order-modal-card .modal-actions", page_html)
+        self.assertIn("position: sticky;", page_html)
+        self.assertIn("bottom: -20px;", page_html)
+        self.assertIn('id="ce-sell-go"', page_html)
         self.assertIn("submitOrderModal(event, incomePeModal, incomePeReview, incomePeGo);", page_html)
 
     def test_heavy_actions_use_global_blocking_work_overlay(self):
@@ -1111,6 +1413,80 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("beginGlobalWork('Submitting order to Kite...'", page_html)
         self.assertIn("setQuoteLoading(ceSellModal, ceSellLoading, true, 'Revalidating covered CE SELL candidate...')", page_html)
         self.assertIn("setQuoteLoading(incomePeModal, incomePeLoading, true, 'Recalculating PE SELL candidate...')", page_html)
+
+    def test_income_growth_renders_dividend_income_invits_with_equity_actions(self):
+        state = app.PageState(active_tab="income-growth")
+        state.income_growth_summary = {
+            "dividend_income_rows": [
+                {
+                    "symbol": "PGINVIT-IV",
+                    "company": "PGINVIT",
+                    "quantity": 0,
+                    "avg_price": 0,
+                    "cmp": 102.5,
+                    "market_value": 0,
+                    "pnl": 0,
+                    "covered_lots": 0,
+                    "decision": "DIVIDEND_INCOME_ACCUMULATION",
+                },
+                {
+                    "symbol": "IRBINVIT-IV",
+                    "company": "IRBINVIT",
+                    "quantity": 0,
+                    "avg_price": 0,
+                    "cmp": 65.25,
+                    "market_value": 0,
+                    "pnl": 0,
+                    "covered_lots": 0,
+                    "decision": "DIVIDEND_INCOME_ACCUMULATION",
+                },
+            ]
+        }
+
+        output = app.render_income_growth_panel(state)
+
+        self.assertIn("Dividend Income", output)
+        self.assertIn('id="dividend-income-table"', output)
+        self.assertIn('data-symbol="PGINVIT-IV"', output)
+        self.assertIn('data-symbol="IRBINVIT-IV"', output)
+        self.assertIn('id="income-equity-limit-price"', output)
+        self.assertIn("CNC LIMIT BUY or SELL", output)
+
+    def test_income_growth_equity_order_uses_requested_limit_price(self):
+        snapshot = {
+            "symbol": "PGINVIT-IV",
+            "quantity": 0,
+            "average_price": 0,
+            "ltp": 101.2,
+            "pnl": None,
+        }
+        fake_kite = object()
+        placed = {}
+
+        def place_order(_kite, order):
+            placed.update(order)
+            return "order-123"
+
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app, "income_growth_equity_snapshot", return_value=snapshot),
+            patch.object(app.kite_orders, "kite_client", return_value=fake_kite),
+            patch.object(app.kite_orders, "place_order", side_effect=place_order),
+            patch.object(app, "invalidate_kite_trade_cache"),
+        ):
+            result = app.place_income_growth_equity_order("PGINVIT-IV", "BUY", 10, 100.03)
+
+        self.assertEqual(result["status"], "LIVE_SENT")
+        self.assertEqual(placed["tradingsymbol"], "PGINVIT-IV")
+        self.assertEqual(placed["product"], "CNC")
+        self.assertEqual(placed["order_type"], "LIMIT")
+        self.assertEqual(placed["price"], 100.05)
+
+    def test_income_growth_page_enables_dividend_table_sorting_and_limit_gap(self):
+        page_html = app.render_page(app.PageState(active_tab="income-growth")).decode("utf-8")
+        self.assertIn("enableTableSorting(document.getElementById('dividend-income-table'))", page_html)
+        self.assertIn("const incomeEquityLimitPrice", page_html)
+        self.assertIn("Limit vs CMP", page_html)
 
 
 if __name__ == "__main__":

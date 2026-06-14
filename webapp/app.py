@@ -213,6 +213,7 @@ INCOME_DASHBOARD_CACHE_SECONDS = 15 * 60
 CE_SELL_DASHBOARD_CACHE_SECONDS = 15 * 60
 DEFAULT_PE_SELL_SETTINGS = {
     "max_assignment_cash_per_stock": 600000,
+    "max_portfolio_concentration_percent": 20,
     "min_otm_percent": 8,
     "max_otm_percent": 12,
     "min_premium_yield_percent": 0.30,
@@ -224,6 +225,7 @@ DEFAULT_PE_SELL_SETTINGS = {
     "event_lookahead_trading_days": 5,
     "preferred_dte_min": 12,
     "preferred_dte_max": 28,
+    "minimum_top_score": 65,
     "price_markup_percent": DEFAULT_OPTION_SELL_MARKUP_PERCENT,
 }
 STOCK_NEWS_NAMES = {
@@ -282,7 +284,7 @@ INVESTING_HOLDINGS = [
     {"code": "NSE:FIEMIND", "company": "Fiem Industries Ltd", "sector": "Auto", "core": "N", "quantity": 333, "avg_price": 677.39},
     {"code": "NSE:HAVELLS", "company": "Havells India Ltd", "sector": "Good", "core": "Y", "quantity": 520, "avg_price": 1375.19},
     {"code": "NSE:NAUKRI", "company": "Info Edge", "sector": "Start ups", "core": "Y", "quantity": 615, "avg_price": 771.21},
-    {"code": "NSE:CDSL", "company": "Central Depository Services (India) Ltd", "sector": "Capital Market", "core": "Y", "quantity": 410, "avg_price": 678.05},
+    {"code": "NSE:CDSL", "company": "Central Depository Services (India) Ltd", "sector": "Capital Market", "core": "Y", "quantity": 435, "avg_price": 678.05},
     {"code": "NSE:EPACK", "company": "Epack Durable Ltd", "sector": "Manf", "core": "", "quantity": 1750, "avg_price": 176.00},
     {"code": "BSE:516030", "company": "Pakka Limited", "sector": "Manf", "core": "N", "quantity": 4400, "avg_price": 184.00},
     {"code": "NSE:LATENTVIEW", "company": "Latent View", "sector": "IT", "core": "N", "quantity": 1250, "avg_price": 373.40},
@@ -290,7 +292,7 @@ INVESTING_HOLDINGS = [
     {"code": "NSE:WAAREEENER", "company": "Waaree Energies", "sector": "Energy", "core": "", "quantity": 130, "avg_price": 1503.00},
     {"code": "NSE:NTPC", "company": "NTPC Ltd", "sector": "Manf", "core": "", "quantity": 927, "avg_price": 214.53},
     {"code": "NSE:NSE", "company": "NSE", "sector": "Capital Market", "core": "", "quantity": 175, "avg_price": 2000.00},
-    {"code": "NSE:CAMS", "company": "Computer Age Management Services Ltd", "sector": "Capital Market", "core": "", "quantity": 410, "avg_price": 582.00},
+    {"code": "NSE:CAMS", "company": "Computer Age Management Services Ltd", "sector": "Capital Market", "core": "", "quantity": 510, "avg_price": 582.00},
     {"code": "NSE:NIFTYBEES", "company": "Nifty INDEX", "sector": "Index", "core": "", "quantity": 1175, "avg_price": 265.00},
     {"code": "NSE:OLAELEC", "company": "OLA Elec", "sector": "EV", "core": "", "quantity": 8265, "avg_price": 73.91},
     {"code": "NSE:FRESHARA", "company": "Freshara", "sector": "Food", "core": "", "quantity": 1200, "avg_price": 180.00},
@@ -385,12 +387,16 @@ INCOME_GROWTH_SHEET = [
     {"symbol": "HAVELLS", "holding": 520, "times_lot": 1.04, "lots_can_sell": 1.0, "cmp": 1186, "call_strike": 1281, "value": 616720, "to_sell": 550, "lot_size": 500, "gap_pct": 8, "put_down_pct": 44.02, "pe": 1091, "week_52": -36.69, "one_year": -20.3, "month": -5.62, "week_1": -1.48, "today": -2.1},
     {"symbol": "NAUKRI", "holding": 615, "times_lot": 1.64, "lots_can_sell": 1.0, "cmp": 1002, "call_strike": 1082, "value": 616230, "to_sell": 412.5, "lot_size": 375, "gap_pct": 8, "put_down_pct": 44.81, "pe": 922, "week_52": -54.69, "one_year": -32.04, "month": 2.6, "week_1": 6.77, "today": -0.4},
     {"symbol": "PFC", "holding": 3515, "times_lot": 2.70, "lots_can_sell": 2.0, "cmp": 431, "call_strike": 465, "value": 1514965, "to_sell": 1430, "lot_size": 1300, "gap_pct": 8, "put_down_pct": 5.49, "pe": 397, "week_52": -12.88, "one_year": 5.66, "month": -3.85, "week_1": -1.8, "today": -0.6},
-    {"symbol": "CAMS", "holding": 410, "times_lot": 1.03, "lots_can_sell": 1.0, "cmp": 790, "call_strike": 853, "value": 323900, "to_sell": 440, "lot_size": 750, "gap_pct": 8, "put_down_pct": 41.3, "pe": 727, "week_52": -10.76, "one_year": -7.02, "month": 8.09, "week_1": 2.64, "today": 0.4},
-    {"symbol": "CDSL", "holding": 410, "times_lot": 0.86, "lots_can_sell": 1.0, "cmp": 1245, "call_strike": 1345, "value": 510450, "to_sell": 522.5, "lot_size": 475, "gap_pct": 8, "put_down_pct": 57.06, "pe": 1145, "week_52": -46.90, "one_year": -30.01, "month": 0.54, "week_1": 2.27, "today": 0.1},
+    {"symbol": "CAMS", "holding": 510, "times_lot": 0.68, "lots_can_sell": 0.0, "cmp": 790, "call_strike": 853, "value": 402900, "to_sell": 825, "lot_size": 750, "gap_pct": 8, "put_down_pct": 41.3, "pe": 727, "week_52": -10.76, "one_year": -7.02, "month": 8.09, "week_1": 2.64, "today": 0.4},
+    {"symbol": "CDSL", "holding": 435, "times_lot": 0.92, "lots_can_sell": 0.0, "cmp": 1245, "call_strike": 1345, "value": 541575, "to_sell": 522.5, "lot_size": 475, "gap_pct": 8, "put_down_pct": 57.06, "pe": 1145, "week_52": -46.90, "one_year": -30.01, "month": 0.54, "week_1": 2.27, "today": 0.1},
     {"symbol": "MAZDOCK", "holding": 475, "times_lot": 1.58, "lots_can_sell": 1.0, "cmp": 2460, "call_strike": 2657, "value": 1168500, "to_sell": 330, "lot_size": 200, "gap_pct": 8, "put_down_pct": 38.41, "pe": 2263, "week_52": -53.46, "one_year": -28.28, "month": -5.8, "week_1": -0.41, "today": 0.2},
     {"symbol": "NUVAMA", "holding": 0, "times_lot": 0.0, "lots_can_sell": 0.0, "cmp": 1563, "call_strike": 1688, "value": 0, "to_sell": 550, "lot_size": 500, "gap_pct": 8, "put_down_pct": 27.88, "pe": 1438, "week_52": -8.87, "one_year": 8.34, "month": 17.58, "week_1": 3.87, "today": 1.7},
     {"symbol": "NTPC", "holding": 927, "times_lot": 0.62, "lots_can_sell": 1.0, "cmp": 389.5, "call_strike": 421, "value": 361066.5, "to_sell": 1650, "lot_size": 1500, "gap_pct": 8, "put_down_pct": 13.96, "pe": 358, "week_52": -6.39, "one_year": 18.52, "month": -2.64, "week_1": -0.14, "today": -2.2},
     {"symbol": "WAAREEENER", "holding": 130, "times_lot": 0.74, "lots_can_sell": 1.0, "cmp": 3129.1, "call_strike": 3379, "value": 406783, "to_sell": 192.5, "lot_size": 175, "gap_pct": 8, "put_down_pct": 24.29, "pe": 2879, "week_52": -23.52, "one_year": 9.7, "month": -0.23, "week_1": 4.86, "today": 0.0},
+]
+DIVIDEND_INCOME_SECURITIES = [
+    {"symbol": "PGINVIT-IV", "company": "PGINVIT", "holding": 0},
+    {"symbol": "IRBINVIT-IV", "company": "IRBINVIT", "holding": 0},
 ]
 INCOME_GROWTH_LOT_CAPS = {
     str(item.get("symbol") or "").upper(): float(item.get("lots_can_sell") or 0)
@@ -410,6 +416,11 @@ INCOME_GROWTH_BY_SYMBOL = {
     str(item["symbol"]).upper().replace("NSE:", "").replace("BSE:", ""): item
     for item in INCOME_GROWTH_SHEET
 }
+for dividend_security in DIVIDEND_INCOME_SECURITIES:
+    INCOME_GROWTH_BY_SYMBOL.setdefault(
+        str(dividend_security["symbol"]).upper(),
+        dividend_security,
+    )
 INCOME_ROLL_TRADING_DAY_THRESHOLD = 9
 INCOME_UNDERLYINGS = [
     {
@@ -556,6 +567,46 @@ def app_db_connection() -> sqlite3.Connection:
                     now_text,
                 ),
             )
+    now_text = app_now().isoformat(timespec="seconds")
+    for old_symbol, new_symbol in (
+        ("PGINVIT", "PGINVIT-IV"),
+        ("IRBINVIT", "IRBINVIT-IV"),
+    ):
+        conn.execute(
+            "UPDATE OR REPLACE income_growth_holdings SET symbol = ? WHERE symbol = ?",
+            (new_symbol, old_symbol),
+        )
+    for symbol, old_holding, new_holding, reference_cmp in (
+        ("CAMS", 410, 510, 790),
+        ("CDSL", 410, 435, 1245),
+    ):
+        conn.execute(
+            """
+            UPDATE income_growth_holdings
+            SET holding = ?, value = ?, updated_at = ?
+            WHERE symbol = ? AND holding = ?
+            """,
+            (
+                new_holding,
+                new_holding * reference_cmp,
+                now_text,
+                symbol,
+                old_holding,
+            ),
+        )
+    for item in DIVIDEND_INCOME_SECURITIES:
+        conn.execute(
+            """
+            INSERT INTO income_growth_holdings (symbol, holding, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(symbol) DO NOTHING
+            """,
+            (
+                normalize_income_growth_symbol(item.get("symbol")),
+                item.get("holding") or 0,
+                now_text,
+            ),
+        )
     for symbol in INCOME_GROWTH_BY_SYMBOL:
         if symbol not in CURRENT_FNO_LOT_SIZES:
             continue
@@ -1394,12 +1445,6 @@ def is_kite_related_error(error: Any) -> bool:
     if not text:
         return False
     direct_markers = (
-        "api.kite.trade",
-        "kiteconnect",
-        "kite api",
-        "kite quote",
-        "kite positions",
-        "kite orders",
         "kite setup",
         "kite_place_order",
         "missing kite setup",
@@ -1415,27 +1460,23 @@ def is_kite_related_error(error: Any) -> bool:
         "tokenexception",
         "access token is invalid",
         "access_token is invalid",
+        "authentication failed",
     )
     return any(marker in text for marker in direct_markers + authentication_markers)
 
 
 def redirect_state_to_kite_setup_on_error(state: "PageState") -> bool:
-    """Open Kite Setup when any rendered tab reports a Kite-related failure."""
+    """Open Kite Setup only when a rendered tab reports a setup/auth failure."""
     error_values = (
         state.error,
         state.order_book_error,
         state.commodity_error,
         state.income_error,
     )
-    setup_issue = kite_setup_issue()
-    should_redirect = bool(setup_issue) or any(
-        is_kite_related_error(error) for error in error_values
-    )
+    should_redirect = any(is_kite_related_error(error) for error in error_values)
     if not should_redirect:
         return False
     state.active_tab = "kite-setup"
-    if setup_issue and not state.error:
-        state.error = setup_issue
     state.message = "Kite needs attention. Review the selected profile and access token."
     return True
 
@@ -3150,7 +3191,11 @@ def select_valid_pe_contract(
     return max(valid, key=lambda item: float(item.get("strike") or 0))
 
 
-def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
+def next_monthly_pe_candidate(
+    kite: Any,
+    underlying: str,
+    extra_otm_percent: float = 0,
+) -> dict[str, Any]:
     today = datetime.now().date()
     spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
     spot = quote_ltp(spot_quote)
@@ -3172,7 +3217,8 @@ def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
         today,
     )
     expiry_instruments = [item for item in instruments if item.get("expiry") == expiry]
-    target_strike = spot * 0.90
+    final_otm_percent = min(30.0, 10.0 + max(0.0, float(extra_otm_percent or 0)))
+    target_strike = spot * (1 - final_otm_percent / 100)
     selected = select_valid_pe_contract(expiry_instruments, target_strike)
     return {
         "symbol": str(selected["tradingsymbol"]).upper(),
@@ -3182,6 +3228,9 @@ def next_monthly_pe_candidate(kite: Any, underlying: str) -> dict[str, Any]:
         "rolled_from_expiry": rolled_from_expiry,
         "rolled_from_trading_days": rolled_from_trading_days,
         "target_strike": target_strike,
+        "base_otm_percent": 10.0,
+        "beta_adjustment_percent": max(0.0, float(extra_otm_percent or 0)),
+        "final_otm_percent": final_otm_percent,
         "lot_size": int(selected.get("lot_size") or 0),
     }
 
@@ -4499,6 +4548,14 @@ def commodity_moving_averages(symbol: str) -> dict[str, float | None]:
     )
 
 
+def stock_moving_averages(symbol: str) -> dict[str, float | None]:
+    return cached_value(
+        f"stock:dma:{symbol.upper()}",
+        lambda: fetch_yahoo_moving_averages(symbol),
+        INVESTING_52W_CACHE_SECONDS,
+    )
+
+
 def commodity_below_200_dma(ltp: Any, dma_200: Any) -> bool:
     try:
         price = float(ltp or 0)
@@ -4791,6 +4848,73 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     }
 
 
+def dividend_income_rows(
+    kite: Any,
+    stored_holdings: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    symbols = [str(item["symbol"]).upper() for item in DIVIDEND_INCOME_SECURITIES]
+    quote_keys = [f"NSE:{symbol}" for symbol in symbols]
+    quotes = cached_kite_quote(kite, quote_keys) if quote_keys else {}
+    try:
+        kite_holdings = cached_value(
+            f"kite:holdings:{selected_kite_profile_name()}",
+            kite.holdings,
+            KITE_READ_CACHE_SECONDS,
+        )
+    except Exception:
+        kite_holdings = []
+    actual_by_symbol = {
+        str(item.get("tradingsymbol") or "").upper(): item
+        for item in kite_holdings
+        if str(item.get("exchange") or "NSE").upper() == "NSE"
+    }
+    rows: list[dict[str, Any]] = []
+    for item in DIVIDEND_INCOME_SECURITIES:
+        symbol = str(item["symbol"]).upper()
+        stored = stored_holdings.get(symbol, {})
+        actual = actual_by_symbol.get(symbol, {})
+        quote = quotes.get(f"NSE:{symbol}", {})
+        ltp = quote_ltp(quote) or float(actual.get("last_price") or stored.get("cmp") or 0)
+        holding = int(float(actual.get("quantity") or stored.get("holding") or 0))
+        average_price = float(actual.get("average_price") or 0)
+        market_value = holding * ltp if ltp > 0 else 0.0
+        pnl = (ltp - average_price) * holding if holding > 0 and average_price > 0 and ltp > 0 else 0.0
+        close = float((quote.get("ohlc") or {}).get("close") or 0)
+        today_change = ((ltp - close) / close * 100) if ltp > 0 and close > 0 else None
+        rows.append(
+            {
+                "symbol": symbol,
+                "company": str(item.get("company") or symbol),
+                "quantity": holding,
+                "avg_price": average_price,
+                "cmp": ltp or None,
+                "market_value": market_value,
+                "pnl": pnl,
+                "times_lot": None,
+                "covered_lots": 0,
+                "input_call_strike": None,
+                "input_to_sell": None,
+                "lot_size": None,
+                "input_gap_pct": None,
+                "input_put_down_pct": None,
+                "input_put_strike": None,
+                "input_pe": None,
+                "input_52w": None,
+                "input_1y": None,
+                "input_month": None,
+                "input_1w": None,
+                "input_today": today_change,
+                "candidate_ce": "N/A",
+                "premium": None,
+                "monthly_income": None,
+                "cc_capacity_score": None,
+                "decision": "DIVIDEND_INCOME_ACCUMULATION",
+                "decision_color": "green",
+            }
+        )
+    return rows
+
+
 def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -4953,6 +5077,7 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "portfolio_market": investing_summary.get("total_market"),
         "count": len(rows),
         "as_of": app_now().strftime("%d %b %Y %H:%M:%S"),
+        "dividend_income_rows": dividend_income_rows(kite, income_growth_by_symbol),
     }
 
 
@@ -5215,6 +5340,124 @@ def classify_pe_event_risk(symbol: str, news_cache: dict[str, list[dict[str, str
     return "GREEN", "Only generic or non-adverse recent articles found."
 
 
+def pe_macro_beta_buffer(macro_risk: str, beta: Any) -> float:
+    try:
+        beta_value = max(0.0, float(beta))
+    except (TypeError, ValueError):
+        beta_value = 1.0
+    risk = str(macro_risk or "CHECK").upper()
+    if risk == "GREEN":
+        return 0.0
+    if beta_value < 0.8:
+        return 2.0 if risk == "RED" else 1.0
+    if beta_value <= 1.2:
+        return 3.0 if risk == "RED" else 2.0
+    return 5.0 if risk == "RED" else 3.0
+
+
+def calculate_corrected_not_broken_score(
+    cmp_value: Any,
+    dma_200: Any,
+    high_52w: Any,
+    trend_falling: bool = False,
+) -> dict[str, Any]:
+    try:
+        price = float(cmp_value or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    try:
+        dma = float(dma_200 or 0)
+    except (TypeError, ValueError):
+        dma = 0.0
+    try:
+        high = float(high_52w or 0)
+    except (TypeError, ValueError):
+        high = 0.0
+    retracement = ((high - price) / high * 100) if high > 0 and price > 0 else None
+    above_dma = None if dma <= 0 or price <= 0 else price >= dma
+    if above_dma is False and trend_falling:
+        score, risk, reason = 0.0, "RED", "Stock is below 200 DMA and still falling."
+    elif retracement is None:
+        score, risk, reason = 3.0, "CHECK", "52-week high or 200 DMA data is unavailable."
+    elif 10 <= retracement <= 30 and above_dma is not False:
+        score, risk, reason = 6.0, "GREEN", "Healthy 10-30% correction while holding above 200 DMA."
+    elif 30 < retracement <= 45 and (above_dma is not False or not trend_falling):
+        score, risk, reason = 4.0, "AMBER", "Deep correction is stabilizing; assignment needs review."
+    elif retracement > 45:
+        score = 0.0 if trend_falling else 1.0
+        risk = "RED" if trend_falling else "AMBER"
+        reason = "More than 45% below the 52-week high; recovery quality is weak."
+    else:
+        score, risk, reason = 2.0, "GREEN", "Near the 52-week high; PUT buffer matters more than correction."
+    return {
+        "retracement_from_52w_high_percent": retracement,
+        "dma_200": dma or None,
+        "above_200dma": above_dma,
+        "corrected_not_broken_score": score,
+        "falling_knife_risk": risk,
+        "falling_knife_reason": reason,
+    }
+
+
+def pe_assignment_recovery_metrics(
+    candidate: dict[str, Any],
+    corrected: dict[str, Any],
+    stock_quality_base: float,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    ce_available = bool(candidate.get("same_stock_ce_available"))
+    ce_oi = int(float(candidate.get("same_stock_ce_oi") or 0))
+    ce_volume = int(float(candidate.get("same_stock_ce_volume") or 0))
+    ce_spread = candidate.get("same_stock_ce_spread_percent")
+    ce_spread_value = float(ce_spread) if isinstance(ce_spread, (int, float)) else None
+    if ce_available and (ce_oi > 0 or ce_volume > 0) and (ce_spread_value is None or ce_spread_value <= 15):
+        covered_call_liquidity_score = 5.0
+    elif ce_available:
+        covered_call_liquidity_score = 3.0
+    else:
+        covered_call_liquidity_score = 0.0
+
+    ce_yield = float(candidate.get("post_assignment_ce_yield_percent") or 0)
+    post_assignment_ce_yield_score = (
+        5.0 if ce_yield >= 0.60 else 4.0 if ce_yield >= 0.40 else 2.0 if ce_yield > 0 else 0.0
+    )
+    fundamental_hold_comfort_score = min(4.0, max(0.0, stock_quality_base / 21 * 4))
+    drawdown_recovery_score = min(
+        3.0,
+        max(0.0, float(corrected.get("corrected_not_broken_score") or 0) / 2),
+    )
+    concentration = float(candidate.get("portfolio_after_assignment_percent") or 0)
+    concentration_limit = float(settings["max_portfolio_concentration_percent"])
+    portfolio_concentration_score = (
+        3.0 if concentration <= 0 or concentration <= concentration_limit * 0.75
+        else 1.5 if concentration <= concentration_limit
+        else 0.0
+    )
+    score = (
+        covered_call_liquidity_score
+        + post_assignment_ce_yield_score
+        + fundamental_hold_comfort_score
+        + drawdown_recovery_score
+        + portfolio_concentration_score
+    )
+    if not ce_available:
+        score = min(score, 10.0)
+    return {
+        "assignment_recovery_score": min(20.0, score),
+        "covered_call_liquidity_score": covered_call_liquidity_score,
+        "post_assignment_ce_yield_percent": ce_yield or None,
+        "post_assignment_ce_yield_score": post_assignment_ce_yield_score,
+        "fundamental_hold_comfort_score": fundamental_hold_comfort_score,
+        "drawdown_recovery_score": drawdown_recovery_score,
+        "portfolio_concentration_score": portfolio_concentration_score,
+        "assignment_recovery_reason": (
+            f"CE liquidity {'available' if ce_available else 'unavailable'}; "
+            f"indicative CE yield {ce_yield:.2f}%; post-assignment concentration {concentration:.1f}%."
+        ),
+        "next_leg_ce_candidate": candidate.get("next_leg_ce_candidate") or "N/A",
+    }
+
+
 def score_pe_sell_candidate(
     candidate: dict[str, Any],
     settings: dict[str, Any] | None = None,
@@ -5239,7 +5482,36 @@ def score_pe_sell_candidate(
     spread_value = float(spread) if isinstance(spread, (int, float)) else None
     dte = int(float(result.get("dte") or 0))
     event_risk = str(result.get("event_risk") or "AMBER").upper()
+    corporate_action_risk = str(result.get("corporate_action_risk") or "CHECK").upper()
+    macro_risk = str(result.get("macro_risk") or "CHECK").upper()
     reject_reasons = [str(item) for item in result.get("reject_reasons", []) if str(item)]
+    month = float(result.get("month_return") or 0)
+    week = float(result.get("week_return") or 0)
+    today = float(result.get("today_return") or 0)
+    trend_falling = bool(result.get("trend_falling")) or month < -10 or week < -6 or today < -4
+    high_52w = result.get("high_52w")
+    pct_52w = result.get("pct_to_52w_high")
+    if not isinstance(high_52w, (int, float)) and isinstance(pct_52w, (int, float)) and pct_52w < 0:
+        high_52w = cmp_value / (1 + float(pct_52w) / 100)
+    corrected = calculate_corrected_not_broken_score(
+        cmp_value,
+        result.get("dma_200"),
+        high_52w,
+        trend_falling,
+    )
+    if result.get("falling_knife_risk"):
+        corrected["falling_knife_risk"] = str(result["falling_knife_risk"]).upper()
+    iv_metrics = classify_ce_iv_metrics(
+        result.get("iv_percentile"),
+        result.get("iv_rank"),
+        iv,
+        premium_yield,
+        float(settings["min_premium_yield_percent"]),
+    )
+    if bool(result.get("severe_breakdown")) and iv_metrics["iv_status"] == "GREEN":
+        iv_metrics.update(
+            {"iv_status": "RED", "iv_score": 0.0, "iv_reason": "High IV during severe breakdown is an assignment trap."}
+        )
 
     if assignment_cash > float(settings["max_assignment_cash_per_stock"]):
         reject_reasons.append("Assignment cash exceeds configured per-stock limit")
@@ -5255,6 +5527,8 @@ def score_pe_sell_candidate(
         reject_reasons.append("Option volume is below configured minimum")
     if event_risk == "RED":
         reject_reasons.append("RED event risk")
+    if corporate_action_risk == "RED":
+        reject_reasons.append("RED corporate action risk")
     if result.get("fno_ban"):
         reject_reasons.append("Stock is in F&O ban period")
     if premium_yield < float(settings["min_premium_yield_percent"]):
@@ -5263,30 +5537,30 @@ def score_pe_sell_candidate(
         reject_reasons.append("Selected PE strike is not below CMP")
     if result.get("severe_breakdown"):
         reject_reasons.append("Daily trend is a severe breakdown")
+    if corrected["falling_knife_risk"] == "RED":
+        reject_reasons.append("Falling-knife risk is RED")
+    if macro_risk == "RED" and corrected.get("above_200dma") is False:
+        reject_reasons.append("Macro risk is RED while stock is below 200 DMA")
+    if iv_metrics["iv_status"] == "RED":
+        reject_reasons.append(str(iv_metrics["iv_reason"]))
+    if result.get("do_not_assign"):
+        reject_reasons.append("Stock is marked do not assign")
     if result.get("has_active_pe_position"):
         reject_reasons.append("Existing active PE position for this stock")
 
     core = str(result.get("core") or "").upper() == "Y"
     pe_value = result.get("stock_pe")
-    pct_52w = result.get("pct_to_52w_high")
     one_year = result.get("one_year_return")
-    month = float(result.get("month_return") or 0)
-    week = float(result.get("week_return") or 0)
-    today = float(result.get("today_return") or 0)
-    business_quality_score = 10 if core else 7
-    valuation_score = 5
+    business_quality_score = 8 if core else 5
+    valuation_score = 4
     if isinstance(pe_value, (int, float)):
-        valuation_score = 8 if pe_value <= 30 else 6 if pe_value <= 50 else 3 if pe_value <= 70 else 1
-    financial_strength_score = 8 if core else 5
-    corrected_but_not_broken_score = (
-        6 if isinstance(pct_52w, (int, float)) and -50 < pct_52w <= -10 and month > -12
-        else 4 if month > -12 and week > -8
-        else 1
-    )
+        valuation_score = 7 if pe_value <= 30 else 5 if pe_value <= 50 else 2 if pe_value <= 70 else 1
+    financial_strength_score = 6 if core else 4
+    corrected_but_not_broken_score = float(corrected["corrected_not_broken_score"])
     sector_quality_score = 4 if result.get("sector") else 2
     portfolio_fit_score = 4 if int(float(result.get("holding") or 0)) > 0 else 2
     stock_quality_score = min(
-        40,
+        35,
         business_quality_score
         + valuation_score
         + financial_strength_score
@@ -5295,30 +5569,34 @@ def score_pe_sell_candidate(
         + portfolio_fit_score,
     )
 
-    otm_buffer_score = 12 if float(settings["min_otm_percent"]) <= otm <= float(settings["max_otm_percent"]) else 8 if otm > float(settings["max_otm_percent"]) else 3
-    delta_pop_score = 10 if sell_pop >= float(settings["min_sell_pop_percent"]) and delta <= float(settings["max_delta"]) else 7 if sell_pop >= 80 and delta <= 0.25 else 2
-    premium_yield_score = 10 if premium_yield >= 0.60 else 8 if premium_yield >= 0.45 else 6 if premium_yield >= float(settings["min_premium_yield_percent"]) else 0
-    liquidity_score = 10
+    otm_buffer_score = 8 if float(settings["min_otm_percent"]) <= otm <= float(settings["max_otm_percent"]) else 6 if otm > float(settings["max_otm_percent"]) else 2
+    delta_pop_score = 7 if sell_pop >= float(settings["min_sell_pop_percent"]) and delta <= float(settings["max_delta"]) else 5 if sell_pop >= 80 and delta <= 0.25 else 1
+    premium_yield_score = 8 if premium_yield >= 0.60 else 6 if premium_yield >= 0.45 else 4 if premium_yield >= float(settings["min_premium_yield_percent"]) else 0
+    liquidity_score = 6
     if oi <= 0 and volume <= 0:
-        liquidity_score = 5
+        liquidity_score = 3
     elif spread_value is not None and spread_value > 10:
-        liquidity_score = 6
-    iv_score = 6 if 15 <= iv <= 40 else 4 if 40 < iv <= 50 else 2
+        liquidity_score = 4
+    iv_score = min(5.0, float(iv_metrics["iv_score"]))
     pcr = result.get("pcr")
-    support_score = 6 if isinstance(pcr, (int, float)) and pcr > 0.80 else 4 if isinstance(pcr, (int, float)) and pcr >= 0.60 else 2
-    market_sector_trend_score = 4 if month >= -5 and week >= -5 and today >= -4 else 2 if month >= -10 and week >= -8 else 0
+    below_support = bool(result.get("strike_below_support"))
+    support_score = 5 if below_support or isinstance(pcr, (int, float)) and pcr > 0.80 else 3 if isinstance(pcr, (int, float)) and pcr >= 0.60 else 1
+    macro_trend_score = 4 if macro_risk == "GREEN" and month >= -5 else 2 if macro_risk in {"AMBER", "CHECK"} and month >= -10 else 0
     dte_score = 2 if int(settings["preferred_dte_min"]) <= dte <= int(settings["preferred_dte_max"]) else 1
     pe_trade_score = min(
-        60,
+        45,
         otm_buffer_score
         + delta_pop_score
         + premium_yield_score
         + liquidity_score
         + iv_score
         + support_score
-        + market_sector_trend_score
+        + macro_trend_score
         + dte_score,
     )
+    stock_quality_base = business_quality_score + valuation_score + financial_strength_score
+    recovery = pe_assignment_recovery_metrics(result, corrected, stock_quality_base, settings)
+    final_score = min(100.0, stock_quality_score + pe_trade_score + recovery["assignment_recovery_score"])
     result.update(
         {
             "assignment_cash": assignment_cash,
@@ -5327,13 +5605,32 @@ def score_pe_sell_candidate(
             "otm_percent": otm,
             "stock_quality_score": stock_quality_score,
             "pe_trade_score": pe_trade_score,
-            "final_pe_score": min(100, stock_quality_score + pe_trade_score),
+            "final_pe_score": final_score,
+            "business_quality_score": business_quality_score,
+            "valuation_comfort_score": valuation_score,
+            "financial_strength_score": financial_strength_score,
+            "sector_quality_score": sector_quality_score,
+            "portfolio_fit_score": portfolio_fit_score,
+            "otm_buffer_score": otm_buffer_score,
+            "delta_pop_score": delta_pop_score,
+            "premium_yield_score": premium_yield_score,
+            "liquidity_score": liquidity_score,
+            "iv_percentile_score": iv_score,
+            "support_score": support_score,
+            "macro_trend_score": macro_trend_score,
+            "dte_score": dte_score,
+            "corporate_action_risk": corporate_action_risk,
+            "macro_risk": macro_risk,
             "reject_reason": "; ".join(dict.fromkeys(reject_reasons)),
             "status": "AVOID_TODAY" if reject_reasons else "WATCH_REVIEW",
             "explanation": (
                 f"{otm:.1f}% OTM, {sell_pop:.1f}% SELL POP, "
-                f"{premium_yield:.2f}% premium yield, event risk {event_risk}."
+                f"{premium_yield:.2f}% premium yield, assignment recovery "
+                f"{recovery['assignment_recovery_score']:.0f}/20."
             ),
+            **corrected,
+            **iv_metrics,
+            **recovery,
         }
     )
     return result
@@ -5344,21 +5641,34 @@ def rank_pe_sell_candidates(
     settings: dict[str, Any] | None = None,
     limit: int = 3,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    scored = [score_pe_sell_candidate(candidate, settings) for candidate in candidates]
+    effective_settings = {**DEFAULT_PE_SELL_SETTINGS, **(settings or {})}
+    scored = [score_pe_sell_candidate(candidate, effective_settings) for candidate in candidates]
     valid = [item for item in scored if item["status"] != "AVOID_TODAY"]
     valid.sort(
         key=lambda item: (
             float(item.get("final_pe_score") or 0),
             float(item.get("premium_yield_percent") or 0),
             int(item.get("oi") or 0) + int(item.get("volume") or 0),
+            float(item.get("assignment_recovery_score") or 0),
+            -float(item.get("delta") or 0),
             -float(item.get("assignment_cash") or 0),
         ),
         reverse=True,
     )
-    top = valid[:limit]
+    top = [
+        item
+        for item in valid
+        if float(item.get("final_pe_score") or 0) >= float(effective_settings["minimum_top_score"])
+        and item.get("above_200dma") is not False
+        and str(item.get("event_risk") or "GREEN").upper() != "AMBER"
+        and str(item.get("corporate_action_risk") or "CHECK").upper() != "AMBER"
+        and str(item.get("macro_risk") or "CHECK").upper() not in {"AMBER", "RED"}
+        and str(item.get("iv_status") or "UNKNOWN").upper() != "WATCH"
+    ][:limit]
     for item in top:
         item["status"] = "TOP_3"
-    watch = valid[limit:]
+    top_ids = {id(item) for item in top}
+    watch = [item for item in valid if id(item) not in top_ids]
     avoid = [item for item in scored if item["status"] == "AVOID_TODAY"]
     return top, watch, avoid
 
@@ -5373,13 +5683,23 @@ def build_live_pe_sell_rankings(
     active_pe_underlyings = active_pe_position_underlyings(False)
     news_cache: dict[str, list[dict[str, str]]] = {}
     candidates: list[dict[str, Any]] = []
+    macro_tape = ce_macro_tape_snapshot()
+    portfolio_value = sum(
+        float(row.get("value") or row.get("market_value") or 0)
+        for row in growth_rows
+    )
     for row in growth_rows:
         symbol = str(row.get("symbol") or "").upper()
         cmp_value = float(row.get("cmp") or 0)
         if not symbol or cmp_value <= 0:
             continue
         try:
-            contract = next_monthly_pe_candidate(kite, symbol)
+            month = float(row.get("input_month") or 0)
+            week = float(row.get("input_1w") or 0)
+            today = float(row.get("input_today") or 0)
+            beta_proxy = min(2.0, max(0.7, 1.0 + abs(month) / 50 + abs(week) / 25))
+            beta_adjustment = pe_macro_beta_buffer(str(macro_tape.get("risk") or "CHECK"), beta_proxy)
+            contract = next_monthly_pe_candidate(kite, symbol, beta_adjustment)
             quote_key = f"NFO:{contract['symbol']}"
             quote = cached_kite_quote(kite, [quote_key]).get(quote_key, {})
             premium = quote_ltp(quote)
@@ -5388,9 +5708,19 @@ def build_live_pe_sell_rankings(
             markup = float(settings["price_markup_percent"])
             sell_limit = ceil_to_tick(premium * (1 + markup / 100), 0.05) if premium > 0 else 0
             event_risk, event_detail = classify_pe_event_risk(contract["symbol"], news_cache)
-            month = float(row.get("input_month") or 0)
-            week = float(row.get("input_1w") or 0)
-            today = float(row.get("input_today") or 0)
+            corporate_action = ce_corporate_action_from_news(news_cache.get(symbol, []))
+            try:
+                dma = stock_moving_averages(symbol)
+            except Exception:
+                dma = {"dma_50": None, "dma_200": None}
+            assignment_cash = float(contract["strike"]) * int(contract["lot_size"])
+            existing_value = float(row.get("value") or row.get("market_value") or 0)
+            concentration = (
+                (existing_value + assignment_cash) / (portfolio_value + assignment_cash) * 100
+                if portfolio_value + assignment_cash > 0 else 0
+            )
+            same_stock_ce = str(row.get("candidate_ce") or "")
+            macro_risk = str(macro_tape.get("risk") or "CHECK").upper()
             candidates.append(
                 {
                     "stock": symbol,
@@ -5398,6 +5728,7 @@ def build_live_pe_sell_rankings(
                     "option_symbol": contract["symbol"],
                     "cmp": cmp_value,
                     "target_strike": contract["target_strike"],
+                    "target_pe_strike_zone": contract["target_strike"],
                     "strike": contract["strike"],
                     "expiry": contract["expiry"].strftime("%d %b %Y"),
                     "dte": trading_days_remaining(contract["expiry"]),
@@ -5407,6 +5738,8 @@ def build_live_pe_sell_rankings(
                     "delta": abs(float(analytics.get("delta") or 0)),
                     "sell_pop": float(analytics.get("sell_pop") or 0),
                     "iv": float(analytics.get("iv_percent") or 0),
+                    "iv_percentile": analytics.get("iv_percentile"),
+                    "iv_rank": analytics.get("iv_rank"),
                     "oi": quote_oi(quote),
                     "volume": int(float(quote.get("volume") or 0)),
                     "bid": bid,
@@ -5415,10 +5748,26 @@ def build_live_pe_sell_rankings(
                     "pcr": analytics.get("pcr"),
                     "event_risk": event_risk,
                     "event_risk_explanation": event_detail,
+                    **corporate_action,
                     "contract_valid": bool(contract.get("symbol")) and float(contract.get("strike") or 0) <= float(contract.get("target_strike") or 0),
                     "fno_ban": False,
                     "severe_breakdown": month < -12 or week < -8 or today < -6,
+                    "trend_falling": month < -10 and week < 0,
+                    "dma_200": dma.get("dma_200"),
                     "has_active_pe_position": symbol in active_pe_underlyings,
+                    "macro_risk": macro_risk,
+                    "macro_reason": macro_tape.get("detail"),
+                    "beta": beta_proxy,
+                    "base_otm_percent": contract.get("base_otm_percent"),
+                    "beta_adjustment_percent": contract.get("beta_adjustment_percent"),
+                    "final_otm_percent": contract.get("final_otm_percent"),
+                    "lot_reduction_reason": (
+                        "Macro RED: keep one cash-secured lot only."
+                        if macro_risk == "RED" else
+                        "Macro AMBER: reduce configured lots by 25%."
+                        if macro_risk == "AMBER" else
+                        "No macro lot reduction."
+                    ),
                     "core": row.get("core"),
                     "sector": row.get("sector"),
                     "holding": row.get("quantity"),
@@ -5428,6 +5777,10 @@ def build_live_pe_sell_rankings(
                     "month_return": row.get("input_month"),
                     "week_return": row.get("input_1w"),
                     "today_return": row.get("input_today"),
+                    "same_stock_ce_available": bool(same_stock_ce),
+                    "post_assignment_ce_yield_percent": row.get("premium_yield_pct"),
+                    "next_leg_ce_candidate": same_stock_ce or "N/A",
+                    "portfolio_after_assignment_percent": concentration,
                 }
             )
         except Exception as exc:
@@ -5525,6 +5878,9 @@ DEFAULT_CE_SELL_SETTINGS = {
     "min_option_volume": 0,
     "max_bid_ask_spread_percent": 35.0,
     "price_markup_percent": DEFAULT_OPTION_SELL_MARKUP_PERCENT,
+    "stcg_tax_rate_percent": 20.0,
+    "ltcg_tax_rate_percent": 12.5,
+    "minimum_top_score": 65.0,
 }
 
 
@@ -5553,6 +5909,276 @@ def select_valid_ce_contract(
     if not valid:
         raise ValueError("No valid CE strike available above target")
     return min(valid, key=lambda item: float(item.get("strike") or 0))
+
+
+def classify_ce_corporate_action(
+    action: dict[str, Any] | None,
+    cmp_value: float = 0,
+    trade_date: date | None = None,
+    expiry_date: date | None = None,
+) -> dict[str, Any]:
+    action = dict(action or {})
+    action_type = str(action.get("type") or action.get("action_type") or "").strip().lower()
+    ex_date = action.get("ex_date")
+    record_date = action.get("record_date")
+    dividend_amount = float(action.get("dividend_amount") or 0)
+    adjustment_notice = bool(action.get("adjustment_notice"))
+    today = trade_date or app_now().date()
+
+    def parsed_day(value: Any) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if value:
+            try:
+                return datetime.fromisoformat(str(value)).date()
+            except ValueError:
+                return None
+        return None
+
+    ex_day = parsed_day(ex_date)
+    record_day = parsed_day(record_date)
+    inside_cycle = bool(
+        expiry_date
+        and (
+            (ex_day and today <= ex_day <= expiry_date)
+            or (record_day and today <= record_day <= expiry_date)
+        )
+    )
+    dividend_yield = dividend_amount / cmp_value * 100 if cmp_value > 0 and dividend_amount > 0 else 0
+    major_actions = {"split", "stock split", "bonus", "rights", "rights issue", "merger", "demerger", "buyback"}
+    if adjustment_notice:
+        risk, reason = "RED", "F&O corporate-action adjustment notice exists."
+    elif action_type in major_actions and inside_cycle:
+        risk, reason = "RED", f"{action_type.title()} is inside the selected expiry cycle."
+    elif action_type in {"dividend", "ex-dividend"} and inside_cycle and dividend_yield >= 2:
+        risk, reason = "RED", f"Dividend yield {dividend_yield:.2f}% is extraordinary inside the expiry cycle."
+    elif action_type in {"dividend", "ex-dividend"} and inside_cycle:
+        risk, reason = "AMBER", f"Normal dividend yield {dividend_yield:.2f}% is inside the expiry cycle."
+    elif action_type:
+        risk, reason = "GREEN", f"{action_type.title()} is outside the selected expiry cycle."
+    else:
+        risk, reason = "GREEN", "No corporate action is known inside the selected expiry cycle."
+    return {
+        "corporate_action_risk": risk,
+        "corporate_action_type": action_type.upper() or "NONE",
+        "corporate_action_ex_date": ex_day.isoformat() if ex_day else "",
+        "corporate_action_record_date": record_day.isoformat() if record_day else "",
+        "dividend_amount": dividend_amount,
+        "dividend_yield_percent": dividend_yield,
+        "corporate_action_reason": reason,
+    }
+
+
+def classify_ce_corporate_action_risk(news_items: list[dict[str, str]]) -> tuple[str, str]:
+    major_terms = {"stock split", "split", "bonus", "demerger", "merger", "rights issue", "buyback"}
+    dividend_terms = {"dividend", "ex-dividend", "record date"}
+    for item in news_items:
+        title = str(item.get("title") or "").strip()
+        if title and any(term in title.lower() for term in major_terms):
+            return "RED", f"Major corporate-action headline requires expiry-cycle rejection: {title[:140]}"
+        if title and any(term in title.lower() for term in dividend_terms):
+            return "AMBER", f"Corporate-action headline requires expiry-cycle calendar review: {title[:140]}"
+    return "CHECK", "No corporate action found in recent news; verify NSE corporate-action calendar before entry."
+
+
+def ce_corporate_action_from_news(news_items: list[dict[str, str]]) -> dict[str, Any]:
+    risk, reason = classify_ce_corporate_action_risk(news_items)
+    action_type = "NONE"
+    for item in news_items:
+        title = str(item.get("title") or "").lower()
+        for term in ("demerger", "merger", "rights issue", "buyback", "stock split", "split", "bonus", "dividend"):
+            if term in title:
+                action_type = term.upper()
+                break
+        if action_type != "NONE":
+            break
+    return {
+        "corporate_action_risk": risk,
+        "corporate_action_type": action_type,
+        "corporate_action_ex_date": "",
+        "corporate_action_record_date": "",
+        "dividend_amount": 0.0,
+        "dividend_yield_percent": 0.0,
+        "corporate_action_reason": reason,
+        "corporate_action_detail": reason,
+    }
+
+
+def classify_ce_iv_metrics(
+    percentile_value: Any,
+    rank_value: Any,
+    iv_percent: Any,
+    premium_yield_percent: float,
+    minimum_yield_percent: float,
+) -> dict[str, Any]:
+    try:
+        percentile = float(percentile_value)
+    except (TypeError, ValueError):
+        percentile = None
+    try:
+        rank = float(rank_value)
+    except (TypeError, ValueError):
+        rank = None
+    if percentile is None and rank is None:
+        iv_text = fmt_number(iv_percent, 1) if isinstance(iv_percent, (int, float)) else "N/A"
+        return {
+            "iv_status": "UNKNOWN", "iv_reason": f"Historical IV data unavailable; current IV is {iv_text}%.",
+            "iv_percentile": None, "iv_rank": None, "iv_score": 2.5,
+        }
+    best_metric = max(value for value in (percentile, rank) if value is not None)
+    if best_metric >= 60 or (rank is not None and rank >= 50):
+        status, score = "GREEN", 5.0
+    elif best_metric >= 40 or (rank is not None and rank >= 30):
+        status, score = "AMBER", 3.5
+    elif best_metric < 20 and premium_yield_percent < minimum_yield_percent:
+        status, score = "RED", 0.0
+    else:
+        status, score = "WATCH", 1.5
+    return {
+        "iv_status": status,
+        "iv_reason": f"IV percentile {fmt_number(percentile, 0)}; IV rank {fmt_number(rank, 0)}.",
+        "iv_percentile": percentile, "iv_rank": rank, "iv_score": score,
+    }
+
+
+def classify_ce_iv_percentile(value: Any, iv_percent: Any = None) -> tuple[str, str, float | None]:
+    metrics = classify_ce_iv_metrics(value, None, iv_percent, 1.0, 0.20)
+    status = "CHECK" if metrics["iv_status"] == "UNKNOWN" else metrics["iv_status"]
+    return status, str(metrics["iv_reason"]), metrics["iv_percentile"]
+
+
+def ce_macro_tape_snapshot() -> dict[str, Any]:
+    try:
+        payload = fetch_global_market_quotes()
+        changes = [
+            float(item["change_percent"])
+            for item in payload.get("quotes", [])
+            if isinstance(item.get("change_percent"), (int, float))
+            and str(item.get("label") or "").upper() not in {"INDIA VIX", "USD/INR"}
+        ]
+    except Exception as exc:
+        return {"risk": "CHECK", "detail": f"Macro tape unavailable: {friendly_external_error(exc)}", "average_change": None}
+    if not changes:
+        return {"risk": "CHECK", "detail": "Macro tape has no usable change data.", "average_change": None}
+    average_change = sum(changes) / len(changes)
+    red_count = sum(1 for value in changes if value <= -1)
+    if red_count >= 4 or average_change <= -1:
+        risk = "RED"
+    elif red_count >= 2 or average_change < 0:
+        risk = "AMBER"
+    else:
+        risk = "GREEN"
+    return {
+        "risk": risk,
+        "detail": f"{red_count}/{len(changes)} global cues down at least 1%; average move {average_change:.2f}%.",
+        "average_change": average_change,
+    }
+
+
+def ce_macro_beta_buffer(macro_risk: str, beta: Any) -> float:
+    try:
+        beta_value = max(0.0, float(beta))
+    except (TypeError, ValueError):
+        beta_value = 1.0
+    risk = str(macro_risk or "CHECK").upper()
+    if risk == "RED":
+        return 5.0 if beta_value >= 1.2 else 3.0
+    if risk == "AMBER" and beta_value >= 1.2:
+        return 2.0
+    return 0.0
+
+
+def classify_ce_redeployment_yield(put_strike: Any, put_premium: Any) -> tuple[str, str, float | None]:
+    try:
+        strike = float(put_strike)
+        premium = float(put_premium)
+    except (TypeError, ValueError):
+        return "CHECK", "Next-leg CSP premium is unavailable; review capital redeployment manually.", None
+    if strike <= 0 or premium <= 0:
+        return "CHECK", "Next-leg CSP premium is unavailable; review capital redeployment manually.", None
+    yield_percent = premium / strike * 100
+    if yield_percent >= 0.50:
+        status = "GREEN"
+    elif yield_percent >= 0.25:
+        status = "AMBER"
+    else:
+        status = "RED"
+    return status, f"Indicative next-leg CSP yield is {yield_percent:.2f}% of strike.", yield_percent
+
+
+def tax_adjusted_callaway_metrics(candidate: dict[str, Any], quantity: int, settings: dict[str, Any]) -> dict[str, Any]:
+    average_cost = float(candidate.get("average_buy_price") or candidate.get("average_cost") or 0)
+    strike = float(candidate.get("selected_ce_strike") or 0)
+    holding_days_raw = candidate.get("holding_period_days")
+    holding_days = int(float(holding_days_raw)) if isinstance(holding_days_raw, (int, float)) else None
+    tax_type = "LTCG" if holding_days is not None and holding_days > 365 else "STCG" if holding_days is not None else "UNKNOWN"
+    estimated_gain = max(0.0, strike - average_cost) * quantity if average_cost > 0 else 0.0
+    tax_rate = (
+        float(settings["ltcg_tax_rate_percent"])
+        if tax_type == "LTCG"
+        else float(settings["stcg_tax_rate_percent"])
+        if tax_type == "STCG"
+        else max(float(settings["ltcg_tax_rate_percent"]), float(settings["stcg_tax_rate_percent"]))
+    )
+    estimated_tax = estimated_gain * tax_rate / 100
+    target_exit = float(candidate.get("target_exit_price") or 0)
+    core = str(candidate.get("core") or "").upper() == "Y"
+    do_not_call = bool(candidate.get("do_not_call_away"))
+    score = 0.0
+    score += 7 if estimated_gain > 0 else 3 if average_cost <= 0 else 1
+    score += 5 if tax_type == "LTCG" else 2 if tax_type == "STCG" else 2.5
+    score += 5 if target_exit <= 0 or strike >= target_exit else 1
+    score += 3 if not core else 1
+    score += 3 if float(candidate.get("coverage_ratio_percent") or 0) <= 50 else 1
+    reasons = []
+    if average_cost <= 0:
+        reasons.append("Cost basis unavailable; conservative tax penalty applied")
+    if tax_type == "STCG":
+        reasons.append("STCG reduces call-away comfort")
+    if target_exit > 0 and strike < target_exit:
+        reasons.append("CE strike is below target exit price")
+    if core:
+        reasons.append("Core holding call-away penalty")
+    if do_not_call:
+        reasons.append("Holding is marked do not call away")
+    return {
+        "average_cost": average_cost or None,
+        "holding_period_days": holding_days,
+        "tax_type": tax_type,
+        "estimated_tax": estimated_tax,
+        "after_tax_callaway_profit": max(0.0, estimated_gain - estimated_tax),
+        "tax_adjusted_callaway_score": min(25.0, score),
+        "tax_reason": "; ".join(reasons) or "Tax-adjusted call-away outcome is acceptable.",
+        "do_not_call_away": do_not_call,
+    }
+
+
+def reinvestment_metrics(candidate: dict[str, Any], quantity: int) -> dict[str, Any]:
+    strike = float(candidate.get("selected_ce_strike") or 0)
+    freed_capital = strike * quantity
+    same_status, same_reason, same_yield = classify_ce_redeployment_yield(
+        candidate.get("next_leg_put_strike"), candidate.get("next_leg_put_premium")
+    )
+    alternate_score = float(candidate.get("best_alternate_csp_score") or 0)
+    alternate_yield = float(candidate.get("best_alternate_csp_yield_percent") or 0)
+    same_score = 5 if same_status == "GREEN" else 3 if same_status == "AMBER" else 1 if same_status == "CHECK" else 0
+    alternate_points = 5 if alternate_score >= 80 else 3 if alternate_score >= 65 else 1 if alternate_yield > 0 else 0
+    idle_points = 3 if same_score >= 3 or alternate_points >= 3 else 1
+    continuity_points = 2 if same_score >= 3 and alternate_points >= 3 else 1 if same_score or alternate_points else 0
+    score = min(15.0, same_score + alternate_points + idle_points + continuity_points)
+    return {
+        "freed_capital_if_called": freed_capital,
+        "best_same_stock_csp": candidate.get("best_same_stock_csp") or candidate.get("next_leg_put_strike") or "N/A",
+        "best_alternate_csp": candidate.get("best_alternate_csp") or "N/A",
+        "best_redeployment_yield_percent": max(same_yield or 0, alternate_yield),
+        "reinvestment_score": score,
+        "reinvestment_reason": f"{same_reason} Alternate CSP score {alternate_score:.0f}.",
+        "redeployment_risk": same_status,
+        "redeployment_detail": same_reason,
+        "redeployment_yield_percent": same_yield,
+    }
 
 
 def score_ce_sell_candidate(
@@ -5589,6 +6215,27 @@ def score_ce_sell_candidate(
     spread_value = float(spread) if isinstance(spread, (int, float)) else None
     event_risk = str(result.get("event_risk") or "AMBER").upper()
     breakout_risk = str(result.get("breakout_risk") or "AMBER").upper()
+    corporate_action_risk = str(result.get("corporate_action_risk") or "CHECK").upper()
+    macro_risk = str(result.get("macro_risk") or "CHECK").upper()
+    beta_buffer = ce_macro_beta_buffer(macro_risk, result.get("beta"))
+    required_otm = (
+        float(result["required_otm_percent"])
+        if isinstance(result.get("required_otm_percent"), (int, float))
+        else float(settings["default_otm_percent"]) + beta_buffer
+    )
+    coverage_ratio = (quantity / holding_qty * 100) if holding_qty > 0 else 0
+    dte = max(1, int(float(result.get("dte") or 30)))
+    annualized_yield = premium_yield * (365 / dte)
+    result["coverage_ratio_percent"] = coverage_ratio
+    iv_metrics = classify_ce_iv_metrics(
+        result.get("iv_percentile"),
+        result.get("iv_rank"),
+        result.get("iv"),
+        premium_yield,
+        float(settings["min_premium_yield_percent"]),
+    )
+    tax_metrics = tax_adjusted_callaway_metrics(result, quantity, settings)
+    reinvestment = reinvestment_metrics(result, quantity)
     reject = [str(item) for item in result.get("reject_reasons", []) if str(item)]
     if holding_qty <= 0:
         reject.append("No share holding; naked CE not allowed")
@@ -5612,43 +6259,110 @@ def score_ce_sell_candidate(
         reject.append("Option volume below configured minimum")
     if event_risk == "RED":
         reject.append("RED company event risk")
+    if corporate_action_risk == "RED":
+        reject.append("Corporate action or dividend risk inside expiry cycle")
     if result.get("has_active_position"):
         reject.append("Existing active option position for this stock")
-    if premium_yield < float(settings["min_premium_yield_percent"]):
-        reject.append("Premium yield below configured minimum")
-    if sell_pop < float(settings["min_sell_pop_percent"]):
-        reject.append("SELL POP below configured minimum")
-    if delta > float(settings["max_delta"]):
-        reject.append("CE delta exceeds configured maximum")
-    if breakout_risk == "RED" and otm < 12:
-        reject.append("RED breakout risk with CE strike too close")
+    if tax_metrics["do_not_call_away"]:
+        reject.append("Holding is marked do not call away")
 
-    coverage_score = min(30, (10 if covered_lots >= requested_lots > 0 else 5) + (5 if holding_qty - quantity >= lot_size else 3) + (5 if lots_to_sell <= 2 else 3) + (5 if result.get("core") != "Y" else 3) + 5)
-    call_away_score = min(30, (8 if otm >= 10 else 5 if otm >= 7 else 2) + (6 if float(result.get("one_year_return") or 0) <= 10 else 3) + (5 if float(result.get("week_return") or 0) <= 2 else 2) + (5 if breakout_risk == "GREEN" else 3 if breakout_risk == "AMBER" else 0) + (4 if result.get("core") != "Y" else 2) + 2)
-    trade_score = min(40, (8 if otm >= 10 else 5 if otm >= 7 else 2) + (7 if sell_pop >= 85 and delta <= 0.25 else 4 if sell_pop >= 75 else 1) + (8 if premium_yield >= 0.5 else 5 if premium_yield >= 0.25 else 1) + (7 if spread_value is None or spread_value <= 15 else 3) + (4 if 15 <= float(result.get("iv") or 0) <= 50 else 2) + (4 if breakout_risk == "GREEN" else 2) + 2)
+    beta_value = float(result.get("beta") or 1)
+    high_momentum = breakout_risk == "RED" or float(result.get("week_return") or 0) > 4
+    coverage_components = {
+        "covered_lots_available_score": 5 if covered_lots >= 1 else 0,
+        "partial_coverage_score": 7 if 25 <= coverage_ratio <= 50 else 5 if coverage_ratio <= 75 else 2 if high_momentum else 4,
+        "surplus_shares_score": 4 if holding_qty - quantity >= lot_size else 2 if holding_qty > quantity else 0,
+        "position_concentration_score": 4 if coverage_ratio <= 50 else 2 if coverage_ratio <= 75 else 0 if high_momentum else 2,
+        "lot_reduction_safety_score": 5 if lots_to_sell <= 1 else 3,
+    }
+    coverage_score = min(25.0, sum(coverage_components.values()))
+    target_exit = float(result.get("target_exit_price") or 0)
+    callaway_components = {
+        "valuation_richness_score": 5 if float(result.get("one_year_return") or 0) <= 10 else 3,
+        "tax_adjusted_callaway_score_component": min(7.0, float(tax_metrics["tax_adjusted_callaway_score"]) / 25 * 7),
+        "target_price_comfort_score": 5 if target_exit <= 0 or strike >= target_exit else 1,
+        "core_holding_penalty_score": 5 if str(result.get("core") or "").upper() != "Y" else 2,
+        "trend_callaway_comfort_score": 3 if breakout_risk == "GREEN" else 2 if breakout_risk == "AMBER" else 0,
+    }
+    call_away_score = min(25.0, sum(callaway_components.values()))
+    trade_components = {
+        "delta_pop_score": 6 if sell_pop >= 85 and delta <= 0.25 else 4 if sell_pop >= 75 and delta <= 0.30 else 1,
+        "premium_yield_score": 7 if premium_yield >= 0.50 else 4 if premium_yield >= float(settings["min_premium_yield_percent"]) else 1,
+        "annualized_yield_score": 5 if annualized_yield >= 12 else 3 if annualized_yield >= 6 else 1,
+        "liquidity_score": 5 if spread_value is None or spread_value <= 15 else 3 if spread_value <= float(settings["max_bid_ask_spread_percent"]) else 0,
+        "iv_percentile_score": float(iv_metrics["iv_score"]),
+        "otm_buffer_score": 4 if otm >= required_otm else 2 if otm >= required_otm - 2 else 0,
+        "resistance_score": 2 if breakout_risk == "GREEN" else 1 if breakout_risk == "AMBER" else 0,
+        "dte_score": 1 if 14 <= dte <= 45 else 0.5,
+    }
+    trade_score = min(35.0, sum(trade_components.values()))
     if event_risk == "AMBER":
-        trade_score = max(0, trade_score - 4)
-    if breakout_risk == "AMBER":
-        trade_score = max(0, trade_score - 4)
-    final_score = min(100, coverage_score + call_away_score + trade_score)
+        trade_score = max(0, trade_score - 2)
+    if corporate_action_risk == "AMBER":
+        trade_score = max(0, trade_score - 3)
+    if macro_risk == "RED":
+        trade_score = max(0, trade_score - 2)
+    if breakout_risk == "RED":
+        trade_score = max(0, trade_score - 3)
+    reinvestment_score = min(15.0, float(reinvestment["reinvestment_score"]))
+    final_score = min(100.0, coverage_score + call_away_score + trade_score + reinvestment_score)
+    moderate_risks = {
+        event_risk,
+        corporate_action_risk,
+        macro_risk,
+        breakout_risk,
+        str(iv_metrics["iv_status"]),
+    } & {"AMBER", "RED", "WATCH", "UNKNOWN", "CHECK"}
+    status = "AVOID_TODAY" if reject else "WATCH_REVIEW"
     result.update(
         {
             "covered_lots_available": covered_lots,
+            "lot_size": lot_size,
             "lots_to_sell": lots_to_sell,
             "quantity": quantity,
             "max_profit": max_profit,
             "notional_covered_value": covered_notional,
             "premium_yield_percent": premium_yield,
+            "annualized_premium_yield_percent": annualized_yield,
             "otm_percent": otm,
+            "required_otm_percent": required_otm,
+            "base_otm_percent": max(0.0, required_otm - beta_buffer),
+            "beta_adjustment_percent": beta_buffer,
+            "breakout_adjustment_percent": float(result.get("breakout_adjustment_percent") or 0),
+            "final_otm_percent": required_otm,
+            "coverage_ratio_percent": coverage_ratio,
+            "corporate_action_risk": corporate_action_risk,
+            "corporate_action_reason": result.get("corporate_action_reason") or result.get("corporate_action_detail") or "Review NSE corporate-action calendar.",
+            "iv_percentile_risk": iv_metrics["iv_status"],
+            "iv_percentile_detail": iv_metrics["iv_reason"],
+            "current_iv": result.get("iv"),
+            "iv_percentile": iv_metrics["iv_percentile"],
+            "iv_rank": iv_metrics["iv_rank"],
+            "iv_status": iv_metrics["iv_status"],
+            "iv_reason": iv_metrics["iv_reason"],
+            "macro_risk": macro_risk,
+            "macro_reason": result.get("macro_reason") or result.get("macro_detail") or "Macro tape unavailable.",
+            "beta_buffer_percent": beta_buffer,
+            "beta_adjusted_otm_percent": required_otm,
+            **tax_metrics,
+            **reinvestment,
+            "holding_coverage_components": coverage_components,
+            "callaway_comfort_components": callaway_components,
+            "ce_trade_components": trade_components,
+            "score_model": "25/25/35/15",
             "holding_coverage_score": coverage_score,
             "call_away_comfort_score": call_away_score,
+            "callaway_comfort_score": call_away_score,
             "ce_trade_score": trade_score,
+            "reinvestment_score": reinvestment_score,
             "final_ce_score": final_score,
-            "status": "AVOID_TODAY" if reject else "WATCH_REVIEW",
+            "status": status,
             "reject_reason": "; ".join(dict.fromkeys(reject)),
+            "review_reason": "; ".join(sorted(moderate_risks)),
             "explanation": (
                 f"{otm:.1f}% OTM, {sell_pop:.1f}% SELL POP, "
-                f"{premium_yield:.2f}% covered-value yield, {breakout_risk} breakout risk."
+                f"{premium_yield:.2f}% covered-value yield ({annualized_yield:.1f}% annualized), "
+                f"{breakout_risk} breakout risk, next-leg score {reinvestment_score:.0f}/15."
             ),
         }
     )
@@ -5660,6 +6374,7 @@ def rank_ce_sell_candidates(
     settings: dict[str, Any] | None = None,
     limit: int = 3,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    settings = {**DEFAULT_CE_SELL_SETTINGS, **(settings or {})}
     scored = [score_ce_sell_candidate(item, settings) for item in candidates]
     valid = [item for item in scored if item["status"] != "AVOID_TODAY"]
     valid.sort(
@@ -5670,10 +6385,15 @@ def rank_ce_sell_candidates(
         ),
         reverse=True,
     )
-    top = valid[:limit]
+    top = [
+        item
+        for item in valid
+        if float(item.get("final_ce_score") or 0) >= float(settings["minimum_top_score"])
+    ][:limit]
     for item in top:
         item["status"] = "TOP_3"
-    return top, valid[limit:], [item for item in scored if item["status"] == "AVOID_TODAY"]
+    top_ids = {id(item) for item in top}
+    return top, [item for item in valid if id(item) not in top_ids], [item for item in scored if item["status"] == "AVOID_TODAY"]
 
 
 def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -5686,6 +6406,23 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
     instruments = cached_kite_instruments(kite, "NFO")
     by_symbol = {str(item.get("tradingsymbol") or "").upper(): item for item in instruments}
     news_cache: dict[str, list[dict[str, str]]] = {}
+    macro_tape = ce_macro_tape_snapshot()
+    redeployment_universe = []
+    for growth_row in growth_rows:
+        put_strike = growth_row.get("input_put_strike")
+        put_premium = growth_row.get("input_pe")
+        try:
+            redeployment_yield = float(put_premium) / float(put_strike) * 100
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        redeployment_universe.append(
+            {
+                "symbol": str(growth_row.get("symbol") or "").upper(),
+                "strike": put_strike,
+                "yield": redeployment_yield,
+                "score": min(100.0, 60 + redeployment_yield * 20),
+            }
+        )
     candidates: list[dict[str, Any]] = []
     for row in growth_rows:
         symbol = str(row.get("symbol") or "").upper()
@@ -5698,9 +6435,22 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
             candidates.append({"stock": symbol, "holding_qty": holding, "requested_lots": requested_lots, "cmp": cmp_value, "contract_valid": False})
             continue
         lot_size = int(instrument.get("lot_size") or 0)
+        event_risk, event_reason = classify_pe_event_risk(symbol, news_cache)
+        corporate_action = ce_corporate_action_from_news(news_cache.get(symbol, []))
+        corporate_action_risk = str(corporate_action["corporate_action_risk"])
         desired_otm = float(settings["default_otm_percent"])
         if str(row.get("core") or "").upper() == "Y":
             desired_otm += float(settings["core_otm_add_percent"])
+        month = float(row.get("input_month") or 0)
+        week = float(row.get("input_1w") or 0)
+        today = float(row.get("input_today") or 0)
+        beta_proxy = min(2.0, max(0.7, 1.0 + abs(month) / 50 + abs(week) / 25))
+        breakout = "RED" if today > 4 or week > 7 else "AMBER" if today > 2 or week > 4 or month > 10 else "GREEN"
+        breakout_adjustment = 4.0 if breakout == "RED" else 2.0 if breakout == "AMBER" else 0.0
+        desired_otm += ce_macro_beta_buffer(str(macro_tape.get("risk") or "CHECK"), beta_proxy)
+        desired_otm += breakout_adjustment
+        if corporate_action_risk == "AMBER":
+            desired_otm += 1.0
         target = cmp_value * (1 + desired_otm / 100)
         expiry = instrument.get("expiry")
         same_expiry = [
@@ -5718,11 +6468,22 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
             premium = quote_ltp(quote)
             bid, ask, spread = quote_bid_ask(quote)
             analytics = option_analytics_for_symbol(option_symbol)
-            event_risk, event_reason = classify_pe_event_risk(symbol, news_cache)
-            week = float(row.get("input_1w") or 0)
-            today = float(row.get("input_today") or 0)
-            month = float(row.get("input_month") or 0)
-            breakout = "RED" if today > 4 or week > 7 else "AMBER" if today > 2 or week > 4 or month > 10 else "GREEN"
+            average_price = float(row.get("avg_price") or row.get("average_price") or 0)
+            selected_strike = float(selected.get("strike") or 0)
+            call_away_gain = (
+                ((selected_strike - average_price) / average_price * 100)
+                if average_price > 0
+                else None
+            )
+            expiry_day = selected.get("expiry")
+            if isinstance(expiry_day, datetime):
+                expiry_day = expiry_day.date()
+            dte = max(1, (expiry_day - app_now().date()).days) if isinstance(expiry_day, date) else 30
+            alternate = max(
+                (item for item in redeployment_universe if item["symbol"] != symbol),
+                key=lambda item: float(item["score"]),
+                default={},
+            )
             sell_limit = ceil_to_tick(
                 premium * (1 + float(settings["price_markup_percent"]) / 100),
                 0.05,
@@ -5735,12 +6496,30 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
                     "expiry": str(expiry), "option_symbol": option_symbol, "premium": premium,
                     "sell_limit_price": sell_limit, "delta": abs(float(analytics.get("delta") or 0)),
                     "sell_pop": float(analytics.get("sell_pop") or 0), "iv": float(analytics.get("iv_percent") or 0),
+                    "iv_percentile": analytics.get("iv_percentile"),
+                    "iv_rank": analytics.get("iv_rank"),
                     "oi": quote_oi(quote), "volume": int(float(quote.get("volume") or 0)),
                     "bid": bid, "ask": ask, "bid_ask_spread_percent": spread,
                     "event_risk": event_risk, "event_risk_reason": event_reason,
+                    **corporate_action,
                     "breakout_risk": breakout, "contract_valid": True,
                     "has_active_position": symbol in active_underlyings, "core": row.get("core"),
                     "one_year_return": row.get("input_1y"), "week_return": week,
+                    "macro_risk": macro_tape.get("risk"), "macro_detail": macro_tape.get("detail"),
+                    "beta": beta_proxy, "required_otm_percent": desired_otm,
+                    "base_otm_percent": float(settings["default_otm_percent"]),
+                    "breakout_adjustment_percent": breakout_adjustment,
+                    "next_leg_put_strike": row.get("input_put_strike"),
+                    "next_leg_put_premium": row.get("input_pe"),
+                    "best_alternate_csp": alternate.get("symbol") or "N/A",
+                    "best_alternate_csp_score": alternate.get("score") or 0,
+                    "best_alternate_csp_yield_percent": alternate.get("yield") or 0,
+                    "average_buy_price": average_price,
+                    "call_away_gain_percent": call_away_gain,
+                    "target_exit_price": row.get("target_exit_price"),
+                    "do_not_call_away": row.get("do_not_call_away", False),
+                    "holding_period_days": row.get("holding_period_days"),
+                    "dte": dte,
                 }
             )
         except Exception as exc:
@@ -6042,7 +6821,12 @@ def income_growth_equity_snapshot(symbol: str) -> dict[str, Any]:
     }
 
 
-def place_income_growth_equity_order(symbol: str, side: str, quantity: Any) -> dict[str, Any]:
+def place_income_growth_equity_order(
+    symbol: str,
+    side: str,
+    quantity: Any,
+    limit_price: Any = None,
+) -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
@@ -6068,7 +6852,19 @@ def place_income_growth_equity_order(symbol: str, side: str, quantity: Any) -> d
     ltp = float(snapshot.get("ltp") or 0)
     if ltp <= 0:
         raise ValueError(f"Could not read current LTP for {clean_symbol}.")
-    price = ceil_to_tick(ltp, 0.05) if clean_side == "BUY" else floor_to_tick(ltp, 0.05)
+    try:
+        requested_price = float(limit_price or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid equity limit price.") from exc
+    price = (
+        round(round(requested_price / 0.05) * 0.05, 2)
+        if requested_price > 0
+        else ceil_to_tick(ltp, 0.05)
+        if clean_side == "BUY"
+        else floor_to_tick(ltp, 0.05)
+    )
+    if price <= 0:
+        raise ValueError("Equity limit price must be greater than zero.")
     order = {
         "variety": "regular",
         "exchange": "NSE",
@@ -8449,13 +9245,44 @@ def render_score_badge(score_pct: float | None) -> str:
 
 
 def render_ce_sell_dashboard(state: PageState) -> str:
+    def check_item(label: str, status: Any, detail: Any) -> str:
+        clean_status = str(status or "CHECK").upper()
+        css = (
+            "validation-green"
+            if clean_status == "GREEN"
+            else "validation-red"
+            if clean_status == "RED"
+            else "validation-yellow"
+        )
+        return (
+            f'<span class="ce-institutional-check {css}"><b>{html.escape(label)}</b>'
+            f'<strong>{html.escape(clean_status)}</strong><small>{html.escape(str(detail or "Review required"))}</small></span>'
+        )
+
     def card(item: dict[str, Any], css_class: str, actionable: bool = False) -> str:
+        institutional_checks = "".join(
+            (
+                check_item("Corporate action", item.get("corporate_action_risk"), item.get("corporate_action_detail")),
+                check_item("IV percentile", item.get("iv_percentile_risk"), item.get("iv_percentile_detail")),
+                check_item(
+                    "Macro / beta buffer",
+                    item.get("macro_risk"),
+                    (
+                        f"{item.get('macro_detail') or 'Review macro tape'} "
+                        f"Required OTM {fmt_number(item.get('required_otm_percent'), 1)}%; "
+                        f"beta proxy {fmt_number(item.get('beta'), 2)}."
+                    ),
+                ),
+                check_item("Next-leg yield", item.get("redeployment_risk"), item.get("redeployment_detail")),
+            )
+        )
         content = (
             f'<div class="pe-rank-card-head"><strong>{html.escape(str(item.get("stock") or ""))}</strong>'
             f'<span>Score {html.escape(fmt_number(item.get("final_ce_score"), 0))}/100</span></div>'
-            f'<div class="pe-score-split"><span>Coverage <strong>{html.escape(fmt_number(item.get("holding_coverage_score"), 0))}/30</strong></span>'
-            f'<span>Call-away <strong>{html.escape(fmt_number(item.get("call_away_comfort_score"), 0))}/30</strong></span>'
-            f'<span>CE trade <strong>{html.escape(fmt_number(item.get("ce_trade_score"), 0))}/40</strong></span></div>'
+            f'<div class="pe-score-split"><span>Coverage <strong>{html.escape(fmt_number(item.get("holding_coverage_score"), 0))}/25</strong><small>{html.escape(fmt_number(item.get("coverage_ratio_percent"), 1))}% of holding called away</small></span>'
+            f'<span>Call-away <strong>{html.escape(fmt_number(item.get("call_away_comfort_score"), 0))}/25</strong><small>{html.escape(str(item.get("tax_type") or "UNKNOWN"))} | after-tax comfort</small></span>'
+            f'<span>CE trade <strong>{html.escape(fmt_number(item.get("ce_trade_score"), 0))}/35</strong><small>POP/delta + IV + annualized yield</small></span>'
+            f'<span>Next leg <strong>{html.escape(fmt_number(item.get("reinvestment_score"), 0))}/15</strong><small>{html.escape(str(item.get("best_alternate_csp") or "No alternate CSP"))}</small></span></div>'
             f'<div class="pe-rank-metrics"><span>Selected CE<strong>{html.escape(str(item.get("option_symbol") or "N/A"))}</strong></span>'
             f'<span>Holding / lot<strong>{html.escape(str(item.get("holding_qty") or 0))} / {html.escape(str(item.get("active_lot_size") or 0))}</strong></span>'
             f'<span>Covered / sell lots<strong>{html.escape(str(item.get("covered_lots_available") or 0))} / {html.escape(str(item.get("lots_to_sell") or 0))}</strong></span>'
@@ -8464,7 +9291,11 @@ def render_ce_sell_dashboard(state: PageState) -> str:
             f'<span>Sell limit<strong>{html.escape(fmt_number(item.get("sell_limit_price")))}</strong></span>'
             f'<span>Max profit<strong>{html.escape(format_buy_amount(item.get("max_profit")))}</strong></span>'
             f'<span>Yield<strong>{html.escape(fmt_number(item.get("premium_yield_percent"), 2))}%</strong></span>'
+            f'<span>Annualized yield<strong>{html.escape(fmt_number(item.get("annualized_premium_yield_percent"), 1))}%</strong></span>'
+            f'<span>Freed capital<strong>{html.escape(format_buy_amount(item.get("freed_capital_if_called")))}</strong></span>'
+            f'<span>Next-leg yield<strong>{html.escape(fmt_number(item.get("best_redeployment_yield_percent"), 2))}%</strong></span>'
             f'<span>Event / breakout<strong>{html.escape(str(item.get("event_risk") or "N/A"))} / {html.escape(str(item.get("breakout_risk") or "N/A"))}</strong></span></div>'
+            f'<div class="ce-institutional-checks">{institutional_checks}</div>'
             f'<p>{html.escape(str(item.get("reject_reason") or item.get("explanation") or ""))}</p>'
         )
         if actionable:
@@ -8481,7 +9312,7 @@ def render_ce_sell_dashboard(state: PageState) -> str:
     return (
         '<section class="panel income-growth-pe-panel ce-sell-dashboard">'
         '<div class="panel-title">Top 3 CE Sell Candidates For Today</div>'
-        '<div class="status pe-scoring-note">Covered CALL candidates are first filtered for full holding coverage, active F&amp;O contract, existing option positions, event risk, liquidity, premium yield, and breakout risk. Valid candidates are scored using 30 points for holding coverage, 30 points for call-away comfort, and 40 points for CE trade quality. Suggested and submitted Top 3 CE orders are capped at one lot each.</div>'
+        '<div class="status pe-scoring-note">Covered CALL candidates are filtered for naked exposure, contract validity, existing positions, corporate actions, event risk, liquidity, and zero premium. Moderate IV, macro, breakout, tax and reinvestment concerns reduce the score or widen the strike. Final score: Coverage 25 + Call-away 25 + CE Trade 35 + Reinvestment 15. Suggested and submitted Top 3 CE orders remain capped at one lot each.</div>'
         '<div class="actions"><button type="submit" formaction="/ce-scan/load">Recalculate Best 3 CE SELL</button></div>'
         f'<div class="pe-candidate-grid">{top or "<div class=\"status\">No covered CE candidate passed every hard filter today.</div>"}</div></section>'
         f'<details class="panel income-growth-pe-panel"><summary>CE Watch / Review <span>{len(state.ce_sell_watch or [])}</span></summary><div class="pe-candidate-grid">{watch or "<div class=\"status\">No additional valid CE candidates.</div>"}</div></details>'
@@ -9327,7 +10158,8 @@ def render_income_growth_panel(state: PageState) -> str:
             f'<strong>{html.escape(symbol)}</strong><span>{html.escape(company)}</span>'
             "</button>"
         )
-    table_rows = "".join(
+    def render_income_growth_row(row: dict[str, Any]) -> str:
+        return (
         "<tr>"
         f'<td class="position-symbol-cell">{equity_stock_button(row)}</td>'
         f"<td>{html.escape(str(row.get('quantity', '')))}</td>"
@@ -9353,8 +10185,15 @@ def render_income_growth_panel(state: PageState) -> str:
         f"<td><strong>{html.escape(fmt_number(row.get('cc_capacity_score'), 2))}</strong></td>"
         f'<td class="{strength_class(row.get("decision_color"))}"><strong>{html.escape(str(row.get("decision", "")))}</strong></td>'
         "</tr>"
+        )
+    table_rows = "".join(
+        render_income_growth_row(row)
         for row in rows
     )
+    dividend_rows = list(summary.get("dividend_income_rows") or [])
+    dividend_table_rows = "".join(render_income_growth_row(row) for row in dividend_rows)
+    if not dividend_table_rows:
+        dividend_table_rows = '<tr><td colspan="23" class="muted-cell">Refresh Income Growth to load PGINVIT-IV and IRBINVIT-IV market data.</td></tr>'
     if not table_rows:
         table_rows = '<tr><td colspan="23" class="muted-cell">Click Refresh Income Growth to calculate covered-call capacity from your holdings sheet.</td></tr>'
     try:
@@ -9433,6 +10272,11 @@ def render_income_growth_panel(state: PageState) -> str:
         </div>
       </section>
       <section class="panel investing-summary-panel"><div class="summary-grid">{summary_cards}</div></section>
+      <section class="panel income-growth-table-panel dividend-income-panel">
+        <div class="panel-title">Dividend Income</div>
+        <div class="status">Income-focused InvIT watchlist. PGINVIT-IV and IRBINVIT-IV start with zero holding; click either security to place a CNC LIMIT BUY or SELL order through the selected Kite profile.</div>
+        <div class="table-wrap"><table id="dividend-income-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{dividend_table_rows}</tbody></table></div>
+      </section>
       {render_income_growth_gpt_schedule_panel()}
       {gpt_result}
       <section class="panel income-growth-table-panel">
@@ -9460,6 +10304,8 @@ def render_income_growth_panel(state: PageState) -> str:
               </select>
             </label>
             <label><span>Stock quantity</span><input name="income_growth_equity_quantity" id="income-equity-quantity" type="number" min="1" step="1" value="1"></label>
+            <label><span>Limit price</span><input name="income_growth_equity_limit_price" id="income-equity-limit-price" type="number" min="0.05" step="0.05"></label>
+            <div class="equity-price-gap"><span>Limit vs CMP</span><strong id="income-equity-price-gap">--</strong></div>
           </div>
           <input type="hidden" name="income_growth_equity_symbol" id="income-equity-symbol">
           <input type="hidden" name="income_growth_equity_confirmed" id="income-equity-confirmed" value="0">
@@ -10519,18 +11365,28 @@ def render_income_panel(state: PageState) -> str:
         content = (
             f'<div class="pe-rank-card-head"><strong>{html.escape(symbol)}</strong>'
             f'<span>Score {html.escape(fmt_number(item.get("final_pe_score"), 0))}/100</span></div>'
-            f'<div class="pe-score-split"><span>Stock quality <strong>{html.escape(fmt_number(item.get("stock_quality_score"), 0))}/40</strong></span>'
-            f'<span>PE trade <strong>{html.escape(fmt_number(item.get("pe_trade_score"), 0))}/60</strong></span></div>'
+            f'<div class="pe-score-split"><span>Stock quality <strong>{html.escape(fmt_number(item.get("stock_quality_score"), 0))}/35</strong></span>'
+            f'<span>PE trade <strong>{html.escape(fmt_number(item.get("pe_trade_score"), 0))}/45</strong></span>'
+            f'<span>Recovery <strong>{html.escape(fmt_number(item.get("assignment_recovery_score"), 0))}/20</strong></span></div>'
             f'<div class="pe-rank-metrics"><span>Selected PE<strong>{html.escape(str(item.get("option_symbol") or "N/A"))}</strong></span>'
             f'<span>Target zone<strong>{html.escape(fmt_number(item.get("target_strike")))}</strong></span>'
             f'<span>Tradable strike<strong>{html.escape(fmt_number(item.get("strike")))}</strong></span>'
             f'<span>CMP<strong>{html.escape(fmt_number(item.get("cmp")))}</strong></span>'
             f'<span>OTM<strong>{html.escape(fmt_number(item.get("otm_percent"), 2))}%</strong></span>'
+            f'<span>Expiry / DTE<strong>{html.escape(str(item.get("expiry") or "N/A"))} / {html.escape(str(item.get("dte") or "N/A"))}</strong></span>'
+            f'<span>Lot size<strong>{html.escape(str(item.get("lot_size") or "N/A"))}</strong></span>'
+            f'<span>Premium / LTP<strong>{html.escape(fmt_number(item.get("premium")))}</strong></span>'
             f'<span>Sell limit<strong>{html.escape(fmt_number(item.get("sell_limit_price")))}</strong></span>'
             f'<span>Max profit<strong>{html.escape(format_buy_amount(item.get("max_profit")))}</strong></span>'
             f'<span>Assignment cash<strong>{html.escape(format_buy_amount(item.get("assignment_cash")))}</strong></span>'
             f'<span>Yield<strong>{html.escape(fmt_number(item.get("premium_yield_percent"), 2))}%</strong></span>'
-            f'<span>Event risk<strong>{html.escape(event_risk)}</strong></span></div>'
+            f'<span>Delta / SELL POP<strong>{html.escape(fmt_number(item.get("delta"), 2))} / {html.escape(fmt_number(item.get("sell_pop"), 1))}%</strong></span>'
+            f'<span>IVP / IVR<strong>{html.escape(fmt_number(item.get("iv_percentile"), 0))} / {html.escape(fmt_number(item.get("iv_rank"), 0))}</strong></span>'
+            f'<span>OI / Volume<strong>{html.escape(str(item.get("oi") or 0))} / {html.escape(str(item.get("volume") or 0))}</strong></span>'
+            f'<span>Spread<strong>{html.escape(fmt_number(item.get("bid_ask_spread_percent"), 2))}%</strong></span>'
+            f'<span>Event / Action<strong>{html.escape(event_risk)} / {html.escape(str(item.get("corporate_action_risk") or "CHECK"))}</strong></span>'
+            f'<span>Knife / Macro<strong>{html.escape(str(item.get("falling_knife_risk") or "CHECK"))} / {html.escape(str(item.get("macro_risk") or "CHECK"))}</strong></span>'
+            f'<span>Next-leg CE<strong>{html.escape(str(item.get("next_leg_ce_candidate") or "N/A"))}</strong></span></div>'
             f'<p>{html.escape(str(item.get("reject_reason") or item.get("explanation") or ""))}</p>'
         )
         if actionable:
@@ -10547,7 +11403,7 @@ def render_income_panel(state: PageState) -> str:
     avoid_cards = "".join(pe_candidate_card(item, False) for item in pe_avoid)
     growth_pe_section = (
         '<section class="panel income-growth-pe-panel"><div class="panel-title">Top 3 PE Sell Candidates For Today</div>'
-        '<div class="status pe-scoring-note">Candidates are first filtered for assignment size, existing PE positions, event risk, contract validity, liquidity, premium yield, and trend breakdown. Valid candidates are then scored using 40 points for assignment quality and 60 points for PE trade quality. Click an approved card to review a live SELL order.</div>'
+        '<div class="status pe-scoring-note">PE candidates are first filtered for assignment cash, tradable option contract, liquidity, premium yield, event risk, corporate actions, F&amp;O ban and falling-knife risk. Valid candidates are then scored using 35 points for stock quality, 45 points for PE trade quality and 20 points for assignment recovery. Click an approved card to review a live SELL order.</div>'
         f'<div class="pe-candidate-grid">{top_cards or "<div class=\"status\">No candidate passed every hard filter today.</div>"}</div></section>'
         f'<details class="panel income-growth-pe-panel"><summary>Watch / Review <span>{len(pe_watch)}</span></summary>'
         f'<div class="pe-candidate-grid">{watch_cards or "<div class=\"status\">No additional valid candidates.</div>"}</div></details>'
@@ -12294,6 +13150,8 @@ def render_page(state: PageState) -> bytes:
     .pe-rank-card-head strong {{ color: #006b5f; font-size: 17px; }}
     .pe-rank-card-head span {{ font-weight: 800; }}
     .pe-score-split {{ margin: 8px 0; font-size: 12px; color: #475569; }}
+    .pe-score-split span {{ flex: 1; }}
+    .pe-score-split small {{ display: block; margin-top: 2px; color: #64748b; font-size: 9px; line-height: 1.25; }}
     .pe-rank-metrics {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -12301,6 +13159,27 @@ def render_page(state: PageState) -> bytes:
     }}
     .pe-rank-metrics span {{ color: #64748b; font-size: 11px; }}
     .pe-rank-metrics strong {{ display: block; color: #0f172a; font-size: 13px; overflow-wrap: anywhere; }}
+    .ce-institutional-checks {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 10px;
+    }}
+    .ce-institutional-check {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 2px 8px;
+      padding: 7px 8px;
+      border: 1px solid #cbd5e1;
+      border-radius: 7px;
+      background: rgba(255,255,255,.72);
+    }}
+    .ce-institutional-check b {{ font-size: 10px; color: #475569; text-transform: uppercase; }}
+    .ce-institutional-check strong {{ font-size: 10px; }}
+    .ce-institutional-check small {{ grid-column: 1 / -1; color: #475569; font-size: 9px; line-height: 1.3; }}
+    .ce-institutional-check.validation-green {{ border-color: #86efac; background: #ecfdf5; }}
+    .ce-institutional-check.validation-yellow {{ border-color: #fde68a; background: #fffbeb; }}
+    .ce-institutional-check.validation-red {{ border-color: #fecaca; background: #fff1f2; }}
     .pe-rank-card p {{ margin: 9px 0 0; font-size: 12px; color: #475569; }}
     .pe-rank-card em {{ display: block; margin-top: 8px; font-style: normal; font-weight: 800; color: #047857; }}
     .income-growth-prompt-modal {{
@@ -12408,7 +13287,24 @@ def render_page(state: PageState) -> bytes:
     }}
     .income-equity-breath {{ display: none; }}
     .income-equity-breath.active {{ display: block; }}
-    .income-pe-order-modal-card {{ width: min(680px, calc(100vw - 24px)); }}
+    .income-pe-order-modal-card {{
+      width: min(680px, calc(100vw - 24px));
+      max-height: calc(100vh - 32px);
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+    }}
+    .income-pe-order-modal-card .modal-actions {{
+      position: sticky;
+      z-index: 4;
+      bottom: -20px;
+      margin: 18px -20px -20px;
+      padding: 12px 20px 16px;
+      border-top: 1px solid #dbe7ea;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: 0 -10px 24px rgba(15, 23, 42, 0.08);
+      backdrop-filter: blur(8px);
+    }}
     .income-pe-breath {{ display: none; }}
     .income-pe-breath.active {{ display: block; }}
     .quote-loading-state {{
@@ -14507,6 +15403,15 @@ def render_page(state: PageState) -> bytes:
       .position-settings-grid,
       .position-settings-secondary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .position-settings-wide {{ grid-column: 1 / -1; }}
+      .live-modal-backdrop {{
+        align-items: flex-start;
+        padding: 8px;
+        overflow-y: auto;
+      }}
+      .income-pe-order-modal-card {{
+        width: min(680px, calc(100vw - 16px));
+        max-height: calc(100vh - 16px);
+      }}
       .compact-rules {{ grid-template-columns: 1fr; }}
       .decision-tile {{ min-height: auto; }}
       .tab-button[data-tab="home"] {{ display: inline-flex; }}
@@ -14872,6 +15777,7 @@ def render_page(state: PageState) -> bytes:
     }}
     enableTableSorting(investingTable);
     enableTableSorting(document.getElementById('income-growth-table'));
+    enableTableSorting(document.getElementById('dividend-income-table'));
     enableTableSorting(document.getElementById('equity-holdings-table'));
     const ordersSelectAll = document.getElementById('orders-select-all');
     const ordersUnselectAll = document.getElementById('orders-unselect-all');
@@ -15140,6 +16046,8 @@ def render_page(state: PageState) -> bytes:
     const incomeEquitySymbol = document.getElementById('income-equity-symbol');
     const incomeEquitySide = document.getElementById('income-equity-side');
     const incomeEquityQuantity = document.getElementById('income-equity-quantity');
+    const incomeEquityLimitPrice = document.getElementById('income-equity-limit-price');
+    const incomeEquityPriceGap = document.getElementById('income-equity-price-gap');
     const incomeEquityConfirmed = document.getElementById('income-equity-confirmed');
     const incomeEquityHolding = document.getElementById('income-equity-holding');
     const incomeEquityAvg = document.getElementById('income-equity-avg');
@@ -15487,9 +16395,15 @@ def render_page(state: PageState) -> bytes:
       const quantity = Number(incomeEquityQuantity ? incomeEquityQuantity.value : 0);
       const symbol = incomeEquitySymbol ? incomeEquitySymbol.value : '';
       const ltp = Number(incomeEquitySnapshot && incomeEquitySnapshot.ltp || 0);
+      const limit = Number(incomeEquityLimitPrice ? incomeEquityLimitPrice.value : 0);
       const holding = Number(incomeEquitySnapshot && incomeEquitySnapshot.quantity || 0);
-      const value = quantity > 0 && ltp > 0 ? quantity * ltp : 0;
-      incomeEquitySummary.textContent = `${{side}} ${{quantity || 0}} ${{symbol}} share(s) near LTP ${{ltp.toFixed(2)}} | Approx value ${{value.toFixed(2)}} | Holding ${{holding}}`;
+      const gap = ltp > 0 && limit > 0 ? ((limit - ltp) / ltp) * 100 : 0;
+      const value = quantity > 0 && limit > 0 ? quantity * limit : 0;
+      if (incomeEquityPriceGap) {{
+        incomeEquityPriceGap.textContent = ltp > 0 && limit > 0 ? `${{gap >= 0 ? '+' : ''}}${{gap.toFixed(2)}}%` : '--';
+        incomeEquityPriceGap.className = gap >= 0 ? 'pnl-positive' : 'pnl-negative';
+      }}
+      incomeEquitySummary.textContent = `${{side}} ${{quantity || 0}} ${{symbol}} at LIMIT ${{limit.toFixed(2)}} | LTP ${{ltp.toFixed(2)}} | Approx value ${{value.toFixed(2)}} | Holding ${{holding}}`;
       incomeEquitySummary.classList.toggle('signal-red', side === 'SELL' && quantity > holding);
     }}
     async function openIncomeEquityModal(button) {{
@@ -15509,6 +16423,7 @@ def render_page(state: PageState) -> bytes:
       if (incomeEquitySymbol) incomeEquitySymbol.value = symbol;
       if (incomeEquityQuantity) incomeEquityQuantity.value = '1';
       if (incomeEquitySide) incomeEquitySide.value = 'BUY';
+      if (incomeEquityLimitPrice) incomeEquityLimitPrice.value = (Math.round(Number(incomeEquitySnapshot.ltp || 0) / 0.05) * 0.05).toFixed(2);
       if (incomeEquityHolding) incomeEquityHolding.textContent = String(incomeEquitySnapshot.quantity);
       if (incomeEquityAvg) incomeEquityAvg.textContent = Number(incomeEquitySnapshot.average_price || 0).toFixed(2);
       if (incomeEquityLtp) incomeEquityLtp.textContent = Number(incomeEquitySnapshot.ltp || 0).toFixed(2);
@@ -15526,6 +16441,7 @@ def render_page(state: PageState) -> bytes:
           incomeEquityPnl.textContent = Number(data.pnl || 0).toFixed(2);
           incomeEquityPnl.className = Number(data.pnl || 0) >= 0 ? 'pnl-positive' : 'pnl-negative';
         }}
+        if (incomeEquityLimitPrice) incomeEquityLimitPrice.value = (Math.round(Number(data.ltp || 0) / 0.05) * 0.05).toFixed(2);
         updateIncomeEquitySummary();
       }} catch (error) {{
         if (incomeEquitySummary) incomeEquitySummary.textContent = compactClientError(error.message, 'Could not refresh equity data');
@@ -15542,6 +16458,10 @@ def render_page(state: PageState) -> bytes:
       resetIncomeEquityConfirmation();
       updateIncomeEquitySummary();
     }});
+    incomeEquityLimitPrice && incomeEquityLimitPrice.addEventListener('input', () => {{
+      resetIncomeEquityConfirmation();
+      updateIncomeEquitySummary();
+    }});
     incomeEquityCancel && incomeEquityCancel.addEventListener('click', () => {{
       resetIncomeEquityConfirmation();
       if (incomeEquityModal) incomeEquityModal.style.display = 'none';
@@ -15550,12 +16470,17 @@ def render_page(state: PageState) -> bytes:
       const quantity = Number(incomeEquityQuantity ? incomeEquityQuantity.value : 0);
       const holding = Number(incomeEquitySnapshot && incomeEquitySnapshot.quantity || 0);
       const side = incomeEquitySide ? incomeEquitySide.value : '';
+      const limit = Number(incomeEquityLimitPrice ? incomeEquityLimitPrice.value : 0);
       if (!Number.isInteger(quantity) || quantity <= 0) {{
         if (incomeEquitySummary) incomeEquitySummary.textContent = 'Enter a valid whole-number quantity greater than zero.';
         return;
       }}
       if (side === 'SELL' && quantity > holding) {{
         if (incomeEquitySummary) incomeEquitySummary.textContent = `SELL blocked: quantity ${{quantity}} exceeds current holding ${{holding}}.`;
+        return;
+      }}
+      if (!Number.isFinite(limit) || limit <= 0) {{
+        if (incomeEquitySummary) incomeEquitySummary.textContent = 'Enter a valid LIMIT price greater than zero.';
         return;
       }}
       resetIncomeEquityConfirmation();
@@ -17048,6 +17973,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     first(form, "income_growth_equity_symbol"),
                     first(form, "income_growth_equity_side"),
                     first(form, "income_growth_equity_quantity"),
+                    first(form, "income_growth_equity_limit_price"),
                 )
                 state.income_growth_equity_results = [result]
                 (
