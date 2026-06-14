@@ -1125,7 +1125,7 @@ class PageState:
     position_selected_indexes: set[int] | None = None
     position_results: list[dict[str, Any]] | None = None
     position_dry_run: bool = True
-    position_discount_percent: float = 20.0
+    position_discount_percent: float = field(default_factory=position_close_discount_percent_setting)
     position_exchange: str = "NFO"
     position_product: str = ""
     position_include_long: bool = False
@@ -7988,7 +7988,10 @@ def run_scheduled_position_close_job(now: datetime | None = None) -> dict[str, A
                     message=market_message,
                     results=[],
                 )
-            state = PageState(position_dry_run=False)
+            state = PageState(
+                position_dry_run=False,
+                position_discount_percent=position_close_discount_percent_setting(),
+            )
             orders = build_position_buy_orders(state)
             selected = set(range(len(orders)))
             submitted_orders, results = execute_position_buy_orders(
@@ -8268,7 +8271,7 @@ def run_intraday_position_close_job(now: datetime | None = None) -> dict[str, An
                 )
             state = PageState(
                 position_dry_run=False,
-                position_discount_percent=20.0,
+                position_discount_percent=position_close_discount_percent_setting(),
                 position_keep_existing_orders=True,
             )
             orders = build_position_buy_orders(state)
@@ -8283,7 +8286,7 @@ def run_intraday_position_close_job(now: datetime | None = None) -> dict[str, An
             status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
             pricing_details = "; ".join(
                 f"{order.get('tradingsymbol')}: LIMIT {float(order.get('price') or 0):.2f} "
-                f"(20% below {order.get('price_basis') or 'price basis'})"
+                f"({state.position_discount_percent:g}% below {order.get('price_basis') or 'price basis'})"
                 for order in submitted_orders
             )
             return save_intraday_position_close_schedule_state(
@@ -9979,6 +9982,7 @@ def render_research_panel(state: PageState) -> str:
 def render_position_close_schedule_panel() -> str:
     schedule = position_close_schedule_state()
     intraday = intraday_position_close_schedule_state()
+    discount_percent = position_close_discount_percent_setting()
     results = schedule.get("results") if isinstance(schedule.get("results"), list) else []
     intraday_results = intraday.get("results") if isinstance(intraday.get("results"), list) else []
     status = str(schedule.get("status") or "WAITING").upper()
@@ -10033,7 +10037,8 @@ def render_position_close_schedule_panel() -> str:
         f'<div class="position-summary-chip"><span>Last run</span><strong>{html.escape(str(schedule.get("last_run_at") or "Not run yet"))}</strong></div>'
         "</div>"
         f'<p class="status">{html.escape(str(schedule.get("message") or ""))} '
-        "Default close-position BUY orders use the current Position BUY pricing logic; existing open BUY close orders are skipped.</p>"
+        f"Default close-position BUY orders use the saved BUY Preview discount of {discount_percent:g}%; "
+        "existing open BUY close orders are skipped.</p>"
         f"{details}"
         '<hr><div class="panel-title">Intraday Missing Close-Order Guard</div>'
         '<div class="position-summary-strip">'
@@ -10043,7 +10048,8 @@ def render_position_close_schedule_panel() -> str:
         f'<div class="position-summary-chip"><span>Last run</span><strong>{html.escape(str(intraday.get("last_run_at") or "Not run yet"))}</strong></div>'
         "</div>"
         f'<p class="status">{html.escape(str(intraday.get("message") or ""))} '
-        "Price rule: when average is above LTP, BUY at 20% below fresh LTP; otherwise BUY at 20% below average price. Existing close BUY orders are skipped.</p>"
+        f"Price rule: when average is above LTP, BUY at {discount_percent:g}% below fresh LTP; "
+        f"otherwise BUY at {discount_percent:g}% below average price. Existing close BUY orders are skipped.</p>"
         f"{intraday_details}</section>"
     )
 
@@ -10224,8 +10230,8 @@ def render_positions_panel(
         </div>
       </section>
       <section class="panel positions-summary-panel"><div class="position-summary-strip">{summary_cards}</div></section>
-      {render_position_close_schedule_panel()}
       {table}
+      {render_position_close_schedule_panel()}
       {position_orders_table}
       {render_results(state.position_results)}
       <details class="panel position-buy-settings">
@@ -10252,6 +10258,10 @@ def render_positions_panel(
             {render_input("position_tag", "Order tag", state.position_tag)}
             {render_number_input("position_tick_size", "Tick size", state.position_tick_size, "0.01")}
           </div>
+          <div class="actions">
+            <button type="submit" formaction="/positions/settings">Save BUY Preview Settings</button>
+          </div>
+          <p class="status">The saved discount is also used by Scheduled Default Close Orders and the Intraday Missing Close-Order Guard.</p>
         </div>
       </details>
       {render_console(state.console_log)}
@@ -16583,7 +16593,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             confirm_live_order=first(form, "confirm_live_order"),
             kite_profile=selected_kite_profile_name(first(form, "kite_profile")),
             position_dry_run=checked(form, "position_dry_run"),
-            position_discount_percent=float(first(form, "position_discount_percent", "20") or 20),
+            position_discount_percent=float(
+                first(
+                    form,
+                    "position_discount_percent",
+                    str(position_close_discount_percent_setting()),
+                )
+                or position_close_discount_percent_setting()
+            ),
             position_exchange=first(form, "position_exchange", "NFO"),
             position_product=first(form, "position_product"),
             position_include_long=checked(form, "position_include_long"),
@@ -16624,6 +16641,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             ),
             home_tickers=first(form, "home_tickers", home_tickers_text()),
         )
+        if request_path.startswith("/positions") and "position_discount_percent" in form:
+            if 0 <= state.position_discount_percent < 100:
+                save_app_settings(
+                    {"position_close_discount_percent": state.position_discount_percent}
+                )
+            else:
+                state.position_discount_percent = position_close_discount_percent_setting()
 
         try:
             if request_path == "/load":
@@ -16759,6 +16783,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 state.position_selected_indexes = set(range(len(state.position_orders)))
                 state.message = f"Loaded {len(state.position_orders)} BUY order(s) from current positions."
+            elif request_path == "/positions/settings":
+                state.message = (
+                    f"BUY Preview discount saved at {state.position_discount_percent:g}%. "
+                    "Scheduled Default Close Orders and Intraday Missing Close-Order Guard will use this value."
+                )
             elif request_path == "/positions/execute":
                 orders_payload = first(form, "position_orders_payload")
                 state.position_orders = decode_orders(orders_payload) if orders_payload else None

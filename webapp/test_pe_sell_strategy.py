@@ -61,16 +61,23 @@ class PeSellStrategyTests(unittest.TestCase):
         order = {"tradingsymbol": "PFC26JUN400PE", "quantity": 1300}
         result = {"tradingsymbol": "PFC26JUN400PE", "status": "LIVE_SENT", "order_id": "123"}
         run_at = app.datetime(2026, 6, 12, 9, 20, tzinfo=app.INDIA_TIME_ZONE)
+        built_states = []
+
+        def build_orders(state):
+            built_states.append(state)
+            return [order]
+
         with (
             patch.object(app, "position_close_schedule_state", side_effect=read_schedule),
             patch.object(app, "save_position_close_schedule_state", side_effect=save_schedule),
+            patch.object(app, "position_close_discount_percent_setting", return_value=32.5),
             patch.object(app, "selected_kite_profile_name", return_value="Shanti"),
             patch.object(app, "load_kite_profiles", return_value={"Shanti": app.blank_kite_profile()}),
             patch.object(app, "apply_kite_profile_to_env"),
             patch.object(app, "kite_setup_issue", return_value=""),
             patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
             patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
-            patch.object(app, "build_position_buy_orders", return_value=[order]),
+            patch.object(app, "build_position_buy_orders", side_effect=build_orders),
             patch.object(app, "execute_position_buy_orders", return_value=([order], [result])),
         ):
             first = app.run_scheduled_position_close_job(run_at)
@@ -78,6 +85,7 @@ class PeSellStrategyTests(unittest.TestCase):
 
         self.assertEqual(first["status"], "PLACED")
         self.assertEqual(first["results"], [result])
+        self.assertEqual(built_states[0].position_discount_percent, 32.5)
         self.assertIsNone(second)
 
     def test_scheduled_position_close_job_does_not_run_on_weekend(self):
@@ -207,16 +215,23 @@ class PeSellStrategyTests(unittest.TestCase):
         }
         result = {"tradingsymbol": "PFC26JUN400PE", "status": "LIVE_SENT", "order_id": "456"}
         run_at = app.datetime(2026, 6, 12, 9, 45, 10, tzinfo=app.INDIA_TIME_ZONE)
+        built_states = []
+
+        def build_orders(state):
+            built_states.append(state)
+            return [order]
+
         with (
             patch.object(app, "intraday_position_close_schedule_state", side_effect=read_schedule),
             patch.object(app, "save_intraday_position_close_schedule_state", side_effect=save_schedule),
+            patch.object(app, "position_close_discount_percent_setting", return_value=35.0),
             patch.object(app, "selected_kite_profile_name", return_value="Shanti"),
             patch.object(app, "load_kite_profiles", return_value={"Shanti": app.blank_kite_profile()}),
             patch.object(app, "apply_kite_profile_to_env"),
             patch.object(app, "kite_setup_issue", return_value=""),
             patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
             patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
-            patch.object(app, "build_position_buy_orders", return_value=[order]),
+            patch.object(app, "build_position_buy_orders", side_effect=build_orders),
             patch.object(app, "execute_position_buy_orders", return_value=([order], [result])),
         ):
             first = app.run_intraday_position_close_job(run_at)
@@ -224,7 +239,8 @@ class PeSellStrategyTests(unittest.TestCase):
 
         self.assertEqual(first["status"], "PLACED")
         self.assertEqual(first["run_count_today"], 1)
-        self.assertIn("20% below LTP", first["message"])
+        self.assertEqual(built_states[0].position_discount_percent, 35.0)
+        self.assertIn("35% below LTP", first["message"])
         self.assertIsNone(second)
 
     def test_intraday_position_close_job_does_not_run_outside_market_window(self):
@@ -321,6 +337,33 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("Income Growth GPT CSV", output)
         self.assertIn("Intraday Close-Order Guard", output)
         self.assertIn("Pause for 1 day", output)
+
+    def test_position_analytics_render_before_scheduled_close_orders(self):
+        state = app.PageState(active_tab="positions")
+        state.positions_rows = [{"symbol": "PFC26JUN400PE", "quantity": -1300}]
+        state.positions_summary = {}
+        with patch.object(
+            app,
+            "render_position_close_schedule_panel",
+            return_value="<section>SCHEDULE PANEL</section>",
+        ):
+            output = app.render_positions_panel(state)
+
+        self.assertLess(
+            output.index("Active Position Analytics"),
+            output.index("SCHEDULE PANEL"),
+        )
+
+    def test_schedule_panel_shows_saved_buy_preview_discount(self):
+        with patch.object(
+            app,
+            "position_close_discount_percent_setting",
+            return_value=27.5,
+        ):
+            output = app.render_position_close_schedule_panel()
+
+        self.assertIn("saved BUY Preview discount of 27.5%", output)
+        self.assertIn("BUY at 27.5% below fresh LTP", output)
 
     def test_kite_runtime_error_redirects_to_kite_setup(self):
         state = app.PageState(
