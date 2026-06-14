@@ -43,6 +43,320 @@ def candidate(**overrides):
 
 
 class PeSellStrategyTests(unittest.TestCase):
+    def test_scheduled_position_close_job_places_default_buy_orders_once(self):
+        schedule = {
+            "enabled": True,
+            "schedule_time": "09:20",
+            "status": "WAITING",
+            "results": [],
+        }
+
+        def read_schedule():
+            return dict(schedule)
+
+        def save_schedule(**updates):
+            schedule.update(updates)
+            return dict(schedule)
+
+        order = {"tradingsymbol": "PFC26JUN400PE", "quantity": 1300}
+        result = {"tradingsymbol": "PFC26JUN400PE", "status": "LIVE_SENT", "order_id": "123"}
+        run_at = app.datetime(2026, 6, 12, 9, 20, tzinfo=app.INDIA_TIME_ZONE)
+        with (
+            patch.object(app, "position_close_schedule_state", side_effect=read_schedule),
+            patch.object(app, "save_position_close_schedule_state", side_effect=save_schedule),
+            patch.object(app, "selected_kite_profile_name", return_value="Shanti"),
+            patch.object(app, "load_kite_profiles", return_value={"Shanti": app.blank_kite_profile()}),
+            patch.object(app, "apply_kite_profile_to_env"),
+            patch.object(app, "kite_setup_issue", return_value=""),
+            patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
+            patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
+            patch.object(app, "build_position_buy_orders", return_value=[order]),
+            patch.object(app, "execute_position_buy_orders", return_value=([order], [result])),
+        ):
+            first = app.run_scheduled_position_close_job(run_at)
+            second = app.run_scheduled_position_close_job(run_at)
+
+        self.assertEqual(first["status"], "PLACED")
+        self.assertEqual(first["results"], [result])
+        self.assertIsNone(second)
+
+    def test_scheduled_position_close_job_does_not_run_on_weekend(self):
+        run_at = app.datetime(2026, 6, 13, 9, 20, tzinfo=app.INDIA_TIME_ZONE)
+        with patch.object(app, "position_close_schedule_state") as schedule_state:
+            result = app.run_scheduled_position_close_job(run_at)
+
+        self.assertIsNone(result)
+        schedule_state.assert_called_once()
+
+    def test_scheduled_income_growth_gpt_job_saves_valid_today_csv_once(self):
+        schedule = {
+            "enabled": True,
+            "schedule_time": "09:30",
+            "status": "WAITING",
+        }
+
+        def read_schedule():
+            return dict(schedule)
+
+        def save_schedule(**updates):
+            schedule.update(updates)
+            return dict(schedule)
+
+        csv_text = (
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "NFO,PFC26JUN400PE,1300,SELL,NRML,LIMIT,0,DAY\n"
+        )
+        parsed_rows = [{
+            "exchange": "NFO",
+            "tradingsymbol": "PFC26JUN400PE",
+            "quantity": "1300",
+            "transaction_type": "SELL",
+            "product": "NRML",
+            "order_type": "LIMIT",
+            "price": "0",
+            "validity": "DAY",
+        }]
+        run_at = app.datetime(2026, 6, 12, 9, 30, tzinfo=app.INDIA_TIME_ZONE)
+        with (
+            patch.object(app, "income_growth_gpt_schedule_state", side_effect=read_schedule),
+            patch.object(app, "save_income_growth_gpt_schedule_state", side_effect=save_schedule),
+            patch.object(app, "selected_kite_profile_name", return_value="Shanti"),
+            patch.object(app, "load_kite_profiles", return_value={"Shanti": app.blank_kite_profile()}),
+            patch.object(app, "apply_kite_profile_to_env"),
+            patch.object(app, "kite_setup_issue", return_value=""),
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
+            patch.object(app, "income_growth_candidates", return_value=([{"symbol": "PFC"}], {"count": 1})),
+            patch.object(app, "validate_income_growth_with_openai", return_value=(csv_text, csv_text, "resp_123", False)),
+            patch.object(app, "parse_csv_text", return_value=parsed_rows),
+            patch.object(app, "validate_kite_order_rows"),
+            patch.object(app, "save_today_csv_text", return_value=("12Jun2026.csv", "Saved CSV.")),
+            patch.object(app, "activate_today_csv_path") as activate_path,
+        ):
+            first = app.run_scheduled_income_growth_gpt_job(run_at)
+            second = app.run_scheduled_income_growth_gpt_job(run_at)
+
+        self.assertEqual(first["status"], "SAVED")
+        self.assertEqual(first["order_count"], 1)
+        self.assertIsNone(second)
+        activate_path.assert_called_once_with("12Jun2026.csv")
+
+    def test_scheduled_income_growth_gpt_job_does_not_run_on_weekend(self):
+        run_at = app.datetime(2026, 6, 13, 9, 30, tzinfo=app.INDIA_TIME_ZONE)
+        with patch.object(app, "income_growth_gpt_schedule_state") as schedule_state:
+            result = app.run_scheduled_income_growth_gpt_job(run_at)
+
+        self.assertIsNone(result)
+        schedule_state.assert_called_once()
+
+    def test_position_buy_prices_follow_requested_twenty_percent_rule(self):
+        orders = [
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "PFC26JUN400PE",
+                "transaction_type": "BUY",
+                "quantity": 1300,
+                "average_price": 12.0,
+            },
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "CAMS26JUN760PE",
+                "transaction_type": "BUY",
+                "quantity": 750,
+                "average_price": 8.0,
+            },
+        ]
+        args = Namespace(discount_percent=20.0, tick_size=0.05)
+        with patch.object(
+            app,
+            "fresh_kite_ltp_map",
+            return_value={
+                "NFO:PFC26JUN400PE": 10.0,
+                "NFO:CAMS26JUN760PE": 10.0,
+            },
+        ):
+            refreshed = app.refresh_position_buy_order_prices(orders, object(), args)
+
+        self.assertEqual(refreshed[0]["price_basis"], "LTP")
+        self.assertEqual(refreshed[0]["price"], 8.0)
+        self.assertEqual(refreshed[1]["price_basis"], "average_price")
+        self.assertEqual(refreshed[1]["price"], 6.4)
+
+    def test_intraday_position_close_job_runs_once_per_fifteen_minute_slot(self):
+        schedule = {
+            "enabled": True,
+            "start_time": "09:30",
+            "end_time": "15:15",
+            "interval_minutes": 15,
+            "status": "WAITING",
+            "results": [],
+        }
+
+        def read_schedule():
+            return dict(schedule)
+
+        def save_schedule(**updates):
+            schedule.update(updates)
+            return dict(schedule)
+
+        order = {
+            "tradingsymbol": "PFC26JUN400PE",
+            "quantity": 1300,
+            "price": 2.4,
+            "price_basis": "LTP",
+        }
+        result = {"tradingsymbol": "PFC26JUN400PE", "status": "LIVE_SENT", "order_id": "456"}
+        run_at = app.datetime(2026, 6, 12, 9, 45, 10, tzinfo=app.INDIA_TIME_ZONE)
+        with (
+            patch.object(app, "intraday_position_close_schedule_state", side_effect=read_schedule),
+            patch.object(app, "save_intraday_position_close_schedule_state", side_effect=save_schedule),
+            patch.object(app, "selected_kite_profile_name", return_value="Shanti"),
+            patch.object(app, "load_kite_profiles", return_value={"Shanti": app.blank_kite_profile()}),
+            patch.object(app, "apply_kite_profile_to_env"),
+            patch.object(app, "kite_setup_issue", return_value=""),
+            patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
+            patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
+            patch.object(app, "build_position_buy_orders", return_value=[order]),
+            patch.object(app, "execute_position_buy_orders", return_value=([order], [result])),
+        ):
+            first = app.run_intraday_position_close_job(run_at)
+            second = app.run_intraday_position_close_job(run_at)
+
+        self.assertEqual(first["status"], "PLACED")
+        self.assertEqual(first["run_count_today"], 1)
+        self.assertIn("20% below LTP", first["message"])
+        self.assertIsNone(second)
+
+    def test_intraday_position_close_job_does_not_run_outside_market_window(self):
+        run_at = app.datetime(2026, 6, 12, 15, 16, tzinfo=app.INDIA_TIME_ZONE)
+        with patch.object(
+            app,
+            "intraday_position_close_schedule_state",
+            return_value={
+                "enabled": True,
+                "start_time": "09:30",
+                "end_time": "15:15",
+                "interval_minutes": 15,
+            },
+        ):
+            result = app.run_intraday_position_close_job(run_at)
+
+        self.assertIsNone(result)
+
+    def test_paused_scheduler_job_is_skipped(self):
+        run_at = app.datetime(2026, 6, 12, 9, 20, tzinfo=app.INDIA_TIME_ZONE)
+        schedule = {
+            "enabled": True,
+            "schedule_time": "09:20",
+            "paused_until": app.datetime(
+                2026, 6, 13, 9, 20, tzinfo=app.INDIA_TIME_ZONE
+            ).isoformat(),
+        }
+        with (
+            patch.object(app, "position_close_schedule_state", return_value=schedule),
+            patch.object(app, "build_position_buy_orders") as build_orders,
+        ):
+            result = app.run_scheduled_position_close_job(run_at)
+
+        self.assertIsNone(result)
+        build_orders.assert_not_called()
+
+    def test_scheduler_controls_persist_stop_start_and_pause(self):
+        state = {"enabled": True, "status": "WAITING"}
+        saved_updates = []
+
+        def load_state():
+            return dict(state)
+
+        def save_state(**updates):
+            state.update(updates)
+            saved_updates.append(dict(updates))
+            return dict(state)
+
+        jobs = {
+            "test-job": {
+                "name": "Test Job",
+                "purpose": "Test",
+                "schedule": "Weekdays",
+                "load": load_state,
+                "save": save_state,
+            }
+        }
+        now = app.datetime(2026, 6, 12, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
+        with patch.object(app, "scheduled_job_definitions", return_value=jobs):
+            stopped = app.update_scheduled_job_control("test-job", "stop", now)
+            started = app.update_scheduled_job_control("test-job", "start", now)
+            paused = app.update_scheduled_job_control("test-job", "pause-day", now)
+
+        self.assertFalse(stopped["enabled"])
+        self.assertTrue(started["enabled"])
+        self.assertEqual(paused["status"], "PAUSED")
+        self.assertTrue(app.scheduled_job_is_paused(paused, now))
+        self.assertEqual(len(saved_updates), 3)
+
+    def test_next_intraday_schedule_skips_weekend(self):
+        friday_after_close = app.datetime(
+            2026, 6, 12, 16, 0, tzinfo=app.INDIA_TIME_ZONE
+        )
+        state = {
+            "enabled": True,
+            "start_time": "09:30",
+            "end_time": "15:15",
+            "interval_minutes": 15,
+        }
+
+        next_run = app.next_scheduled_job_run(
+            "intraday_position_close",
+            state,
+            friday_after_close,
+        )
+
+        self.assertEqual(next_run.strftime("%Y-%m-%d %H:%M"), "2026-06-15 09:30")
+
+    def test_kite_setup_scheduler_control_panel_lists_all_jobs(self):
+        output = app.render_scheduler_control_panel()
+
+        self.assertIn("Scheduled Jobs Control", output)
+        self.assertIn("Default Close Orders", output)
+        self.assertIn("Income Growth GPT CSV", output)
+        self.assertIn("Intraday Close-Order Guard", output)
+        self.assertIn("Pause for 1 day", output)
+
+    def test_kite_runtime_error_redirects_to_kite_setup(self):
+        state = app.PageState(
+            active_tab="positions",
+            error="Kite positions authentication failed: open Kite Setup.",
+        )
+
+        redirected = app.redirect_state_to_kite_setup_on_error(state)
+
+        self.assertTrue(redirected)
+        self.assertEqual(state.active_tab, "kite-setup")
+        self.assertIn("Kite needs attention", state.message)
+
+    def test_non_kite_error_stays_on_current_tab(self):
+        state = app.PageState(
+            active_tab="research",
+            error="Could not find a valid Kite order CSV.",
+        )
+
+        with patch.object(app, "kite_setup_issue", return_value=""):
+            redirected = app.redirect_state_to_kite_setup_on_error(state)
+
+        self.assertFalse(redirected)
+        self.assertEqual(state.active_tab, "research")
+
+    def test_nested_kite_order_error_redirects_to_kite_setup(self):
+        state = app.PageState(
+            active_tab="order-management",
+            order_book_error="Kite API is unreachable from this machine.",
+        )
+
+        redirected = app.redirect_state_to_kite_setup_on_error(state)
+
+        self.assertTrue(redirected)
+        self.assertEqual(state.active_tab, "kite-setup")
+
     def test_zero_price_trading_sell_uses_fresh_option_ltp_plus_markup_and_max_gain(self):
         row = {
             "exchange": "NFO",

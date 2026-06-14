@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -75,6 +76,14 @@ APP_DB_PATH = APP_ROOT / "vikalp_income.db"
 OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_OPTION_SELL_MARKUP_PERCENT = 20.0
+POSITION_CLOSE_SCHEDULE_TIME = "09:20"
+POSITION_CLOSE_SCHEDULE_WINDOW_MINUTES = 10
+INCOME_GROWTH_GPT_SCHEDULE_TIME = "09:30"
+INCOME_GROWTH_GPT_SCHEDULE_WINDOW_MINUTES = 15
+INTRADAY_POSITION_CLOSE_START_TIME = "09:30"
+INTRADAY_POSITION_CLOSE_END_TIME = "15:15"
+INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES = 15
+INDIA_TIME_ZONE = ZoneInfo("Asia/Kolkata")
 DEFAULT_KITE_ENV = {
     "KITE_CONFIRM_LIVE_ORDER": "YES",
     "KITE_API_KEY": "vr6yz47r650vum8p",
@@ -188,6 +197,10 @@ TOP_QUOTE_CACHE_SECONDS = 300
 APP_CACHE: dict[str, tuple[float, Any]] = {}
 APP_CACHE_LOCK = threading.Lock()
 APP_CACHE_KEY_LOCKS: dict[str, threading.Lock] = {}
+SETTINGS_LOCK = threading.RLock()
+POSITION_CLOSE_SCHEDULER_LOCK = threading.Lock()
+INCOME_GROWTH_GPT_SCHEDULER_LOCK = threading.Lock()
+INTRADAY_POSITION_CLOSE_SCHEDULER_LOCK = threading.Lock()
 KITE_READ_CACHE_SECONDS = 60
 KITE_QUOTE_CACHE_SECONDS = 60
 KITE_INSTRUMENT_CACHE_SECONDS = 3600
@@ -693,19 +706,21 @@ def place_order_allowing_autoslice(kite: Any, order: dict[str, Any]) -> str:
 
 
 def load_app_settings() -> dict[str, Any]:
-    if not SETTINGS_PATH.exists():
-        return {}
-    try:
-        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    with SETTINGS_LOCK:
+        if not SETTINGS_PATH.exists():
+            return {}
+        try:
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
 
 
 def save_app_settings(settings: dict[str, Any]) -> None:
-    current = load_app_settings()
-    current.update(settings)
-    SETTINGS_PATH.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
+    with SETTINGS_LOCK:
+        current = load_app_settings()
+        current.update(settings)
+        SETTINGS_PATH.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def save_env_values(values: dict[str, str], env_path: Path = APP_ROOT / ".env") -> None:
@@ -1358,6 +1373,58 @@ def kite_setup_issue() -> str:
 
 def default_active_tab() -> str:
     return "kite-setup" if kite_setup_issue() else "place"
+
+
+def is_kite_related_error(error: Any) -> bool:
+    """Return True only for failures that require attention in Kite Setup."""
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    direct_markers = (
+        "api.kite.trade",
+        "kiteconnect",
+        "kite api",
+        "kite quote",
+        "kite positions",
+        "kite orders",
+        "kite setup",
+        "kite_place_order",
+        "missing kite setup",
+        "missing kite_api",
+        "kite_access_token",
+        "kite_api_key",
+        "kite_api_secret",
+    )
+    authentication_markers = (
+        "incorrect `api_key` or `access_token`",
+        "incorrect api_key or access_token",
+        "invalid session",
+        "tokenexception",
+        "access token is invalid",
+        "access_token is invalid",
+    )
+    return any(marker in text for marker in direct_markers + authentication_markers)
+
+
+def redirect_state_to_kite_setup_on_error(state: "PageState") -> bool:
+    """Open Kite Setup when any rendered tab reports a Kite-related failure."""
+    error_values = (
+        state.error,
+        state.order_book_error,
+        state.commodity_error,
+        state.income_error,
+    )
+    setup_issue = kite_setup_issue()
+    should_redirect = bool(setup_issue) or any(
+        is_kite_related_error(error) for error in error_values
+    )
+    if not should_redirect:
+        return False
+    state.active_tab = "kite-setup"
+    if setup_issue and not state.error:
+        state.error = setup_issue
+    state.message = "Kite needs attention. Review the selected profile and access token."
+    return True
 
 
 def set_kite_env(form: dict[str, list[str]]) -> None:
@@ -4969,6 +5036,108 @@ def validate_income_growth_with_openai(
     return result[0], result[1], result[2], False
 
 
+def income_growth_gpt_schedule_state() -> dict[str, Any]:
+    saved = load_app_settings().get("income_growth_gpt_scheduler")
+    state = dict(saved) if isinstance(saved, dict) else {}
+    state.setdefault("enabled", True)
+    state.setdefault("schedule_time", INCOME_GROWTH_GPT_SCHEDULE_TIME)
+    state.setdefault("status", "WAITING")
+    state.setdefault("message", "Waiting for the next weekday 09:30 IST validation.")
+    return state
+
+
+def save_income_growth_gpt_schedule_state(**updates: Any) -> dict[str, Any]:
+    state = income_growth_gpt_schedule_state()
+    state.update(updates)
+    save_app_settings({"income_growth_gpt_scheduler": state})
+    return state
+
+
+def activate_today_csv_path(csv_path: str) -> None:
+    global DEFAULT_CSV_PATH
+    DEFAULT_CSV_PATH = Path(csv_path)
+
+
+def run_scheduled_income_growth_gpt_job(now: datetime | None = None) -> dict[str, Any] | None:
+    now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
+        now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
+    )
+    schedule_state = income_growth_gpt_schedule_state()
+    if (
+        not schedule_state.get("enabled", True)
+        or scheduled_job_is_paused(schedule_state, now)
+        or now.weekday() >= 5
+    ):
+        return None
+    schedule_hour, schedule_minute = (
+        int(part) for part in str(schedule_state.get("schedule_time") or INCOME_GROWTH_GPT_SCHEDULE_TIME).split(":", 1)
+    )
+    scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
+    window_ends = scheduled_at + timedelta(minutes=INCOME_GROWTH_GPT_SCHEDULE_WINDOW_MINUTES)
+    if now < scheduled_at or now >= window_ends:
+        return None
+    today_key = now.strftime("%Y-%m-%d")
+    if str(schedule_state.get("last_attempt_date") or "") == today_key:
+        return None
+    if not INCOME_GROWTH_GPT_SCHEDULER_LOCK.acquire(blocking=False):
+        return None
+    try:
+        schedule_state = income_growth_gpt_schedule_state()
+        if str(schedule_state.get("last_attempt_date") or "") == today_key:
+            return None
+        profile_name = selected_kite_profile_name()
+        started_at = now.strftime("%d %b %Y %H:%M:%S IST")
+        save_income_growth_gpt_schedule_state(
+            last_attempt_date=today_key,
+            last_run_at=started_at,
+            profile=profile_name,
+            status="RUNNING",
+            message="Refreshing Income Growth candidates and requesting fresh GPT validation.",
+        )
+        try:
+            profile = load_kite_profiles().get(profile_name, blank_kite_profile())
+            apply_kite_profile_to_env(profile)
+            setup_issue = kite_setup_issue()
+            if setup_issue:
+                raise RuntimeError(setup_issue)
+            kite = kite_orders.kite_client()
+            market_open, market_message = verify_scheduled_position_market_open(kite, now)
+            if not market_open:
+                return save_income_growth_gpt_schedule_state(
+                    status="MARKET_CLOSED",
+                    message=market_message,
+                )
+            rows, summary = income_growth_candidates()
+            csv_text, output, response_id, _ = validate_income_growth_with_openai(
+                rows,
+                summary,
+                DEFAULT_OPENAI_MODEL,
+                read_openai_csv_system_prompt(),
+                "",
+                True,
+            )
+            normalized_csv = normalize_kite_csv_input(csv_text)
+            parsed_rows = parse_csv_text(normalized_csv)
+            validate_kite_order_rows(parsed_rows)
+            saved_path, save_message = save_today_csv_text(normalized_csv)
+            activate_today_csv_path(saved_path)
+            return save_income_growth_gpt_schedule_state(
+                status="SAVED",
+                message=f"{market_message} {save_message} Ready for Research and Trading preview.",
+                csv_path=saved_path,
+                order_count=len(parsed_rows),
+                response_id=response_id,
+                output_preview=str(output or "")[:600],
+            )
+        except Exception as exc:
+            return save_income_growth_gpt_schedule_state(
+                status="ERROR",
+                message=friendly_external_error(exc, "Scheduled Income Growth GPT validation"),
+            )
+    finally:
+        INCOME_GROWTH_GPT_SCHEDULER_LOCK.release()
+
+
 def load_pe_sell_settings() -> dict[str, Any]:
     settings = dict(DEFAULT_PE_SELL_SETTINGS)
     if PE_SELL_SETTINGS_PATH.exists():
@@ -7699,6 +7868,469 @@ def execute_position_buy_orders(
     return selected_orders, results
 
 
+def position_close_schedule_state() -> dict[str, Any]:
+    saved = load_app_settings().get("position_close_scheduler")
+    state = dict(saved) if isinstance(saved, dict) else {}
+    state.setdefault("enabled", True)
+    state.setdefault("schedule_time", POSITION_CLOSE_SCHEDULE_TIME)
+    state.setdefault("status", "WAITING")
+    state.setdefault("message", "Waiting for the next weekday 09:20 IST run.")
+    state.setdefault("results", [])
+    return state
+
+
+def save_position_close_schedule_state(**updates: Any) -> dict[str, Any]:
+    state = position_close_schedule_state()
+    state.update(updates)
+    save_app_settings({"position_close_scheduler": state})
+    return state
+
+
+def parse_kite_market_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    parsed = datetime.strptime(text, pattern)
+                    break
+                except ValueError:
+                    parsed = None
+            if parsed is None:
+                return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=INDIA_TIME_ZONE)
+    return parsed.astimezone(INDIA_TIME_ZONE)
+
+
+def verify_scheduled_position_market_open(kite: Any, now: datetime) -> tuple[bool, str]:
+    if now.weekday() >= 5:
+        return False, "Weekend: no scheduled close BUY orders placed."
+    quotes = kite.quote(["NSE:NIFTY 50"])
+    quote = quotes.get("NSE:NIFTY 50", {}) if isinstance(quotes, dict) else {}
+    market_stamp = parse_kite_market_timestamp(
+        quote.get("timestamp") or quote.get("last_trade_time")
+    )
+    if market_stamp is None:
+        return False, "Could not verify today's NSE market timestamp; orders were not placed."
+    if market_stamp.date() != now.date():
+        return False, f"NSE appears closed; latest market timestamp is {market_stamp:%d %b %Y %H:%M} IST."
+    return True, f"NSE market timestamp verified at {market_stamp:%H:%M:%S} IST."
+
+
+def run_scheduled_position_close_job(now: datetime | None = None) -> dict[str, Any] | None:
+    now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
+        now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
+    )
+    schedule_state = position_close_schedule_state()
+    if (
+        not schedule_state.get("enabled", True)
+        or scheduled_job_is_paused(schedule_state, now)
+        or now.weekday() >= 5
+    ):
+        return None
+    schedule_hour, schedule_minute = (
+        int(part) for part in str(schedule_state.get("schedule_time") or POSITION_CLOSE_SCHEDULE_TIME).split(":", 1)
+    )
+    scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
+    window_ends = scheduled_at + timedelta(minutes=POSITION_CLOSE_SCHEDULE_WINDOW_MINUTES)
+    if now < scheduled_at or now >= window_ends:
+        return None
+    today_key = now.strftime("%Y-%m-%d")
+    if str(schedule_state.get("last_attempt_date") or "") == today_key:
+        return None
+    if not POSITION_CLOSE_SCHEDULER_LOCK.acquire(blocking=False):
+        return None
+    try:
+        schedule_state = position_close_schedule_state()
+        if str(schedule_state.get("last_attempt_date") or "") == today_key:
+            return None
+        profile_name = selected_kite_profile_name()
+        started_at = now.strftime("%d %b %Y %H:%M:%S IST")
+        save_position_close_schedule_state(
+            last_attempt_date=today_key,
+            last_run_at=started_at,
+            profile=profile_name,
+            status="RUNNING",
+            message="Building default close-position BUY orders.",
+            results=[],
+        )
+        try:
+            profile = load_kite_profiles().get(profile_name, blank_kite_profile())
+            apply_kite_profile_to_env(profile)
+            setup_issue = kite_setup_issue()
+            if setup_issue:
+                raise RuntimeError(setup_issue)
+            kite = kite_buy_positions.kite_client()
+            market_open, market_message = verify_scheduled_position_market_open(kite, now)
+            if not market_open:
+                return save_position_close_schedule_state(
+                    status="MARKET_CLOSED",
+                    message=market_message,
+                    results=[],
+                )
+            state = PageState(position_dry_run=False)
+            orders = build_position_buy_orders(state)
+            selected = set(range(len(orders)))
+            submitted_orders, results = execute_position_buy_orders(
+                orders,
+                selected,
+                False,
+                False,
+            )
+            live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
+            error_count = sum(1 for result in results if result.get("status") == "ERROR")
+            status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
+            message = (
+                f"{market_message} Default close position orders placed: {live_count}; "
+                f"errors: {error_count}."
+            )
+            return save_position_close_schedule_state(
+                status=status,
+                message=message,
+                order_count=len(submitted_orders),
+                results=results,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status = "NO_ORDERS" if "No matching positions need a new BUY order" in message else "ERROR"
+            return save_position_close_schedule_state(status=status, message=message, results=[])
+        except Exception as exc:
+            return save_position_close_schedule_state(
+                status="ERROR",
+                message=friendly_external_error(exc, "Scheduled close BUY"),
+                results=[],
+            )
+    finally:
+        POSITION_CLOSE_SCHEDULER_LOCK.release()
+
+
+def intraday_position_close_schedule_state() -> dict[str, Any]:
+    saved = load_app_settings().get("intraday_position_close_scheduler")
+    state = dict(saved) if isinstance(saved, dict) else {}
+    state.setdefault("enabled", True)
+    state.setdefault("start_time", INTRADAY_POSITION_CLOSE_START_TIME)
+    state.setdefault("end_time", INTRADAY_POSITION_CLOSE_END_TIME)
+    state.setdefault("interval_minutes", INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES)
+    state.setdefault("status", "WAITING")
+    state.setdefault(
+        "message",
+        "Waiting for the next 15-minute trading-hours close-order check.",
+    )
+    state.setdefault("results", [])
+    return state
+
+
+def save_intraday_position_close_schedule_state(**updates: Any) -> dict[str, Any]:
+    state = intraday_position_close_schedule_state()
+    state.update(updates)
+    save_app_settings({"intraday_position_close_scheduler": state})
+    return state
+
+
+def scheduled_job_definitions() -> dict[str, dict[str, Any]]:
+    return {
+        "position_close_open": {
+            "name": "Default Close Orders",
+            "purpose": "Place default close-position BUY orders once at market open.",
+            "schedule": "Weekdays at 09:20 IST",
+            "load": position_close_schedule_state,
+            "save": save_position_close_schedule_state,
+        },
+        "income_growth_gpt": {
+            "name": "Income Growth GPT CSV",
+            "purpose": "Validate Income Growth with GPT and save today's trading CSV.",
+            "schedule": "Weekdays at 09:30 IST",
+            "load": income_growth_gpt_schedule_state,
+            "save": save_income_growth_gpt_schedule_state,
+        },
+        "intraday_position_close": {
+            "name": "Intraday Close-Order Guard",
+            "purpose": "Find option positions without close BUY orders and place the missing orders.",
+            "schedule": "Every 15 min, weekdays 09:30-15:15 IST",
+            "load": intraday_position_close_schedule_state,
+            "save": save_intraday_position_close_schedule_state,
+        },
+    }
+
+
+def scheduled_job_pause_until(state: dict[str, Any]) -> datetime | None:
+    return parse_kite_market_timestamp(state.get("paused_until"))
+
+
+def scheduled_job_is_paused(
+    state: dict[str, Any],
+    now: datetime | None = None,
+) -> bool:
+    now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
+        now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
+    )
+    paused_until = scheduled_job_pause_until(state)
+    return bool(paused_until and paused_until > now)
+
+
+def next_weekday_schedule(base: datetime, hour: int, minute: int) -> datetime:
+    candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= base:
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def next_scheduled_job_run(
+    job_key: str,
+    state: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> datetime | None:
+    now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
+        now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
+    )
+    state = state or scheduled_job_definitions()[job_key]["load"]()
+    if not state.get("enabled", True):
+        return None
+    base = max(now, scheduled_job_pause_until(state) or now)
+    if job_key == "intraday_position_close":
+        start_hour, start_minute = (
+            int(part)
+            for part in str(
+                state.get("start_time") or INTRADAY_POSITION_CLOSE_START_TIME
+            ).split(":", 1)
+        )
+        end_hour, end_minute = (
+            int(part)
+            for part in str(
+                state.get("end_time") or INTRADAY_POSITION_CLOSE_END_TIME
+            ).split(":", 1)
+        )
+        interval = max(
+            int(state.get("interval_minutes") or INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES),
+            1,
+        )
+        if base.weekday() < 5:
+            start = base.replace(
+                hour=start_hour, minute=start_minute, second=0, microsecond=0
+            )
+            end = base.replace(
+                hour=end_hour, minute=end_minute, second=0, microsecond=0
+            )
+            if base < start:
+                return start
+            if base < end:
+                elapsed = max(int((base - start).total_seconds() // 60), 0)
+                next_offset = ((elapsed // interval) + 1) * interval
+                candidate = start + timedelta(minutes=next_offset)
+                if candidate <= end:
+                    return candidate
+        return next_weekday_schedule(base, start_hour, start_minute)
+    schedule_default = (
+        POSITION_CLOSE_SCHEDULE_TIME
+        if job_key == "position_close_open"
+        else INCOME_GROWTH_GPT_SCHEDULE_TIME
+    )
+    hour, minute = (
+        int(part)
+        for part in str(state.get("schedule_time") or schedule_default).split(":", 1)
+    )
+    return next_weekday_schedule(base, hour, minute)
+
+
+def update_scheduled_job_control(
+    job_key: str,
+    action: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    jobs = scheduled_job_definitions()
+    if job_key not in jobs:
+        raise ValueError("Unknown scheduled job.")
+    now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
+        now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
+    )
+    job = jobs[job_key]
+    if action == "stop":
+        return job["save"](
+            enabled=False,
+            paused_until="",
+            status="STOPPED",
+            message=f"{job['name']} stopped manually.",
+        )
+    if action == "start":
+        return job["save"](
+            enabled=True,
+            paused_until="",
+            status="WAITING",
+            message=f"{job['name']} started. Waiting for the next eligible run.",
+        )
+    if action == "pause-day":
+        paused_until = now + timedelta(days=1)
+        return job["save"](
+            enabled=True,
+            paused_until=paused_until.isoformat(),
+            status="PAUSED",
+            message=f"{job['name']} paused until {paused_until:%d %b %Y %H:%M} IST.",
+        )
+    raise ValueError("Unknown scheduled job action.")
+
+
+def intraday_position_close_slot(now: datetime) -> tuple[str, datetime] | None:
+    state = intraday_position_close_schedule_state()
+    start_hour, start_minute = (
+        int(part) for part in str(state.get("start_time") or INTRADAY_POSITION_CLOSE_START_TIME).split(":", 1)
+    )
+    end_hour, end_minute = (
+        int(part) for part in str(state.get("end_time") or INTRADAY_POSITION_CLOSE_END_TIME).split(":", 1)
+    )
+    interval = max(int(state.get("interval_minutes") or INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES), 1)
+    start = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    end = now.replace(hour=end_hour, minute=end_minute, second=59, microsecond=999999)
+    if now < start or now > end:
+        return None
+    elapsed_minutes = int((now - start).total_seconds() // 60)
+    slot_offset = (elapsed_minutes // interval) * interval
+    slot_at = start + timedelta(minutes=slot_offset)
+    if now >= slot_at + timedelta(minutes=interval):
+        return None
+    return f"{now:%Y-%m-%d}:{slot_at:%H:%M}", slot_at
+
+
+def run_intraday_position_close_job(now: datetime | None = None) -> dict[str, Any] | None:
+    now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
+        now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
+    )
+    schedule_state = intraday_position_close_schedule_state()
+    if (
+        not schedule_state.get("enabled", True)
+        or scheduled_job_is_paused(schedule_state, now)
+        or now.weekday() >= 5
+    ):
+        return None
+    slot = intraday_position_close_slot(now)
+    if slot is None:
+        return None
+    slot_key, slot_at = slot
+    if str(schedule_state.get("last_slot_key") or "") == slot_key:
+        return None
+    if not INTRADAY_POSITION_CLOSE_SCHEDULER_LOCK.acquire(blocking=False):
+        return None
+    try:
+        schedule_state = intraday_position_close_schedule_state()
+        if str(schedule_state.get("last_slot_key") or "") == slot_key:
+            return None
+        profile_name = selected_kite_profile_name()
+        today_key = now.strftime("%Y-%m-%d")
+        run_count = int(schedule_state.get("run_count_today") or 0)
+        if str(schedule_state.get("run_date") or "") != today_key:
+            run_count = 0
+        started_at = now.strftime("%d %b %Y %H:%M:%S IST")
+        save_intraday_position_close_schedule_state(
+            last_slot_key=slot_key,
+            last_run_at=started_at,
+            last_slot=slot_at.strftime("%H:%M"),
+            run_date=today_key,
+            run_count_today=run_count + 1,
+            profile=profile_name,
+            status="RUNNING",
+            message="Checking open option positions and existing close BUY orders.",
+            results=[],
+        )
+        try:
+            profile = load_kite_profiles().get(profile_name, blank_kite_profile())
+            apply_kite_profile_to_env(profile)
+            setup_issue = kite_setup_issue()
+            if setup_issue:
+                raise RuntimeError(setup_issue)
+            kite = kite_buy_positions.kite_client()
+            market_open, market_message = verify_scheduled_position_market_open(kite, now)
+            if not market_open:
+                return save_intraday_position_close_schedule_state(
+                    status="MARKET_CLOSED",
+                    message=market_message,
+                    results=[],
+                )
+            state = PageState(
+                position_dry_run=False,
+                position_discount_percent=20.0,
+                position_keep_existing_orders=True,
+            )
+            orders = build_position_buy_orders(state)
+            submitted_orders, results = execute_position_buy_orders(
+                orders,
+                set(range(len(orders))),
+                False,
+                True,
+            )
+            live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
+            error_count = sum(1 for result in results if result.get("status") == "ERROR")
+            status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
+            pricing_details = "; ".join(
+                f"{order.get('tradingsymbol')}: LIMIT {float(order.get('price') or 0):.2f} "
+                f"(20% below {order.get('price_basis') or 'price basis'})"
+                for order in submitted_orders
+            )
+            return save_intraday_position_close_schedule_state(
+                status=status,
+                message=(
+                    f"{market_message} Missing close BUY orders placed: {live_count}; "
+                    f"errors: {error_count}. {pricing_details}"
+                ),
+                order_count=len(submitted_orders),
+                results=results,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status = "ALL_COVERED" if "No matching positions need a new BUY order" in message else "ERROR"
+            return save_intraday_position_close_schedule_state(
+                status=status,
+                message=(
+                    "All open option positions already have close BUY orders."
+                    if status == "ALL_COVERED"
+                    else message
+                ),
+                order_count=0,
+                results=[],
+            )
+        except Exception as exc:
+            return save_intraday_position_close_schedule_state(
+                status="ERROR",
+                message=friendly_external_error(exc, "Intraday close BUY check"),
+                results=[],
+            )
+    finally:
+        INTRADAY_POSITION_CLOSE_SCHEDULER_LOCK.release()
+
+
+def position_close_scheduler_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            close_result = run_scheduled_position_close_job()
+            if close_result:
+                print(
+                    "Scheduled close BUY job: "
+                    f"{close_result.get('status')} - {close_result.get('message')}"
+                )
+            gpt_result = run_scheduled_income_growth_gpt_job()
+            if gpt_result:
+                print(
+                    "Scheduled Income Growth GPT job: "
+                    f"{gpt_result.get('status')} - {gpt_result.get('message')}"
+                )
+            intraday_result = run_intraday_position_close_job()
+            if intraday_result:
+                print(
+                    "Intraday close BUY check: "
+                    f"{intraday_result.get('status')} - {intraday_result.get('message')}"
+                )
+        except Exception as exc:
+            print(f"Scheduled task error: {friendly_external_error(exc, 'Scheduler')}")
+        stop_event.wait(30)
+
+
 def call_with_console(func: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
     stream = io.StringIO()
     with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
@@ -8571,6 +9203,38 @@ def render_investing_panel(state: PageState) -> str:
     </form>"""
 
 
+def render_income_growth_gpt_schedule_panel() -> str:
+    schedule = income_growth_gpt_schedule_state()
+    status = str(schedule.get("status") or "WAITING").upper()
+    color = "green" if status == "SAVED" else "yellow" if status in {"WAITING", "MARKET_CLOSED"} else "red"
+    response_id = str(schedule.get("response_id") or "")
+    response_link = (
+        f' <a href="https://platform.openai.com/logs" target="_blank" rel="noopener">OpenAI response {html.escape(response_id)}</a>'
+        if response_id
+        else ""
+    )
+    preview = str(schedule.get("output_preview") or "")
+    preview_html = (
+        f'<details><summary>Show scheduled GPT response preview</summary><pre>{html.escape(preview)}</pre></details>'
+        if preview
+        else ""
+    )
+    return (
+        '<section class="panel income-growth-schedule-panel">'
+        '<div class="panel-title">Scheduled Daily GPT Validation</div>'
+        '<div class="position-summary-strip">'
+        '<div class="position-summary-chip"><span>Schedule</span><strong>09:30 IST</strong></div>'
+        f'<div class="position-summary-chip"><span>Profile</span><strong>{html.escape(str(schedule.get("profile") or selected_kite_profile_name()))}</strong></div>'
+        f'<div class="position-summary-chip {strength_class(color)}"><span>Last status</span><strong>{html.escape(status)}</strong></div>'
+        f'<div class="position-summary-chip"><span>CSV orders</span><strong>{html.escape(str(schedule.get("order_count") or 0))}</strong></div>'
+        "</div>"
+        f'<p class="status">{html.escape(str(schedule.get("message") or ""))}{response_link}</p>'
+        f'<p class="status">Last run: <strong>{html.escape(str(schedule.get("last_run_at") or "Not run yet"))}</strong>'
+        f' | Active CSV: <strong>{html.escape(str(schedule.get("csv_path") or "Not generated yet"))}</strong></p>'
+        f"{preview_html}</section>"
+    )
+
+
 def render_income_growth_panel(state: PageState) -> str:
     panel_style = "" if state.active_tab == "income-growth" else ' style="display:none"'
     rows = state.income_growth_rows or []
@@ -8753,6 +9417,7 @@ def render_income_growth_panel(state: PageState) -> str:
         </div>
       </section>
       <section class="panel investing-summary-panel"><div class="summary-grid">{summary_cards}</div></section>
+      {render_income_growth_gpt_schedule_panel()}
       {gpt_result}
       <section class="panel income-growth-table-panel">
         <div class="panel-title">Covered Call Capacity Score From Current Holding Sheet</div>
@@ -9298,6 +9963,128 @@ def render_research_panel(state: PageState) -> str:
     </form>"""
 
 
+def render_position_close_schedule_panel() -> str:
+    schedule = position_close_schedule_state()
+    intraday = intraday_position_close_schedule_state()
+    results = schedule.get("results") if isinstance(schedule.get("results"), list) else []
+    intraday_results = intraday.get("results") if isinstance(intraday.get("results"), list) else []
+    status = str(schedule.get("status") or "WAITING").upper()
+    intraday_status = str(intraday.get("status") or "WAITING").upper()
+    color = "green" if status == "PLACED" else "yellow" if status in {"WAITING", "NO_ORDERS", "MARKET_CLOSED"} else "red"
+    intraday_color = (
+        "green"
+        if intraday_status in {"PLACED", "ALL_COVERED"}
+        else "yellow"
+        if intraday_status in {"WAITING", "MARKET_CLOSED"}
+        else "red"
+    )
+    result_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(result.get('tradingsymbol') or ''))}</td>"
+        f"<td>{html.escape(str(result.get('status') or ''))}</td>"
+        f"<td>{html.escape(str(result.get('order_id') or ''))}</td>"
+        f"<td>{html.escape(str(result.get('detail') or ''))}</td>"
+        "</tr>"
+        for result in results
+    )
+    details = (
+        '<details class="scheduled-position-results"><summary>View scheduled order details</summary>'
+        '<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Status</th><th>Order ID</th><th>Detail</th></tr></thead>'
+        f"<tbody>{result_rows}</tbody></table></div></details>"
+        if result_rows
+        else ""
+    )
+    intraday_result_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(result.get('tradingsymbol') or ''))}</td>"
+        f"<td>{html.escape(str(result.get('status') or ''))}</td>"
+        f"<td>{html.escape(str(result.get('order_id') or ''))}</td>"
+        f"<td>{html.escape(str(result.get('detail') or ''))}</td>"
+        "</tr>"
+        for result in intraday_results
+    )
+    intraday_details = (
+        '<details class="scheduled-position-results"><summary>View latest intraday order details</summary>'
+        '<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Status</th><th>Order ID</th><th>Detail</th></tr></thead>'
+        f"<tbody>{intraday_result_rows}</tbody></table></div></details>"
+        if intraday_result_rows
+        else ""
+    )
+    return (
+        '<section class="panel scheduled-position-close-panel">'
+        '<div class="panel-title">Scheduled Default Close Orders</div>'
+        '<div class="position-summary-strip">'
+        '<div class="position-summary-chip"><span>Schedule</span><strong>09:20 IST</strong></div>'
+        f'<div class="position-summary-chip"><span>Profile</span><strong>{html.escape(str(schedule.get("profile") or selected_kite_profile_name()))}</strong></div>'
+        f'<div class="position-summary-chip {strength_class(color)}"><span>Last status</span><strong>{html.escape(status)}</strong></div>'
+        f'<div class="position-summary-chip"><span>Last run</span><strong>{html.escape(str(schedule.get("last_run_at") or "Not run yet"))}</strong></div>'
+        "</div>"
+        f'<p class="status">{html.escape(str(schedule.get("message") or ""))} '
+        "Default close-position BUY orders use the current Position BUY pricing logic; existing open BUY close orders are skipped.</p>"
+        f"{details}"
+        '<hr><div class="panel-title">Intraday Missing Close-Order Guard</div>'
+        '<div class="position-summary-strip">'
+        '<div class="position-summary-chip"><span>Schedule</span><strong>Every 15 min | 09:30-15:15</strong></div>'
+        f'<div class="position-summary-chip"><span>Runs today</span><strong>{html.escape(str(intraday.get("run_count_today") or 0))}</strong></div>'
+        f'<div class="position-summary-chip {strength_class(intraday_color)}"><span>Last status</span><strong>{html.escape(intraday_status)}</strong></div>'
+        f'<div class="position-summary-chip"><span>Last run</span><strong>{html.escape(str(intraday.get("last_run_at") or "Not run yet"))}</strong></div>'
+        "</div>"
+        f'<p class="status">{html.escape(str(intraday.get("message") or ""))} '
+        "Price rule: when average is above LTP, BUY at 20% below fresh LTP; otherwise BUY at 20% below average price. Existing close BUY orders are skipped.</p>"
+        f"{intraday_details}</section>"
+    )
+
+
+def render_scheduler_control_panel() -> str:
+    now = datetime.now(INDIA_TIME_ZONE)
+    rows: list[str] = []
+    for job_key, job in scheduled_job_definitions().items():
+        state = job["load"]()
+        enabled = bool(state.get("enabled", True))
+        paused = scheduled_job_is_paused(state, now)
+        status = "STOPPED" if not enabled else "PAUSED" if paused else str(
+            state.get("status") or "WAITING"
+        ).upper()
+        status_badge = (
+            "avoid"
+            if status in {"STOPPED", "ERROR"}
+            else "ok"
+            if status in {"PAUSED", "WAITING", "MARKET_CLOSED", "NO_ORDERS"}
+            else "good"
+        )
+        next_run = next_scheduled_job_run(job_key, state, now)
+        next_run_text = next_run.strftime("%d %b %Y %H:%M IST") if next_run else "Stopped"
+        primary_action = "start" if not enabled else "stop"
+        primary_label = "Start job" if not enabled else "Stop job"
+        pause_disabled = " disabled" if not enabled else ""
+        rows.append(
+            "<tr>"
+            f"<td><strong>{html.escape(job['name'])}</strong><small>{html.escape(job['schedule'])}</small></td>"
+            f"<td>{html.escape(job['purpose'])}</td>"
+            f"<td>{html.escape(str(state.get('last_run_at') or 'Not run yet'))}</td>"
+            f"<td>{html.escape(next_run_text)}</td>"
+            f'<td><span class="score-badge {html.escape(status_badge)}">{html.escape(status)}</span></td>'
+            '<td><div class="scheduler-job-actions">'
+            f'<button type="submit" class="{"secondary" if not enabled else "danger"}" '
+            f'formaction="/scheduler/{primary_action}" name="job_name" value="{html.escape(job_key)}">{primary_label}</button>'
+            f'<button type="submit" class="secondary" formaction="/scheduler/pause-day" '
+            f'name="job_name" value="{html.escape(job_key)}"{pause_disabled}>Pause for 1 day</button>'
+            "</div></td>"
+            "</tr>"
+        )
+    return (
+        '<section class="panel kite-setup-card scheduler-control-panel">'
+        '<div class="setup-card-kicker">07</div>'
+        '<div class="panel-title">Scheduled Jobs Control</div>'
+        '<p class="status">Monitor and control automated trading jobs. Changes persist in '
+        '<code>app_settings.json</code> across restarts. Stopping a job does not cancel orders already placed.</p>'
+        '<div class="table-wrap"><table class="scheduler-control-table"><thead><tr>'
+        '<th>Name / Schedule</th><th>Purpose</th><th>Last run</th><th>Next schedule</th><th>Status</th><th>Controls</th>'
+        f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        "</section>"
+    )
+
+
 def render_positions_panel(
     state: PageState,
     position_orders_payload: str = "",
@@ -9424,6 +10211,7 @@ def render_positions_panel(
         </div>
       </section>
       <section class="panel positions-summary-panel"><div class="position-summary-strip">{summary_cards}</div></section>
+      {render_position_close_schedule_panel()}
       {table}
       {position_orders_table}
       {render_results(state.position_results)}
@@ -13081,6 +13869,34 @@ def render_page(state: PageState) -> bytes:
       color: #047857;
       font-weight: 900;
     }}
+    .scheduler-control-panel {{
+      grid-column: 1 / -1;
+      border-color: #a7f3d0;
+    }}
+    .scheduler-control-table td {{
+      vertical-align: top;
+      min-width: 130px;
+    }}
+    .scheduler-control-table td:first-child {{
+      min-width: 190px;
+      color: #064e3b;
+    }}
+    .scheduler-control-table td:first-child small {{
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-weight: 650;
+    }}
+    .scheduler-job-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-width: 210px;
+    }}
+    .scheduler-job-actions button {{
+      padding: 7px 10px;
+      font-size: 12px;
+    }}
     .order-book-table .pnl-negative {{
       background: #fef2f2;
       color: #b91c1c;
@@ -13774,6 +14590,7 @@ def render_page(state: PageState) -> bytes:
     {render_positions_panel(state, position_orders_payload, position_orders_table, position_execute_button)}
     <form id="kite-setup-panel" method="post" action="/kite-setup"{kite_setup_panel_style}>
       {env_panel}
+      {render_scheduler_control_panel()}
       <div class="actions">
         <button type="submit" formaction="/kite-setup">Save Kite Setup</button>
       </div>
@@ -14134,6 +14951,7 @@ def render_page(state: PageState) -> bytes:
     function compactClientError(message, fallback) {{
       const text = String(message || '').trim();
       if (!text) return fallback || 'Data unavailable.';
+      openKiteSetupForError(text);
       const lower = text.toLowerCase();
       if (lower.includes('getaddrinfo') || lower.includes('failed to resolve') || lower.includes('name resolution')) {{
         return 'Network/DNS error: this machine cannot resolve Kite or market-data hosts. Check internet/DNS, then refresh.';
@@ -15730,7 +16548,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 else "gpt"
                 if request_path.startswith("/gpt")
                 else "kite-setup"
-                if request_path.startswith("/kite-setup") or request_path.startswith("/kite-token") or request_path.startswith("/kite-ip")
+                if request_path.startswith("/kite-setup") or request_path.startswith("/kite-token") or request_path.startswith("/kite-ip") or request_path.startswith("/scheduler")
                 else "order-management"
                 if request_path.startswith("/orders")
                 else "analytics"
@@ -16095,6 +16913,16 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     if ips
                     else "Could not fetch public IP. Check network and try again."
                 )
+            elif request_path in {
+                "/scheduler/start",
+                "/scheduler/stop",
+                "/scheduler/pause-day",
+            }:
+                job_key = first(form, "job_name")
+                action = request_path.rsplit("/", 1)[-1]
+                updated = update_scheduled_job_control(job_key, action)
+                job_name = scheduled_job_definitions()[job_key]["name"]
+                state.message = f"{job_name}: {updated.get('message', 'Schedule updated.')}"
             elif request_path == "/analytics/load":
                 state.analytics_data, state.console_log = call_with_console(
                     option_analytics_for_symbol,
@@ -16317,6 +17145,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
 
     def send_page(self, state: PageState) -> None:
         try:
+            redirect_state_to_kite_setup_on_error(state)
             content = render_page(state)
         except Exception as exc:
             content = render_fallback_error_page(f"{exc}\n\n{traceback.format_exc()}")
@@ -16352,13 +17181,26 @@ def main() -> int:
     host = os.getenv("KITE_WEB_HOST", "127.0.0.1")
     port = int(os.getenv("KITE_WEB_PORT", "8765"))
     server = ThreadingHTTPServer((host, port), KiteWebHandler)
+    scheduler_stop = threading.Event()
+    scheduler_thread = threading.Thread(
+        target=position_close_scheduler_loop,
+        args=(scheduler_stop,),
+        name="position-close-scheduler",
+        daemon=True,
+    )
+    scheduler_thread.start()
     print(f"Kite CSV Trader running at http://{host}:{port}")
+    print("Default close-position BUY scheduler enabled for weekdays at 09:20 IST.")
+    print("Intraday missing close-order guard enabled every 15 minutes from 09:30 to 15:15 IST.")
+    print("Income Growth GPT CSV scheduler enabled for weekdays at 09:30 IST.")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping Kite CSV Trader.")
     finally:
+        scheduler_stop.set()
+        scheduler_thread.join(timeout=2)
         server.server_close()
     return 0
 
