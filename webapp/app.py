@@ -76,6 +76,7 @@ APP_DB_PATH = APP_ROOT / "vikalp_income.db"
 OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_OPTION_SELL_MARKUP_PERCENT = 20.0
+DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT = 20.0
 POSITION_CLOSE_SCHEDULE_TIME = "09:20"
 POSITION_CLOSE_SCHEDULE_WINDOW_MINUTES = 10
 INCOME_GROWTH_GPT_SCHEDULE_TIME = "09:30"
@@ -857,6 +858,18 @@ def option_sell_markup_percent_setting() -> float:
     except (TypeError, ValueError):
         return DEFAULT_OPTION_SELL_MARKUP_PERCENT
     return markup if markup >= 0 else DEFAULT_OPTION_SELL_MARKUP_PERCENT
+
+
+def position_close_discount_percent_setting() -> float:
+    value = load_app_settings().get(
+        "position_close_discount_percent",
+        DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT,
+    )
+    try:
+        discount = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT
+    return discount if 0 <= discount < 100 else DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT
 
 
 def normalize_home_tickers(value: Any) -> list[str]:
