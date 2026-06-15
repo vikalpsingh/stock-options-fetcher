@@ -17,6 +17,23 @@
     "NTPC",
     "WAAREEENER"
   ],
+  "income_growth_gpt_scheduler": {
+    "enabled": true,
+    "message": "Income Growth GPT CSV started. Waiting for the next eligible run.",
+    "paused_until": "",
+    "schedule_time": "09:30",
+    "status": "WAITING"
+  },
+  "intraday_position_close_scheduler": {
+    "enabled": true,
+    "end_time": "15:15",
+    "interval_minutes": 15,
+    "message": "Intraday Close-Order Guard started. Waiting for the next eligible run.",
+    "paused_until": "",
+    "results": [],
+    "start_time": "09:30",
+    "status": "WAITING"
+  },
   "kite_profiles": {
     "Aanya": {
       "KITE_ACCESS_TOKEN": "",
@@ -31,7 +48,7 @@
       "KITE_CONFIRM_LIVE_ORDER": "YES"
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "H5CnYqYGmYigy0a39XmGEBvH5eYsptHz",
+      "KITE_ACCESS_TOKEN": "rxHbFu9vyjQK2GG5qCeKXiEb1MLm54K0",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES"
@@ -42,6 +59,14 @@
       "KITE_API_SECRET": "",
       "KITE_CONFIRM_LIVE_ORDER": "YES"
     }
+  },
+  "position_close_scheduler": {
+    "enabled": true,
+    "message": "Default Close Orders started. Waiting for the next eligible run.",
+    "paused_until": "",
+    "results": [],
+    "schedule_time": "09:20",
+    "status": "WAITING"
   },
   "selected_kite_profile": "Shanti"
 }

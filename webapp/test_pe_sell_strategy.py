@@ -430,6 +430,118 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertFalse(redirected)
         self.assertEqual(state.active_tab, "income")
 
+    def test_generic_permission_and_token_errors_stay_on_current_tab(self):
+        for error in (
+            "Order permission denied for this instrument.",
+            "OpenAI response token limit exceeded.",
+            "Traceback in kite_place_order.py while validating quantity.",
+        ):
+            with self.subTest(error=error):
+                state = app.PageState(active_tab="place", error=error)
+
+                redirected = app.redirect_state_to_kite_setup_on_error(state)
+
+                self.assertFalse(redirected)
+                self.assertEqual(state.active_tab, "place")
+
+    def test_allowed_ip_error_redirects_to_kite_setup(self):
+        state = app.PageState(
+            active_tab="place",
+            error="IP address is not allowed to place orders for this app.",
+        )
+
+        redirected = app.redirect_state_to_kite_setup_on_error(state)
+
+        self.assertTrue(redirected)
+        self.assertEqual(state.active_tab, "kite-setup")
+
+    def test_client_error_router_uses_only_explicit_setup_markers(self):
+        output = app.render_page(app.PageState(active_tab="place")).decode("utf-8")
+
+        self.assertNotIn("text.includes('token')", output)
+        self.assertNotIn("text.includes('permission')", output)
+        self.assertIn("'access token is invalid'", output)
+        self.assertIn("'ip address is not allowed'", output)
+
+    def test_daily_kite_login_prompt_is_claimed_once_per_day(self):
+        original_day = app.DAILY_KITE_LOGIN_PROMPT_DATE
+        try:
+            app.DAILY_KITE_LOGIN_PROMPT_DATE = None
+            prompt_day = date(2026, 6, 15)
+
+            self.assertTrue(app.claim_daily_kite_login_prompt(prompt_day))
+            self.assertFalse(app.claim_daily_kite_login_prompt(prompt_day))
+            self.assertTrue(app.claim_daily_kite_login_prompt(date(2026, 6, 16)))
+        finally:
+            app.DAILY_KITE_LOGIN_PROMPT_DATE = original_day
+
+    def test_daily_kite_login_prompt_only_applies_to_full_app_pages(self):
+        self.assertTrue(app.is_app_page_request("/"))
+        self.assertTrue(app.is_app_page_request("/positions"))
+        self.assertTrue(app.is_app_page_request("/kite-setup"))
+        self.assertFalse(app.is_app_page_request("/market-quotes"))
+        self.assertFalse(app.is_app_page_request("/global-quotes"))
+        self.assertFalse(app.is_app_page_request("/trade-news"))
+
+    def test_daily_kite_login_setup_page_opens_login_url_with_fallback(self):
+        output = app.render_page(
+            app.PageState(active_tab="kite-setup", auto_open_kite_login=True)
+        ).decode("utf-8")
+
+        self.assertIn("Start-of-day Kite login opened", output)
+        self.assertIn("Open Kite Login manually", output)
+        self.assertIn("window.open(dailyKiteLoginUrl", output)
+
+    def test_order_book_separates_terminal_orders_from_actionable_orders(self):
+        state = app.PageState(
+            active_tab="order-management",
+            order_book=[
+                {
+                    "order_id": "open-1",
+                    "variety": "regular",
+                    "tradingsymbol": "PFC26JUN400PE",
+                    "transaction_type": "SELL",
+                    "quantity": 1300,
+                    "pending_quantity": 1300,
+                    "price": 2.5,
+                    "ltp": 2.2,
+                    "status": "OPEN",
+                    "is_cancellable": True,
+                },
+                {
+                    "order_id": "done-1",
+                    "variety": "regular",
+                    "tradingsymbol": "CAMS26JUN760PE",
+                    "transaction_type": "BUY",
+                    "quantity": 750,
+                    "pending_quantity": 0,
+                    "price": 8.3,
+                    "ltp": 8.1,
+                    "status": "COMPLETE",
+                    "is_cancellable": False,
+                },
+            ],
+        )
+
+        output = app.render_order_book(state)
+        actionable_section, completed_section = output.split(
+            '<div class="completed-orders-section">', 1
+        )
+
+        self.assertIn("PFC26JUN400PE", actionable_section)
+        self.assertNotIn("CAMS26JUN760PE", actionable_section)
+        self.assertIn("Completed Orders", completed_section)
+        self.assertIn("CAMS26JUN760PE", completed_section)
+        self.assertNotIn('name="order_key"', completed_section)
+        self.assertNotIn("price-step-button", completed_section)
+
+    def test_active_tab_uses_dark_high_contrast_style(self):
+        output = app.render_page(app.PageState(active_tab="place")).decode("utf-8")
+
+        self.assertIn("background: linear-gradient(135deg, #0f4c5c 0%, #0f766e 100%)", output)
+        self.assertIn("color: #ffffff", output)
+        self.assertIn("border-color: #083f49", output)
+
     def test_zero_price_trading_sell_uses_fresh_option_ltp_plus_markup_and_max_gain(self):
         row = {
             "exchange": "NFO",

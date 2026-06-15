@@ -85,6 +85,8 @@ INTRADAY_POSITION_CLOSE_START_TIME = "09:30"
 INTRADAY_POSITION_CLOSE_END_TIME = "15:15"
 INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES = 15
 INDIA_TIME_ZONE = ZoneInfo("Asia/Kolkata")
+DAILY_KITE_LOGIN_PROMPT_LOCK = threading.Lock()
+DAILY_KITE_LOGIN_PROMPT_DATE: date | None = None
 DEFAULT_KITE_ENV = {
     "KITE_CONFIRM_LIVE_ORDER": "YES",
     "KITE_API_KEY": "vr6yz47r650vum8p",
@@ -1155,6 +1157,7 @@ class PageState:
     active_tab: str = "place"
     message: str = ""
     error: str = ""
+    auto_open_kite_login: bool = False
     csv_path: str = field(default_factory=lambda: str(DEFAULT_CSV_PATH))
     csv_text: str = field(default_factory=read_default_csv_text)
     rows: list[dict[str, str]] | None = None
@@ -1439,19 +1442,56 @@ def default_active_tab() -> str:
     return "kite-setup" if kite_setup_issue() else "place"
 
 
+def claim_daily_kite_login_prompt(day: date | None = None) -> bool:
+    """Claim the once-per-process, once-per-IST-day Kite login prompt."""
+    global DAILY_KITE_LOGIN_PROMPT_DATE
+    prompt_day = day or datetime.now(INDIA_TIME_ZONE).date()
+    with DAILY_KITE_LOGIN_PROMPT_LOCK:
+        if DAILY_KITE_LOGIN_PROMPT_DATE == prompt_day:
+            return False
+        DAILY_KITE_LOGIN_PROMPT_DATE = prompt_day
+        return True
+
+
+def is_app_page_request(path: str) -> bool:
+    """Return True for full UI pages, excluding JSON/data/background endpoints."""
+    return path in {
+        "/",
+        "/home",
+        "/positions",
+        "/research",
+        "/trading",
+        "/orders",
+        "/income",
+        "/investing",
+        "/equity",
+        "/income-growth",
+        "/commodity",
+        "/analytics",
+        "/gpt",
+        "/kite-setup",
+    }
+
+
 def is_kite_related_error(error: Any) -> bool:
     """Return True only for failures that require attention in Kite Setup."""
     text = str(error or "").strip().lower()
     if not text:
         return False
-    direct_markers = (
+    setup_markers = (
         "kite setup",
-        "kite_place_order",
         "missing kite setup",
         "missing kite_api",
+        "missing kite api",
         "kite_access_token",
         "kite_api_key",
         "kite_api_secret",
+        "could not import kite_place_order",
+        "no module named 'kite_place_order'",
+        "selected kite profile",
+        "allowed ip",
+        "ip address is not allowed",
+        "is not allowed to place orders for this app",
     )
     authentication_markers = (
         "incorrect `api_key` or `access_token`",
@@ -1462,7 +1502,7 @@ def is_kite_related_error(error: Any) -> bool:
         "access_token is invalid",
         "authentication failed",
     )
-    return any(marker in text for marker in direct_markers + authentication_markers)
+    return any(marker in text for marker in setup_markers + authentication_markers)
 
 
 def redirect_state_to_kite_setup_on_error(state: "PageState") -> bool:
@@ -9658,7 +9698,8 @@ def render_order_book(state: PageState) -> str:
         except Exception as exc:
             orders = []
             error = str(exc)
-    rows: list[str] = []
+    actionable_rows: list[str] = []
+    completed_rows: list[str] = []
     for order in orders:
         checked_attr = " checked" if order.get("is_cancellable") else ""
         disabled_attr = "" if order.get("is_cancellable") else " disabled"
@@ -9715,7 +9756,22 @@ def render_order_book(state: PageState) -> str:
                 f"<strong>{html.escape(display_cell('pnl', position_pnl_value))}</strong>"
                 f"<small>Qty {html.escape(str(order.get('position_qty') or ''))}</small>"
             )
-        rows.append(
+        if not order.get("is_cancellable"):
+            completed_rows.append(
+                '<tr class="completed-order-row">'
+                f"<td>{html.escape(str(order.get('tradingsymbol', '')))}</td>"
+                f"<td>{html.escape(str(order.get('transaction_type', '')))}</td>"
+                f"<td>{html.escape(str(order.get('quantity', '')))}</td>"
+                f"<td>{html.escape(fmt_number(order.get('price')))}</td>"
+                f"<td>{html.escape(fmt_number(order.get('ltp')))}</td>"
+                f"<td>{html.escape(fmt_number(order.get('position_avg_price')))}</td>"
+                f'<td class="{position_pnl_class}">{position_pnl_cell}</td>'
+                f'<td class="{close_pnl_class}">{close_pnl_cell}</td>'
+                f"<td>{html.escape(str(order.get('status', '')))}</td>"
+                "</tr>"
+            )
+            continue
+        actionable_rows.append(
             "<tr>"
             f'<td><input type="checkbox" name="order_key" value="{html.escape(key, quote=True)}"{checked_attr}{disabled_attr}></td>'
             f"<td>{html.escape(str(order.get('tradingsymbol', '')))}</td>"
@@ -9733,10 +9789,15 @@ def render_order_book(state: PageState) -> str:
             f"<td>{html.escape(str(order.get('status', '')))}</td>"
             "</tr>"
         )
-    body = (
-        "".join(rows)
-        if rows
-        else '<tr><td colspan="14" class="status">No Kite orders found.</td></tr>'
+    actionable_body = (
+        "".join(actionable_rows)
+        if actionable_rows
+        else '<tr><td colspan="14" class="status">No open or pending Kite orders.</td></tr>'
+    )
+    completed_body = (
+        "".join(completed_rows)
+        if completed_rows
+        else '<tr><td colspan="9" class="status">No completed or terminal orders found.</td></tr>'
     )
     error_html = render_graceful_error(error, "Kite Orders Error")
     return (
@@ -9751,7 +9812,13 @@ def render_order_book(state: PageState) -> str:
         '<div class="table-wrap"><table class="order-book-table"><thead><tr>'
         '<th>Select</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Pending</th>'
         '<th>Price</th><th>LTP</th><th>Avg Price</th><th>Current P&L</th><th>Suggestion</th><th>% Diff</th><th>Score</th><th>Close P&L</th><th>Status</th>'
-        f"</tr></thead><tbody>{body}</tbody></table></div></section>"
+        f"</tr></thead><tbody>{actionable_body}</tbody></table></div>"
+        '<div class="completed-orders-section"><div class="panel-title">Completed Orders</div>'
+        '<p class="status">Read-only terminal orders. Completed, cancelled, and rejected orders cannot be modified or cancelled.</p>'
+        '<div class="table-wrap"><table class="completed-orders-table"><thead><tr>'
+        '<th>Symbol</th><th>Side</th><th>Qty</th><th>Order Price</th><th>LTP</th>'
+        '<th>Position Avg</th><th>Current P&L</th><th>Close P&L</th><th>Status</th>'
+        f"</tr></thead><tbody>{completed_body}</tbody></table></div></div></section>"
     )
 
 
@@ -11798,6 +11865,14 @@ def render_page(state: PageState) -> bytes:
         "https://kite.zerodha.com/connect/login?"
         f"api_key={quote_plus(active_kite_values.get('KITE_API_KEY') or '')}&v=3"
     )
+    if state.auto_open_kite_login:
+        alert += (
+            '<div class="alert ok daily-kite-login-alert">'
+            "Start-of-day Kite login opened for the selected profile. "
+            f'<a href="{html.escape(active_login_url, quote=True)}" target="_blank" rel="noopener">'
+            "Open Kite Login manually</a> if the browser blocked it."
+            "</div>"
+        )
     def kite_env_input(name: str, label: str, env_key: str, input_type: str = "text") -> str:
         safe_value = html.escape(active_kite_values.get(env_key, ""), quote=True)
         secret_class = " secret-field" if input_type == "password" else ""
@@ -13676,10 +13751,20 @@ def render_page(state: PageState) -> bytes:
     }}
     .tab-button.active {{
       transform: none;
-      filter: saturate(1.08);
+      background: linear-gradient(135deg, #0f4c5c 0%, #0f766e 100%);
+      color: #ffffff;
+      border-color: #083f49;
+      filter: saturate(1.12);
+      box-shadow:
+        inset 0 0 0 1px rgba(255, 255, 255, 0.22),
+        inset 0 -3px 0 rgba(0, 0, 0, 0.2),
+        0 7px 16px rgba(15, 76, 92, 0.28);
+      font-weight: 900;
     }}
     .tab-button.active::after {{
       margin-top: 5px;
+      background: #a7f3d0;
+      opacity: 1;
     }}
     #place-panel,
     #positions-panel,
@@ -14788,6 +14873,42 @@ def render_page(state: PageState) -> bytes:
       color: #047857;
       font-weight: 900;
     }}
+    .completed-orders-section {{
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 2px solid #cbd5e1;
+    }}
+    .completed-orders-section .panel-title {{
+      color: #475569;
+    }}
+    .completed-orders-table {{
+      min-width: 980px;
+    }}
+    .completed-orders-table th {{
+      background: #e2e8f0;
+      color: #334155;
+    }}
+    .completed-order-row {{
+      background: #f8fafc;
+      color: #475569;
+    }}
+    .completed-orders-table small {{
+      display: block;
+      margin-top: 2px;
+      color: #64748b;
+      font-size: 10px;
+      font-weight: 750;
+    }}
+    .completed-orders-table .pnl-positive {{
+      background: #ecfdf5;
+      color: #047857;
+      font-weight: 900;
+    }}
+    .completed-orders-table .pnl-negative {{
+      background: #fef2f2;
+      color: #b91c1c;
+      font-weight: 900;
+    }}
     .scheduler-control-panel {{
       grid-column: 1 / -1;
       border-color: #a7f3d0;
@@ -15863,14 +15984,29 @@ def render_page(state: PageState) -> bytes:
     }}
     function isKiteSetupError(message) {{
       const text = String(message || '').toLowerCase();
-      return text.includes('api_key')
-        || text.includes('access_token')
-        || text.includes('api secret')
-        || text.includes('token')
-        || text.includes('kite setup')
-        || text.includes('invalid session')
-        || text.includes('permission')
-        || text.includes('could not import kite_place_order');
+      const setupMarkers = [
+        'kite setup',
+        'missing kite setup',
+        'missing kite_api',
+        'missing kite api',
+        'kite_api_key',
+        'kite_api_secret',
+        'kite_access_token',
+        'could not import kite_place_order',
+        "no module named 'kite_place_order'",
+        'selected kite profile',
+        'allowed ip',
+        'ip address is not allowed',
+        'is not allowed to place orders for this app',
+        'incorrect `api_key` or `access_token`',
+        'incorrect api_key or access_token',
+        'invalid session',
+        'tokenexception',
+        'access token is invalid',
+        'access_token is invalid',
+        'authentication failed'
+      ];
+      return setupMarkers.some((marker) => text.includes(marker));
     }}
     function openKiteSetupForError(message) {{
       if (!isKiteSetupError(message)) return;
@@ -17122,6 +17258,12 @@ def render_page(state: PageState) -> bytes:
     }}
     const refreshCommodityButton = document.getElementById('refresh-commodity-quotes');
     refreshCommodityButton && refreshCommodityButton.addEventListener('click', refreshCommodityQuotes);
+    const dailyKiteLoginUrl = {json.dumps(active_login_url if state.auto_open_kite_login else "")};
+    if (dailyKiteLoginUrl) {{
+      window.setTimeout(() => {{
+        window.open(dailyKiteLoginUrl, '_blank', 'noopener,noreferrer');
+      }}, 150);
+    }}
   </script>
 </body>
 </html>"""
@@ -17204,6 +17346,18 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             return
         if not self.is_authenticated():
             self.send_login()
+            return
+        if is_app_page_request(parsed_url.path) and claim_daily_kite_login_prompt():
+            self.send_page(
+                PageState(
+                    active_tab="kite-setup",
+                    auto_open_kite_login=True,
+                    message=(
+                        "Start-of-day check: log in to Kite and generate today's access token "
+                        "for the selected profile."
+                    ),
+                )
+            )
             return
         if parsed_url.path == "/analytics":
             query = parse_qs(parsed_url.query, keep_blank_values=True)
