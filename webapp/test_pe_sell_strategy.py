@@ -337,6 +337,19 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("Income Growth GPT CSV", output)
         self.assertIn("Intraday Close-Order Guard", output)
         self.assertIn("Pause for 1 day", output)
+        self.assertIn("Run now", output)
+
+    def test_manual_scheduler_run_dispatches_with_force(self):
+        expected = {"status": "PLACED", "message": "Manual run ok."}
+        with patch.object(
+            app,
+            "run_scheduled_position_close_job",
+            return_value=expected,
+        ) as run_close:
+            result = app.run_scheduled_job_now("position_close_open")
+
+        self.assertEqual(result, expected)
+        run_close.assert_called_once_with(force=True)
 
     def test_position_analytics_render_before_scheduled_close_orders(self):
         state = app.PageState(active_tab="positions")
@@ -1536,6 +1549,8 @@ class PeSellStrategyTests(unittest.TestCase):
                     "quantity": 0,
                     "avg_price": 0,
                     "cmp": 102.5,
+                    "holding_source": "Kite profile: Monika",
+                    "invested_amount": 0,
                     "market_value": 0,
                     "pnl": 0,
                     "covered_lots": 0,
@@ -1563,6 +1578,47 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn('data-symbol="IRBINVIT-IV"', output)
         self.assertIn('id="income-equity-limit-price"', output)
         self.assertIn("CNC LIMIT BUY or SELL", output)
+        self.assertIn("Source: Kite profile: Monika", output)
+        self.assertIn("Avg 0", output)
+        self.assertIn("P&L 0", output)
+
+    def test_dividend_income_rows_match_zerodha_holdings_by_invit_alias(self):
+        class FakeKite:
+            def holdings(self):
+                return [
+                    {
+                        "exchange": "NSE",
+                        "tradingsymbol": "PGINVIT",
+                        "quantity": 125,
+                        "average_price": 92.0,
+                        "last_price": 95.5,
+                    },
+                    {
+                        "exchange": "NSE",
+                        "tradingsymbol": "IRBINVIT",
+                        "quantity": 50,
+                        "average_price": 60.0,
+                        "last_price": 63.0,
+                    },
+                ]
+
+        with (
+            patch.object(app, "cached_kite_quote", return_value={}),
+            patch.object(app, "cached_value", side_effect=lambda _key, fn, _ttl: fn()),
+            patch.object(app, "selected_kite_profile_name", return_value="Shanti"),
+        ):
+            rows = app.dividend_income_rows(FakeKite(), {})
+
+        by_symbol = {row["symbol"]: row for row in rows}
+        self.assertEqual(by_symbol["PGINVIT-IV"]["quantity"], 125)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["avg_price"], 92.0)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["cmp"], 95.5)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["invested_amount"], 11500.0)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["market_value"], 11937.5)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["pnl"], 437.5)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["holding_source"], "Kite profile: Shanti")
+        self.assertEqual(by_symbol["IRBINVIT-IV"]["quantity"], 50)
+        self.assertEqual(by_symbol["IRBINVIT-IV"]["avg_price"], 60.0)
 
     def test_income_growth_equity_order_uses_requested_limit_price(self):
         snapshot = {

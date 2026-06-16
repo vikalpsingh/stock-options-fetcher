@@ -400,6 +400,10 @@ DIVIDEND_INCOME_SECURITIES = [
     {"symbol": "PGINVIT-IV", "company": "PGINVIT", "holding": 0},
     {"symbol": "IRBINVIT-IV", "company": "IRBINVIT", "holding": 0},
 ]
+DIVIDEND_INCOME_SYMBOL_ALIASES = {
+    "PGINVIT-IV": {"PGINVIT-IV", "PGINVIT", "PGINVITIV"},
+    "IRBINVIT-IV": {"IRBINVIT-IV", "IRBINVIT", "IRBINVITIV"},
+}
 INCOME_GROWTH_LOT_CAPS = {
     str(item.get("symbol") or "").upper(): float(item.get("lots_can_sell") or 0)
     for item in INCOME_GROWTH_SHEET
@@ -487,6 +491,19 @@ def app_now() -> datetime:
 
 def normalize_income_growth_symbol(value: Any) -> str:
     return str(value or "").upper().replace("NSE:", "").replace("BSE:", "").strip()
+
+
+def normalize_security_lookup_key(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", normalize_income_growth_symbol(value))
+
+
+def dividend_income_alias_keys(symbol: str) -> set[str]:
+    clean_symbol = normalize_income_growth_symbol(symbol)
+    aliases = set(DIVIDEND_INCOME_SYMBOL_ALIASES.get(clean_symbol, {clean_symbol}))
+    aliases.add(clean_symbol)
+    if clean_symbol.endswith("-IV"):
+        aliases.add(clean_symbol.removesuffix("-IV"))
+    return {normalize_security_lookup_key(item) for item in aliases if item}
 
 
 def app_db_connection() -> sqlite3.Connection:
@@ -4893,7 +4910,15 @@ def dividend_income_rows(
     stored_holdings: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     symbols = [str(item["symbol"]).upper() for item in DIVIDEND_INCOME_SECURITIES]
-    quote_keys = [f"NSE:{symbol}" for symbol in symbols]
+    quote_symbols = sorted(
+        {
+            alias
+            for symbol in symbols
+            for alias in DIVIDEND_INCOME_SYMBOL_ALIASES.get(symbol, {symbol})
+            if "-" in alias or alias.endswith("INVIT")
+        }
+    )
+    quote_keys = [f"NSE:{symbol}" for symbol in quote_symbols]
     quotes = cached_kite_quote(kite, quote_keys) if quote_keys else {}
     try:
         kite_holdings = cached_value(
@@ -4903,31 +4928,58 @@ def dividend_income_rows(
         )
     except Exception:
         kite_holdings = []
-    actual_by_symbol = {
-        str(item.get("tradingsymbol") or "").upper(): item
-        for item in kite_holdings
-        if str(item.get("exchange") or "NSE").upper() == "NSE"
-    }
+    actual_by_symbol: dict[str, dict[str, Any]] = {}
+    for holding_item in kite_holdings:
+        if str(holding_item.get("exchange") or "NSE").upper() != "NSE":
+            continue
+        holding_symbol = str(holding_item.get("tradingsymbol") or "").upper()
+        if not holding_symbol:
+            continue
+        actual_by_symbol[normalize_security_lookup_key(holding_symbol)] = holding_item
     rows: list[dict[str, Any]] = []
     for item in DIVIDEND_INCOME_SECURITIES:
         symbol = str(item["symbol"]).upper()
         stored = stored_holdings.get(symbol, {})
-        actual = actual_by_symbol.get(symbol, {})
-        quote = quotes.get(f"NSE:{symbol}", {})
+        actual = next(
+            (
+                actual_by_symbol.get(alias_key)
+                for alias_key in dividend_income_alias_keys(symbol)
+                if actual_by_symbol.get(alias_key)
+            ),
+            {},
+        )
+        quote = next(
+            (
+                quotes.get(f"NSE:{alias}")
+                for alias in DIVIDEND_INCOME_SYMBOL_ALIASES.get(symbol, {symbol})
+                if quotes.get(f"NSE:{alias}") and quote_ltp(quotes.get(f"NSE:{alias}", {}))
+            ),
+            {},
+        )
         ltp = quote_ltp(quote) or float(actual.get("last_price") or stored.get("cmp") or 0)
         holding = int(float(actual.get("quantity") or stored.get("holding") or 0))
         average_price = float(actual.get("average_price") or 0)
+        invested_amount = average_price * holding if average_price > 0 and holding > 0 else 0.0
         market_value = holding * ltp if ltp > 0 else 0.0
         pnl = (ltp - average_price) * holding if holding > 0 and average_price > 0 and ltp > 0 else 0.0
         close = float((quote.get("ohlc") or {}).get("close") or 0)
         today_change = ((ltp - close) / close * 100) if ltp > 0 and close > 0 else None
+        holding_source = (
+            f"Kite profile: {selected_kite_profile_name()}"
+            if actual
+            else "Saved Income Growth holding"
+            if stored.get("holding")
+            else "No Zerodha holding"
+        )
         rows.append(
             {
                 "symbol": symbol,
                 "company": str(item.get("company") or symbol),
+                "holding_source": holding_source,
                 "quantity": holding,
                 "avg_price": average_price,
                 "cmp": ltp or None,
+                "invested_amount": invested_amount,
                 "market_value": market_value,
                 "pnl": pnl,
                 "times_lot": None,
@@ -5236,12 +5288,15 @@ def activate_today_csv_path(csv_path: str) -> None:
     DEFAULT_CSV_PATH = Path(csv_path)
 
 
-def run_scheduled_income_growth_gpt_job(now: datetime | None = None) -> dict[str, Any] | None:
+def run_scheduled_income_growth_gpt_job(
+    now: datetime | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
     now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
         now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
     )
     schedule_state = income_growth_gpt_schedule_state()
-    if (
+    if not force and (
         not schedule_state.get("enabled", True)
         or scheduled_job_is_paused(schedule_state, now)
         or now.weekday() >= 5
@@ -5252,16 +5307,16 @@ def run_scheduled_income_growth_gpt_job(now: datetime | None = None) -> dict[str
     )
     scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
     window_ends = scheduled_at + timedelta(minutes=INCOME_GROWTH_GPT_SCHEDULE_WINDOW_MINUTES)
-    if now < scheduled_at or now >= window_ends:
+    if not force and (now < scheduled_at or now >= window_ends):
         return None
     today_key = now.strftime("%Y-%m-%d")
-    if str(schedule_state.get("last_attempt_date") or "") == today_key:
+    if not force and str(schedule_state.get("last_attempt_date") or "") == today_key:
         return None
     if not INCOME_GROWTH_GPT_SCHEDULER_LOCK.acquire(blocking=False):
         return None
     try:
         schedule_state = income_growth_gpt_schedule_state()
-        if str(schedule_state.get("last_attempt_date") or "") == today_key:
+        if not force and str(schedule_state.get("last_attempt_date") or "") == today_key:
             return None
         profile_name = selected_kite_profile_name()
         started_at = now.strftime("%d %b %Y %H:%M:%S IST")
@@ -5270,7 +5325,11 @@ def run_scheduled_income_growth_gpt_job(now: datetime | None = None) -> dict[str
             last_run_at=started_at,
             profile=profile_name,
             status="RUNNING",
-            message="Refreshing Income Growth candidates and requesting fresh GPT validation.",
+            message=(
+                "Manual run: refreshing Income Growth candidates and requesting fresh GPT validation."
+                if force
+                else "Refreshing Income Growth candidates and requesting fresh GPT validation."
+            ),
         )
         try:
             profile = load_kite_profiles().get(profile_name, blank_kite_profile())
@@ -8773,12 +8832,15 @@ def verify_scheduled_position_market_open(kite: Any, now: datetime) -> tuple[boo
     return True, f"NSE market timestamp verified at {market_stamp:%H:%M:%S} IST."
 
 
-def run_scheduled_position_close_job(now: datetime | None = None) -> dict[str, Any] | None:
+def run_scheduled_position_close_job(
+    now: datetime | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
     now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
         now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
     )
     schedule_state = position_close_schedule_state()
-    if (
+    if not force and (
         not schedule_state.get("enabled", True)
         or scheduled_job_is_paused(schedule_state, now)
         or now.weekday() >= 5
@@ -8789,16 +8851,16 @@ def run_scheduled_position_close_job(now: datetime | None = None) -> dict[str, A
     )
     scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
     window_ends = scheduled_at + timedelta(minutes=POSITION_CLOSE_SCHEDULE_WINDOW_MINUTES)
-    if now < scheduled_at or now >= window_ends:
+    if not force and (now < scheduled_at or now >= window_ends):
         return None
     today_key = now.strftime("%Y-%m-%d")
-    if str(schedule_state.get("last_attempt_date") or "") == today_key:
+    if not force and str(schedule_state.get("last_attempt_date") or "") == today_key:
         return None
     if not POSITION_CLOSE_SCHEDULER_LOCK.acquire(blocking=False):
         return None
     try:
         schedule_state = position_close_schedule_state()
-        if str(schedule_state.get("last_attempt_date") or "") == today_key:
+        if not force and str(schedule_state.get("last_attempt_date") or "") == today_key:
             return None
         profile_name = selected_kite_profile_name()
         started_at = now.strftime("%d %b %Y %H:%M:%S IST")
@@ -8807,7 +8869,11 @@ def run_scheduled_position_close_job(now: datetime | None = None) -> dict[str, A
             last_run_at=started_at,
             profile=profile_name,
             status="RUNNING",
-            message="Building default close-position BUY orders.",
+            message=(
+                "Manual run: building default close-position BUY orders."
+                if force
+                else "Building default close-position BUY orders."
+            ),
             results=[],
         )
         try:
@@ -9030,6 +9096,20 @@ def update_scheduled_job_control(
     raise ValueError("Unknown scheduled job action.")
 
 
+def run_scheduled_job_now(job_key: str) -> dict[str, Any]:
+    if job_key == "position_close_open":
+        result = run_scheduled_position_close_job(force=True)
+    elif job_key == "income_growth_gpt":
+        result = run_scheduled_income_growth_gpt_job(force=True)
+    elif job_key == "intraday_position_close":
+        result = run_intraday_position_close_job(force=True)
+    else:
+        raise ValueError("Unknown scheduled job.")
+    if result is None:
+        raise RuntimeError("Job did not run. Check whether it is already running or blocked.")
+    return result
+
+
 def intraday_position_close_slot(now: datetime) -> tuple[str, datetime] | None:
     state = intraday_position_close_schedule_state()
     start_hour, start_minute = (
@@ -9051,28 +9131,35 @@ def intraday_position_close_slot(now: datetime) -> tuple[str, datetime] | None:
     return f"{now:%Y-%m-%d}:{slot_at:%H:%M}", slot_at
 
 
-def run_intraday_position_close_job(now: datetime | None = None) -> dict[str, Any] | None:
+def run_intraday_position_close_job(
+    now: datetime | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
     now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
         now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
     )
     schedule_state = intraday_position_close_schedule_state()
-    if (
+    if not force and (
         not schedule_state.get("enabled", True)
         or scheduled_job_is_paused(schedule_state, now)
         or now.weekday() >= 5
     ):
         return None
     slot = intraday_position_close_slot(now)
-    if slot is None:
+    if slot is None and not force:
         return None
-    slot_key, slot_at = slot
-    if str(schedule_state.get("last_slot_key") or "") == slot_key:
+    if slot is None:
+        slot_at = now.replace(second=0, microsecond=0)
+        slot_key = f"manual:{now:%Y-%m-%d:%H:%M:%S}"
+    else:
+        slot_key, slot_at = slot
+    if not force and str(schedule_state.get("last_slot_key") or "") == slot_key:
         return None
     if not INTRADAY_POSITION_CLOSE_SCHEDULER_LOCK.acquire(blocking=False):
         return None
     try:
         schedule_state = intraday_position_close_schedule_state()
-        if str(schedule_state.get("last_slot_key") or "") == slot_key:
+        if not force and str(schedule_state.get("last_slot_key") or "") == slot_key:
             return None
         profile_name = selected_kite_profile_name()
         today_key = now.strftime("%Y-%m-%d")
@@ -9088,7 +9175,11 @@ def run_intraday_position_close_job(now: datetime | None = None) -> dict[str, An
             run_count_today=run_count + 1,
             profile=profile_name,
             status="RUNNING",
-            message="Checking open option positions and existing close BUY orders.",
+            message=(
+                "Manual run: checking open option positions and existing close BUY orders."
+                if force
+                else "Checking open option positions and existing close BUY orders."
+            ),
             results=[],
         )
         try:
@@ -10214,6 +10305,15 @@ def render_income_growth_panel(state: PageState) -> str:
     def equity_stock_button(row: dict[str, Any]) -> str:
         symbol = str(row.get("symbol") or "").upper()
         company = str(row.get("company") or "")
+        holding_source = str(row.get("holding_source") or "")
+        extra_detail = ""
+        if holding_source:
+            extra_detail = (
+                f'<span class="income-growth-stock-detail">Source: {html.escape(holding_source)}</span>'
+                f'<span class="income-growth-stock-detail">Avg {html.escape(fmt_number(row.get("avg_price")))}'
+                f' | Invested {html.escape(format_buy_amount(row.get("invested_amount")))}'
+                f' | P&L {html.escape(fmt_number(row.get("pnl")))}</span>'
+            )
         return (
             f'<button type="button" class="income-equity-stock" '
             f'data-symbol="{html.escape(symbol, quote=True)}" '
@@ -10223,6 +10323,7 @@ def render_income_growth_panel(state: PageState) -> str:
             f'data-ltp="{html.escape(str(row.get("cmp") or 0), quote=True)}" '
             f'data-pnl="{html.escape(str(row.get("pnl") or 0), quote=True)}">'
             f'<strong>{html.escape(symbol)}</strong><span>{html.escape(company)}</span>'
+            f"{extra_detail}"
             "</button>"
         )
     def render_income_growth_row(row: dict[str, Any]) -> str:
@@ -10341,7 +10442,7 @@ def render_income_growth_panel(state: PageState) -> str:
       <section class="panel investing-summary-panel"><div class="summary-grid">{summary_cards}</div></section>
       <section class="panel income-growth-table-panel dividend-income-panel">
         <div class="panel-title">Dividend Income</div>
-        <div class="status">Income-focused InvIT watchlist. PGINVIT-IV and IRBINVIT-IV start with zero holding; click either security to place a CNC LIMIT BUY or SELL order through the selected Kite profile.</div>
+        <div class="status">Income-focused InvIT watchlist. PGINVIT-IV and IRBINVIT-IV holdings are matched from the selected Kite profile; click either security to place a CNC LIMIT BUY or SELL order.</div>
         <div class="table-wrap"><table id="dividend-income-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{dividend_table_rows}</tbody></table></div>
       </section>
       {render_income_growth_gpt_schedule_panel()}
@@ -10989,6 +11090,7 @@ def render_scheduler_control_panel() -> str:
         primary_action = "start" if not enabled else "stop"
         primary_label = "Start job" if not enabled else "Stop job"
         pause_disabled = " disabled" if not enabled else ""
+        run_disabled = " disabled" if status == "RUNNING" else ""
         rows.append(
             "<tr>"
             f"<td><strong>{html.escape(job['name'])}</strong><small>{html.escape(job['schedule'])}</small></td>"
@@ -11001,6 +11103,8 @@ def render_scheduler_control_panel() -> str:
             f'formaction="/scheduler/{primary_action}" name="job_name" value="{html.escape(job_key)}">{primary_label}</button>'
             f'<button type="submit" class="secondary" formaction="/scheduler/pause-day" '
             f'name="job_name" value="{html.escape(job_key)}"{pause_disabled}>Pause for 1 day</button>'
+            f'<button type="submit" formaction="/scheduler/run-now" '
+            f'name="job_name" value="{html.escape(job_key)}"{run_disabled}>Run now</button>'
             "</div></td>"
             "</tr>"
         )
@@ -13299,6 +13403,12 @@ def render_page(state: PageState) -> bytes:
       color: #49627d;
       font-size: 9px;
       font-weight: 700;
+    }}
+    .income-equity-stock .income-growth-stock-detail {{
+      color: #0f766e;
+      font-size: 8px;
+      line-height: 1.25;
+      opacity: 0.95;
     }}
     .income-equity-modal-card {{ width: min(680px, calc(100vw - 24px)); }}
     .equity-hero {{
@@ -18044,6 +18154,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 updated = update_scheduled_job_control(job_key, action)
                 job_name = scheduled_job_definitions()[job_key]["name"]
                 state.message = f"{job_name}: {updated.get('message', 'Schedule updated.')}"
+            elif request_path == "/scheduler/run-now":
+                job_key = first(form, "job_name")
+                result = run_scheduled_job_now(job_key)
+                job_name = scheduled_job_definitions()[job_key]["name"]
+                state.message = (
+                    f"{job_name} manual run finished with status "
+                    f"{str(result.get('status') or 'UNKNOWN').upper()}: "
+                    f"{result.get('message', '')}"
+                )
             elif request_path == "/analytics/load":
                 state.analytics_data, state.console_log = call_with_console(
                     option_analytics_for_symbol,
