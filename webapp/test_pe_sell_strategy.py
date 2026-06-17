@@ -157,6 +157,107 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIsNone(result)
         schedule_state.assert_called_once()
 
+    def test_income_growth_gpt_csv_save_loads_research(self):
+        csv_text = (
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "NFO,PFC26JUN400PE,1300,SELL,NRML,LIMIT,0,DAY\n"
+        )
+        parsed_rows = [{
+            "exchange": "NFO",
+            "tradingsymbol": "PFC26JUN400PE",
+            "quantity": "1300",
+            "transaction_type": "SELL",
+            "product": "NRML",
+            "order_type": "LIMIT",
+            "price": "0",
+            "validity": "DAY",
+        }]
+        research_rows = [{"symbol": "PFC26JUN400PE"}]
+        with (
+            patch.object(app, "parse_csv_text", return_value=parsed_rows),
+            patch.object(app, "validate_kite_order_rows"),
+            patch.object(app, "save_today_csv_text", return_value=("16Jun2026.csv", "Saved CSV.")),
+            patch.object(app, "activate_today_csv_path") as activate_path,
+            patch.object(app, "research_csv_symbols", return_value=research_rows) as research,
+        ):
+            outcome = app.save_income_growth_gpt_csv_for_research(csv_text)
+
+        self.assertEqual(outcome["csv_path"], "16Jun2026.csv")
+        self.assertEqual(outcome["order_count"], 1)
+        self.assertEqual(outcome["research_rows"], research_rows)
+        self.assertEqual(outcome["research_count"], 1)
+        activate_path.assert_called_once_with("16Jun2026.csv")
+        research.assert_called_once()
+
+    def test_income_growth_outcome_links_to_gpt_and_research(self):
+        state = app.PageState(
+            active_tab="income-growth",
+            income_growth_saved_csv_path="C:/income/16Jun2026.csv",
+            income_growth_outcome_message="Saved CSV. Loaded Research comparison for 1 symbol(s).",
+            income_growth_research_count=1,
+            income_growth_gpt_response_id="resp_123",
+            income_growth_gpt_csv="exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n",
+            income_growth_gpt_output="exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n",
+        )
+
+        html = app.render_income_growth_panel(state)
+
+        self.assertIn("Outcome", html)
+        self.assertIn("16Jun2026.csv", html)
+        self.assertIn("Open GPT response", html)
+        self.assertIn('data-tab-target="research"', html)
+
+    def test_best_sell_candidate_csv_combines_top_ce_and_pe(self):
+        ce_top = [
+            {
+                "option_symbol": "PFC26JUN480CE",
+                "active_lot_size": 1300,
+                "lots_to_sell": 2,
+                "sell_limit_price": 3.6,
+            },
+            {
+                "option_symbol": "HAVELLS26JUN1300CE",
+                "active_lot_size": 500,
+                "lots_to_sell": 1,
+                "sell_limit_price": 14.2,
+            },
+        ]
+        pe_top = [
+            {
+                "option_symbol": "PFC26JUN400PE",
+                "lot_size": 1300,
+                "sell_limit_price": 2.8,
+            },
+            {
+                "option_symbol": "CAMS26JUN760PE",
+                "lot_size": 750,
+                "sell_limit_price": 8.3,
+            },
+        ]
+        with (
+            patch.object(app, "ce_sell_dashboard", return_value=(ce_top, [], [])),
+            patch.object(app, "income_dashboard_snapshot", return_value={"pe_top": pe_top}),
+        ):
+            csv_text, returned_ce, returned_pe = app.best_sell_candidate_csv(True)
+
+        rows = app.parse_csv_text(csv_text)
+        self.assertEqual(returned_ce, ce_top)
+        self.assertEqual(returned_pe, pe_top)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]["tradingsymbol"], "PFC26JUN480CE")
+        self.assertEqual(rows[0]["quantity"], "1300")
+        self.assertEqual(rows[2]["tradingsymbol"], "PFC26JUN400PE")
+        self.assertEqual(rows[2]["quantity"], "1300")
+        self.assertEqual(rows[2]["transaction_type"], "SELL")
+
+    def test_research_panel_has_best_sell_csv_button(self):
+        state = app.PageState(active_tab="research")
+
+        html = app.render_research_panel(state)
+
+        self.assertIn("/research/best-sells", html)
+        self.assertIn("Generate Best 3 PE + 3 CE SELL CSV", html)
+
     def test_position_buy_prices_follow_requested_twenty_percent_rule(self):
         orders = [
             {
@@ -588,15 +689,19 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.object(
                 app,
                 "cached_kite_quote",
-                return_value={"NFO:PFC26JUN400PE": {"last_price": 2.85}},
+                return_value={
+                    "NFO:PFC26JUN400PE": {
+                        "last_price": 2.85,
+                        "depth": {"buy": [{"price": 2.80}], "sell": [{"price": 2.90}]},
+                    }
+                },
             ),
         ):
             orders = app.build_orders([row], True, False)
-        self.assertEqual(orders[0]["price"], 3.45)
+        self.assertEqual(orders[0]["price"], 2.75)
         self.assertEqual(orders[0]["ltp"], 2.85)
-        self.assertEqual(orders[0]["max_gain"], 4485.0)
-        self.assertEqual(orders[0]["price_basis"], "fresh_ltp_plus_markup")
-        self.assertEqual(orders[0]["price_markup_percent"], 20.0)
+        self.assertEqual(orders[0]["max_gain"], 3575.0)
+        self.assertEqual(orders[0]["price_protection_status"], "ADJUSTED")
 
     def test_explicit_trading_sell_price_is_replaced_by_fresh_ltp_plus_markup(self):
         row = {
@@ -628,13 +733,19 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.object(
                 app,
                 "cached_kite_quote",
-                return_value={"NFO:PFC26JUN400PE": {"last_price": 2.85}},
+                return_value={
+                    "NFO:PFC26JUN400PE": {
+                        "last_price": 2.85,
+                        "depth": {"buy": [{"price": 2.80}], "sell": [{"price": 2.90}]},
+                    }
+                },
             ),
         ):
             orders = app.build_orders([row], True, False)
-        self.assertEqual(orders[0]["price"], 3.45)
+        self.assertEqual(orders[0]["price"], 3.20)
         self.assertEqual(orders[0]["ltp"], 2.85)
-        self.assertEqual(orders[0]["max_gain"], 4485.0)
+        self.assertEqual(orders[0]["max_gain"], 4160.0)
+        self.assertEqual(orders[0]["price_protection_status"], "OK")
 
     def test_trading_orders_table_shows_option_ltp_and_maximum_gain(self):
         order = {
@@ -716,6 +827,7 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
             patch.object(app, "build_orders", return_value=[built]),
             patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "apply_nfo_option_price_protection", return_value=[built]),
             patch.object(app, "active_position_option_block_keys", return_value=set()),
             patch.object(
                 app,
@@ -727,6 +839,177 @@ class PeSellStrategyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "same open/pending Kite order already exists"):
                 app.execute_orders([row], {0}, False, True, True)
         place_order.assert_not_called()
+
+    def test_sell_zero_price_uses_best_bid_inside_lpp(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26JUN24000CE",
+            "transaction_type": "SELL",
+            "order_type": "LIMIT",
+            "price": 0,
+        }
+        quote = {
+            "last_price": 12.0,
+            "depth": {"buy": [{"price": 11.80}], "sell": [{"price": 11.95}]},
+        }
+        result = app.validateOrderPriceWithinRange(order, quote)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["price"], 11.75)
+        self.assertTrue(result["auto_adjusted"])
+
+    def test_buy_zero_price_uses_best_ask_inside_lpp(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26JUN24000CE",
+            "transaction_type": "BUY",
+            "order_type": "LIMIT",
+            "price": 0,
+        }
+        quote = {
+            "last_price": 12.0,
+            "depth": {"buy": [{"price": 11.80}], "sell": [{"price": 11.95}]},
+        }
+        result = app.validateOrderPriceWithinRange(order, quote)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["price"], 12.0)
+
+    def test_lpp_range_below_and_above_50(self):
+        self.assertEqual(app.estimateOptionLppRange(12.0), (0.05, 32.0))
+        self.assertEqual(app.estimateOptionLppRange(100.0), (60.0, 140.0))
+
+    def test_sell_without_bid_is_blocked(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26JUN24000CE",
+            "transaction_type": "SELL",
+            "order_type": "LIMIT",
+            "price": 0,
+        }
+        quote = {"last_price": 12.0, "depth": {"buy": [], "sell": [{"price": 11.95}]}}
+        result = app.validateOrderPriceWithinRange(order, quote)
+        self.assertFalse(result["ok"])
+        self.assertIn("No valid best bid", result["reason"])
+
+    def test_buy_without_ask_is_blocked(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26JUN24000CE",
+            "transaction_type": "BUY",
+            "order_type": "LIMIT",
+            "price": 0,
+        }
+        quote = {"last_price": 12.0, "depth": {"buy": [{"price": 11.80}], "sell": []}}
+        result = app.validateOrderPriceWithinRange(order, quote)
+        self.assertFalse(result["ok"])
+        self.assertIn("No valid best ask", result["reason"])
+
+    def test_wide_spread_is_blocked(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26JUN24000CE",
+            "transaction_type": "SELL",
+            "order_type": "LIMIT",
+            "price": 0,
+        }
+        quote = {
+            "last_price": 10.0,
+            "depth": {"buy": [{"price": 7.0}], "sell": [{"price": 11.0}]},
+        }
+        result = app.validateOrderPriceWithinRange(order, quote)
+        self.assertFalse(result["ok"])
+        self.assertIn("spread", result["reason"])
+
+    def test_price_rounds_to_five_paise_tick(self):
+        self.assertEqual(app.roundToTick(11.773), 11.75)
+        self.assertEqual(app.roundToTick(11.778), 11.80)
+
+    def test_lpp_rejection_retries_once_with_recalculated_price(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26JUN24000CE",
+            "transaction_type": "SELL",
+            "order_type": "LIMIT",
+            "quantity": 65,
+            "price": 40.0,
+            "_csv_price": 40.0,
+        }
+        quote = {
+            "NFO:NIFTY26JUN24000CE": {
+                "last_price": 12.0,
+                "depth": {"buy": [{"price": 11.80}], "sell": [{"price": 11.95}]},
+            }
+        }
+        calls = []
+
+        def fake_place(_kite, payload):
+            calls.append(payload["price"])
+            if len(calls) == 1:
+                raise Exception("outside the current allowed limit price protection range")
+            return "OID123"
+
+        with (
+            patch.object(app, "cached_kite_quote", return_value=quote),
+            patch.object(app, "place_order_allowing_autoslice", side_effect=fake_place),
+        ):
+            order_id, action = app.send_order_with_lpp_retry(object(), order, True)
+        self.assertEqual(order_id, "OID123")
+        self.assertIn("retried_after_lpp_rejection", action)
+        self.assertEqual(calls, [40.0, 11.75])
+
+    def test_kite_error_result_includes_allowed_price_retry_order(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26JUN24000CE",
+            "transaction_type": "SELL",
+            "order_type": "LIMIT",
+            "quantity": 65,
+            "product": "NRML",
+            "price": 40.0,
+            "validity": "DAY",
+        }
+        quote = {
+            "NFO:NIFTY26JUN24000CE": {
+                "last_price": 12.0,
+                "depth": {"buy": [{"price": 11.80}], "sell": [{"price": 11.95}]},
+            }
+        }
+        with patch.object(app, "cached_kite_quote", return_value=quote):
+            result = app.kite_error_result_with_retry(
+                object(),
+                order,
+                Exception("outside the current allowed limit price protection range"),
+                "NIFTY order",
+            )
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["retry_order"]["price"], 11.75)
+        self.assertIn("Allowed-price retry", result["detail"])
+
+    def test_kite_response_modal_shows_retry_action(self):
+        state = app.PageState(
+            active_tab="place",
+            results=[
+                {
+                    "tradingsymbol": "NIFTY26JUN24000CE",
+                    "status": "ERROR",
+                    "detail": "Kite rejected price.",
+                    "retry_order": {
+                        "exchange": "NFO",
+                        "tradingsymbol": "NIFTY26JUN24000CE",
+                        "transaction_type": "SELL",
+                        "quantity": 65,
+                        "product": "NRML",
+                        "order_type": "LIMIT",
+                        "price": 11.75,
+                        "validity": "DAY",
+                    },
+                }
+            ],
+        )
+        html = app.render_kite_response_modal(state)
+        self.assertIn("Kite Order Response", html)
+        self.assertIn("/nfo/retry-safe-price", html)
+        self.assertIn("Submit allowed price", html)
+        self.assertIn("11.75", html)
 
     def test_far_otm_ce_is_adjusted_to_highest_active_strike_within_cap(self):
         row = {
@@ -1655,6 +1938,602 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("enableTableSorting(document.getElementById('dividend-income-table'))", page_html)
         self.assertIn("const incomeEquityLimitPrice", page_html)
         self.assertIn("Limit vs CMP", page_html)
+
+    def test_nifty_income_mmi_rules_choose_safer_strikes(self):
+        greed = app.calculate_nifty_dynamic_strikes(24000, 65)
+        fear = app.calculate_nifty_dynamic_strikes(24000, 35)
+
+        self.assertEqual(greed["mmi_regime"], "GREED_OVERBOUGHT")
+        self.assertEqual(greed["pe_sell_strike"], 22400)
+        self.assertEqual(greed["ce_sell_strike"], 25100)
+        self.assertEqual(fear["mmi_regime"], "FEAR_OVERSOLD")
+        self.assertEqual(fear["pe_sell_strike"], 22900)
+        self.assertEqual(fear["ce_sell_strike"], 25600)
+
+    def test_nifty_income_vix_filter_rejects_low_and_high_vix(self):
+        low = app.apply_vix_filter_and_adjustment(5.5, 5.5, 10.5)
+        high = app.apply_vix_filter_and_adjustment(5.5, 5.5, 25)
+        elevated = app.apply_vix_filter_and_adjustment(5.5, 5.5, 18)
+
+        self.assertFalse(low["allowed"])
+        self.assertEqual(low["skip_reason"], "LOW_VIX_POOR_PREMIUM")
+        self.assertFalse(high["allowed"])
+        self.assertEqual(high["skip_reason"], "VERY_HIGH_VIX_EVENT_RISK")
+        self.assertTrue(elevated["allowed"])
+        self.assertEqual(elevated["adjusted_pe_otm_pct"], 6.0)
+        self.assertEqual(elevated["position_size_multiplier"], 0.75)
+
+    def test_nifty_income_expected_move_pushes_close_strikes_away(self):
+        result = app.validate_short_strikes_against_expected_move(
+            spot=24000,
+            pe_sell_strike=23800,
+            ce_sell_strike=24200,
+            expected_move_points=300,
+            min_expected_move_multiplier=1.2,
+            strike_rounding=100,
+        )
+
+        self.assertEqual(result["adjusted_pe_sell_strike"], 23600)
+        self.assertEqual(result["adjusted_ce_sell_strike"], 24400)
+        self.assertIn("expected move", result["expected_move_adjustment_reason"])
+
+    def test_nifty_income_strategy_selector_prefers_defined_risk_only(self):
+        neutral = app.select_nifty_income_strategy(
+            {
+                "mmi": 50,
+                "trend_regime": "SIDEWAYS",
+                "vix_allowed": True,
+                "monthly_risk_allowed": True,
+                "margin_heat_allowed": True,
+                "pe_sell_strike": 22600,
+                "ce_sell_strike": 25400,
+                "hedge_distance_points": 500,
+            }
+        )
+        greed = app.select_nifty_income_strategy(
+            {
+                "mmi": 70,
+                "trend_regime": "MIXED",
+                "vix_allowed": True,
+                "monthly_risk_allowed": True,
+                "margin_heat_allowed": True,
+                "pe_sell_strike": 22600,
+                "ce_sell_strike": 25400,
+                "hedge_distance_points": 500,
+            }
+        )
+
+        self.assertEqual(neutral["selected_strategy"], "IRON_CONDOR")
+        self.assertEqual(neutral["hedge_pe_strike"], 22100)
+        self.assertEqual(neutral["hedge_ce_strike"], 25900)
+        self.assertEqual(greed["selected_strategy"], "BEAR_CALL_SPREAD")
+        self.assertIsNone(greed["final_pe_sell_strike"])
+
+    def test_nifty_time_exit_date_moves_weekend_to_previous_trading_day(self):
+        expiry = date(2026, 7, 3)
+        self.assertEqual(app.scheduled_nifty_time_exit_date(expiry, 7), date(2026, 6, 26))
+
+        saturday_due = date(2026, 7, 4)
+        self.assertEqual(app.scheduled_nifty_time_exit_date(saturday_due, 7), date(2026, 6, 26))
+
+    def test_nifty_time_exit_orders_reverse_open_positions(self):
+        positions = [
+            {
+                "tradingsymbol": "NIFTY26JUN24000CE",
+                "quantity": -75,
+                "expiry": date(2026, 6, 26),
+                "ltp": 100,
+            },
+            {
+                "tradingsymbol": "NIFTY26JUN24500CE",
+                "quantity": 75,
+                "expiry": date(2026, 6, 26),
+                "ltp": 25,
+            },
+        ]
+        now = app.datetime(2026, 6, 19, 14, 59, tzinfo=app.INDIA_TIME_ZONE)
+        with patch.object(app, "nifty_income_state", return_value={"time_exit_generated_keys": []}):
+            orders = app.nifty_time_exit_orders_for_positions(
+                positions,
+                {"time_exit_days_before_expiry": 7, "time_exit_time": "14:59", "time_exit_order_type": "MARKET"},
+                now,
+            )
+
+        self.assertEqual(orders[0]["transaction_type"], "BUY")
+        self.assertEqual(orders[1]["transaction_type"], "SELL")
+        self.assertEqual(orders[0]["quantity"], 75)
+        self.assertEqual(orders[0]["exit_reason"], "TIME_EXIT_T_MINUS_7")
+
+    def test_nifty_income_jobs_are_visible_in_scheduler_and_tab(self):
+        jobs = app.scheduled_job_definitions()
+        self.assertIn("nifty_income_entry", jobs)
+        self.assertIn("nifty_income_time_exit", jobs)
+
+        with patch.object(
+            app,
+            "nifty_income_snapshot",
+            return_value={
+                "config": app.nifty_income_config(),
+                "state": app.nifty_income_state(),
+                "summary": {"active_positions": 0, "pnl": 0, "spot": 24000, "mmi": 50, "vix": 14, "pop": "Defined-risk"},
+                "positions": [],
+                "suggestion": {"selected_strategy": "IRON_CONDOR", "allowed": True, "pe_otm_pct": 5.5, "ce_otm_pct": 5.5},
+                "entry_orders": [],
+                "time_exit_orders": [],
+                "warnings": [],
+            },
+        ):
+            page_html = app.render_page(app.PageState(active_tab="nifty-income")).decode("utf-8")
+
+        self.assertIn("Nifty Income", page_html)
+        self.assertIn("Defined-risk NIFTY income engine", page_html)
+        self.assertIn("Run T-7 Exit Now", page_html)
+        self.assertIn("'nifty-income': '/nifty-income'", page_html)
+        self.assertIn("document.getElementById('nifty-income-panel').style.display", page_html)
+
+    def test_next_nifty_income_entry_date_uses_upcoming_friday(self):
+        thursday = app.datetime(2026, 6, 18, 12, 0, tzinfo=app.INDIA_TIME_ZONE)
+        friday_before = app.datetime(2026, 6, 19, 14, 0, tzinfo=app.INDIA_TIME_ZONE)
+        friday_after = app.datetime(2026, 6, 19, 16, 0, tzinfo=app.INDIA_TIME_ZONE)
+
+        self.assertEqual(app.next_nifty_income_entry_date(thursday, "15:22"), date(2026, 6, 19))
+        self.assertEqual(app.next_nifty_income_entry_date(friday_before, "15:22"), date(2026, 6, 19))
+        self.assertEqual(app.next_nifty_income_entry_date(friday_after, "15:22"), date(2026, 6, 26))
+
+    def test_nifty_candidate_preview_calculates_ltp_otm_max_gain_and_yield(self):
+        entry_orders = [
+            {
+                "tradingsymbol": "NIFTY26JUN22600PE",
+                "transaction_type": "SELL",
+                "option_type": "PE",
+                "strike": 22600,
+                "expiry_date": "2026-06-26",
+                "mmi_selected_otm_pct": 5.5,
+            },
+            {
+                "tradingsymbol": "NIFTY26JUN22100PE",
+                "transaction_type": "BUY",
+                "option_type": "PE",
+                "strike": 22100,
+                "expiry_date": "2026-06-26",
+            },
+        ]
+        quote_map = {
+            "NFO:NIFTY26JUN22600PE": {
+                "last_price": 120,
+                "oi": 1000,
+                "volume": 250,
+                "depth": {"buy": [{"price": 119}], "sell": [{"price": 121}]},
+            },
+            "NFO:NIFTY26JUN22100PE": {"last_price": 40},
+        }
+
+        rows = app.nifty_candidate_previews(
+            entry_orders,
+            quote_map,
+            24000,
+            {"lot_size": 75},
+            300,
+        )
+
+        self.assertEqual(rows[0]["side"], "PE")
+        self.assertAlmostEqual(rows[0]["otm_pct"], 5.8333, places=3)
+        self.assertEqual(rows[0]["option_ltp"], 120)
+        self.assertEqual(rows[0]["premium_value_per_lot"], 9000)
+        self.assertEqual(rows[0]["max_gain_opportunity"], 6000)
+        self.assertEqual(rows[0]["max_loss"], 31500)
+        self.assertAlmostEqual(rows[0]["premium_yield_on_margin_pct"], 19.0476, places=3)
+        self.assertEqual(rows[0]["risk_status"], "GREEN")
+
+    def test_nifty_preview_liquidity_reduces_ce_otm_by_max_200_points(self):
+        quotes = {
+            "NIFTY26JUN25500CE": {"oi": 100, "volume": 0},
+            "NIFTY26JUN25400CE": {"oi": 9000, "volume": 5},
+            "NIFTY26JUN25300CE": {"oi": 0, "volume": 0},
+            "NIFTY26JUN25200CE": {"oi": 50000, "volume": 1000},
+        }
+        order = {
+            "tradingsymbol": "NIFTY26JUN25500CE",
+            "transaction_type": "SELL",
+            "option_type": "CE",
+            "strike": 25500,
+        }
+
+        adjusted = app.adjust_nifty_preview_sell_order_for_liquidity(
+            order,
+            lambda symbol: quotes.get(symbol, {}),
+            lambda strike, option_type: f"NIFTY26JUN{strike}{option_type}",
+        )
+
+        self.assertEqual(adjusted["strike"], 25300)
+        self.assertEqual(adjusted["tradingsymbol"], "NIFTY26JUN25300CE")
+        self.assertEqual(adjusted["liquidity_shift_points"], 200)
+        self.assertIn("Max adjustment allowed is 200 points", adjusted["liquidity_adjustment_note"])
+
+    def test_nifty_preview_liquidity_reduces_pe_otm_towards_spot(self):
+        quotes = {
+            "NIFTY26JUN22600PE": {"oi": 500, "volume": 1},
+            "NIFTY26JUN22700PE": {"oi": 15000, "volume": 0},
+        }
+        order = {
+            "tradingsymbol": "NIFTY26JUN22600PE",
+            "transaction_type": "SELL",
+            "option_type": "PE",
+            "strike": 22600,
+        }
+
+        adjusted = app.adjust_nifty_preview_sell_order_for_liquidity(
+            order,
+            lambda symbol: quotes.get(symbol, {}),
+            lambda strike, option_type: f"NIFTY26JUN{strike}{option_type}",
+        )
+
+        self.assertEqual(adjusted["strike"], 22700)
+        self.assertEqual(adjusted["tradingsymbol"], "NIFTY26JUN22700PE")
+        self.assertEqual(adjusted["liquidity_shift_points"], 100)
+
+    def test_nifty_dashboard_renders_market_preview_and_scheduled_jobs(self):
+        config = app.nifty_income_config()
+        snapshot = {
+            "config": config,
+            "state": app.nifty_income_state(),
+            "summary": {
+                "active_positions": 1,
+                "pnl": 1250,
+                "spot": 24000,
+                "mmi": 55,
+                "vix": 14,
+                "pop": "Defined-risk",
+                "margin_required": 31500,
+                "max_gain": 6000,
+            },
+            "market_regime": {
+                "nifty_spot": 24000,
+                "nifty_futures": 24050,
+                "mmi": 55,
+                "mmi_regime": "NEUTRAL",
+                "india_vix": 14,
+                "vix_regime": "NORMAL_LOW",
+                "rsi_14": "N/A",
+                "adx_14": "N/A",
+                "dma_20": "N/A",
+                "dma_50": "N/A",
+                "trend_regime": "SIDEWAYS",
+                "expected_move_points": 300,
+                "expected_move_pct": 1.25,
+            },
+            "positions": [],
+            "suggestion": {
+                "selected_strategy": "IRON_CONDOR",
+                "allowed": True,
+                "mmi_regime": "NEUTRAL",
+                "vix_regime": "NORMAL_LOW",
+                "entry_date": "2026-06-19",
+                "final_pe_sell_strike": 22600,
+                "final_ce_sell_strike": 25400,
+                "pe_otm_pct": 5.5,
+                "ce_otm_pct": 5.5,
+                "expected_net_credit": 80,
+                "estimated_target_profit": 787.5,
+                "estimated_stop_loss": 945,
+                "time_exit_date": "2026-06-19",
+            },
+            "entry_orders": [],
+            "candidate_previews": [
+                {
+                    "side": "PE",
+                    "action": "SELL",
+                    "expiry_date": "2026-06-26",
+                    "tradingsymbol": "NIFTY26JUN22600PE",
+                    "hedge_symbol": "NIFTY26JUN22100PE",
+                    "strike": 22600,
+                    "nifty_spot": 24000,
+                    "otm_pct": 5.83,
+                    "mmi_selected_otm_pct": 5.5,
+                    "option_ltp": 120,
+                    "bid": 119,
+                    "ask": 121,
+                    "delta": "N/A",
+                    "iv": "N/A",
+                    "oi": 1000,
+                    "change_oi": "N/A",
+                    "volume": 250,
+                    "premium_value_per_lot": 9000,
+                    "max_gain_opportunity": 6000,
+                    "margin_required": 31500,
+                    "premium_yield_on_margin_pct": 19.04,
+                    "risk_status": "GREEN",
+                    "selection_reason": "test",
+                },
+                {
+                    "side": "CE",
+                    "action": "SELL",
+                    "expiry_date": "2026-06-26",
+                    "tradingsymbol": "NIFTY26JUN25400CE",
+                    "hedge_symbol": "N/A",
+                    "strike": 25400,
+                    "nifty_spot": 24000,
+                    "otm_pct": 5.83,
+                    "mmi_selected_otm_pct": 5.5,
+                    "option_ltp": 110,
+                    "bid": 109,
+                    "ask": 112,
+                    "delta": "N/A",
+                    "iv": "N/A",
+                    "oi": 900,
+                    "change_oi": "N/A",
+                    "volume": 200,
+                    "premium_value_per_lot": 8250,
+                    "max_gain_opportunity": 8250,
+                    "margin_required": "Use defined-risk hedge",
+                    "premium_yield_on_margin_pct": 0,
+                    "risk_status": "GREEN",
+                    "selection_reason": "test",
+                }
+            ],
+            "time_exit_orders": [],
+            "scheduled_jobs": [
+                {
+                    "name": "NIFTY Income Entry",
+                    "purpose": "Build defined-risk NIFTY income orders",
+                    "enabled": True,
+                    "schedule": "Fridays at 15:22 IST",
+                    "timezone": "Asia/Kolkata",
+                    "next_run": "19 Jun 2026 15:22 IST",
+                    "last_run": "Not run yet",
+                    "last_status": "WAITING",
+                    "execution_mode": "SUGGESTION_ONLY",
+                    "auto_order": False,
+                    "auto_exit": True,
+                }
+            ],
+            "warnings": [],
+        }
+
+        html = app.render_nifty_income_panel(
+            app.PageState(active_tab="nifty-income", nifty_income_snapshot=snapshot)
+        )
+
+        self.assertIn("NIFTY Income Strategy Preview", html)
+        self.assertIn("Upcoming Friday Preview", html)
+        self.assertIn("nifty-preview-table", html)
+        self.assertIn("PE SELL", html)
+        self.assertIn("CE SELL", html)
+        self.assertIn("NIFTY26JUN22600PE", html)
+        self.assertIn("NIFTY26JUN25400CE", html)
+        self.assertIn("strike-cell", html)
+        self.assertIn("otm-cell", html)
+        self.assertIn("Scheduled Jobs", html)
+        self.assertIn("NIFTY Income Entry", html)
+
+    def nifty_pair(self, age_days, pnl_pct, margin=100000, now=None):
+        now = now or app.datetime(2026, 6, 16, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
+        entry = now - app.timedelta(days=age_days)
+        return {
+            "strategy_id": "NIFTY-WEEKLY-2026-06-30",
+            "pair_id": "NIFTY-2026-06-30",
+            "expiry_date": "2026-06-30",
+            "entry_datetime": entry.isoformat(),
+            "margin_required": margin,
+            "current_mtm_pnl": margin * pnl_pct / 100,
+            "open_legs": [
+                {"tradingsymbol": "NIFTY26JUN23000PE", "quantity": -75, "option_type": "PE", "closure_transaction_type": "BUY"},
+                {"tradingsymbol": "NIFTY26JUN25000CE", "quantity": -75, "option_type": "CE", "closure_transaction_type": "BUY"},
+            ],
+            "pe_symbol": "NIFTY26JUN23000PE",
+            "ce_symbol": "NIFTY26JUN25000CE",
+            "warnings": [],
+        }
+
+    def test_nifty_weekly_pair_exit_age_based_rules(self):
+        now = app.datetime(2026, 6, 16, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
+        cases = [
+            (5, 2.1, True, "WEEK1_PROFIT_TARGET_2_PERCENT"),
+            (5, -6.0, False, ""),
+            (10, 2.6, True, "WEEK2_PROFIT_TARGET_2_5_PERCENT"),
+            (10, -5.1, True, "WEEK2_STOP_LOSS_5_PERCENT"),
+            (16, 3.1, True, "WEEK3_PROFIT_TARGET_3_PERCENT"),
+            (16, -5.1, True, "WEEK3_STOP_LOSS_5_PERCENT"),
+        ]
+        for age, pnl_pct, should_exit, reason in cases:
+            result = app.evaluate_nifty_weekly_pair_exit(self.nifty_pair(age, pnl_pct, now=now), now)
+            self.assertEqual(result["exit_signal"], should_exit, (age, pnl_pct))
+            self.assertEqual(result["exit_reason"], reason)
+
+    def test_nifty_weekly_pair_force_close_only_after_time(self):
+        before = app.datetime(2026, 6, 22, 14, 58, tzinfo=app.INDIA_TIME_ZONE)
+        after = app.datetime(2026, 6, 22, 15, 0, tzinfo=app.INDIA_TIME_ZONE)
+        pair = self.nifty_pair(21, 0.0, now=before)
+
+        before_result = app.evaluate_nifty_weekly_pair_exit(pair, before)
+        after_result = app.evaluate_nifty_weekly_pair_exit(pair, after)
+
+        self.assertFalse(before_result["exit_signal"])
+        self.assertTrue(after_result["exit_signal"])
+        self.assertEqual(after_result["exit_reason"], "FORCE_CLOSE_WEEK3_14_59")
+
+    def test_nifty_weekly_pair_exit_orders_reverse_sell_and_buy_hedges(self):
+        now = app.datetime(2026, 6, 16, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
+        positions = [
+            {"tradingsymbol": "NIFTY26JUN23000PE", "quantity": -75, "pnl": 1500, "margin_required": 25000, "entry_datetime": (now - app.timedelta(days=5)).isoformat()},
+            {"tradingsymbol": "NIFTY26JUN25000CE", "quantity": -75, "pnl": 700, "margin_required": 25000, "entry_datetime": (now - app.timedelta(days=5)).isoformat()},
+            {"tradingsymbol": "NIFTY26JUN22500PE", "quantity": 75, "pnl": -50, "margin_required": 0, "entry_datetime": (now - app.timedelta(days=5)).isoformat()},
+            {"tradingsymbol": "NIFTY26JUN25500CE", "quantity": 75, "pnl": -50, "margin_required": 0, "entry_datetime": (now - app.timedelta(days=5)).isoformat()},
+        ]
+        with patch.object(app, "nifty_income_state", return_value={"weekly_pair_exit_generated_keys": []}):
+            rows, orders = app.nifty_weekly_pair_exit_orders_for_positions(positions, now=now)
+
+        self.assertTrue(rows[0]["exit_signal"])
+        sides = {order["tradingsymbol"]: order["transaction_type"] for order in orders}
+        self.assertEqual(sides["NIFTY26JUN23000PE"], "BUY")
+        self.assertEqual(sides["NIFTY26JUN25000CE"], "BUY")
+        self.assertEqual(sides["NIFTY26JUN22500PE"], "SELL")
+        self.assertEqual(sides["NIFTY26JUN25500CE"], "SELL")
+
+    def test_nifty_weekly_pair_duplicate_exit_is_not_generated(self):
+        now = app.datetime(2026, 6, 16, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
+        positions = [
+            {"tradingsymbol": "NIFTY26JUN23000PE", "quantity": -75, "pnl": 1500, "margin_required": 25000, "entry_datetime": (now - app.timedelta(days=5)).isoformat()},
+            {"tradingsymbol": "NIFTY26JUN25000CE", "quantity": -75, "pnl": 700, "margin_required": 25000, "entry_datetime": (now - app.timedelta(days=5)).isoformat()},
+        ]
+        duplicate_key = "NIFTY-2026-06-30:WEEK1_PROFIT_TARGET_2_PERCENT"
+        with patch.object(app, "nifty_income_state", return_value={"weekly_pair_exit_generated_keys": [duplicate_key]}):
+            rows, orders = app.nifty_weekly_pair_exit_orders_for_positions(positions, now=now)
+
+        self.assertEqual(orders, [])
+        self.assertEqual(rows[0]["last_monitor_status"], "DUPLICATE_SKIPPED")
+
+    def test_nifty_weekly_pair_suggestion_and_auto_modes(self):
+        orders = [{"tradingsymbol": "NIFTY26JUN23000PE", "exchange": "NFO", "transaction_type": "BUY", "quantity": 75, "product": "NRML", "order_type": "MARKET", "price": 0, "validity": "DAY"}]
+        suggestion = app.execute_nifty_orders(orders, "SUGGESTION_ONLY", "test")
+        self.assertEqual(suggestion[0]["status"], "SUGGESTION_ONLY")
+
+        with patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}), patch.object(app.kite_orders, "kite_client") as kite_client, patch.object(app, "place_order_allowing_autoslice", return_value="OID"):
+            kite_client.return_value = object()
+            live = app.execute_nifty_orders(orders, "AUTO_EXIT_ONLY", "test")
+        self.assertEqual(live[0]["status"], "LIVE_SENT")
+
+    def test_nifty_manual_pair_orders_use_entered_otm_and_sell_only_legs(self):
+        expiry = date(2026, 7, 14)
+        instruments = [
+            {
+                "name": "NIFTY",
+                "segment": "NFO-OPT",
+                "expiry": expiry,
+                "strike": strike,
+                "instrument_type": option_type,
+                "tradingsymbol": f"NIFTY{strike}{option_type}",
+            }
+            for strike, option_type in (
+                (22600, "PE"),
+                (25400, "CE"),
+            )
+        ]
+        quote_map = {
+            "NFO:NIFTY22600PE": {"last_price": 31.25, "oi": 20000, "volume": 100},
+            "NFO:NIFTY25400CE": {"last_price": 33.4, "oi": 20000, "volume": 100},
+        }
+        config = {
+            "lot_size": 65,
+            "strike_rounding": 100,
+            "hedge_distance_points": 500,
+            "manual_pair_sell_markup_percent": 20,
+        }
+
+        orders, previews = app.nifty_income_pair_orders_from_otm(
+            instruments,
+            expiry,
+            23989.15,
+            5.5,
+            5.5,
+            config,
+            quote_map,
+            lots=2,
+        )
+
+        self.assertEqual([row["transaction_type"] for row in orders], ["SELL", "SELL"])
+        self.assertEqual([row["quantity"] for row in orders], [130, 130])
+        self.assertEqual([row["lot_size"] for row in orders], [65, 65])
+        self.assertEqual([row["lots"] for row in orders], [2, 2])
+        self.assertEqual(
+            [row["tradingsymbol"] for row in orders],
+            ["NIFTY22600PE", "NIFTY25400CE"],
+        )
+        self.assertEqual([row["price"] for row in orders], [37.5, 40.1])
+        sell_gain = sum(
+            row["max_gain_opportunity"]
+            for row in previews
+            if row["transaction_type"] == "SELL"
+        )
+        self.assertEqual(sell_gain, 8404.5)
+
+    def test_nifty_manual_pair_orders_use_liquidity_adjusted_strikes_for_submission(self):
+        expiry = date(2026, 7, 14)
+        instruments = [
+            {
+                "name": "NIFTY",
+                "segment": "NFO-OPT",
+                "expiry": expiry,
+                "strike": strike,
+                "instrument_type": option_type,
+                "tradingsymbol": f"NIFTY{strike}{option_type}",
+            }
+            for strike, option_type in (
+                (22600, "PE"),
+                (22700, "PE"),
+                (25400, "CE"),
+                (25300, "CE"),
+            )
+        ]
+        quote_map = {
+            "NFO:NIFTY22600PE": {"last_price": 31.25, "oi": 100, "volume": 0},
+            "NFO:NIFTY22700PE": {"last_price": 40.0, "oi": 20000, "volume": 100},
+            "NFO:NIFTY25400CE": {"last_price": 33.4, "oi": 9000, "volume": 5},
+            "NFO:NIFTY25300CE": {"last_price": 45.0, "oi": 25000, "volume": 50},
+        }
+        config = {
+            "lot_size": 65,
+            "strike_rounding": 100,
+            "manual_pair_sell_markup_percent": 20,
+        }
+
+        orders, previews = app.nifty_income_pair_orders_from_otm(
+            instruments,
+            expiry,
+            23989.15,
+            5.5,
+            5.5,
+            config,
+            quote_map,
+            lots=1,
+        )
+
+        self.assertEqual([row["tradingsymbol"] for row in orders], ["NIFTY22700PE", "NIFTY25300CE"])
+        self.assertEqual([row["strike"] for row in orders], [22700, 25300])
+        self.assertEqual([row["liquidity_shift_points"] for row in previews], [100, 100])
+        self.assertEqual([row["price"] for row in orders], [48.0, 54.0])
+
+    def test_nifty_entry_scheduler_runs_weekday_pair_at_916(self):
+        now = app.datetime(2026, 6, 15, 9, 16, tzinfo=app.INDIA_TIME_ZONE)
+        saved_states = []
+        config = {
+            **app.NIFTY_INCOME_DEFAULT_CONFIG,
+            "enabled": True,
+            "entry_time": "09:16",
+            "execution_mode": "SUGGESTION_ONLY",
+        }
+        pair_orders = [
+            {"tradingsymbol": "NIFTY22700PE", "transaction_type": "SELL", "quantity": 65},
+            {"tradingsymbol": "NIFTY25300CE", "transaction_type": "SELL", "quantity": 65},
+        ]
+
+        def save_state(**updates):
+            saved_states.append(updates)
+            return updates
+
+        with (
+            patch.object(app, "nifty_income_config", return_value=config),
+            patch.object(app, "nifty_income_state", return_value={}),
+            patch.object(app, "nifty_income_entry_schedule_state", return_value={"enabled": True, "schedule_time": "09:16"}),
+            patch.object(app, "save_nifty_income_state", side_effect=save_state),
+            patch.object(
+                app,
+                "nifty_income_snapshot",
+                return_value={"suggestion": {"allowed": True, "pe_otm_pct": 5.5, "ce_otm_pct": 5.5}},
+            ),
+            patch.object(
+                app,
+                "nifty_income_manual_pair_snapshot",
+                return_value={"orders": pair_orders, "missing_ltp": [], "max_gain": 1000},
+            ) as pair_snapshot,
+            patch.object(app, "execute_nifty_orders", return_value=[{"status": "SUGGESTION_ONLY"}]) as execute_orders,
+        ):
+            result = app.run_nifty_income_entry_job(now)
+
+        self.assertIsNotNone(result)
+        pair_snapshot.assert_called_once_with(5.5, 5.5, 1)
+        execute_orders.assert_called_once_with(pair_orders, "SUGGESTION_ONLY", "NIFTY weekday PE/CE SELL pair entry")
+        self.assertIn("NIFTY PE/CE SELL pair entry generated 2 leg(s)", result["message"])
 
 
 if __name__ == "__main__":
