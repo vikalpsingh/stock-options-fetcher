@@ -462,11 +462,11 @@ INCOME_GROWTH_SHEET = [
     {"symbol": "WAAREEENER", "holding": 130, "times_lot": 0.74, "lots_can_sell": 1.0, "cmp": 3129.1, "call_strike": 3379, "value": 406783, "to_sell": 192.5, "lot_size": 175, "gap_pct": 8, "put_down_pct": 24.29, "pe": 2879, "week_52": -23.52, "one_year": 9.7, "month": -0.23, "week_1": 4.86, "today": 0.0},
 ]
 DIVIDEND_INCOME_SECURITIES = [
-    {"symbol": "PGINVIT-IV", "company": "PGINVIT", "holding": 0},
-    {"symbol": "IRBINVIT-IV", "company": "IRBINVIT", "holding": 0},
+    {"symbol": "PGINVIT", "company": "PGINVIT", "exchange": "BSE", "holding": 0},
+    {"symbol": "IRBINVIT-IV", "company": "IRBINVIT", "exchange": "NSE", "holding": 0},
 ]
 DIVIDEND_INCOME_SYMBOL_ALIASES = {
-    "PGINVIT-IV": {"PGINVIT-IV", "PGINVIT", "PGINVITIV"},
+    "PGINVIT": {"PGINVIT", "PGINVIT-IV", "PGINVITIV"},
     "IRBINVIT-IV": {"IRBINVIT-IV", "IRBINVIT", "IRBINVITIV"},
 }
 INCOME_GROWTH_LOT_CAPS = {
@@ -571,6 +571,15 @@ def dividend_income_alias_keys(symbol: str) -> set[str]:
     return {normalize_security_lookup_key(item) for item in aliases if item}
 
 
+def dividend_income_security(symbol: str) -> dict[str, Any] | None:
+    lookup_key = normalize_security_lookup_key(symbol)
+    for item in DIVIDEND_INCOME_SECURITIES:
+        canonical = str(item.get("symbol") or "").upper()
+        if lookup_key in dividend_income_alias_keys(canonical):
+            return dict(item)
+    return None
+
+
 def app_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(APP_DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -653,7 +662,7 @@ def app_db_connection() -> sqlite3.Connection:
             )
     now_text = app_now().isoformat(timespec="seconds")
     for old_symbol, new_symbol in (
-        ("PGINVIT", "PGINVIT-IV"),
+        ("PGINVIT-IV", "PGINVIT"),
         ("IRBINVIT", "IRBINVIT-IV"),
     ):
         conn.execute(
@@ -6110,6 +6119,338 @@ def premium_capture_for_position(position: dict[str, Any], data: dict[str, Any])
     }
 
 
+SELL_PE_EXIT_DEFAULTS = {
+    "profit_capture_exit_percent": 50.0,
+    "hard_loss_multiplier": 2.0,
+    "near_strike_otm_percent": 2.0,
+    "near_strike_loss_multiplier": 1.5,
+    "vix_spike_2d_percent": 10.0,
+    "cash_secured_percent": 90.0,
+}
+INDEX_OPTION_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
+
+
+def sell_pe_exit_settings() -> dict[str, float]:
+    saved = load_app_settings().get("sell_pe_exit_strategy")
+    settings = dict(SELL_PE_EXIT_DEFAULTS)
+    if isinstance(saved, dict):
+        settings.update(saved)
+    for key, fallback in SELL_PE_EXIT_DEFAULTS.items():
+        try:
+            settings[key] = float(settings.get(key) or fallback)
+        except (TypeError, ValueError):
+            settings[key] = fallback
+    return settings
+
+
+def calculate_pe_otm_percent(stock_cmp: Any, strike: Any) -> float | None:
+    try:
+        cmp_value = float(stock_cmp or 0)
+        strike_value = float(strike or 0)
+    except (TypeError, ValueError):
+        return None
+    if cmp_value <= 0 or strike_value <= 0:
+        return None
+    return ((cmp_value - strike_value) / cmp_value) * 100
+
+
+def calculate_captured_percent_for_short_option(avg_price: Any, ltp: Any) -> float | None:
+    try:
+        average = float(avg_price or 0)
+        current = float(ltp or 0)
+    except (TypeError, ValueError):
+        return None
+    if average <= 0 or current < 0:
+        return None
+    return ((average - current) / average) * 100
+
+
+def kite_available_cash(kite: Any) -> float | None:
+    try:
+        margins = cached_value(
+            "kite:margins:equity",
+            lambda: kite.margins("equity"),
+            KITE_READ_CACHE_SECONDS,
+        )
+    except Exception:
+        return None
+    if not isinstance(margins, dict):
+        return None
+    available = margins.get("available") if isinstance(margins.get("available"), dict) else {}
+    for key in ("live_balance", "cash", "opening_balance", "net"):
+        try:
+            value = float(available.get(key) or margins.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+    return None
+
+
+def evaluate_sell_pe_exit(
+    position: dict[str, Any],
+    market_data: dict[str, Any] | None = None,
+    available_cash: float | None = None,
+    settings: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    market_data = market_data or {}
+    settings = settings or sell_pe_exit_settings()
+    symbol = str(position.get("tradingsymbol") or position.get("symbol") or "").upper()
+    parts = option_symbol_parts(symbol)
+    quantity = abs(numeric_int(position.get("quantity")))
+    avg_price = float(position.get("average_price") or 0)
+    ltp = float(position.get("ltp") or market_data.get("option_ltp") or 0)
+    stock_cmp = float(market_data.get("stock_cmp") or market_data.get("spot") or 0)
+    strike = float(
+        market_data.get("strike")
+        or position.get("strike")
+        or (parts.get("strike") if parts else 0)
+        or 0
+    )
+    option_type = str((parts or {}).get("option_type") or position.get("option_type") or "").upper()
+    underlying = str((parts or {}).get("underlying") or "").upper()
+    captured_percent = calculate_captured_percent_for_short_option(avg_price, ltp)
+    otm_percent = calculate_pe_otm_percent(stock_cmp, strike)
+    required_cash = strike * quantity * float(settings["cash_secured_percent"]) / 100
+    cash_covered = available_cash is None or available_cash >= required_cash
+    assignment_allowed = bool(position.get("assignment_allowed", market_data.get("assignment_allowed", False)))
+    score = 100
+    reasons: list[str] = []
+
+    def below(key: str, value: float) -> bool:
+        try:
+            current = float(market_data.get(key) or 0)
+        except (TypeError, ValueError):
+            return False
+        return current > 0 and value < current
+
+    if stock_cmp > 0 and strike > 0 and stock_cmp <= strike:
+        score -= 50
+    if avg_price > 0 and ltp >= float(settings["hard_loss_multiplier"]) * avg_price:
+        score -= 40
+    if captured_percent is not None and captured_percent <= -100:
+        score -= 30
+    if otm_percent is not None and otm_percent <= float(settings["near_strike_otm_percent"]):
+        score -= 25
+    if avg_price > 0 and ltp >= float(settings["near_strike_loss_multiplier"]) * avg_price:
+        score -= 20
+    if below("intraday_vwap", stock_cmp):
+        score -= 20
+    if below("ema20", stock_cmp):
+        score -= 20
+    if below("ema50", stock_cmp):
+        score -= 15
+    if float(market_data.get("vix_change_2d_percent") or 0) >= float(settings["vix_spike_2d_percent"]):
+        score -= 15
+    if available_cash is not None and not cash_covered:
+        score -= 25
+    if bool(market_data.get("support_broken")):
+        score -= 20
+    if str(market_data.get("market_regime") or "").upper() in {"SELL_ON_RISE", "PANIC_DOWN"}:
+        score -= 10
+    if bool(market_data.get("event_risk")):
+        score -= 15
+    score = max(score, 0)
+
+    should_exit = False
+    action = "HOLD"
+    exit_status = "GREEN_HOLD"
+    reason = "PE risk controls are within limits."
+    if (
+        option_type != "PE"
+        or numeric_int(position.get("quantity")) >= 0
+        or underlying in INDEX_OPTION_UNDERLYINGS
+    ):
+        return {
+            "should_exit": False,
+            "action": "N/A",
+            "exit_status": "NOT_SELL_PE",
+            "reason": (
+                "Index PE is managed by the NIFTY pair exit monitor."
+                if underlying in INDEX_OPTION_UNDERLYINGS
+                else "Strict SELL PE exit rules do not apply."
+            ),
+            "score": score,
+            "score_status": "N/A",
+            "otm_percent": otm_percent,
+            "captured_percent": captured_percent,
+            "required_cash": required_cash,
+            "cash_covered": cash_covered,
+            "allow_new_pe_same_underlying": True,
+        }
+    if available_cash is not None and not cash_covered:
+        should_exit, action, exit_status = True, "BUY_TO_CLOSE", "CASH_RISK_EXIT"
+        reason = "PE not fully cash secured"
+    elif captured_percent is not None and captured_percent >= float(settings["profit_capture_exit_percent"]):
+        should_exit, action, exit_status = True, "BUY_TO_CLOSE", "PROFIT_BOOK"
+        reason = f"{settings['profit_capture_exit_percent']:g}% premium captured"
+    elif (
+        (avg_price > 0 and ltp >= float(settings["hard_loss_multiplier"]) * avg_price)
+        or (captured_percent is not None and captured_percent <= -100)
+    ):
+        should_exit, action, exit_status = True, "BUY_TO_CLOSE", "HARD_LOSS_EXIT"
+        reason = "PE premium expanded to 2x avg sell price"
+    elif stock_cmp > 0 and strike > 0 and stock_cmp <= strike:
+        if assignment_allowed:
+            action, exit_status = "REVIEW_ASSIGNMENT_OR_CLOSE", "ITM_ASSIGNMENT_REVIEW"
+            reason = "Stock breached PE strike; assignment plan is enabled"
+        else:
+            should_exit, action, exit_status = True, "BUY_TO_CLOSE", "ITM_EXIT"
+            reason = "Stock breached PE strike"
+    elif (
+        otm_percent is not None
+        and otm_percent <= float(settings["near_strike_otm_percent"])
+        and avg_price > 0
+        and ltp >= float(settings["near_strike_loss_multiplier"]) * avg_price
+    ):
+        should_exit, action, exit_status = True, "BUY_TO_CLOSE", "NEAR_STRIKE_EXIT"
+        reason = "PE near strike and premium expanded"
+    else:
+        trend_break = (
+            below("intraday_vwap", stock_cmp)
+            and below("ema20", stock_cmp)
+            and (below("ema50", stock_cmp) or bool(market_data.get("previous_day_low_broken")))
+            and bool(market_data.get("lower_lows"))
+            and otm_percent is not None
+            and otm_percent <= 3
+        )
+        volatility_exit = (
+            float(market_data.get("vix_change_2d_percent") or 0) >= float(settings["vix_spike_2d_percent"])
+            and otm_percent is not None
+            and otm_percent <= 3
+            and ltp > avg_price > 0
+        )
+        if trend_break:
+            should_exit, action, exit_status = True, "BUY_TO_CLOSE", "TREND_BREAK_EXIT"
+            reason = "Downtrend support break before PE strike"
+        elif volatility_exit:
+            should_exit, action, exit_status = True, "BUY_TO_CLOSE", "VOLATILITY_EXIT"
+            reason = "VIX spike and PE risk increasing"
+        elif score < 50:
+            action, exit_status, reason = "REVIEW_CLOSE", "RED_EXIT", "SELL PE risk score is below 50"
+        elif score < 65:
+            action, exit_status, reason = "REVIEW", "ORANGE_REVIEW", "SELL PE risk score needs review"
+        elif score < 80:
+            action, exit_status, reason = "MONITOR", "YELLOW_MONITOR", "SELL PE risk is increasing"
+
+    score_status = (
+        "GREEN_HOLD" if score >= 80 else
+        "YELLOW_MONITOR" if score >= 65 else
+        "ORANGE_REVIEW" if score >= 50 else
+        "RED_EXIT"
+    )
+    if reasons:
+        reason = "; ".join(reasons)
+    return {
+        "should_exit": should_exit,
+        "action": action,
+        "exit_status": exit_status,
+        "reason": reason,
+        "score": score,
+        "score_status": score_status,
+        "otm_percent": otm_percent,
+        "captured_percent": captured_percent,
+        "required_cash": required_cash,
+        "cash_covered": cash_covered,
+        "assignment_allowed": assignment_allowed,
+        "allow_new_pe_same_underlying": not (
+            captured_percent is not None and captured_percent < 0
+        ),
+    }
+
+
+def generate_pe_buy_to_close_order(
+    position: dict[str, Any],
+    quote: dict[str, Any],
+    evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    order = {
+        "variety": "regular",
+        "exchange": position.get("exchange") or "NFO",
+        "tradingsymbol": str(position.get("tradingsymbol") or "").upper(),
+        "quantity": abs(numeric_int(position.get("quantity"))),
+        "transaction_type": "BUY",
+        "product": position.get("product") or "NRML",
+        "order_type": "LIMIT",
+        "price": 0.0,
+        "validity": "DAY",
+        "tag": "PE_RISK_EXIT",
+        "average_price": float(position.get("average_price") or 0),
+        "ltp": quote_ltp(quote),
+        "exit_status": evaluation.get("exit_status"),
+        "exit_reason": evaluation.get("reason"),
+        "pe_exit_score": evaluation.get("score"),
+    }
+    safe = calculateSafeLimitPrice(order, quote)
+    if not safe.get("ok"):
+        raise ValueError(
+            f"{order['tradingsymbol']} PE exit price unavailable: {safe.get('reason') or 'unknown quote error'}"
+        )
+    order["price"] = float(safe["price"])
+    order["safe_price_detail"] = safe
+    return order
+
+
+def build_intraday_pe_risk_exit_orders(
+    kite: Any,
+    positions: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    positions = positions if positions is not None else refresh_option_positions_with_live_ltp(
+        open_option_positions(use_cache=False),
+        kite,
+    )
+    pe_positions = [
+        row for row in positions
+        if numeric_int(row.get("quantity")) < 0
+        and str((option_symbol_parts(str(row.get("tradingsymbol") or "").upper()) or {}).get("option_type") or "") == "PE"
+        and str((option_symbol_parts(str(row.get("tradingsymbol") or "").upper()) or {}).get("underlying") or "") not in INDEX_OPTION_UNDERLYINGS
+    ]
+    if not pe_positions:
+        return [], []
+    option_keys = [f"{row.get('exchange') or 'NFO'}:{row.get('tradingsymbol')}" for row in pe_positions]
+    underlying_keys = [
+        f"NSE:{underlying_for_symbol(str(row.get('tradingsymbol') or ''))}"
+        for row in pe_positions
+    ]
+    clear_app_cache(("kite:quote:", "kite:margins:equity"))
+    quotes = cached_kite_quote(kite, list(dict.fromkeys(option_keys + underlying_keys)))
+    available_cash = kite_available_cash(kite)
+    evaluations: list[dict[str, Any]] = []
+    exit_orders: list[dict[str, Any]] = []
+    for position in pe_positions:
+        symbol = str(position.get("tradingsymbol") or "").upper()
+        parts = option_symbol_parts(symbol) or {}
+        option_key = f"{position.get('exchange') or 'NFO'}:{symbol}"
+        underlying_key = f"NSE:{parts.get('underlying') or underlying_for_symbol(symbol)}"
+        option_quote = quotes.get(option_key, {}) or {}
+        stock_quote = quotes.get(underlying_key, {}) or {}
+        fresh_position = dict(position)
+        fresh_position["ltp"] = quote_ltp(option_quote) or float(position.get("ltp") or 0)
+        evaluation = evaluate_sell_pe_exit(
+            fresh_position,
+            {
+                "stock_cmp": quote_ltp(stock_quote),
+                "strike": parts.get("strike"),
+            },
+            available_cash,
+        )
+        evaluation["tradingsymbol"] = symbol
+        evaluations.append(evaluation)
+        print(
+            "SELL PE risk check: "
+            f"{symbol} avg={float(fresh_position.get('average_price') or 0):.2f} "
+            f"ltp={float(fresh_position.get('ltp') or 0):.2f} "
+            f"stock_cmp={float(quote_ltp(stock_quote) or 0):.2f} strike={float(parts.get('strike') or 0):.2f} "
+            f"otm={float(evaluation.get('otm_percent') or 0):.2f}% "
+            f"captured={float(evaluation.get('captured_percent') or 0):.2f}% "
+            f"score={evaluation.get('score')} status={evaluation.get('exit_status')} "
+            f"reason={evaluation.get('reason')}"
+        )
+        if evaluation.get("should_exit"):
+            exit_orders.append(generate_pe_buy_to_close_order(fresh_position, option_quote, evaluation))
+    return exit_orders, evaluations
+
+
 def open_option_buy_orders_by_symbol(kite: Any, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
     if force_refresh:
         clear_app_cache(("kite:orders",))
@@ -6157,15 +6498,28 @@ def build_position_close_buy_order(symbol: str) -> dict[str, Any]:
         )
     quantity = abs(int(position.get("quantity") or 0))
     ltp = float(position.get("ltp") or 0)
-    if ltp <= 0:
-        quote_key = f"{position.get('exchange') or 'NFO'}:{clean_symbol}"
-        quote = cached_kite_quote(kite, [quote_key]).get(
-            quote_key,
-            {},
-        )
-        ltp = quote_ltp(quote)
+    quote_key = f"{position.get('exchange') or 'NFO'}:{clean_symbol}"
+    parts = option_symbol_parts(clean_symbol) or {}
+    underlying_key = f"NSE:{parts.get('underlying')}" if parts.get("underlying") else ""
+    quote_keys = [quote_key] + ([underlying_key] if underlying_key else [])
+    clear_app_cache(("kite:quote:",))
+    quotes = cached_kite_quote(kite, quote_keys)
+    quote = quotes.get(quote_key, {}) or {}
+    ltp = quote_ltp(quote) or ltp
     if ltp <= 0:
         raise ValueError(f"Could not read LTP for {clean_symbol}.")
+    fresh_position = dict(position)
+    fresh_position["ltp"] = ltp
+    pe_evaluation = evaluate_sell_pe_exit(
+        fresh_position,
+        {
+            "stock_cmp": quote_ltp(quotes.get(underlying_key, {}) or {}) if underlying_key else 0,
+            "strike": parts.get("strike"),
+        },
+        kite_available_cash(kite),
+    )
+    if pe_evaluation.get("should_exit"):
+        return generate_pe_buy_to_close_order(fresh_position, quote, pe_evaluation)
     limit_price = floor_to_tick(ltp * 0.90, 0.05)
     return {
         "variety": "regular",
@@ -6216,6 +6570,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
     positions = open_option_positions(use_cache=not force_refresh)
     if force_refresh:
         positions = refresh_option_positions_with_live_ltp(positions, kite)
+    available_cash = kite_available_cash(kite)
     order_lookup_error = ""
     try:
         open_buy_orders = open_option_buy_orders_by_symbol(kite, force_refresh)
@@ -6233,6 +6588,14 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
             risk = decision.get("risk_lights", {})
             strength = strategy_strength_lights(data, decision)
             capture = premium_capture_for_position(position, data)
+            pe_exit = evaluate_sell_pe_exit(
+                position,
+                {
+                    "stock_cmp": data.get("spot"),
+                    "strike": data.get("strike"),
+                },
+                available_cash,
+            )
             deployed = margin_required_for_position(kite, position)
             pnl = float(position.get("pnl") or 0)
             total_pnl += pnl
@@ -6250,6 +6613,14 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "deployed": deployed,
                     "return_pct": (pnl / deployed * 100) if deployed > 0 else None,
                     **capture,
+                    "pe_exit": pe_exit,
+                    "pe_exit_status": pe_exit.get("exit_status"),
+                    "pe_exit_action": pe_exit.get("action"),
+                    "pe_exit_reason": pe_exit.get("reason"),
+                    "pe_exit_score": pe_exit.get("score"),
+                    "pe_required_cash": pe_exit.get("required_cash"),
+                    "pe_cash_covered": pe_exit.get("cash_covered"),
+                    "allow_new_pe_same_underlying": pe_exit.get("allow_new_pe_same_underlying"),
                     "sell_signal": risk.get("final_sell"),
                     "sell_color": risk.get("final_sell_color"),
                     "buy_signal": risk.get("buy_signal"),
@@ -6282,6 +6653,37 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "existing_buy_order": existing_buy_order,
                 }
             )
+    breached_pe_underlyings = {
+        underlying_for_symbol(str(row.get("symbol") or ""))
+        for row in rows
+        if str(row.get("pe_exit_status") or "") in {
+            "HARD_LOSS_EXIT",
+            "ITM_EXIT",
+            "NEAR_STRIKE_EXIT",
+            "TREND_BREAK_EXIT",
+            "VOLATILITY_EXIT",
+            "CASH_RISK_EXIT",
+        }
+    }
+    pe_counts: dict[str, int] = {}
+    for row in rows:
+        parts = option_symbol_parts(str(row.get("symbol") or "").upper())
+        if parts and parts.get("option_type") == "PE":
+            underlying = str(parts.get("underlying") or "")
+            pe_counts[underlying] = pe_counts.get(underlying, 0) + 1
+    for row in rows:
+        parts = option_symbol_parts(str(row.get("symbol") or "").upper())
+        underlying = str((parts or {}).get("underlying") or "")
+        if (
+            parts
+            and parts.get("option_type") == "PE"
+            and pe_counts.get(underlying, 0) > 1
+            and underlying in breached_pe_underlyings
+        ):
+            row["pe_multiple_position_risk"] = "HIGH_RISK"
+            row["allow_new_pe_same_underlying"] = False
+            if not row.get("pe_exit_reason"):
+                row["pe_exit_reason"] = "Another PE strike on this underlying triggered a strict exit."
     summary = {
         "count": len(rows),
         "total_pnl": total_pnl,
@@ -7238,16 +7640,16 @@ def dividend_income_rows(
     kite: Any,
     stored_holdings: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    symbols = [str(item["symbol"]).upper() for item in DIVIDEND_INCOME_SECURITIES]
-    quote_symbols = sorted(
+    quote_keys = sorted(
         {
-            alias
-            for symbol in symbols
-            for alias in DIVIDEND_INCOME_SYMBOL_ALIASES.get(symbol, {symbol})
-            if "-" in alias or alias.endswith("INVIT")
+            f"{str(item.get('exchange') or 'NSE').upper()}:{alias}"
+            for item in DIVIDEND_INCOME_SECURITIES
+            for alias in DIVIDEND_INCOME_SYMBOL_ALIASES.get(
+                str(item["symbol"]).upper(),
+                {str(item["symbol"]).upper()},
+            )
         }
     )
-    quote_keys = [f"NSE:{symbol}" for symbol in quote_symbols]
     quotes = cached_kite_quote(kite, quote_keys) if quote_keys else {}
     try:
         kite_holdings = cached_value(
@@ -7257,31 +7659,34 @@ def dividend_income_rows(
         )
     except Exception:
         kite_holdings = []
-    actual_by_symbol: dict[str, dict[str, Any]] = {}
+    actual_by_symbol: dict[tuple[str, str], dict[str, Any]] = {}
     for holding_item in kite_holdings:
-        if str(holding_item.get("exchange") or "NSE").upper() != "NSE":
-            continue
+        holding_exchange = str(holding_item.get("exchange") or "NSE").upper()
         holding_symbol = str(holding_item.get("tradingsymbol") or "").upper()
         if not holding_symbol:
             continue
-        actual_by_symbol[normalize_security_lookup_key(holding_symbol)] = holding_item
+        actual_by_symbol[
+            (holding_exchange, normalize_security_lookup_key(holding_symbol))
+        ] = holding_item
     rows: list[dict[str, Any]] = []
     for item in DIVIDEND_INCOME_SECURITIES:
         symbol = str(item["symbol"]).upper()
+        exchange = str(item.get("exchange") or "NSE").upper()
         stored = stored_holdings.get(symbol, {})
         actual = next(
             (
-                actual_by_symbol.get(alias_key)
+                actual_by_symbol.get((exchange, alias_key))
                 for alias_key in dividend_income_alias_keys(symbol)
-                if actual_by_symbol.get(alias_key)
+                if actual_by_symbol.get((exchange, alias_key))
             ),
             {},
         )
         quote = next(
             (
-                quotes.get(f"NSE:{alias}")
+                quotes.get(f"{exchange}:{alias}")
                 for alias in DIVIDEND_INCOME_SYMBOL_ALIASES.get(symbol, {symbol})
-                if quotes.get(f"NSE:{alias}") and quote_ltp(quotes.get(f"NSE:{alias}", {}))
+                if quotes.get(f"{exchange}:{alias}")
+                and quote_ltp(quotes.get(f"{exchange}:{alias}", {}))
             ),
             {},
         )
@@ -7303,6 +7708,7 @@ def dividend_income_rows(
         rows.append(
             {
                 "symbol": symbol,
+                "exchange": exchange,
                 "company": str(item.get("company") or symbol),
                 "holding_source": holding_source,
                 "quantity": holding,
@@ -9295,22 +9701,36 @@ def income_growth_equity_snapshot(symbol: str) -> dict[str, Any]:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     clean_symbol = normalize_income_growth_symbol(symbol)
     stored = load_income_growth_holding_map()
+    dividend_security = dividend_income_security(clean_symbol)
+    if dividend_security:
+        clean_symbol = str(dividend_security.get("symbol") or clean_symbol).upper()
     if clean_symbol not in stored:
         raise ValueError(f"{clean_symbol} is not an Income Growth stock.")
     kite = kite_orders.kite_client()
-    quote_key = f"NSE:{clean_symbol}"
+    exchange = str((dividend_security or {}).get("exchange") or "NSE").upper()
+    aliases = DIVIDEND_INCOME_SYMBOL_ALIASES.get(clean_symbol, {clean_symbol})
+    quote_keys = [f"{exchange}:{alias}" for alias in aliases]
     try:
-        quote = kite.quote([quote_key]).get(quote_key, {})
+        quotes = kite.quote(quote_keys)
         holdings = kite.holdings()
     except Exception as exc:
         raise RuntimeError(friendly_external_error(exc, f"{clean_symbol} equity quote")) from exc
+    quote = next(
+        (
+            quotes.get(key)
+            for key in quote_keys
+            if quotes.get(key) and quote_ltp(quotes.get(key, {}))
+        ),
+        {},
+    )
     ltp = quote_ltp(quote)
     holding = next(
         (
             item
             for item in holdings
-            if str(item.get("exchange") or "NSE").upper() == "NSE"
-            and str(item.get("tradingsymbol") or "").upper() == clean_symbol
+            if str(item.get("exchange") or "NSE").upper() == exchange
+            and normalize_security_lookup_key(item.get("tradingsymbol"))
+            in dividend_income_alias_keys(clean_symbol)
         ),
         {},
     )
@@ -9331,6 +9751,7 @@ def income_growth_equity_snapshot(symbol: str) -> dict[str, Any]:
     pnl = (ltp - average_price) * actual_quantity if ltp > 0 and average_price > 0 else None
     return {
         "symbol": clean_symbol,
+        "exchange": exchange,
         "quantity": actual_quantity,
         "average_price": average_price,
         "ltp": ltp,
@@ -9387,7 +9808,7 @@ def place_income_growth_equity_order(
         raise ValueError("Equity limit price must be greater than zero.")
     order = {
         "variety": "regular",
-        "exchange": "NSE",
+        "exchange": str(snapshot.get("exchange") or "NSE").upper(),
         "tradingsymbol": clean_symbol,
         "transaction_type": clean_side,
         "quantity": clean_quantity,
@@ -11605,6 +12026,8 @@ def update_scheduled_job_control(
         now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
     )
     job = jobs[job_key]
+    if action == "start" and not scheduler_master_state().get("enabled", True):
+        raise ValueError("All scheduler jobs are paused. Click Start All before starting an individual job.")
     if action == "stop":
         return job["save"](
             enabled=False,
@@ -11630,7 +12053,68 @@ def update_scheduled_job_control(
     raise ValueError("Unknown scheduled job action.")
 
 
+def scheduler_master_state() -> dict[str, Any]:
+    saved = load_app_settings().get("scheduler_master_control")
+    state = dict(saved) if isinstance(saved, dict) else {}
+    state.setdefault("enabled", True)
+    state.setdefault("status", "RUNNING")
+    state.setdefault("message", "All scheduler jobs are enabled.")
+    state.setdefault("updated_at", "")
+    return state
+
+
+def save_scheduler_master_state(**updates: Any) -> dict[str, Any]:
+    state = scheduler_master_state()
+    state.update(updates)
+    save_app_settings({"scheduler_master_control": state})
+    return state
+
+
+def update_all_scheduled_jobs(
+    action: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
+        now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
+    )
+    if action not in {"pause-all", "start-all"}:
+        raise ValueError("Unknown all-jobs scheduler action.")
+    enabled = action == "start-all"
+    status = "WAITING" if enabled else "PAUSED_ALL"
+    action_text = "started" if enabled else "paused"
+    results: dict[str, dict[str, Any]] = {}
+    for job_key, job in scheduled_job_definitions().items():
+        results[job_key] = job["save"](
+            enabled=enabled,
+            paused_until="",
+            status=status,
+            message=(
+                f"{job['name']} enabled by Start All. Waiting for the next eligible run."
+                if enabled
+                else f"{job['name']} paused by Pause All. Use Start All to resume scheduler automation."
+            ),
+        )
+    master = save_scheduler_master_state(
+        enabled=enabled,
+        status="RUNNING" if enabled else "PAUSED",
+        message=(
+            "All scheduler jobs are enabled and waiting for their next eligible run."
+            if enabled
+            else "All scheduler jobs are paused indefinitely. Click Start All to resume them."
+        ),
+        updated_at=now.isoformat(),
+    )
+    return {
+        "enabled": enabled,
+        "status": master["status"],
+        "message": f"All {len(results)} scheduler jobs {action_text}.",
+        "jobs": results,
+    }
+
+
 def run_scheduled_job_now(job_key: str) -> dict[str, Any]:
+    if not scheduler_master_state().get("enabled", True):
+        raise RuntimeError("All scheduler jobs are paused. Click Start All before running a job.")
     if job_key == "position_close_open":
         result = run_scheduled_position_close_job(force=True)
     elif job_key == "income_growth_gpt":
@@ -11741,13 +12225,56 @@ def run_intraday_position_close_job(
                 position_discount_percent=position_close_discount_percent_setting(),
                 position_keep_existing_orders=True,
             )
-            orders = build_position_buy_orders(state)
-            submitted_orders, results = execute_position_buy_orders(
-                orders,
-                set(range(len(orders))),
-                False,
-                True,
-            )
+            risk_scan_error = ""
+            try:
+                risk_orders, risk_evaluations = build_intraday_pe_risk_exit_orders(kite)
+            except Exception as exc:
+                risk_orders, risk_evaluations = [], []
+                risk_scan_error = friendly_external_error(exc, "Strict SELL PE risk scan")
+            risk_symbols = {
+                str(order.get("tradingsymbol") or "").upper()
+                for order in risk_orders
+            }
+            default_orders: list[dict[str, Any]] = []
+            try:
+                default_orders = [
+                    order for order in build_position_buy_orders(state)
+                    if str(order.get("tradingsymbol") or "").upper() not in risk_symbols
+                ]
+            except ValueError as exc:
+                if "No matching positions need a new BUY order" not in str(exc):
+                    raise
+            submitted_orders: list[dict[str, Any]] = []
+            results: list[dict[str, Any]] = []
+            if risk_orders:
+                risk_submitted, risk_results = execute_position_buy_orders(
+                    risk_orders,
+                    set(range(len(risk_orders))),
+                    False,
+                    False,
+                )
+                submitted_orders.extend(risk_submitted)
+                results.extend(risk_results)
+            if default_orders:
+                default_submitted, default_results = execute_position_buy_orders(
+                    default_orders,
+                    set(range(len(default_orders))),
+                    False,
+                    True,
+                )
+                submitted_orders.extend(default_submitted)
+                results.extend(default_results)
+            if not submitted_orders:
+                return save_intraday_position_close_schedule_state(
+                    status="ALL_COVERED",
+                    message=(
+                        "All open option positions already have close BUY orders."
+                        + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
+                    ),
+                    order_count=0,
+                    results=[],
+                    pe_risk_evaluations=risk_evaluations,
+                )
             live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
             error_count = sum(1 for result in results if result.get("status") == "ERROR")
             status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
@@ -11760,10 +12287,12 @@ def run_intraday_position_close_job(
                 status=status,
                 message=(
                     f"{market_message} Missing close BUY orders placed: {live_count}; "
-                    f"errors: {error_count}. {pricing_details}"
+                    f"strict PE exits: {len(risk_orders)}; errors: {error_count}. {pricing_details}"
+                    + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
                 ),
                 order_count=len(submitted_orders),
                 results=results,
+                pe_risk_evaluations=risk_evaluations,
             )
         except ValueError as exc:
             message = str(exc)
@@ -11791,6 +12320,9 @@ def run_intraday_position_close_job(
 def position_close_scheduler_loop(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         try:
+            if not scheduler_master_state().get("enabled", True):
+                stop_event.wait(30)
+                continue
             close_result = run_scheduled_position_close_job()
             if close_result:
                 print(
@@ -13030,7 +13562,7 @@ def render_income_growth_panel(state: PageState) -> str:
     dividend_rows = list(summary.get("dividend_income_rows") or [])
     dividend_table_rows = "".join(render_income_growth_row(row) for row in dividend_rows)
     if not dividend_table_rows:
-        dividend_table_rows = '<tr><td colspan="23" class="muted-cell">Refresh Income Growth to load PGINVIT-IV and IRBINVIT-IV market data.</td></tr>'
+        dividend_table_rows = '<tr><td colspan="23" class="muted-cell">Refresh Income Growth to load PGINVIT and IRBINVIT-IV market data.</td></tr>'
     if not table_rows:
         table_rows = '<tr><td colspan="23" class="muted-cell">Click Refresh Income Growth to calculate covered-call capacity from your holdings sheet.</td></tr>'
     try:
@@ -13115,7 +13647,7 @@ def render_income_growth_panel(state: PageState) -> str:
       {outcome_panel}
       <section class="panel income-growth-table-panel dividend-income-panel">
         <div class="panel-title">Dividend Income</div>
-        <div class="status">Income-focused InvIT watchlist. PGINVIT-IV and IRBINVIT-IV holdings are matched from the selected Kite profile; click either security to place a CNC LIMIT BUY or SELL order.</div>
+        <div class="status">Income-focused InvIT watchlist. PGINVIT (BSE) and IRBINVIT-IV (NSE) holdings are matched from the selected Kite profile; click either security to place a CNC LIMIT BUY or SELL order.</div>
         <div class="table-wrap"><table id="dividend-income-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{dividend_table_rows}</tbody></table></div>
       </section>
       {render_income_growth_gpt_schedule_panel()}
@@ -13130,7 +13662,7 @@ def render_income_growth_panel(state: PageState) -> str:
       <div class="live-modal-backdrop" id="income-equity-modal">
         <div class="live-modal income-equity-modal-card">
           <h2 id="income-equity-title">Income Growth Equity Order</h2>
-          <p class="status">NSE equity order using CNC, LIMIT, DAY. The price is refreshed from Kite before execution.</p>
+          <p class="status">Equity order using the instrument's Kite exchange with CNC, LIMIT, DAY. The price is refreshed from Kite before execution.</p>
           <div class="income-equity-metrics">
             <div><span>Current holding</span><strong id="income-equity-holding">--</strong></div>
             <div><span>Average buy price</span><strong id="income-equity-avg">--</strong></div>
@@ -13744,6 +14276,9 @@ def render_position_close_schedule_panel() -> str:
 
 def render_scheduler_control_panel() -> str:
     now = datetime.now(INDIA_TIME_ZONE)
+    master = scheduler_master_state()
+    master_enabled = bool(master.get("enabled", True))
+    master_status = "RUNNING" if master_enabled else "PAUSED"
     rows: list[str] = []
     for job_key, job in scheduled_job_definitions().items():
         state = job["load"]()
@@ -13764,7 +14299,7 @@ def render_scheduler_control_panel() -> str:
         primary_action = "start" if not enabled else "stop"
         primary_label = "Start job" if not enabled else "Stop job"
         pause_disabled = " disabled" if not enabled else ""
-        run_disabled = " disabled" if status == "RUNNING" else ""
+        run_disabled = " disabled" if status == "RUNNING" or not master_enabled else ""
         rows.append(
             "<tr>"
             f"<td><strong>{html.escape(job['name'])}</strong><small>{html.escape(job['schedule'])}</small></td>"
@@ -13785,9 +14320,18 @@ def render_scheduler_control_panel() -> str:
     return (
         '<section class="panel kite-setup-card scheduler-control-panel">'
         '<div class="setup-card-kicker">07</div>'
-        '<div class="panel-title">Scheduled Jobs Control</div>'
+        '<div class="scheduler-master-header">'
+        '<div><div class="panel-title">Scheduled Jobs Control</div>'
         '<p class="status">Monitor and control automated trading jobs. Changes persist in '
-        '<code>app_settings.json</code> across restarts. Stopping a job does not cancel orders already placed.</p>'
+        '<code>app_settings.json</code> across restarts. Pausing jobs does not cancel orders already placed.</p></div>'
+        '<div class="scheduler-master-actions">'
+        f'<span class="score-badge {"good" if master_enabled else "avoid"}">{master_status}</span>'
+        '<button type="submit" class="danger" formaction="/scheduler/pause-all"'
+        f'{" disabled" if not master_enabled else ""}>Pause All</button>'
+        '<button type="submit" formaction="/scheduler/start-all"'
+        f'{" disabled" if master_enabled else ""}>Start All</button>'
+        '</div></div>'
+        f'<div class="status scheduler-master-message">{html.escape(str(master.get("message") or ""))}</div>'
         '<div class="table-wrap"><table class="scheduler-control-table"><thead><tr>'
         '<th>Name / Schedule</th><th>Purpose</th><th>Last run</th><th>Next schedule</th><th>Status</th><th>Controls</th>'
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
@@ -13839,6 +14383,13 @@ def render_positions_panel(
     def position_action(row: dict[str, Any]) -> str:
         if row.get("existing_buy_order"):
             return '<span class="existing-buy-action">Close BUY pending</span>'
+        pe_exit = row.get("pe_exit") or {}
+        if pe_exit.get("should_exit"):
+            return (
+                f'<button type="submit" class="book-profit-button compact-action-button" '
+                f'formaction="/positions/close-buy" name="close_symbol" '
+                f'value="{html.escape(str(row.get("symbol", "")), quote=True)}">BUY CLOSE</button>'
+            )
         if int(row.get("quantity") or 0) < 0 and (
             (row.get("captured_pct") is not None and abs(float(row.get("captured_pct") or 0)) >= 50)
             or float(row.get("return_pct") or 0) <= -40
@@ -13849,6 +14400,24 @@ def render_positions_panel(
                 f'value="{html.escape(str(row.get("symbol", "")), quote=True)}">BUY -10%</button>'
             )
         return '<span class="commodity-wait">Wait</span>'
+
+    def position_exit_cell(row: dict[str, Any]) -> str:
+        pe_exit = row.get("pe_exit") or {}
+        if pe_exit.get("exit_status") not in {None, "", "NOT_SELL_PE"}:
+            color = (
+                "red" if pe_exit.get("should_exit") or float(pe_exit.get("score") or 100) < 50
+                else "yellow" if float(pe_exit.get("score") or 100) < 80
+                else "green"
+            )
+            return (
+                f'<td class="{strength_class(color)}"><strong>{html.escape(str(pe_exit.get("exit_status")))}</strong>'
+                f'<span>{html.escape(str(pe_exit.get("reason") or ""))}</span></td>'
+            )
+        return (
+            f'<td class="{strength_class(row.get("capture_color"))}">'
+            f'<strong>{html.escape(str(row.get("capture_action", "")))}</strong>'
+            f'<span>{html.escape(str(row.get("capture_detail", "")))}</span></td>'
+        )
 
     summary_cards = "".join(
         f'<div class="position-summary-chip"><span>{html.escape(label)}</span>'
@@ -13869,9 +14438,17 @@ def render_positions_panel(
         f'<td class="{metric_class(row.get("pnl"))}"><strong>{html.escape(display_cell("pnl", row.get("pnl", "")))}</strong><span>{html.escape(fmt_number(row.get("return_pct")))}% on margin</span></td>'
         f'<td class="{strength_class("green" if (row.get("captured_pct") is not None and float(row.get("captured_pct") or 0) >= 50) else row.get("capture_color"))}"><strong>{html.escape(fmt_number(row.get("captured_pct")))}%</strong><span>Captured</span></td>'
         f"<td><strong>{html.escape(fmt_number(row.get('remaining_premium')))}</strong><span>{html.escape(fmt_number(row.get('remaining_pct')))}% remaining</span></td>"
-        f'<td class="{strength_class(row.get("capture_color"))}"><strong>{html.escape(str(row.get("capture_action", "")))}</strong><span>{html.escape(str(row.get("capture_detail", "")))}</span></td>'
+        f'{position_exit_cell(row)}'
         f"<td>{position_action(row)}</td>"
-        f"<td><strong>{html.escape(fmt_number(row.get('deployed')))}</strong><span>Required</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('deployed')))}</strong><span>Margin"
+        + (
+            f" | PE cash {html.escape(fmt_number(row.get('pe_required_cash')))} "
+            f"({'YES' if row.get('pe_cash_covered') else 'NO'})"
+            if row.get("pe_exit_status") not in {None, "", "NOT_SELL_PE"}
+            else ""
+        )
+        + "</span></td>"
+        f'<td class="{strength_class("red" if float(row.get("pe_exit_score") or 100) < 50 else "yellow" if float(row.get("pe_exit_score") or 100) < 80 else "green")}"><strong>{html.escape(fmt_number(row.get("pe_exit_score")))}</strong><span>PE risk score</span></td>'
         f'<td class="{strength_class(row.get("buy_color"))}"><strong>{html.escape(compact_signal(row.get("buy_signal")))}</strong><span>{html.escape(str(row.get("buy_signal", "")))}</span></td>'
         f'<td><strong>{html.escape(fmt_number(row.get("sell_pop")))}%</strong><span>SELL POP</span></td>'
         f'<td><strong>{html.escape(fmt_number(row.get("otm_distance")))}%</strong><span>OTM</span></td>'
@@ -13897,7 +14474,7 @@ def render_positions_panel(
         )
         + "</div>"
         '<div class="table-wrap positions-table-wrap"><table class="positions-table"><thead><tr>'
-        '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>Buy</th>'
+        '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>PE Score</th><th>Buy</th>'
         '<th>POP</th><th>OTM</th><th>Sell</th><th>Strength</th><th>Delta</th>'
         '<th>IV</th><th>PCR</th><th>S / R</th><th>Error</th></tr></thead>'
         f"<tbody>{table_rows}</tbody></table></div></section>"
@@ -18314,6 +18891,35 @@ def render_page(state: PageState) -> bytes:
       grid-column: 1 / -1;
       border-color: #a7f3d0;
     }}
+    .scheduler-master-header {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    .scheduler-master-header .status {{
+      margin-bottom: 0;
+    }}
+    .scheduler-master-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 8px;
+      flex: 0 0 auto;
+    }}
+    .scheduler-master-actions button {{
+      min-width: 100px;
+    }}
+    .scheduler-master-message {{
+      margin: 8px 0 10px;
+      padding: 8px 10px;
+      border: 1px solid #bbf7d0;
+      border-radius: 7px;
+      background: #f0fdf4;
+      color: #166534;
+      font-weight: 700;
+    }}
     .scheduler-control-table td {{
       vertical-align: top;
       min-width: 130px;
@@ -18337,6 +18943,15 @@ def render_page(state: PageState) -> bytes:
     .scheduler-job-actions button {{
       padding: 7px 10px;
       font-size: 12px;
+    }}
+    @media (max-width: 720px) {{
+      .scheduler-master-header {{
+        flex-direction: column;
+      }}
+      .scheduler-master-actions {{
+        width: 100%;
+        justify-content: flex-start;
+      }}
     }}
     .order-book-table .pnl-negative {{
       background: #fef2f2;
@@ -21662,6 +22277,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 updated = update_scheduled_job_control(job_key, action)
                 job_name = scheduled_job_definitions()[job_key]["name"]
                 state.message = f"{job_name}: {updated.get('message', 'Schedule updated.')}"
+            elif request_path in {
+                "/scheduler/pause-all",
+                "/scheduler/start-all",
+            }:
+                action = request_path.rsplit("/", 1)[-1]
+                updated = update_all_scheduled_jobs(action)
+                state.message = str(updated.get("message") or "All scheduler jobs updated.")
             elif request_path == "/scheduler/run-now":
                 job_key = first(form, "job_name")
                 result = run_scheduled_job_now(job_key)

@@ -43,6 +43,102 @@ def candidate(**overrides):
 
 
 class PeSellStrategyTests(unittest.TestCase):
+    def sell_pe_position(self, **overrides):
+        position = {
+            "tradingsymbol": "NTPC26JUN310PE",
+            "exchange": "NFO",
+            "quantity": -1500,
+            "average_price": 10.0,
+            "ltp": 8.0,
+            "product": "NRML",
+            "assignment_allowed": False,
+        }
+        position.update(overrides)
+        return position
+
+    def test_sell_pe_profit_capture_generates_profit_book_exit(self):
+        result = app.evaluate_sell_pe_exit(
+            self.sell_pe_position(ltp=5),
+            {"stock_cmp": 350, "strike": 310},
+            500000,
+        )
+        self.assertTrue(result["should_exit"])
+        self.assertEqual(result["action"], "BUY_TO_CLOSE")
+        self.assertEqual(result["exit_status"], "PROFIT_BOOK")
+
+    def test_sell_pe_two_times_premium_generates_hard_loss_exit(self):
+        result = app.evaluate_sell_pe_exit(
+            self.sell_pe_position(ltp=20),
+            {"stock_cmp": 350, "strike": 310},
+            500000,
+        )
+        self.assertTrue(result["should_exit"])
+        self.assertEqual(result["exit_status"], "HARD_LOSS_EXIT")
+
+    def test_sell_pe_strike_breach_exits_without_assignment_plan(self):
+        result = app.evaluate_sell_pe_exit(
+            self.sell_pe_position(),
+            {"stock_cmp": 309, "strike": 310},
+            500000,
+        )
+        self.assertTrue(result["should_exit"])
+        self.assertEqual(result["exit_status"], "ITM_EXIT")
+
+    def test_sell_pe_near_strike_and_expanding_exits(self):
+        result = app.evaluate_sell_pe_exit(
+            self.sell_pe_position(ltp=16),
+            {"stock_cmp": 315, "strike": 310},
+            500000,
+        )
+        self.assertTrue(result["should_exit"])
+        self.assertEqual(result["exit_status"], "NEAR_STRIKE_EXIT")
+
+    def test_sell_pe_insufficient_cash_exits_before_other_rules(self):
+        result = app.evaluate_sell_pe_exit(
+            self.sell_pe_position(),
+            {"stock_cmp": 350, "strike": 310},
+            300000,
+        )
+        self.assertEqual(result["required_cash"], 418500)
+        self.assertFalse(result["cash_covered"])
+        self.assertTrue(result["should_exit"])
+        self.assertEqual(result["exit_status"], "CASH_RISK_EXIT")
+
+    def test_sell_pe_safe_buy_close_uses_best_ask(self):
+        evaluation = app.evaluate_sell_pe_exit(
+            self.sell_pe_position(ltp=20),
+            {"stock_cmp": 350, "strike": 310},
+            500000,
+        )
+        order = app.generate_pe_buy_to_close_order(
+            self.sell_pe_position(ltp=20),
+            {
+                "last_price": 20,
+                "depth": {
+                    "buy": [{"price": 19.8}],
+                    "sell": [{"price": 20.1}],
+                },
+            },
+            evaluation,
+        )
+        self.assertEqual(order["transaction_type"], "BUY")
+        self.assertEqual(order["price"], 20.15)
+        self.assertEqual(order["exit_status"], "HARD_LOSS_EXIT")
+
+    def test_index_pe_is_left_to_nifty_pair_exit_monitor(self):
+        result = app.evaluate_sell_pe_exit(
+            self.sell_pe_position(
+                tradingsymbol="NIFTY26JUN23000PE",
+                quantity=-65,
+                ltp=25,
+            ),
+            {"stock_cmp": 22900, "strike": 23000},
+            100000,
+        )
+        self.assertFalse(result["should_exit"])
+        self.assertEqual(result["exit_status"], "NOT_SELL_PE")
+        self.assertIn("NIFTY pair exit monitor", result["reason"])
+
     def test_scheduled_position_close_job_places_default_buy_orders_once(self):
         schedule = {
             "enabled": True,
@@ -400,7 +496,10 @@ class PeSellStrategyTests(unittest.TestCase):
             }
         }
         now = app.datetime(2026, 6, 12, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
-        with patch.object(app, "scheduled_job_definitions", return_value=jobs):
+        with (
+            patch.object(app, "scheduled_job_definitions", return_value=jobs),
+            patch.object(app, "scheduler_master_state", return_value={"enabled": True}),
+        ):
             stopped = app.update_scheduled_job_control("test-job", "stop", now)
             started = app.update_scheduled_job_control("test-job", "start", now)
             paused = app.update_scheduled_job_control("test-job", "pause-day", now)
@@ -410,6 +509,48 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(paused["status"], "PAUSED")
         self.assertTrue(app.scheduled_job_is_paused(paused, now))
         self.assertEqual(len(saved_updates), 3)
+
+    def test_scheduler_pause_all_and_start_all_persist_every_job(self):
+        states = {
+            "job-a": {"enabled": True, "status": "WAITING"},
+            "job-b": {"enabled": True, "status": "WAITING"},
+        }
+        master_updates = []
+
+        def job_definition(key):
+            return {
+                "name": key,
+                "purpose": "Test",
+                "schedule": "Weekdays",
+                "load": lambda key=key: dict(states[key]),
+                "save": lambda key=key, **updates: states[key].update(updates) or dict(states[key]),
+            }
+
+        jobs = {key: job_definition(key) for key in states}
+
+        def save_master(**updates):
+            master_updates.append(dict(updates))
+            return dict(updates)
+
+        now = app.datetime(2026, 6, 18, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
+        with (
+            patch.object(app, "scheduled_job_definitions", return_value=jobs),
+            patch.object(app, "save_scheduler_master_state", side_effect=save_master),
+        ):
+            paused = app.update_all_scheduled_jobs("pause-all", now)
+            started = app.update_all_scheduled_jobs("start-all", now)
+
+        self.assertFalse(paused["enabled"])
+        self.assertTrue(started["enabled"])
+        self.assertTrue(all(state["enabled"] for state in states.values()))
+        self.assertEqual(len(master_updates), 2)
+        self.assertEqual(master_updates[0]["status"], "PAUSED")
+        self.assertEqual(master_updates[1]["status"], "RUNNING")
+
+    def test_scheduler_master_pause_blocks_manual_run(self):
+        with patch.object(app, "scheduler_master_state", return_value={"enabled": False}):
+            with self.assertRaisesRegex(RuntimeError, "Click Start All"):
+                app.run_scheduled_job_now("position_close_open")
 
     def test_next_intraday_schedule_skips_weekend(self):
         friday_after_close = app.datetime(
@@ -431,7 +572,12 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(next_run.strftime("%Y-%m-%d %H:%M"), "2026-06-15 09:30")
 
     def test_kite_setup_scheduler_control_panel_lists_all_jobs(self):
-        output = app.render_scheduler_control_panel()
+        with patch.object(
+            app,
+            "scheduler_master_state",
+            return_value={"enabled": True, "status": "RUNNING", "message": "All jobs enabled."},
+        ):
+            output = app.render_scheduler_control_panel()
 
         self.assertIn("Scheduled Jobs Control", output)
         self.assertIn("Default Close Orders", output)
@@ -439,6 +585,10 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("Intraday Close-Order Guard", output)
         self.assertIn("Pause for 1 day", output)
         self.assertIn("Run now", output)
+        self.assertIn("Pause All", output)
+        self.assertIn("Start All", output)
+        self.assertIn("/scheduler/pause-all", output)
+        self.assertIn("/scheduler/start-all", output)
 
     def test_manual_scheduler_run_dispatches_with_force(self):
         expected = {"status": "PLACED", "message": "Manual run ok."}
@@ -1827,7 +1977,7 @@ class PeSellStrategyTests(unittest.TestCase):
         state.income_growth_summary = {
             "dividend_income_rows": [
                 {
-                    "symbol": "PGINVIT-IV",
+                    "symbol": "PGINVIT",
                     "company": "PGINVIT",
                     "quantity": 0,
                     "avg_price": 0,
@@ -1857,7 +2007,7 @@ class PeSellStrategyTests(unittest.TestCase):
 
         self.assertIn("Dividend Income", output)
         self.assertIn('id="dividend-income-table"', output)
-        self.assertIn('data-symbol="PGINVIT-IV"', output)
+        self.assertIn('data-symbol="PGINVIT"', output)
         self.assertIn('data-symbol="IRBINVIT-IV"', output)
         self.assertIn('id="income-equity-limit-price"', output)
         self.assertIn("CNC LIMIT BUY or SELL", output)
@@ -1870,18 +2020,18 @@ class PeSellStrategyTests(unittest.TestCase):
             def holdings(self):
                 return [
                     {
-                        "exchange": "NSE",
+                        "exchange": "BSE",
                         "tradingsymbol": "PGINVIT",
-                        "quantity": 125,
-                        "average_price": 92.0,
-                        "last_price": 95.5,
+                        "quantity": 100,
+                        "average_price": 93.825,
+                        "last_price": 93.79,
                     },
                     {
                         "exchange": "NSE",
-                        "tradingsymbol": "IRBINVIT",
-                        "quantity": 50,
-                        "average_price": 60.0,
-                        "last_price": 63.0,
+                        "tradingsymbol": "IRBINVIT-IV",
+                        "quantity": 150,
+                        "average_price": 60.2167,
+                        "last_price": 60.58,
                     },
                 ]
 
@@ -1893,19 +2043,22 @@ class PeSellStrategyTests(unittest.TestCase):
             rows = app.dividend_income_rows(FakeKite(), {})
 
         by_symbol = {row["symbol"]: row for row in rows}
-        self.assertEqual(by_symbol["PGINVIT-IV"]["quantity"], 125)
-        self.assertEqual(by_symbol["PGINVIT-IV"]["avg_price"], 92.0)
-        self.assertEqual(by_symbol["PGINVIT-IV"]["cmp"], 95.5)
-        self.assertEqual(by_symbol["PGINVIT-IV"]["invested_amount"], 11500.0)
-        self.assertEqual(by_symbol["PGINVIT-IV"]["market_value"], 11937.5)
-        self.assertEqual(by_symbol["PGINVIT-IV"]["pnl"], 437.5)
-        self.assertEqual(by_symbol["PGINVIT-IV"]["holding_source"], "Kite profile: Shanti")
-        self.assertEqual(by_symbol["IRBINVIT-IV"]["quantity"], 50)
-        self.assertEqual(by_symbol["IRBINVIT-IV"]["avg_price"], 60.0)
+        self.assertEqual(by_symbol["PGINVIT"]["quantity"], 100)
+        self.assertEqual(by_symbol["PGINVIT"]["exchange"], "BSE")
+        self.assertEqual(by_symbol["PGINVIT"]["avg_price"], 93.825)
+        self.assertEqual(by_symbol["PGINVIT"]["cmp"], 93.79)
+        self.assertEqual(by_symbol["PGINVIT"]["invested_amount"], 9382.5)
+        self.assertEqual(by_symbol["PGINVIT"]["market_value"], 9379.0)
+        self.assertAlmostEqual(by_symbol["PGINVIT"]["pnl"], -3.5)
+        self.assertEqual(by_symbol["PGINVIT"]["holding_source"], "Kite profile: Shanti")
+        self.assertEqual(by_symbol["IRBINVIT-IV"]["quantity"], 150)
+        self.assertEqual(by_symbol["IRBINVIT-IV"]["exchange"], "NSE")
+        self.assertEqual(by_symbol["IRBINVIT-IV"]["avg_price"], 60.2167)
 
     def test_income_growth_equity_order_uses_requested_limit_price(self):
         snapshot = {
-            "symbol": "PGINVIT-IV",
+            "symbol": "PGINVIT",
+            "exchange": "BSE",
             "quantity": 0,
             "average_price": 0,
             "ltp": 101.2,
@@ -1925,10 +2078,11 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.object(app.kite_orders, "place_order", side_effect=place_order),
             patch.object(app, "invalidate_kite_trade_cache"),
         ):
-            result = app.place_income_growth_equity_order("PGINVIT-IV", "BUY", 10, 100.03)
+            result = app.place_income_growth_equity_order("PGINVIT", "BUY", 10, 100.03)
 
         self.assertEqual(result["status"], "LIVE_SENT")
-        self.assertEqual(placed["tradingsymbol"], "PGINVIT-IV")
+        self.assertEqual(placed["tradingsymbol"], "PGINVIT")
+        self.assertEqual(placed["exchange"], "BSE")
         self.assertEqual(placed["product"], "CNC")
         self.assertEqual(placed["order_type"], "LIMIT")
         self.assertEqual(placed["price"], 100.05)
