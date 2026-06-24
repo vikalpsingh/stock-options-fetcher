@@ -1,0 +1,110 @@
+{
+  "recommendations": [
+    {
+      "city": "Ujjain",
+      "headline": "Stay in Ujjain if Mahakal Darshan is your top priority",
+      "description": "Reduce early-morning transfers, stay closer to the sacred circuit and keep more energy for darshan.",
+      "icon": "temple"
+    },
+    {
+      "city": "Indore",
+      "headline": "Stay in Indore for hotels, airport access, food and day trips",
+      "description": "Choose greater hotel variety and city comfort while accepting a daily Ujjain commute.",
+      "icon": "plane"
+    },
+    {
+      "city": "Bhopal",
+      "headline": "Stay in Bhopal for Sanchi, Bhimbetka and a heritage circuit",
+      "description": "Use Bhopal as a separate base in a longer Madhya Pradesh itinerary, not as a daily Ujjain commute.",
+      "icon": "heritage"
+    }
+  ],
+  "comparison": [
+    {
+      "city": "Ujjain",
+      "bestFor": "Mahakal darshan and short pilgrimages",
+      "pros": ["Lowest daily travel to Mahakal", "Early darshan convenience", "Immersive pilgrimage atmosphere"],
+      "cons": ["Peak pricing", "Traffic restrictions", "Rooms fill quickly"],
+      "idealVisitor": "Families with parents, first-time pilgrims and visitors with limited days",
+      "duration": "2–4 nights"
+    },
+    {
+      "city": "Indore",
+      "bestFor": "Flights, hotels, food and comfort",
+      "pros": ["Nearest major airport", "Wider hotel selection", "Strong food and shopping options"],
+      "cons": ["Daily Ujjain commute", "Festival traffic delays", "Very early starts for darshan"],
+      "idealVisitor": "Working professionals, international visitors and comfort-focused families",
+      "duration": "1–3 nights, often split with Ujjain"
+    },
+    {
+      "city": "Bhopal",
+      "bestFor": "Sanchi, Bhimbetka and heritage travel",
+      "pros": ["Broader heritage circuit", "Lake-city experience", "Useful flight and rail connections"],
+      "cons": ["Too far for daily Mahakal visits", "Requires another travel day", "Long transfer to Ujjain"],
+      "idealVisitor": "Travellers building a 6–8 day Madhya Pradesh itinerary",
+      "duration": "2–3 nights"
+    }
+  ],
+  "areas": [
+    {
+      "city": "Ujjain",
+      "areas": [
+        { "name": "Near Mahakal", "bestFor": "Early darshan and walking access", "note": "Most convenient, but busiest and often costliest during peak dates." },
+        { "name": "Freeganj", "bestFor": "City convenience and restaurants", "note": "A practical central area with broader everyday services." },
+        { "name": "Nanakheda", "bestFor": "Road travellers and bus access", "note": "Useful for highway access and newer accommodation options." }
+      ]
+    },
+    {
+      "city": "Indore",
+      "areas": [
+        { "name": "Vijay Nagar", "bestFor": "Modern hotels and families", "note": "Wide accommodation choice, malls, restaurants and easier business-travel comfort." },
+        { "name": "Airport Road", "bestFor": "Early or late flights", "note": "Prioritises airport convenience; allow time for Ujjain transfers." },
+        { "name": "Sarafa / Central Indore", "bestFor": "Food and heritage", "note": "Best for atmosphere and food exploration, with busier streets." }
+      ]
+    },
+    {
+      "city": "Bhopal",
+      "areas": [
+        { "name": "New Market", "bestFor": "Shopping and central access", "note": "A lively central base with food and city transport nearby." },
+        { "name": "MP Nagar", "bestFor": "Rail and business convenience", "note": "Practical hotels, transport connections and everyday services." },
+        { "name": "Lake View areas", "bestFor": "Peaceful premium stays", "note": "Choose this for a calmer setting and scenic Bhopal experience." }
+      ]
+    }
+  ],
+  "quiz": [
+    { "question": "Traveling with parents?", "recommendation": "Ujjain", "reason": "Shorter travel to Mahakal saves energy and allows more rest." },
+    { "question": "Coming by flight?", "recommendation": "Indore", "reason": "Indore has the nearest major airport and wider airport-transfer options." },
+    { "question": "Want food and shopping?", "recommendation": "Indore", "reason": "Indore offers the strongest combination of dining, markets and modern retail." },
+    { "question": "Want a peaceful stay?", "recommendation": "Bhopal", "reason": "Lake-view areas and a slower heritage circuit can provide a calmer extension." },
+    { "question": "Want lowest travel time to Mahakal?", "recommendation": "Ujjain", "reason": "Staying locally removes the repeated intercity commute." }
+  ],
+  "budgets": [
+    { "category": "Dharamshala / Ashram", "positioning": "Simple pilgrimage stay", "bestFor": "Devotees prioritising location and value", "notes": "Expect basic facilities and confirm family, bathroom and booking rules directly." },
+    { "category": "Budget hotel", "positioning": "Essential private room", "bestFor": "Short stays and price-conscious families", "notes": "Check cleanliness reviews, lift access, hot water and vehicle approach." },
+    { "category": "Mid-range hotel", "positioning": "Balanced comfort", "bestFor": "Most family trips", "notes": "Look for breakfast, power backup, lift access and flexible cancellation." },
+    { "category": "Premium hotel", "positioning": "Higher service and space", "bestFor": "Comfort-focused families and professionals", "notes": "Indore usually provides the widest premium selection." },
+    { "category": "Family apartment / homestay", "positioning": "More room and flexibility", "bestFor": "Larger families and longer stays", "notes": "Confirm kitchen access, housekeeping, stairs and local transport before booking." }
+  ],
+  "faqs": [
+    {
+      "question": "Is it better to stay in Ujjain or Indore for Mahakal Darshan?",
+      "answer": "Stay in Ujjain when darshan convenience and lower daily travel matter most. Choose Indore for airport access, wider hotel choice and food, ideally by splitting nights between both cities."
+    },
+    {
+      "question": "Can we stay in Bhopal and visit Ujjain daily?",
+      "answer": "Bhopal is generally too far for a comfortable daily Ujjain commute. Use it as a separate base for Sanchi, Bhimbetka and a longer Madhya Pradesh circuit."
+    },
+    {
+      "question": "Which Ujjain area is best for elderly visitors?",
+      "answer": "Accommodation near Mahakal reduces transport, but confirm lift access, vehicle approach and crowd-control restrictions. Freeganj may offer a calmer balance for some families."
+    },
+    {
+      "question": "How early should Kumbh accommodation be booked?",
+      "answer": "Book refundable accommodation as early as practical, then reconfirm access, cancellation and transport details when official arrangements are announced."
+    },
+    {
+      "question": "What should families check before booking a hotel?",
+      "answer": "Check lift access, room size, extra beds, hot water, power backup, breakfast timing, cancellation terms and whether vehicles can reach the property during restrictions."
+    }
+  ]
+}

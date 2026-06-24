@@ -1,0 +1,288 @@
+[
+  {
+    "id": "one-day-ujjain",
+    "title": "1 Day Ujjain Temple Tour",
+    "days": 1,
+    "bestFor": "Short pilgrimages and first-time visitors",
+    "startCity": "Ujjain or Indore",
+    "base": "Ujjain",
+    "difficulty": "Moderate",
+    "elderlyRating": "4/5 with rest breaks",
+    "travelStyle": "Focused temple day with local travel",
+    "highlights": ["Mahakal Darshan", "Harsiddhi Mata", "Ram Ghat", "Mahakal Lok"],
+    "daysPlan": [
+      {
+        "day": 1,
+        "title": "Mahakal and Sacred Ujjain",
+        "morning": "Begin with Mahakal Darshan, then have a relaxed breakfast close to your stay.",
+        "afternoon": "Rest during peak heat, followed by Harsiddhi Mata and the old-city temple area.",
+        "evening": "Walk through Mahakal Lok and pause at Ram Ghat for the evening atmosphere.",
+        "food": "Poha Jalebi breakfast and a simple vegetarian thali.",
+        "stay": "Stay near Mahakal or Freeganj if arriving the previous night.",
+        "buffer": "Keep 2–4 hours of flexible queue time for Mahakal.",
+        "familyTip": "Do not add a long-distance side trip on the same day.",
+        "maps": ["Mahakaleshwar Temple", "Harsiddhi Mata Temple Ujjain", "Ram Ghat Ujjain"]
+      }
+    ]
+  },
+  {
+    "id": "two-day-jyotirlinga",
+    "title": "2 Days Ujjain + Omkareshwar",
+    "days": 2,
+    "bestFor": "Two-Jyotirlinga pilgrims",
+    "startCity": "Indore",
+    "base": "Ujjain",
+    "difficulty": "Active",
+    "elderlyRating": "3/5; overnight pacing recommended",
+    "travelStyle": "Temple-focused intercity circuit",
+    "highlights": ["Mahakaleshwar", "Ujjain temples", "Omkareshwar", "Narmada ghats"],
+    "daysPlan": [
+      {
+        "day": 1,
+        "title": "Ujjain Darshan Day",
+        "morning": "Mahakal Darshan followed by breakfast and a short hotel rest.",
+        "afternoon": "Visit Harsiddhi Mata and choose either Kal Bhairav or Sandipani Ashram.",
+        "evening": "Mahakal Lok and Ram Ghat before an early night.",
+        "food": "Poha Jalebi, Sabudana Khichdi and a light dinner.",
+        "stay": "Ujjain, preferably near Mahakal or Freeganj.",
+        "buffer": "Avoid committing to a fixed late-evening transfer.",
+        "familyTip": "Limit the day to three major sacred stops.",
+        "maps": ["Mahakaleshwar Temple", "Kal Bhairav Temple Ujjain", "Mahakal Lok"]
+      },
+      {
+        "day": 2,
+        "title": "Omkareshwar Jyotirlinga",
+        "morning": "Start early for Omkareshwar and keep breakfast packed or planned en route.",
+        "afternoon": "Jyotirlinga darshan and a gentle Narmada ghat experience.",
+        "evening": "Return toward Indore or stay near Omkareshwar if the family is tired.",
+        "food": "Freshly cooked vegetarian meal near the main pilgrim area.",
+        "stay": "Indore for onward travel, or Omkareshwar for slower pacing.",
+        "buffer": "Treat road timing as a placeholder and add festival traffic margin.",
+        "familyTip": "An overnight stop is kinder for elderly parents.",
+        "maps": ["Omkareshwar Jyotirlinga", "Omkareshwar Narmada Ghat"]
+      }
+    ]
+  },
+  {
+    "id": "three-day-malwa",
+    "title": "3 Days Ujjain + Indore + Maheshwar",
+    "days": 3,
+    "bestFor": "Families wanting spirituality, food and culture",
+    "startCity": "Indore",
+    "base": "Split Ujjain and Indore",
+    "difficulty": "Comfortable",
+    "elderlyRating": "4/5 with a split stay",
+    "travelStyle": "Balanced city and Narmada journey",
+    "highlights": ["Mahakal", "Indore food", "Rajwada", "Maheshwar Fort", "Narmada sunset"],
+    "daysPlan": [
+      {
+        "day": 1,
+        "title": "Arrive and Settle into Ujjain",
+        "morning": "Arrive via Indore and transfer to Ujjain without rushing.",
+        "afternoon": "Hotel check-in, lunch and rest.",
+        "evening": "Mahakal Lok, Harsiddhi Mata and Ram Ghat.",
+        "food": "Light Ujjain thali and local lassi.",
+        "stay": "Ujjain.",
+        "buffer": "Keep airport or train delay margin.",
+        "familyTip": "Save the main darshan for a fresh morning.",
+        "maps": ["Mahakal Lok", "Harsiddhi Mata Temple Ujjain"]
+      },
+      {
+        "day": 2,
+        "title": "Mahakal and Indore",
+        "morning": "Early Mahakal Darshan and breakfast.",
+        "afternoon": "Transfer to Indore, check in and rest.",
+        "evening": "Rajwada and a family-friendly food trail.",
+        "food": "Poha Jalebi, Bhutte Ka Kees and selected Sarafa snacks.",
+        "stay": "Indore.",
+        "buffer": "Allow additional time for Ujjain–Indore traffic.",
+        "familyTip": "Keep the evening food walk short for children and elders.",
+        "maps": ["Mahakaleshwar Temple", "Rajwada Palace Indore", "Sarafa Bazaar"]
+      },
+      {
+        "day": 3,
+        "title": "Maheshwar Narmada Day",
+        "morning": "Drive to Maheshwar and visit Ahilya Fort.",
+        "afternoon": "Lunch, weaving exploration and relaxed ghat time.",
+        "evening": "Narmada sunset, then return to Indore.",
+        "food": "Simple regional lunch and an early Indore dinner.",
+        "stay": "Indore, or Maheshwar for slow travel.",
+        "buffer": "Avoid a tight same-night flight after the road trip.",
+        "familyTip": "Use assistance on steep ghat steps.",
+        "maps": ["Ahilya Fort Maheshwar", "Maheshwar Narmada Ghat"]
+      }
+    ]
+  },
+  {
+    "id": "five-day-classic",
+    "title": "5 Days Ujjain + Omkareshwar + Maheshwar + Mandu",
+    "days": 5,
+    "bestFor": "A complete Malwa and Narmada journey",
+    "startCity": "Indore",
+    "base": "Ujjain, Indore and Maheshwar split",
+    "difficulty": "Moderate",
+    "elderlyRating": "4/5 when transfers are split",
+    "travelStyle": "Multi-base spiritual and heritage circuit",
+    "highlights": ["Mahakal", "Omkareshwar", "Maheshwar", "Mandu", "Indore"],
+    "daysPlan": [
+      {
+        "day": 1,
+        "title": "Indore to Ujjain",
+        "morning": "Arrive in Indore and transfer to Ujjain.",
+        "afternoon": "Check in, lunch and rest.",
+        "evening": "Mahakal Lok and Harsiddhi Mata.",
+        "food": "Simple Ujjain vegetarian dinner.",
+        "stay": "Ujjain.",
+        "buffer": "Keep arrival delays flexible.",
+        "familyTip": "Avoid main darshan immediately after a long journey.",
+        "maps": ["Mahakal Lok", "Harsiddhi Mata Temple Ujjain"]
+      },
+      {
+        "day": 2,
+        "title": "Mahakal and Ujjain Circuit",
+        "morning": "Mahakal Darshan and breakfast.",
+        "afternoon": "Rest, then Kal Bhairav and Sandipani Ashram.",
+        "evening": "Ram Ghat.",
+        "food": "Poha Jalebi and Dal Bafla.",
+        "stay": "Ujjain.",
+        "buffer": "Keep the afternoon flexible after darshan.",
+        "familyTip": "Drop one temple if queues are tiring.",
+        "maps": ["Mahakaleshwar Temple", "Kal Bhairav Temple Ujjain", "Sandipani Ashram Ujjain"]
+      },
+      {
+        "day": 3,
+        "title": "Omkareshwar to Maheshwar",
+        "morning": "Early transfer to Omkareshwar.",
+        "afternoon": "Darshan and onward travel to Maheshwar.",
+        "evening": "Narmada ghat sunset.",
+        "food": "Fresh vegetarian pilgrim meal.",
+        "stay": "Maheshwar.",
+        "buffer": "Road timings are placeholders; avoid rushing both sites.",
+        "familyTip": "Overnight in Maheshwar reduces fatigue.",
+        "maps": ["Omkareshwar Jyotirlinga", "Maheshwar Narmada Ghat"]
+      },
+      {
+        "day": 4,
+        "title": "Maheshwar to Mandu",
+        "morning": "Ahilya Fort and local weaving.",
+        "afternoon": "Transfer to Mandu and visit selected monuments.",
+        "evening": "Return toward Indore before late night.",
+        "food": "Regional lunch and Indore dinner.",
+        "stay": "Indore.",
+        "buffer": "Choose two or three Mandu monuments, not the entire circuit.",
+        "familyTip": "Carry sun protection and walking shoes.",
+        "maps": ["Ahilya Fort Maheshwar", "Jahaz Mahal Mandu"]
+      },
+      {
+        "day": 5,
+        "title": "Indore and Departure",
+        "morning": "Rajwada or a relaxed breakfast.",
+        "afternoon": "Shopping, hotel rest and departure preparation.",
+        "evening": "Depart according to flight or train.",
+        "food": "Indore breakfast and a comfortable family lunch.",
+        "stay": "Departure day.",
+        "buffer": "Keep a large airport or station margin.",
+        "familyTip": "Do not add a distant side trip before departure.",
+        "maps": ["Rajwada Palace Indore", "Devi Ahilyabai Holkar Airport"]
+      }
+    ]
+  },
+  {
+    "id": "seven-day-mp",
+    "title": "7 Days MP Spiritual + Heritage Circuit",
+    "days": 7,
+    "bestFor": "Visitors wanting the complete central India story",
+    "startCity": "Indore; depart Bhopal",
+    "base": "Ujjain, Indore/Maheshwar and Bhopal",
+    "difficulty": "Active but balanced",
+    "elderlyRating": "3.5/5 with private transport and rest",
+    "travelStyle": "One-way spiritual, heritage and nature circuit",
+    "highlights": ["Mahakal", "Omkareshwar", "Maheshwar", "Mandu", "Sanchi", "Bhimbetka", "Bhopal"],
+    "daysPlan": [
+      {
+        "day": 1,
+        "title": "Arrive Indore, Transfer Ujjain",
+        "morning": "Arrive and travel to Ujjain.",
+        "afternoon": "Check in and rest.",
+        "evening": "Mahakal Lok and Harsiddhi.",
+        "food": "Light vegetarian meal.",
+        "stay": "Ujjain.",
+        "buffer": "Arrival-day flexibility.",
+        "familyTip": "Keep the first day gentle.",
+        "maps": ["Mahakal Lok"]
+      },
+      {
+        "day": 2,
+        "title": "Mahakal and Ujjain",
+        "morning": "Mahakal Darshan.",
+        "afternoon": "Rest, Kal Bhairav and Sandipani Ashram.",
+        "evening": "Ram Ghat.",
+        "food": "Poha Jalebi and Dal Bafla.",
+        "stay": "Ujjain.",
+        "buffer": "Queue buffer.",
+        "familyTip": "Use a meeting point near crowded zones.",
+        "maps": ["Mahakaleshwar Temple", "Ram Ghat Ujjain"]
+      },
+      {
+        "day": 3,
+        "title": "Omkareshwar and Maheshwar",
+        "morning": "Omkareshwar transfer and darshan.",
+        "afternoon": "Travel to Maheshwar.",
+        "evening": "Narmada sunset.",
+        "food": "Fresh regional vegetarian food.",
+        "stay": "Maheshwar.",
+        "buffer": "Flexible road timing.",
+        "familyTip": "Keep an overnight bag accessible.",
+        "maps": ["Omkareshwar Jyotirlinga", "Maheshwar Narmada Ghat"]
+      },
+      {
+        "day": 4,
+        "title": "Maheshwar, Mandu and Indore",
+        "morning": "Ahilya Fort.",
+        "afternoon": "Selected Mandu monuments.",
+        "evening": "Reach Indore and rest.",
+        "food": "Regional lunch and Indore dinner.",
+        "stay": "Indore.",
+        "buffer": "Shortlist Mandu sites.",
+        "familyTip": "Avoid excessive walking in afternoon heat.",
+        "maps": ["Ahilya Fort Maheshwar", "Jahaz Mahal Mandu"]
+      },
+      {
+        "day": 5,
+        "title": "Indore to Bhopal",
+        "morning": "Relaxed Indore breakfast.",
+        "afternoon": "Transfer to Bhopal.",
+        "evening": "Lake view and early dinner.",
+        "food": "Indore breakfast and Bhopal dinner.",
+        "stay": "Bhopal.",
+        "buffer": "Treat this as a transfer day.",
+        "familyTip": "Choose a comfortable lake or central hotel.",
+        "maps": ["Upper Lake Bhopal"]
+      },
+      {
+        "day": 6,
+        "title": "Sanchi Heritage Day",
+        "morning": "Travel to Sanchi.",
+        "afternoon": "Stupa complex and museum, subject to current opening arrangements.",
+        "evening": "Return to Bhopal.",
+        "food": "Packed water and a planned lunch.",
+        "stay": "Bhopal.",
+        "buffer": "Allow time for walking and sun breaks.",
+        "familyTip": "Use hats and frequent hydration.",
+        "maps": ["Sanchi Stupa"]
+      },
+      {
+        "day": 7,
+        "title": "Bhimbetka and Departure",
+        "morning": "Visit Bhimbetka rock shelters.",
+        "afternoon": "Return, lunch and departure preparation.",
+        "evening": "Depart Bhopal.",
+        "food": "Simple breakfast and early lunch.",
+        "stay": "Departure day.",
+        "buffer": "Do not book a tight flight connection.",
+        "familyTip": "Uneven terrain may not suit every elderly visitor.",
+        "maps": ["Bhimbetka Rock Shelters", "Raja Bhoj Airport Bhopal"]
+      }
+    ]
+  }
+]

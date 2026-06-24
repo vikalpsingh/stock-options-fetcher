@@ -1,0 +1,82 @@
+[
+  {
+    "id": "one-day-ujjain",
+    "title": "1 Day Ujjain Temple Tour",
+    "slug": "one-day-ujjain-temple-tour",
+    "shortDescription": "A focused Mahakal and old-city temple plan for a short visit.",
+    "longDescription": "Prioritize Mahakal darshan, one or two nearby temples and a comfortable meal break. Keep the schedule flexible for queues and traffic controls.",
+    "category": "Itinerary",
+    "city": "Ujjain",
+    "idealDuration": "1 day",
+    "bestFor": ["Weekend pilgrims", "First-time visitors"],
+    "familyFriendly": true,
+    "elderlyFriendly": true,
+    "mapSearchQuery": "Mahakaleshwar Temple Ujjain",
+    "imagePlaceholder": "/images/placeholders/one-day-ujjain.webp",
+    "tags": ["Spiritual", "Family Friendly", "Elderly Friendly"],
+    "days": 1,
+    "baseCity": "Ujjain",
+    "visitorType": ["Family", "Couple", "Elderly Parents"],
+    "dayWisePlan": [
+      { "day": 1, "morning": "Mahakal darshan with verified reporting guidance.", "afternoon": "Rest, lunch and Harsiddhi Mata.", "evening": "Ram Ghat or Mahakal Lok, subject to crowd conditions." }
+    ],
+    "foodSuggestions": ["Light poha breakfast", "Simple vegetarian thali", "Hydration before evening walk"],
+    "travelTips": ["Keep ID copies", "Avoid overloading the temple list", "Verify official timings before travel"],
+    "whatsappShareText": "My 1-day Ujjain plan: Mahakal darshan, Harsiddhi Mata, rest break and Ram Ghat/Mahakal Lok."
+  },
+  {
+    "id": "two-day-ujjain-omkareshwar",
+    "title": "2 Days Ujjain + Omkareshwar",
+    "slug": "two-days-ujjain-omkareshwar",
+    "shortDescription": "A compact two-Jyotirlinga plan with Ujjain as the spiritual anchor.",
+    "longDescription": "Use day one for Ujjain and reserve day two for an early Omkareshwar journey. Exact drive times must be checked for the travel date.",
+    "category": "Itinerary",
+    "city": "Ujjain",
+    "idealDuration": "2 days",
+    "bestFor": ["Jyotirlinga pilgrims", "Couples", "Active families"],
+    "familyFriendly": true,
+    "elderlyFriendly": false,
+    "mapSearchQuery": "Ujjain to Omkareshwar",
+    "imagePlaceholder": "/images/placeholders/ujjain-omkareshwar.webp",
+    "tags": ["Spiritual", "Family Friendly"],
+    "days": 2,
+    "baseCity": "Ujjain",
+    "visitorType": ["Family", "Couple", "Solo"],
+    "dayWisePlan": [
+      { "day": 1, "morning": "Mahakal darshan.", "afternoon": "Rest and selected Ujjain temples.", "evening": "Ram Ghat or Mahakal Lok." },
+      { "day": 2, "morning": "Early transfer to Omkareshwar.", "afternoon": "Darshan and lunch.", "evening": "Return with a generous road buffer." }
+    ],
+    "foodSuggestions": ["Poha breakfast", "Packed water and snacks", "Early dinner after return"],
+    "travelTips": ["Book a comfortable vehicle", "Keep a road buffer", "Consider an overnight if traveling with parents"],
+    "whatsappShareText": "My 2-day plan: Ujjain Mahakal on day 1 and Omkareshwar Jyotirlinga on day 2."
+  },
+  {
+    "id": "five-day-malwa-circuit",
+    "title": "5 Days Ujjain + Omkareshwar + Maheshwar + Mandu",
+    "slug": "five-day-malwa-spiritual-heritage-circuit",
+    "shortDescription": "A balanced Malwa circuit combining Jyotirlingas, Narmada ghats and heritage.",
+    "longDescription": "This plan uses Ujjain and Indore as practical bases, with enough time to avoid turning every day into a long transfer.",
+    "category": "Itinerary",
+    "city": "Ujjain and Indore",
+    "idealDuration": "5 days",
+    "bestFor": ["Families", "Working professionals", "Spiritual and heritage travelers"],
+    "familyFriendly": true,
+    "elderlyFriendly": true,
+    "mapSearchQuery": "Ujjain Omkareshwar Maheshwar Mandu route",
+    "imagePlaceholder": "/images/placeholders/malwa-circuit.webp",
+    "tags": ["Spiritual", "Heritage", "Family Friendly", "Elderly Friendly"],
+    "days": 5,
+    "baseCity": "Ujjain and Indore",
+    "visitorType": ["Family", "Couple", "Elderly Parents", "International Visitor"],
+    "dayWisePlan": [
+      { "day": 1, "morning": "Arrive in Ujjain.", "afternoon": "Rest and orientation.", "evening": "Mahakal Lok." },
+      { "day": 2, "morning": "Mahakal darshan.", "afternoon": "Ujjain temple circuit.", "evening": "Relaxed dinner." },
+      { "day": 3, "morning": "Transfer toward Omkareshwar.", "afternoon": "Darshan.", "evening": "Continue to Maheshwar or Indore." },
+      { "day": 4, "morning": "Maheshwar ghats and fort.", "afternoon": "Handloom visit.", "evening": "Indore stay." },
+      { "day": 5, "morning": "Mandu selective heritage circuit.", "afternoon": "Return toward Indore.", "evening": "Departure buffer." }
+    ],
+    "foodSuggestions": ["Ujjain poha", "Simple Narmada-side lunch", "Indore food walk on a light evening"],
+    "travelTips": ["Use two bases", "Keep one light evening", "Verify road times and monument access"],
+    "whatsappShareText": "My 5-day Malwa plan: Ujjain, Omkareshwar, Maheshwar, Mandu and Indore with comfortable buffers."
+  }
+]

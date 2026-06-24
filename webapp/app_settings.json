@@ -35,16 +35,18 @@
     "enabled": true,
     "end_time": "15:15",
     "interval_minutes": 15,
-    "last_run_at": "17 Jun 2026 13:46:20 IST",
-    "last_slot": "13:45",
-    "last_slot_key": "2026-06-17:13:45",
+    "last_run_at": "24 Jun 2026 14:45:03 IST",
+    "last_slot": "14:45",
+    "last_slot_key": "2026-06-24:14:45",
+    "loss_limit_evaluations": [],
     "message": "All open option positions already have close BUY orders.",
     "order_count": 0,
     "paused_until": "",
-    "profile": "Monika",
+    "pe_risk_evaluations": [],
+    "profile": "Shanti",
     "results": [],
     "run_count_today": 8,
-    "run_date": "2026-06-17",
+    "run_date": "2026-06-24",
     "start_time": "09:30",
     "status": "ALL_COVERED"
   },
@@ -53,133 +55,133 @@
       "KITE_ACCESS_TOKEN": "",
       "KITE_API_KEY": "",
       "KITE_API_SECRET": "",
-      "KITE_CONFIRM_LIVE_ORDER": "YES"
+      "KITE_CONFIRM_LIVE_ORDER": "YES",
+      "NIFTY_INCOME_ENABLED": false
     },
     "Monika": {
       "KITE_ACCESS_TOKEN": "lC2y1M52FutAVihVveHuhC1CIISQgoPd",
       "KITE_API_KEY": "tnaa26kee3iza58w",
       "KITE_API_SECRET": "pk55c56ih0ak3pd6cfmk24z14yt22946",
-      "KITE_CONFIRM_LIVE_ORDER": "YES"
+      "KITE_CONFIRM_LIVE_ORDER": "YES",
+      "NIFTY_INCOME_ENABLED": true
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "qh6JHcPqnGVBzn4XDH6jReXvjiZ2TZgP",
+      "KITE_ACCESS_TOKEN": "zNYieFzLvIAI5S9Yh7OD4DMSc9q5AzLM",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
-      "KITE_CONFIRM_LIVE_ORDER": "YES"
+      "KITE_CONFIRM_LIVE_ORDER": "YES",
+      "NIFTY_INCOME_ENABLED": false
     },
     "Vikalp": {
       "KITE_ACCESS_TOKEN": "",
       "KITE_API_KEY": "",
       "KITE_API_SECRET": "",
-      "KITE_CONFIRM_LIVE_ORDER": "YES"
+      "KITE_CONFIRM_LIVE_ORDER": "YES",
+      "NIFTY_INCOME_ENABLED": false
     }
   },
   "nifty_income_state": {
     "entry_results": [
       {
-        "detail": "NIFTY Friday income entry: order generated, not sent to Kite.",
+        "detail": "NIFTY Friday defined-risk income entry: order generated, not sent to Kite.",
         "status": "SUGGESTION_ONLY",
-        "tradingsymbol": "NIFTY2671422600PE"
+        "tradingsymbol": "NIFTY2672125200CE"
       },
       {
-        "detail": "NIFTY Friday income entry: order generated, not sent to Kite.",
+        "detail": "NIFTY Friday defined-risk income entry: order generated, not sent to Kite.",
         "status": "SUGGESTION_ONLY",
-        "tradingsymbol": "NIFTY2671422100PE"
-      },
-      {
-        "detail": "NIFTY Friday income entry: order generated, not sent to Kite.",
-        "status": "SUGGESTION_ONLY",
-        "tradingsymbol": "NIFTY2671425400CE"
-      },
-      {
-        "detail": "NIFTY Friday income entry: order generated, not sent to Kite.",
-        "status": "SUGGESTION_ONLY",
-        "tradingsymbol": "NIFTY2671425900CE"
+        "tradingsymbol": "NIFTY2672124900CE"
       }
     ],
     "entry_status": "SUGGESTION_ONLY",
     "exit_results": [],
-    "last_entry_attempt_date": "2026-06-17",
+    "last_entry_attempt_date": "2026-06-23",
     "last_entry_orders": [
       {
-        "entry_date": "2026-06-19",
+        "entry_date": "2026-06-26",
         "exchange": "NFO",
-        "expiry_date": "2026-07-14",
-        "mmi_selected_otm_pct": 5.5,
-        "option_type": "PE",
-        "order_type": "LIMIT",
-        "price": 0,
-        "product": "NRML",
-        "quantity": 75,
-        "selected_strategy": "IRON_CONDOR",
-        "strategy_name": "NIFTY_INCOME",
-        "strike": 22600,
-        "tag": "NIFTY_INC",
-        "tradingsymbol": "NIFTY2671422600PE",
-        "transaction_type": "SELL",
-        "validity": "DAY"
-      },
-      {
-        "entry_date": "2026-06-19",
-        "exchange": "NFO",
-        "expiry_date": "2026-07-14",
-        "mmi_selected_otm_pct": 5.5,
-        "option_type": "PE",
-        "order_type": "LIMIT",
-        "price": 0,
-        "product": "NRML",
-        "quantity": 75,
-        "selected_strategy": "IRON_CONDOR",
-        "strategy_name": "NIFTY_INCOME",
-        "strike": 22100,
-        "tag": "NIFTY_INC",
-        "tradingsymbol": "NIFTY2671422100PE",
-        "transaction_type": "BUY",
-        "validity": "DAY"
-      },
-      {
-        "entry_date": "2026-06-19",
-        "exchange": "NFO",
-        "expiry_date": "2026-07-14",
-        "mmi_selected_otm_pct": 5.5,
+        "expiry_date": "2026-07-21",
+        "mmi_selected_otm_pct": 4.5,
         "option_type": "CE",
         "order_type": "LIMIT",
         "price": 0,
         "product": "NRML",
-        "quantity": 75,
-        "selected_strategy": "IRON_CONDOR",
+        "quantity": 65,
+        "selected_strategy": "BEAR_CALL_SPREAD",
         "strategy_name": "NIFTY_INCOME",
-        "strike": 25400,
+        "strike": 25200,
         "tag": "NIFTY_INC",
-        "tradingsymbol": "NIFTY2671425400CE",
-        "transaction_type": "SELL",
+        "tradingsymbol": "NIFTY2672125200CE",
+        "transaction_type": "BUY",
         "validity": "DAY"
       },
       {
-        "entry_date": "2026-06-19",
+        "entry_date": "2026-06-26",
         "exchange": "NFO",
-        "expiry_date": "2026-07-14",
-        "mmi_selected_otm_pct": 5.5,
+        "expiry_date": "2026-07-21",
+        "mmi_selected_otm_pct": 4.5,
         "option_type": "CE",
         "order_type": "LIMIT",
         "price": 0,
         "product": "NRML",
-        "quantity": 75,
-        "selected_strategy": "IRON_CONDOR",
+        "quantity": 65,
+        "selected_strategy": "BEAR_CALL_SPREAD",
         "strategy_name": "NIFTY_INCOME",
-        "strike": 25900,
+        "strike": 24900,
         "tag": "NIFTY_INC",
-        "tradingsymbol": "NIFTY2671425900CE",
-        "transaction_type": "BUY",
+        "tradingsymbol": "NIFTY2672124900CE",
+        "transaction_type": "SELL",
         "validity": "DAY"
       }
     ],
-    "last_entry_run_at": "17 Jun 2026 08:37:15 IST",
-    "last_weekly_pair_exit_run_at": "17 Jun 2026 12:00:26 IST",
-    "last_weekly_pair_exit_slot": "2026-06-17 12:00",
-    "message": "NIFTY entry IRON_CONDOR generated 4 leg(s).",
+    "last_entry_pair_snapshot": {
+      "orders": [
+        {
+          "entry_date": "2026-06-26",
+          "exchange": "NFO",
+          "expiry_date": "2026-07-21",
+          "mmi_selected_otm_pct": 4.5,
+          "option_type": "CE",
+          "order_type": "LIMIT",
+          "price": 0,
+          "product": "NRML",
+          "quantity": 65,
+          "selected_strategy": "BEAR_CALL_SPREAD",
+          "strategy_name": "NIFTY_INCOME",
+          "strike": 25200,
+          "tag": "NIFTY_INC",
+          "tradingsymbol": "NIFTY2672125200CE",
+          "transaction_type": "BUY",
+          "validity": "DAY"
+        },
+        {
+          "entry_date": "2026-06-26",
+          "exchange": "NFO",
+          "expiry_date": "2026-07-21",
+          "mmi_selected_otm_pct": 4.5,
+          "option_type": "CE",
+          "order_type": "LIMIT",
+          "price": 0,
+          "product": "NRML",
+          "quantity": 65,
+          "selected_strategy": "BEAR_CALL_SPREAD",
+          "strategy_name": "NIFTY_INCOME",
+          "strike": 24900,
+          "tag": "NIFTY_INC",
+          "tradingsymbol": "NIFTY2672124900CE",
+          "transaction_type": "SELL",
+          "validity": "DAY"
+        }
+      ],
+      "selected_strategy": "BEAR_CALL_SPREAD"
+    },
+    "last_entry_run_at": "23 Jun 2026 17:21:20 IST",
+    "last_exit_run_at": "23 Jun 2026 17:21:38 IST",
+    "last_weekly_pair_exit_run_at": "23 Jun 2026 17:21:54 IST",
+    "last_weekly_pair_exit_slot": "2026-06-23 17:21",
+    "message": "No NIFTY position is due for T-7 time exit.",
     "open_strategies": [],
-    "time_exit_status": "WAITING",
+    "time_exit_status": "NO_DUE_EXITS",
     "weekly_pair_exit_message": "No NIFTY weekly pair exit signal.",
     "weekly_pair_exit_monitor_rows": [],
     "weekly_pair_exit_results": [],
@@ -196,5 +198,5 @@
     "schedule_time": "09:20",
     "status": "NO_ORDERS"
   },
-  "selected_kite_profile": "Monika"
+  "selected_kite_profile": "Shanti"
 }

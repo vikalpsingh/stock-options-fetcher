@@ -1,0 +1,138 @@
+{
+  "trustBadges": [
+    { "label": "Family Friendly", "description": "Plans with rest and realistic pacing", "icon": "family" },
+    { "label": "Elderly Friendly", "description": "Mobility-aware travel guidance", "icon": "accessibility" },
+    { "label": "Hindi / English Ready", "description": "Built for bilingual content", "icon": "languages" },
+    { "label": "Maps & Routes", "description": "One-tap Google Maps directions", "icon": "map" },
+    { "label": "Updated Travel Guide", "description": "Practical planning notes", "icon": "verified" }
+  ],
+  "stays": [
+    {
+      "city": "Ujjain",
+      "bestFor": "Best for darshan",
+      "description": "Stay close to Mahakal, reduce early-morning travel and experience the pilgrimage atmosphere.",
+      "points": ["Early temple access", "Less daily commuting", "Book far in advance"]
+    },
+    {
+      "city": "Indore",
+      "bestFor": "Best for airport, hotels and food",
+      "description": "Choose wider hotel options, easier flights and excellent dining, with a daily Ujjain transfer.",
+      "points": ["Nearest major airport", "Comfortable family hotels", "Strong food scene"]
+    },
+    {
+      "city": "Bhopal",
+      "bestFor": "Best for Sanchi and Bhimbetka",
+      "description": "Use Bhopal as the base for a longer Madhya Pradesh heritage and spiritual circuit.",
+      "points": ["Sanchi day trip", "Bhimbetka access", "Not a daily Ujjain commute"]
+    }
+  ],
+  "destinations": [
+    {
+      "name": "Omkareshwar",
+      "distance": "140 km",
+      "duration": "1–2 days",
+      "description": "Add a second Jyotirlinga and peaceful Narmada island experience.",
+      "highlights": ["Jyotirlinga", "Narmada ghats"],
+      "tone": "maroon"
+    },
+    {
+      "name": "Maheshwar",
+      "distance": "155 km",
+      "duration": "1–2 days",
+      "description": "Elegant river ghats, Ahilya Fort and celebrated handloom traditions.",
+      "highlights": ["Ahilya Fort", "Narmada sunset"],
+      "tone": "gold"
+    },
+    {
+      "name": "Mandu",
+      "distance": "150 km",
+      "duration": "1 day",
+      "description": "A hilltop heritage city filled with palaces and memorable viewpoints.",
+      "highlights": ["Jahaz Mahal", "Roopmati Pavilion"],
+      "tone": "ink"
+    },
+    {
+      "name": "Indore",
+      "distance": "55 km",
+      "duration": "1 day",
+      "description": "Airport convenience, Rajwada and one of India’s best vegetarian food scenes.",
+      "highlights": ["Rajwada", "Sarafa"],
+      "tone": "saffron"
+    },
+    {
+      "name": "Sanchi",
+      "distance": "240 km",
+      "duration": "1–2 days",
+      "description": "Explore UNESCO-listed Buddhist stupas on a thoughtful Bhopal extension.",
+      "highlights": ["Great Stupa", "Buddhist heritage"],
+      "tone": "gold"
+    },
+    {
+      "name": "Bhimbetka",
+      "distance": "230 km",
+      "duration": "1–2 days",
+      "description": "Visit prehistoric rock shelters and forest landscapes south of Bhopal.",
+      "highlights": ["Rock shelters", "Ancient paintings"],
+      "tone": "ink"
+    }
+  ],
+  "itineraries": [
+    {
+      "title": "1 Day Ujjain",
+      "days": 1,
+      "audience": "Short visit",
+      "summary": "A focused Mahakal and sacred Ujjain day.",
+      "schedule": ["Mahakal darshan, Harsiddhi, Ram Ghat and Mahakal Lok"]
+    },
+    {
+      "title": "Ujjain + Omkareshwar",
+      "days": 2,
+      "audience": "Two Jyotirlingas",
+      "summary": "Pair Mahakaleshwar with Omkareshwar without an overnight rush.",
+      "schedule": ["Mahakal and Ujjain temple circuit", "Omkareshwar and Narmada ghats"]
+    },
+    {
+      "title": "Ujjain + Maheshwar",
+      "days": 3,
+      "audience": "Spiritual & cultural",
+      "summary": "Sacred Ujjain followed by a gentler Narmada experience.",
+      "schedule": ["Mahakal and old Ujjain", "Sacred Ujjain circuit", "Maheshwar fort and ghats"]
+    },
+    {
+      "title": "MP Spiritual Circuit",
+      "days": 5,
+      "audience": "Complete journey",
+      "summary": "Ujjain, Omkareshwar, Maheshwar and Indore at a family-friendly pace.",
+      "schedule": ["Arrive via Indore", "Mahakal and Ujjain", "Ujjain sacred circuit", "Omkareshwar and Maheshwar", "Indore and departure"]
+    }
+  ],
+  "foods": [
+    { "name": "Poha Jalebi", "category": "Breakfast", "description": "The classic light-and-sweet Malwa morning.", "diet": "Vegetarian", "bestTime": "Morning" },
+    { "name": "Dal Bafla", "category": "Local meal", "description": "A hearty regional meal served with dal, ghee and churma.", "diet": "Vegetarian", "bestTime": "Lunch" },
+    { "name": "Bhutte Ka Kees", "category": "Malwa special", "description": "Grated corn cooked gently with milk and spices.", "diet": "Vegetarian", "bestTime": "Evening" },
+    { "name": "Garadu", "category": "Street food", "description": "Crisp, spiced winter yam loved across the Malwa region.", "diet": "Vegetarian", "bestTime": "Evening" },
+    { "name": "Sabudana Khichdi", "category": "Fasting-friendly", "description": "A comforting temple-area favourite with peanuts and mild spices.", "diet": "Vegetarian", "bestTime": "Breakfast / snack" }
+  ],
+  "faqs": [
+    {
+      "question": "How many days are enough for Ujjain?",
+      "answer": "Keep two full days for Mahakal and the main Ujjain temple circuit. During Kumbh, three or more nights provide a useful buffer for crowds and route changes."
+    },
+    {
+      "question": "Should a family stay in Ujjain or Indore?",
+      "answer": "Choose Ujjain for early darshan and less commuting. Choose Indore for airport convenience, a wider hotel choice and food, while allowing additional travel time."
+    },
+    {
+      "question": "Can Omkareshwar be covered with Ujjain?",
+      "answer": "Yes. Keep at least two days for the two Jyotirlingas, and preferably three if travelling with parents or children."
+    },
+    {
+      "question": "Which airport is nearest to Ujjain?",
+      "answer": "Devi Ahilyabai Holkar Airport in Indore is the nearest major airport, approximately 55 kilometres from Ujjain."
+    },
+    {
+      "question": "Is this guide suitable for parents and children?",
+      "answer": "Yes. The itineraries prioritise practical travel time, rest windows, mobility needs, food safety and family-friendly stay decisions."
+    }
+  ]
+}

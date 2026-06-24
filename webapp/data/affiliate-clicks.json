@@ -1,0 +1,68 @@
+[
+  {
+    "linkId": "booking-ujjain-hotels",
+    "providerId": "booking-com-affiliate",
+    "destination": "ujjain-kumbh-2028",
+    "campaign": "ujjain-kumbh-2028-hotels",
+    "sourcePage": "",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    "referrer": "http://localhost:3001/stay-guide",
+    "id": "59c9d74b-ca01-4566-8c38-a82c93ada964",
+    "createdAt": "2026-06-22T03:25:00.685Z"
+  },
+  {
+    "linkId": "booking-indore-hotels",
+    "providerId": "booking-com-affiliate",
+    "destination": "ujjain-kumbh-2028",
+    "campaign": "ujjain-kumbh-2028-indore-stays",
+    "sourcePage": "",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    "referrer": "http://localhost:3001/stay-guide",
+    "id": "e2bc3355-9f34-4552-a4dd-44da9cc9dc4f",
+    "createdAt": "2026-06-22T03:25:00.690Z"
+  },
+  {
+    "linkId": "booking-bhopal-hotels",
+    "providerId": "booking-com-affiliate",
+    "destination": "ujjain-kumbh-2028",
+    "campaign": "ujjain-kumbh-2028-bhopal-stays",
+    "sourcePage": "",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    "referrer": "http://localhost:3001/stay-guide",
+    "id": "d563b47e-2040-4444-bcf4-117d0317aa35",
+    "createdAt": "2026-06-22T03:25:00.694Z"
+  },
+  {
+    "linkId": "booking-ujjain-hotels",
+    "providerId": "booking-com-affiliate",
+    "destination": "ujjain-kumbh-2028",
+    "campaign": "ujjain-kumbh-2028-hotels",
+    "sourcePage": "",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    "referrer": "http://localhost:3001/stay-guide",
+    "id": "7d7a43e2-9ff4-4c1e-8fd3-dacc21859283",
+    "createdAt": "2026-06-22T03:39:36.685Z"
+  },
+  {
+    "linkId": "booking-indore-hotels",
+    "providerId": "booking-com-affiliate",
+    "destination": "ujjain-kumbh-2028",
+    "campaign": "ujjain-kumbh-2028-indore-stays",
+    "sourcePage": "",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    "referrer": "http://localhost:3001/stay-guide",
+    "id": "c328ab62-dc47-4569-b44d-5270d45bf786",
+    "createdAt": "2026-06-22T03:39:36.692Z"
+  },
+  {
+    "linkId": "booking-bhopal-hotels",
+    "providerId": "booking-com-affiliate",
+    "destination": "ujjain-kumbh-2028",
+    "campaign": "ujjain-kumbh-2028-bhopal-stays",
+    "sourcePage": "",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    "referrer": "http://localhost:3001/stay-guide",
+    "id": "8902a3de-725a-4135-990a-a38d0ff8c873",
+    "createdAt": "2026-06-22T03:39:36.698Z"
+  }
+]

@@ -1,0 +1,161 @@
+{
+  "filters": ["All", "Day Trips", "Spiritual", "Heritage", "Nature", "Food", "Family Friendly", "2-Day Trips"],
+  "destinations": [
+    {
+      "id": "omkareshwar",
+      "name": "Omkareshwar",
+      "category": "Spiritual",
+      "tags": ["Spiritual", "Family Friendly", "2-Day Trips"],
+      "bestBase": "Ujjain or Indore",
+      "duration": "1–2 days",
+      "travelTime": "Travel-time placeholder: allow a full intercity day and verify current route conditions.",
+      "whyVisit": "Pair Mahakaleshwar with another Jyotirlinga on a sacred Narmada island.",
+      "suitability": "Good for families; elderly visitors benefit from a slower overnight plan.",
+      "highlights": ["Jyotirlinga", "Narmada ghats"],
+      "tone": "maroon",
+      "mapsQuery": "Omkareshwar Jyotirlinga"
+    },
+    {
+      "id": "maheshwar",
+      "name": "Maheshwar",
+      "category": "Heritage",
+      "tags": ["Heritage", "Family Friendly", "2-Day Trips"],
+      "bestBase": "Indore",
+      "duration": "1–2 days",
+      "travelTime": "Travel-time placeholder: best combined with Omkareshwar or an overnight stay.",
+      "whyVisit": "Experience Ahilya Fort, elegant Narmada ghats, handloom traditions and a gentler pace.",
+      "suitability": "Very family-friendly; ghat steps may require assistance for some elders.",
+      "highlights": ["Ahilya Fort", "Narmada sunset"],
+      "tone": "gold",
+      "mapsQuery": "Maheshwar Madhya Pradesh"
+    },
+    {
+      "id": "mandu",
+      "name": "Mandu",
+      "category": "Heritage",
+      "tags": ["Day Trips", "Heritage", "Family Friendly"],
+      "bestBase": "Indore",
+      "duration": "1 day",
+      "travelTime": "Travel-time placeholder: start early and keep a full day for the hilltop circuit.",
+      "whyVisit": "Explore Jahaz Mahal, Afghan architecture and memorable plateau viewpoints.",
+      "suitability": "Good for families; choose fewer monuments for elderly visitors.",
+      "highlights": ["Jahaz Mahal", "Roopmati Pavilion"],
+      "tone": "ink",
+      "mapsQuery": "Mandu Madhya Pradesh"
+    },
+    {
+      "id": "indore",
+      "name": "Indore",
+      "category": "Food",
+      "tags": ["Day Trips", "Food", "Heritage", "Family Friendly"],
+      "bestBase": "Indore",
+      "duration": "1 day",
+      "travelTime": "Travel-time placeholder: usually the easiest nearby city from Ujjain; festival traffic can change this.",
+      "whyVisit": "Combine Rajwada, airport convenience, shopping and one of India’s best vegetarian food scenes.",
+      "suitability": "Excellent for families and elders when the day is paced around meals and rest.",
+      "highlights": ["Rajwada", "Sarafa food trail"],
+      "tone": "saffron",
+      "mapsQuery": "Rajwada Palace Indore"
+    },
+    {
+      "id": "tincha-falls",
+      "name": "Tincha Falls",
+      "category": "Nature",
+      "tags": ["Day Trips", "Nature"],
+      "bestBase": "Indore",
+      "duration": "Half to full day",
+      "travelTime": "Travel-time placeholder: verify seasonal access, weather and local safety advisories.",
+      "whyVisit": "Add a monsoon-season waterfall and rural landscape break to a city-heavy itinerary.",
+      "suitability": "Better for active families; uneven viewpoints may not suit all elderly visitors.",
+      "highlights": ["Waterfall", "Monsoon landscape"],
+      "tone": "nature",
+      "mapsQuery": "Tincha Falls Madhya Pradesh"
+    },
+    {
+      "id": "sanchi",
+      "name": "Sanchi",
+      "category": "Heritage",
+      "tags": ["Heritage", "Family Friendly", "2-Day Trips"],
+      "bestBase": "Bhopal",
+      "duration": "1–2 days with Bhopal",
+      "travelTime": "Travel-time placeholder: use Bhopal as the practical base and avoid a rushed Ujjain return.",
+      "whyVisit": "See UNESCO-listed Buddhist stupas and one of India’s most important ancient heritage sites.",
+      "suitability": "Educational and family-friendly; walking and sun exposure require planning.",
+      "highlights": ["Great Stupa", "UNESCO heritage"],
+      "tone": "gold",
+      "mapsQuery": "Sanchi Stupa"
+    },
+    {
+      "id": "bhimbetka",
+      "name": "Bhimbetka",
+      "category": "Nature & Heritage",
+      "tags": ["Heritage", "Nature", "Family Friendly", "2-Day Trips"],
+      "bestBase": "Bhopal",
+      "duration": "1–2 days with Bhopal",
+      "travelTime": "Travel-time placeholder: combine with a Bhopal stay and verify site access.",
+      "whyVisit": "Walk through prehistoric rock shelters, ancient paintings and a forested landscape.",
+      "suitability": "Wonderful for families; uneven walking surfaces may be difficult for elders.",
+      "highlights": ["Rock shelters", "Ancient paintings"],
+      "tone": "nature",
+      "mapsQuery": "Bhimbetka Rock Shelters"
+    },
+    {
+      "id": "bhopal",
+      "name": "Bhopal",
+      "category": "Heritage",
+      "tags": ["Heritage", "Nature", "Food", "Family Friendly", "2-Day Trips"],
+      "bestBase": "Bhopal",
+      "duration": "2 days",
+      "travelTime": "Travel-time placeholder: treat Bhopal as a separate base in a longer Madhya Pradesh circuit.",
+      "whyVisit": "Enjoy lake views, museums, food and easy access to Sanchi and Bhimbetka.",
+      "suitability": "Excellent for families and elderly visitors with a comfortable hotel base.",
+      "highlights": ["Upper Lake", "Museums and heritage"],
+      "tone": "blue",
+      "mapsQuery": "Upper Lake Bhopal"
+    }
+  ],
+  "circuits": [
+    {
+      "title": "Ujjain + Omkareshwar",
+      "duration": "2 days",
+      "stops": ["Mahakal and Ujjain", "Omkareshwar Jyotirlinga"],
+      "bestFor": "Two-Jyotirlinga pilgrimage"
+    },
+    {
+      "title": "Ujjain + Maheshwar",
+      "duration": "2–3 days",
+      "stops": ["Mahakal and sacred Ujjain", "Maheshwar fort and Narmada ghats"],
+      "bestFor": "Spiritual and slower cultural travel"
+    },
+    {
+      "title": "Indore + Mandu + Maheshwar",
+      "duration": "3 days",
+      "stops": ["Indore food and heritage", "Mandu monuments", "Maheshwar sunset"],
+      "bestFor": "Food, forts and Narmada landscapes"
+    },
+    {
+      "title": "Bhopal + Sanchi + Bhimbetka",
+      "duration": "3 days",
+      "stops": ["Bhopal lakes and museums", "Sanchi UNESCO circuit", "Bhimbetka rock shelters"],
+      "bestFor": "Heritage and family learning"
+    }
+  ],
+  "tips": [
+    {
+      "title": "Avoid overpacking",
+      "description": "Choose one major destination per day instead of turning the journey into a checklist."
+    },
+    {
+      "title": "Start early",
+      "description": "Early departures provide cooler weather, more daylight and a calmer return."
+    },
+    {
+      "title": "Keep a Kumbh buffer",
+      "description": "Festival traffic, diversions and queues can add substantial travel time."
+    },
+    {
+      "title": "Use Indore for clusters",
+      "description": "Indore is often the most practical base for Mandu, Maheshwar, Tincha Falls and food exploration."
+    }
+  ]
+}

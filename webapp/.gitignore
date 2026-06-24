@@ -1,3 +1,19 @@
 .env
+.env.local
+node_modules/
+.next/
+out/
+*.log
 __pycache__/
 *.pyc
+
+# Legacy local application files kept outside this website repository
+app.py
+streamlit_app.py
+Start-KiteWebApp.ps1
+app_settings.json
+*_strategy.json
+test_*_strategy.py
+vikalp_income.db
+openai_csv_prompt.md
+ETF req

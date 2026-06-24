@@ -1,0 +1,152 @@
+{
+  "cities": ["Ujjain", "Indore", "Maheshwar", "Bhopal"],
+  "foods": [
+    {
+      "id": "poha-jalebi",
+      "name": "Poha Jalebi",
+      "cities": ["Ujjain", "Indore", "Bhopal"],
+      "bestTime": "Breakfast",
+      "weight": "Light + sweet",
+      "familyFriendly": true,
+      "description": "A classic Madhya Pradesh morning: soft savoury poha followed by warm jalebi."
+    },
+    {
+      "id": "kachori",
+      "name": "Kachori",
+      "cities": ["Ujjain", "Indore", "Bhopal"],
+      "bestTime": "Breakfast or snack",
+      "weight": "Heavy",
+      "familyFriendly": true,
+      "description": "Crisp, spiced and satisfying; best shared rather than eaten before a long darshan queue."
+    },
+    {
+      "id": "sabudana-khichdi",
+      "name": "Sabudana Khichdi",
+      "cities": ["Ujjain", "Indore", "Maheshwar"],
+      "bestTime": "Breakfast or fasting meal",
+      "weight": "Light",
+      "familyFriendly": true,
+      "description": "Sago cooked with peanuts, potato and mild spices, widely enjoyed during fasting days."
+    },
+    {
+      "id": "dal-bafla",
+      "name": "Dal Bafla",
+      "cities": ["Ujjain", "Indore", "Bhopal", "Maheshwar"],
+      "bestTime": "Lunch",
+      "weight": "Heavy",
+      "familyFriendly": true,
+      "description": "A rich regional meal of baked wheat dumplings, dal, ghee, chutney and often churma."
+    },
+    {
+      "id": "bhutte-ka-kees",
+      "name": "Bhutte Ka Kees",
+      "cities": ["Indore", "Ujjain"],
+      "bestTime": "Evening snack",
+      "weight": "Medium",
+      "familyFriendly": true,
+      "description": "Grated corn gently cooked with milk, mustard and spices; comforting and distinctly Malwa."
+    },
+    {
+      "id": "garadu",
+      "name": "Garadu",
+      "cities": ["Indore"],
+      "bestTime": "Winter evening",
+      "weight": "Heavy",
+      "familyFriendly": true,
+      "description": "Crisp fried yam tossed with tangy spices, especially popular during cooler months."
+    },
+    {
+      "id": "malpua",
+      "name": "Malpua",
+      "cities": ["Ujjain", "Maheshwar", "Bhopal"],
+      "bestTime": "Dessert",
+      "weight": "Heavy + sweet",
+      "familyFriendly": true,
+      "description": "Soft syrup-soaked pancakes often served warm as a festive or temple-town treat."
+    },
+    {
+      "id": "rabdi",
+      "name": "Rabdi",
+      "cities": ["Ujjain", "Indore", "Bhopal"],
+      "bestTime": "Dessert",
+      "weight": "Heavy + sweet",
+      "familyFriendly": true,
+      "description": "Slow-reduced sweet milk best eaten fresh from a clean, high-turnover shop."
+    },
+    {
+      "id": "shikanji",
+      "name": "Shikanji",
+      "cities": ["Indore"],
+      "bestTime": "Afternoon",
+      "weight": "Rich drink",
+      "familyFriendly": true,
+      "description": "Indore-style shikanji is a thick, creamy drink—not the lemon drink visitors may expect."
+    },
+    {
+      "id": "thandai",
+      "name": "Thandai",
+      "cities": ["Ujjain", "Maheshwar"],
+      "bestTime": "Daytime",
+      "weight": "Rich drink",
+      "familyFriendly": false,
+      "description": "A festive milk drink with nuts and spices. Families should clearly confirm ingredients before ordering."
+    }
+  ],
+  "indoreHighlights": [
+    {
+      "title": "Sarafa Bazaar",
+      "subtitle": "Late-night food market",
+      "description": "A jewellery market by day that transforms into a celebrated vegetarian food street at night.",
+      "bestTime": "Late evening",
+      "notes": ["Go with a shortlist", "Share portions", "Keep children’s bedtime in mind"]
+    },
+    {
+      "title": "Chappan Dukan",
+      "subtitle": "Easy family food walk",
+      "description": "A more structured row of food outlets suited to families wanting variety without a very late night.",
+      "bestTime": "Evening",
+      "notes": ["Broad food choice", "Easier family pacing", "Good first Indore stop"]
+    },
+    {
+      "title": "Street Food Culture",
+      "subtitle": "Taste small portions",
+      "description": "Indore rewards curiosity, but the best strategy is to share small servings across several stalls.",
+      "bestTime": "Evening",
+      "notes": ["Choose busy clean stalls", "Watch spice levels", "Avoid overeating"]
+    },
+    {
+      "title": "Late-Night Food",
+      "subtitle": "Plan it on a non-darshan night",
+      "description": "Keep late-night eating separate from an early Mahakal or long road-travel morning.",
+      "bestTime": "After 9 PM",
+      "notes": ["Not before pre-dawn darshan", "Arrange return transport", "Keep the next morning light"]
+    }
+  ],
+  "safetyTips": [
+    { "title": "Drink safe water", "description": "Use sealed or reliably filtered water and avoid uncertain ice during crowded periods." },
+    { "title": "Eat light before darshan", "description": "Avoid oily or heavy meals before long queues, early rituals or road transfers." },
+    { "title": "Carry ORS or electrolytes", "description": "Heat, walking and crowds can dehydrate visitors faster than expected." },
+    { "title": "Plan for elders and children", "description": "Carry familiar snacks, check spice levels and keep regular meal timing where possible." },
+    { "title": "Choose clean busy stalls", "description": "High turnover and freshly cooked hot food are usually safer choices than food sitting uncovered." }
+  ],
+  "foodItinerary": [
+    {
+      "title": "Ujjain Breakfast",
+      "time": "Morning",
+      "plan": "Poha Jalebi or Sabudana Khichdi after darshan, followed by safe drinking water.",
+      "tip": "Keep the portion light if another temple queue follows."
+    },
+    {
+      "title": "Light Food Before Temple Visit",
+      "time": "Pre-darshan",
+      "plan": "Choose fruit you can peel, simple khichdi, toast or a small familiar snack.",
+      "tip": "Avoid experimental, very spicy or heavy food before a long wait."
+    },
+    {
+      "title": "Indore Evening Food Walk",
+      "time": "Evening",
+      "plan": "Start at Chappan Dukan or choose a focused Sarafa shortlist and share small portions.",
+      "tip": "Schedule it on a night without an early darshan or long transfer next morning."
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "startingCities": ["Indore", "Bhopal", "Delhi", "Mumbai", "Pune", "Ahmedabad", "Bengaluru", "Other"],
+  "days": [1, 2, 3, 5, 7],
+  "visitorTypes": ["Solo", "Couple", "Family", "Elderly Parents", "International Visitor"],
+  "stayPreferences": ["Ujjain", "Indore", "Bhopal", "Not Sure"],
+  "interests": ["Mahakal Darshan", "Jyotirlinga Circuit", "Food", "Heritage", "Nature", "Family Friendly", "Slow Travel"],
+  "routes": {
+    "Indore": "Approximately 1–2.5 hours to Ujjain, subject to route and festival traffic.",
+    "Bhopal": "Approximately 4–5 hours to Ujjain by road; rail timing varies.",
+    "Delhi": "Use a direct or connecting train, or fly to Indore and transfer to Ujjain.",
+    "Mumbai": "Use a train to Ujjain/Indore or fly to Indore and transfer.",
+    "Pune": "Fly to Indore or use a long-distance rail/road combination.",
+    "Ahmedabad": "Rail and road options connect to Ujjain; keep a generous festival buffer.",
+    "Bengaluru": "Fly to Indore and transfer to Ujjain, or use a long-distance train.",
+    "Other": "Compare rail access to Ujjain with flights to Indore before booking."
+  },
+  "plans": {
+    "1": {
+      "base": "Ujjain",
+      "itinerary": ["Early Mahakal Darshan", "Harsiddhi Mata and Mahakal Lok", "Ram Ghat and evening aarti"],
+      "temples": ["Mahakaleshwar", "Harsiddhi Mata", "Ram Ghat"],
+      "nearby": []
+    },
+    "2": {
+      "base": "Ujjain",
+      "itinerary": ["Day 1: Mahakal Darshan, Harsiddhi Mata, Mahakal Lok and Ram Ghat", "Day 2: Omkareshwar Jyotirlinga and Narmada ghats"],
+      "temples": ["Mahakaleshwar", "Harsiddhi Mata", "Omkareshwar"],
+      "nearby": ["Omkareshwar"]
+    },
+    "3": {
+      "base": "Ujjain",
+      "itinerary": ["Day 1: Mahakal Darshan and sacred Ujjain circuit", "Day 2: Indore food, heritage and comfortable city time", "Day 3: Choose Omkareshwar for Jyotirlinga focus or Maheshwar for a slower Narmada day"],
+      "temples": ["Mahakaleshwar", "Kal Bhairav", "Harsiddhi Mata"],
+      "nearby": ["Indore", "Omkareshwar or Maheshwar"]
+    },
+    "5": {
+      "base": "Ujjain",
+      "itinerary": ["Day 1: Arrive and settle in Ujjain", "Day 2: Mahakal Darshan and Ujjain temples", "Day 3: Omkareshwar Jyotirlinga", "Day 4: Maheshwar fort and Narmada ghats", "Day 5: Mandu heritage circuit and departure via Indore"],
+      "temples": ["Mahakaleshwar", "Harsiddhi Mata", "Kal Bhairav", "Omkareshwar"],
+      "nearby": ["Omkareshwar", "Maheshwar", "Mandu", "Indore"]
+    },
+    "7": {
+      "base": "Ujjain",
+      "itinerary": ["Day 1: Arrive via Indore", "Day 2: Mahakal Darshan and Ujjain temples", "Day 3: Omkareshwar", "Day 4: Maheshwar", "Day 5: Mandu and Indore", "Day 6: Transfer to Bhopal and visit Sanchi", "Day 7: Bhimbetka and Bhopal departure"],
+      "temples": ["Mahakaleshwar", "Harsiddhi Mata", "Kal Bhairav", "Omkareshwar"],
+      "nearby": ["Omkareshwar", "Maheshwar", "Mandu", "Indore", "Sanchi", "Bhimbetka", "Bhopal"]
+    }
+  },
+  "foods": {
+    "default": ["Poha Jalebi", "Dal Bafla", "Sabudana Khichdi"],
+    "Food": ["Poha Jalebi", "Dal Bafla", "Bhutte Ka Kees", "Garadu", "Sarafa food walk"],
+    "International Visitor": ["Freshly cooked vegetarian thali", "Poha Jalebi", "Dal Bafla", "Sealed or filtered drinking water"]
+  },
+  "elderlyTips": [
+    "Prefer early morning darshan and avoid peak afternoon heat.",
+    "Keep one major temple activity per half-day and schedule rest.",
+    "Confirm lift, vehicle access and assisted-entry guidance before travel.",
+    "Carry water, regular medicines, identification and a simple meeting-point card."
+  ]
+}

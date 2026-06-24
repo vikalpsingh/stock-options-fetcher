@@ -1,0 +1,46 @@
+{
+  "overview": {
+    "importance": "Shri Mahakaleshwar is one of the twelve Jyotirlingas and the spiritual centre of a Ujjain journey. The south-facing form of Shiva is revered across India, drawing pilgrims for darshan, worship and the distinctive Bhasma Aarti tradition.",
+    "centrality": "Mahakal is closely connected with the old city, Harsiddhi Mata, Ram Ghat and the Mahakal Lok corridor. Planning it first makes the rest of the Ujjain temple circuit easier to pace.",
+    "duration": "Keep 2–4 hours for a normal visit, and a larger buffer on weekends, festivals and Kumbh crowd days. Timings should be verified from official temple sources before travel."
+  },
+  "darshanTypes": [
+    { "title": "Normal Darshan", "description": "The standard queue-based darshan option for most visitors. Crowd flow, entry gates and waiting time can change.", "bestFor": "Flexible family visits", "icon": "users" },
+    { "title": "Bhasma Aarti", "description": "A revered pre-dawn ritual that generally requires advance availability checks, identity verification and specific rules.", "bestFor": "Prepared spiritual visitors", "icon": "sparkles" },
+    { "title": "VIP / Paid Darshan", "description": "Official assisted or paid categories may be offered subject to current temple policy and availability.", "bestFor": "Visitors needing a shorter queue", "icon": "ticket" },
+    { "title": "Festival Crowd Days", "description": "Expect route changes, longer queues, security controls and restricted vehicle access around the temple area.", "bestFor": "Visitors with large time buffers", "icon": "warning" }
+  ],
+  "bhasmaSteps": [
+    { "title": "Check availability", "description": "Use only official Mahakaleshwar temple sources to understand the current process." },
+    { "title": "Book in advance", "description": "High-demand dates can fill quickly. Avoid unofficial agents or guaranteed-entry claims." },
+    { "title": "Carry original ID", "description": "Keep the same valid identification used during the official booking process." },
+    { "title": "Reach early", "description": "Allow time for security, verification, footwear and route changes near the temple." },
+    { "title": "Follow dress code and rules", "description": "Reconfirm clothing, bag, phone and entry requirements before leaving your hotel." }
+  ],
+  "nearbyTemples": [
+    { "id": "kal-bhairav", "name": "Kal Bhairav", "subtitle": "Guardian deity of Ujjain", "description": "An ancient and distinctive shrine associated with the guardian form of Shiva.", "bestTime": "Morning", "duration": "60–90 minutes", "familyTip": "Suitable for families; prepare children for busy ritual activity.", "familySuitability": "Good for families", "highlights": ["Ancient shrine", "Local tradition"], "mapsQuery": "Kal Bhairav Temple Ujjain" },
+    { "id": "harsiddhi", "name": "Harsiddhi Mata", "subtitle": "Historic Shakti temple", "description": "A revered temple known for its tall Maratha-era lamp towers and evening atmosphere.", "bestTime": "Late afternoon or evening", "duration": "45–60 minutes", "familyTip": "Easy to combine with Mahakal, Mahakal Lok and Ram Ghat.", "familySuitability": "Very family-friendly", "highlights": ["Deep stambh", "Evening aarti"], "mapsQuery": "Harsiddhi Mata Temple Ujjain" },
+    { "id": "mangalnath", "name": "Mangalnath", "subtitle": "Temple associated with Mars", "description": "A peaceful Shipra-side temple important in Ujjain’s astrological traditions.", "bestTime": "Morning", "duration": "45–60 minutes", "familyTip": "A calmer stop with open surroundings and easier pacing.", "familySuitability": "Good for elders", "highlights": ["Shipra views", "Astrological tradition"], "mapsQuery": "Mangalnath Temple Ujjain" },
+    { "id": "chintaman-ganesh", "name": "Chintaman Ganesh", "subtitle": "Ancient Ganesh temple", "description": "A popular old temple where devotees seek blessings before important journeys and decisions.", "bestTime": "Morning or late afternoon", "duration": "45–60 minutes", "familyTip": "Family-friendly, though access time should include the drive from central Ujjain.", "familySuitability": "Very family-friendly", "highlights": ["Ancient idol", "Family blessings"], "mapsQuery": "Chintaman Ganesh Temple Ujjain" },
+    { "id": "sandipani", "name": "Sandipani Ashram", "subtitle": "Traditional place of learning", "description": "Associated with the education of Shri Krishna, Balarama and Sudama.", "bestTime": "Morning", "duration": "45–60 minutes", "familyTip": "A meaningful, quieter educational stop for children and grandparents.", "familySuitability": "Excellent for families", "highlights": ["Krishna tradition", "Calm campus"], "mapsQuery": "Sandipani Ashram Ujjain" },
+    { "id": "ram-ghat", "name": "Ram Ghat", "subtitle": "Sacred Shipra riverfront", "description": "Ujjain’s principal pilgrimage ghat and an atmospheric place for aarti and a riverside pause.", "bestTime": "Sunrise or evening", "duration": "45–90 minutes", "familyTip": "Keep children close near steps and water; elders may need assistance.", "familySuitability": "Suitable with supervision", "highlights": ["Shipra river", "Evening aarti"], "mapsQuery": "Ram Ghat Ujjain" }
+  ],
+  "familyTips": [
+    { "title": "Avoid peak heat", "description": "Use early morning and late afternoon for outdoor temple travel." },
+    { "title": "Keep water available", "description": "Carry drinking water and any regular medicines in a light day bag." },
+    { "title": "Plan rest breaks", "description": "Return to the hotel or sit in a calm area after a major queue." },
+    { "title": "Limit temple count", "description": "Four well-paced stops are better than an exhausting all-day checklist." },
+    { "title": "Prefer early darshan", "description": "Earlier starts often provide cooler weather and a calmer family rhythm." }
+  ],
+  "plans": [
+    { "title": "Half-Day Mahakal Plan", "duration": "5–6 hours", "steps": ["Early Mahakal darshan", "Mahakal Lok walk", "Harsiddhi Mata", "Ram Ghat pause"] },
+    { "title": "Full-Day Temple Circuit", "duration": "8–10 hours with rest", "steps": ["Early Mahakal darshan", "Breakfast and rest", "Kal Bhairav", "Mangalnath", "Sandipani Ashram", "Harsiddhi and Ram Ghat in the evening"] }
+  ],
+  "faqs": [
+    { "question": "How much time is needed for Mahakal Darshan?", "answer": "Keep 2–4 hours for a normal visit and more on weekends, festivals or Kumbh crowd days. Timings and queue arrangements should be verified from official temple sources before travel." },
+    { "question": "Is Bhasma Aarti suitable for families?", "answer": "It can be meaningful for prepared families, but the very early reporting, waiting, dress rules and crowd conditions may be tiring for young children or some elderly visitors." },
+    { "question": "What are the main nearby temples?", "answer": "Popular additions include Harsiddhi Mata, Kal Bhairav, Mangalnath, Chintaman Ganesh, Sandipani Ashram and Ram Ghat." },
+    { "question": "Can elderly visitors comfortably visit?", "answer": "Yes, with a lighter itinerary, early starts, planned rest, minimal luggage and current assisted-access guidance from official temple sources." },
+    { "question": "What should be avoided during peak crowd?", "answer": "Avoid tight onward connections, too many temples in one day, unofficial agents, heavy bags and separating from your group without a fixed meeting point." }
+  ]
+}

@@ -43,6 +43,74 @@ def candidate(**overrides):
 
 
 class PeSellStrategyTests(unittest.TestCase):
+    def test_nifty_income_profile_defaults_to_monika_only(self):
+        with patch.object(app, "load_app_settings", return_value={}):
+            profiles = app.load_kite_profiles()
+
+        self.assertTrue(profiles["Monika"]["NIFTY_INCOME_ENABLED"])
+        self.assertFalse(profiles["Vikalp"]["NIFTY_INCOME_ENABLED"])
+        self.assertFalse(profiles["Shanti"]["NIFTY_INCOME_ENABLED"])
+        self.assertFalse(profiles["Aanya"]["NIFTY_INCOME_ENABLED"])
+
+    def test_nifty_income_profile_flag_is_saved_per_profile(self):
+        profiles = {
+            name: app.blank_kite_profile(name)
+            for name in app.KITE_PROFILE_NAMES
+        }
+        with (
+            patch.object(app, "load_kite_profiles", return_value=profiles),
+            patch.object(app, "save_app_settings") as save_settings,
+        ):
+            saved = app.save_kite_profile(
+                "Shanti",
+                {"NIFTY_INCOME_ENABLED": True},
+            )
+
+        self.assertTrue(saved["NIFTY_INCOME_ENABLED"])
+        persisted_profiles = save_settings.call_args.args[0]["kite_profiles"]
+        self.assertTrue(persisted_profiles["Shanti"]["NIFTY_INCOME_ENABLED"])
+        self.assertTrue(persisted_profiles["Monika"]["NIFTY_INCOME_ENABLED"])
+
+    def test_nifty_income_tab_visibility_follows_profile_permission(self):
+        profiles = {
+            name: app.blank_kite_profile(name)
+            for name in app.KITE_PROFILE_NAMES
+        }
+        with patch.object(app, "load_kite_profiles", return_value=profiles):
+            shanti_html = app.render_page(
+                app.PageState(active_tab="kite-setup", kite_profile="Shanti")
+            ).decode("utf-8")
+            monika_html = app.render_page(
+                app.PageState(active_tab="kite-setup", kite_profile="Monika")
+            ).decode("utf-8")
+
+        self.assertNotIn('data-tab="nifty-income"', shanti_html)
+        self.assertIn('data-tab="nifty-income"', monika_html)
+        self.assertIn("Enable Nifty Income tab", monika_html)
+
+    def test_manual_nifty_pair_is_blocked_when_profile_permission_is_disabled(self):
+        with (
+            patch.object(app, "kite_profile_nifty_income_enabled", return_value=False),
+            patch.object(app, "selected_kite_profile_name", return_value="Shanti"),
+            patch.object(app, "nifty_income_manual_pair_snapshot") as snapshot,
+        ):
+            with self.assertRaisesRegex(PermissionError, "disabled for Kite profile Shanti"):
+                app.place_nifty_income_manual_pair(5.5, 5.5, 1)
+
+        snapshot.assert_not_called()
+
+    def test_nifty_scheduler_is_skipped_when_profile_permission_is_disabled(self):
+        with (
+            patch.object(app, "kite_profile_nifty_income_enabled", return_value=False),
+            patch.object(app, "nifty_income_config") as config,
+        ):
+            result = app.run_nifty_income_entry_job(
+                app.datetime(2026, 6, 19, 15, 16, tzinfo=app.INDIA_TIME_ZONE)
+            )
+
+        self.assertIsNone(result)
+        config.assert_not_called()
+
     def sell_pe_position(self, **overrides):
         position = {
             "tradingsymbol": "NTPC26JUN310PE",
@@ -173,6 +241,8 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.object(app, "kite_setup_issue", return_value=""),
             patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
             patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
+            patch.object(app, "build_intraday_loss_limit_close_orders", return_value=([], [])),
+            patch.object(app, "build_intraday_pe_risk_exit_orders", return_value=([], [])),
             patch.object(app, "build_position_buy_orders", side_effect=build_orders),
             patch.object(app, "execute_position_buy_orders", return_value=([order], [result])),
         ):
@@ -353,6 +423,164 @@ class PeSellStrategyTests(unittest.TestCase):
 
         self.assertIn("/research/best-sells", html)
         self.assertIn("Generate Best 3 PE + 3 CE SELL CSV", html)
+        self.assertIn("/research/gpt-best-sells", html)
+        self.assertIn("Generate with GPT + Current Positions", html)
+
+    def test_research_gpt_prompt_contains_current_position_risk_context(self):
+        positions = [
+            {
+                "symbol": "BAJFINANCE26JUN1000CE",
+                "quantity": -750,
+                "average_price": 8.8,
+                "ltp": 12.0,
+                "pnl": -2400,
+                "return_pct": -2.5,
+                "captured_pct": -36.36,
+                "remaining_premium": 9000,
+                "sell_pop": 72,
+                "otm_distance": 4.5,
+                "strategy_strength": "RED_AVOID",
+                "deployed": 96000,
+                "existing_buy_order": {"order_id": "123"},
+                "pe_exit_status": "REVIEW",
+                "pe_exit_reason": "Premium expanded.",
+            }
+        ]
+        prompt = app.research_gpt_prompt_with_current_positions(
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n",
+            positions,
+            {"count": 1, "total_pnl": -2400, "total_deployed": 96000},
+            date(2026, 6, 24),
+        )
+
+        self.assertIn("These are current positions", prompt)
+        self.assertIn("BAJFINANCE26JUN1000CE", prompt)
+        self.assertIn("close_buy_order_pending", prompt)
+        self.assertIn("YES", prompt)
+        self.assertIn("Do not generate an order for an exact option symbol", prompt)
+        self.assertIn("Return at most 3 CE SELL and 3 PE SELL", prompt)
+        self.assertIn("Mandatory expiry for every new NFO option order: 28 Jul 2026", prompt)
+        self.assertIn("Tradingsymbols must use 26JUL", prompt)
+        self.assertIn("fewer than 5", prompt)
+
+    def test_research_monthly_expiry_rolls_to_july_when_under_five_trading_days(self):
+        policy = app.research_monthly_expiry_policy(date(2026, 6, 24))
+
+        self.assertEqual(policy["front_expiry"], date(2026, 6, 30))
+        self.assertEqual(policy["front_trading_days"], 4)
+        self.assertTrue(policy["rolled_to_next_month"])
+        self.assertEqual(policy["target_expiry"], date(2026, 7, 28))
+        self.assertEqual(policy["target_month_code"], "26JUL")
+
+    def test_research_monthly_expiry_keeps_front_month_at_five_trading_days(self):
+        policy = app.research_monthly_expiry_policy(date(2026, 6, 23))
+
+        self.assertEqual(policy["front_trading_days"], 5)
+        self.assertFalse(policy["rolled_to_next_month"])
+        self.assertEqual(policy["target_expiry"], date(2026, 6, 30))
+        self.assertEqual(policy["target_month_code"], "26JUN")
+
+    def test_generate_research_csv_with_current_positions_calls_gpt_with_positions(self):
+        positions = [{"symbol": "PFC26JUN400PE", "quantity": -1300, "pnl": 500}]
+        summary = {"count": 1, "total_pnl": 500}
+        candidate_csv = (
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "NFO,HAVELLS26JUN1300CE,500,SELL,NRML,LIMIT,10,DAY\n"
+        )
+        final_csv = (
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "NFO,HAVELLS26JUL1300CE,500,SELL,NRML,LIMIT,10,DAY\n"
+        )
+        with (
+            patch.object(app, "positions_research", return_value=(positions, summary)),
+            patch.object(app, "best_sell_candidate_csv", return_value=(candidate_csv, [{"symbol": "HAVELLS"}], [])),
+            patch.object(app, "generate_csv_with_openai", return_value=(final_csv, final_csv, "resp_1")) as generate,
+        ):
+            result = app.generate_research_csv_with_current_positions(
+                "gpt-test",
+                "system",
+                date(2026, 6, 24),
+            )
+
+        sent_prompt = generate.call_args.args[0]
+        self.assertIn("PFC26JUN400PE", sent_prompt)
+        self.assertIn("HAVELLS26JUN1300CE", sent_prompt)
+        self.assertIn("26JUL", sent_prompt)
+        self.assertEqual(result["csv_text"], final_csv)
+        self.assertEqual(result["position_summary"], summary)
+        self.assertEqual(result["expiry_policy"]["target_month_name"], "July 2026")
+
+    def test_research_gpt_retries_once_when_front_month_is_returned(self):
+        positions = [{"symbol": "PFC26JUN400PE", "quantity": -1300, "pnl": 500}]
+        summary = {"count": 1, "total_pnl": 500}
+        candidate_csv = (
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "NFO,HAVELLS26JUN1300CE,500,SELL,NRML,LIMIT,10,DAY\n"
+        )
+        invalid_csv = (
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "NFO,HAVELLS26JUN1300CE,500,SELL,NRML,LIMIT,10,DAY\n"
+        )
+        repaired_csv = (
+            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "NFO,HAVELLS26JUL1300CE,500,SELL,NRML,LIMIT,10,DAY\n"
+        )
+        with (
+            patch.object(app, "positions_research", return_value=(positions, summary)),
+            patch.object(app, "best_sell_candidate_csv", return_value=(candidate_csv, [{"symbol": "HAVELLS"}], [])),
+            patch.object(
+                app,
+                "generate_csv_with_openai",
+                side_effect=[
+                    (invalid_csv, invalid_csv, "resp_1"),
+                    (repaired_csv, repaired_csv, "resp_2"),
+                ],
+            ) as generate,
+        ):
+            result = app.generate_research_csv_with_current_positions(
+                "gpt-test",
+                "system",
+                date(2026, 6, 24),
+            )
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertIn("EXPIRY CORRECTION REQUIRED", generate.call_args_list[1].args[0])
+        self.assertIn("26JUL", generate.call_args_list[1].args[0])
+        self.assertEqual(result["csv_text"], repaired_csv)
+        self.assertEqual(result["response_id"], "resp_2")
+
+    def test_research_panel_displays_positions_sent_to_gpt_and_response(self):
+        state = app.PageState(
+            active_tab="research",
+            research_positions_rows=[
+                {
+                    "symbol": "PFC26JUN400PE",
+                    "quantity": -1300,
+                    "average_price": 3.7,
+                    "ltp": 2.1,
+                    "pnl": 2080,
+                    "captured_pct": 43.2,
+                    "sell_pop": 88,
+                    "otm_distance": 9,
+                    "strategy_strength": "GREEN",
+                }
+            ],
+            research_positions_summary={
+                "count": 1,
+                "total_pnl": 2080,
+                "total_deployed": 80000,
+                "return_pct": 2.6,
+            },
+            research_gpt_output="exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity",
+            research_gpt_response_id="resp_1",
+        )
+
+        html = app.render_research_panel(state)
+
+        self.assertIn("Current Positions Sent To GPT", html)
+        self.assertIn("PFC26JUN400PE", html)
+        self.assertIn("GPT Portfolio-Aware Outcome", html)
+        self.assertIn("resp_1", html)
 
     def test_position_buy_prices_follow_requested_twenty_percent_rule(self):
         orders = [
@@ -428,6 +656,8 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.object(app, "kite_setup_issue", return_value=""),
             patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
             patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
+            patch.object(app, "build_intraday_loss_limit_close_orders", return_value=([], [])),
+            patch.object(app, "build_intraday_pe_risk_exit_orders", return_value=([], [])),
             patch.object(app, "build_position_buy_orders", side_effect=build_orders),
             patch.object(app, "execute_position_buy_orders", return_value=([order], [result])),
         ):
@@ -439,6 +669,214 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(built_states[0].position_discount_percent, 35.0)
         self.assertIn("35% below LTP", first["message"])
         self.assertIsNone(second)
+
+    def test_intraday_loss_limit_builds_buy_at_ten_percent_below_fresh_ltp(self):
+        positions = [
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "HAVELLS26JUN1300CE",
+                "quantity": -500,
+                "product": "NRML",
+                "average_price": 10.0,
+                "ltp": 20.0,
+            },
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "PFC26JUN400PE",
+                "quantity": -1300,
+                "product": "NRML",
+                "average_price": 10.0,
+                "ltp": 19.95,
+            },
+        ]
+        with (
+            patch.object(app, "open_option_positions", return_value=positions),
+            patch.object(app, "refresh_option_positions_with_live_ltp", return_value=positions),
+        ):
+            orders, evaluations = app.build_intraday_loss_limit_close_orders(object())
+
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["tradingsymbol"], "HAVELLS26JUN1300CE")
+        self.assertEqual(orders[0]["transaction_type"], "BUY")
+        self.assertEqual(orders[0]["price"], 18.0)
+        self.assertEqual(orders[0]["tag"], "LOSS100_EXIT")
+        self.assertEqual(orders[0]["price_basis"], "fresh_LTP_loss_limit")
+        self.assertIn("LOSS LIMIT", orders[0]["risk_note"])
+        self.assertTrue(evaluations[0]["triggered"])
+        self.assertFalse(evaluations[1]["triggered"])
+
+    def test_intraday_loss_limit_execution_modifies_existing_buy_and_audits_note(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "HAVELLS26JUN1300CE",
+            "transaction_type": "BUY",
+            "quantity": 500,
+            "product": "NRML",
+            "order_type": "LIMIT",
+            "price": 18.0,
+            "validity": "DAY",
+            "risk_note": "LOSS LIMIT: premium loss reached 100%.",
+        }
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
+            patch.object(app.kite_buy_positions, "modify_or_place_order", return_value="OID-1") as modify,
+        ):
+            _, results = app.execute_position_buy_orders([order], {0}, False, False)
+
+        modify.assert_called_once()
+        self.assertEqual(results[0]["status"], "LIVE_SENT")
+        self.assertIn("LOSS LIMIT", results[0]["detail"])
+
+    def test_intraday_strict_pe_scan_skips_profitable_next_month_position_with_existing_close(self):
+        position = {
+            "exchange": "NFO",
+            "tradingsymbol": "NAUKRI26JUL940PE",
+            "quantity": -550,
+            "product": "NRML",
+            "average_price": 20.0,
+            "ltp": 10.0,
+        }
+        option_quote = {"last_price": 10.0}
+        stock_quote = {"last_price": 1100.0}
+        existing_order = {
+            "order_id": "260624150668758",
+            "tradingsymbol": "NAUKRI26JUL940PE",
+            "transaction_type": "BUY",
+            "status": "OPEN",
+            "price": 11.2,
+            "pending_quantity": 550,
+            "quantity": 550,
+        }
+        with (
+            patch.object(
+                app,
+                "cached_kite_quote",
+                return_value={
+                    "NFO:NAUKRI26JUL940PE": option_quote,
+                    "NSE:NAUKRI": stock_quote,
+                },
+            ),
+            patch.object(app, "kite_available_cash", return_value=1000000),
+            patch.object(
+                app,
+                "open_option_buy_orders_by_symbol",
+                return_value={"NAUKRI26JUL940PE": existing_order},
+            ),
+            patch.object(app, "generate_pe_buy_to_close_order") as generate_order,
+        ):
+            orders, evaluations = app.build_intraday_pe_risk_exit_orders(
+                object(),
+                [position],
+            )
+
+        self.assertEqual(orders, [])
+        self.assertEqual(evaluations[0]["exit_status"], "PROFIT_BOOK")
+        self.assertEqual(
+            evaluations[0]["scheduler_action"],
+            "SKIP_EXISTING_CLOSE_ORDER",
+        )
+        self.assertEqual(
+            evaluations[0]["existing_close_order_id"],
+            "260624150668758",
+        )
+        self.assertEqual(evaluations[0]["existing_close_price"], 11.2)
+        generate_order.assert_not_called()
+
+    def test_strict_pe_execution_preserves_close_order_created_after_scan(self):
+        order = {
+            "exchange": "NFO",
+            "tradingsymbol": "NAUKRI26JUL940PE",
+            "transaction_type": "BUY",
+            "quantity": 550,
+            "product": "NRML",
+            "order_type": "LIMIT",
+            "price": 14.45,
+            "validity": "DAY",
+            "skip_if_close_order_exists": True,
+        }
+        existing_order = {
+            "order_id": "260624150668758",
+            "price": 11.2,
+            "pending_quantity": 550,
+        }
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
+            patch.object(
+                app,
+                "open_option_buy_orders_by_symbol",
+                return_value={"NAUKRI26JUL940PE": existing_order},
+            ),
+            patch.object(app.kite_buy_positions, "place_order") as place,
+            patch.object(app.kite_buy_positions, "modify_or_place_order") as modify,
+        ):
+            submitted, results = app.execute_position_buy_orders(
+                [order],
+                {0},
+                False,
+                True,
+            )
+
+        self.assertEqual(submitted, [])
+        self.assertEqual(results[0]["status"], "SKIPPED_EXISTING")
+        self.assertIn("11.20", results[0]["detail"])
+        place.assert_not_called()
+        modify.assert_not_called()
+
+    def test_intraday_job_prioritises_loss_limit_override(self):
+        schedule = {
+            "enabled": True,
+            "start_time": "09:30",
+            "end_time": "15:15",
+            "interval_minutes": 15,
+            "status": "WAITING",
+            "results": [],
+        }
+
+        def read_schedule():
+            return dict(schedule)
+
+        def save_schedule(**updates):
+            schedule.update(updates)
+            return dict(schedule)
+
+        loss_order = {
+            "tradingsymbol": "CAMS26JUN760PE",
+            "quantity": 750,
+            "price": 27.0,
+            "price_basis": "fresh_LTP_loss_limit",
+            "discount_percent": 10,
+            "risk_note": "LOSS LIMIT: premium loss reached 100%.",
+        }
+        run_at = app.datetime(2026, 6, 12, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
+        execute_calls = []
+
+        def execute(orders, selected, dry_run, keep_existing):
+            execute_calls.append((orders, keep_existing))
+            return orders, [{"tradingsymbol": orders[0]["tradingsymbol"], "status": "LIVE_SENT"}]
+
+        with (
+            patch.object(app, "intraday_position_close_schedule_state", side_effect=read_schedule),
+            patch.object(app, "save_intraday_position_close_schedule_state", side_effect=save_schedule),
+            patch.object(app, "selected_kite_profile_name", return_value="Shanti"),
+            patch.object(app, "load_kite_profiles", return_value={"Shanti": app.blank_kite_profile()}),
+            patch.object(app, "apply_kite_profile_to_env"),
+            patch.object(app, "kite_setup_issue", return_value=""),
+            patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
+            patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
+            patch.object(app, "build_intraday_loss_limit_close_orders", return_value=([loss_order], [{"triggered": True}])),
+            patch.object(app, "build_intraday_pe_risk_exit_orders", return_value=([], [])),
+            patch.object(app, "build_position_buy_orders", side_effect=ValueError("No matching positions need a new BUY order")),
+            patch.object(app, "execute_position_buy_orders", side_effect=execute),
+        ):
+            result = app.run_intraday_position_close_job(run_at)
+
+        self.assertEqual(result["status"], "PLACED")
+        self.assertEqual(execute_calls[0][1], False)
+        self.assertIn("100% loss-limit overrides: 1", result["message"])
+        self.assertIn("10% below fresh_LTP_loss_limit", result["message"])
+        self.assertEqual(result["loss_limit_evaluations"], [{"triggered": True}])
 
     def test_intraday_position_close_job_does_not_run_outside_market_window(self):
         run_at = app.datetime(2026, 6, 12, 15, 16, tzinfo=app.INDIA_TIME_ZONE)
@@ -1259,6 +1697,92 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(e2e["quantity"], 4630)
         self.assertEqual(e2e["avg_price"], 213.00)
 
+    def test_investing_bse_numeric_scrip_resolves_to_kite_tradingsymbol(self):
+        item = {
+            "code": "BSE:501423",
+            "company": "Shaily Engg",
+        }
+        bse_instruments = [
+            {
+                "exchange_token": "501423",
+                "instrument_token": 12345,
+                "tradingsymbol": "SHAILY",
+                "name": "Shaily Engineering Plastics",
+            }
+        ]
+
+        candidates = app.investing_resolved_quote_candidates(item, [], bse_instruments)
+
+        self.assertEqual(candidates[0], "BSE:SHAILY")
+        self.assertNotIn("BSE:501423", candidates)
+
+    def test_investing_nse_missing_symbol_falls_back_to_bse_instrument(self):
+        item = {
+            "code": "NSE:TESTCO",
+            "company": "Test Company",
+        }
+        bse_instruments = [
+            {
+                "exchange_token": "500001",
+                "tradingsymbol": "TESTCO",
+                "name": "Test Company",
+            }
+        ]
+
+        candidates = app.investing_resolved_quote_candidates(item, [], bse_instruments)
+
+        self.assertEqual(candidates[0], "NSE:TESTCO")
+        self.assertIn("BSE:TESTCO", candidates)
+
+    def test_investing_rows_use_bse_quote_and_display_resolved_ticker(self):
+        holdings = [
+            {
+                "code": "BSE:501423",
+                "company": "Shaily Engg",
+                "sector": "Manf",
+                "core": "N",
+                "quantity": 1206,
+                "avg_price": 174.98,
+            }
+        ]
+
+        def instruments(_kite, exchange):
+            if exchange == "BSE":
+                return [
+                    {
+                        "exchange_token": "501423",
+                        "tradingsymbol": "SHAILY",
+                        "name": "Shaily Engineering Plastics",
+                    }
+                ]
+            return []
+
+        with (
+            patch.object(app, "INVESTING_HOLDINGS", holdings),
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "cached_kite_instruments", side_effect=instruments),
+            patch.object(
+                app,
+                "cached_kite_quote",
+                return_value={
+                    "BSE:SHAILY": {
+                        "last_price": 200.0,
+                        "ohlc": {"close": 190.0},
+                    }
+                },
+            ) as quotes,
+            patch.object(app, "investing_52_week_levels", return_value={"high": 220, "low": 150}),
+            patch.object(app, "fetch_investing_news", return_value={}),
+        ):
+            rows, summary = app.investing_holdings_rows()
+
+        self.assertIn("BSE:SHAILY", quotes.call_args.args[1])
+        self.assertEqual(rows[0]["quote_key"], "BSE:SHAILY")
+        self.assertEqual(rows[0]["symbol"], "SHAILY")
+        self.assertEqual(rows[0]["cmp"], 200.0)
+        self.assertAlmostEqual(rows[0]["daily_change_pct"], 5.263157, places=5)
+        self.assertGreater(summary["total_market"], 0)
+
     def test_option_sell_markup_setting_feeds_pe_and_ce_settings(self):
         with patch.object(app, "load_app_settings", return_value={"option_sell_markup_percent": 25}):
             self.assertEqual(app.load_pe_sell_settings()["price_markup_percent"], 25)
@@ -1990,7 +2514,7 @@ class PeSellStrategyTests(unittest.TestCase):
                     "decision": "DIVIDEND_INCOME_ACCUMULATION",
                 },
                 {
-                    "symbol": "IRBINVIT-IV",
+                    "symbol": "IRBINVIT",
                     "company": "IRBINVIT",
                     "quantity": 0,
                     "avg_price": 0,
@@ -2008,7 +2532,7 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("Dividend Income", output)
         self.assertIn('id="dividend-income-table"', output)
         self.assertIn('data-symbol="PGINVIT"', output)
-        self.assertIn('data-symbol="IRBINVIT-IV"', output)
+        self.assertIn('data-symbol="IRBINVIT"', output)
         self.assertIn('id="income-equity-limit-price"', output)
         self.assertIn("CNC LIMIT BUY or SELL", output)
         self.assertIn("Source: Kite profile: Monika", output)
@@ -2028,7 +2552,7 @@ class PeSellStrategyTests(unittest.TestCase):
                     },
                     {
                         "exchange": "NSE",
-                        "tradingsymbol": "IRBINVIT-IV",
+                        "tradingsymbol": "IRBINVIT",
                         "quantity": 150,
                         "average_price": 60.2167,
                         "last_price": 60.58,
@@ -2051,9 +2575,9 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(by_symbol["PGINVIT"]["market_value"], 9379.0)
         self.assertAlmostEqual(by_symbol["PGINVIT"]["pnl"], -3.5)
         self.assertEqual(by_symbol["PGINVIT"]["holding_source"], "Kite profile: Shanti")
-        self.assertEqual(by_symbol["IRBINVIT-IV"]["quantity"], 150)
-        self.assertEqual(by_symbol["IRBINVIT-IV"]["exchange"], "NSE")
-        self.assertEqual(by_symbol["IRBINVIT-IV"]["avg_price"], 60.2167)
+        self.assertEqual(by_symbol["IRBINVIT"]["quantity"], 150)
+        self.assertEqual(by_symbol["IRBINVIT"]["exchange"], "NSE")
+        self.assertEqual(by_symbol["IRBINVIT"]["avg_price"], 60.2167)
 
     def test_income_growth_equity_order_uses_requested_limit_price(self):
         snapshot = {
@@ -2116,6 +2640,179 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertTrue(elevated["allowed"])
         self.assertEqual(elevated["adjusted_pe_otm_pct"], 6.0)
         self.assertEqual(elevated["position_size_multiplier"], 0.75)
+
+    def test_nifty_delta_filter_uses_strict_entry_limits(self):
+        warning = app.validate_short_option_delta(-0.16, 0.10)
+        rejected = app.validate_short_option_delta(-0.21, 0.10)
+
+        self.assertTrue(warning["allowed"])
+        self.assertEqual(warning["status"], "WARNING")
+        self.assertEqual(warning["position_size_multiplier"], 0.5)
+        self.assertFalse(rejected["allowed"])
+        self.assertEqual(rejected["status"], "REJECT")
+
+    def test_nifty_vix_layer_limits_and_strong_trend_cap(self):
+        self.assertEqual(app.get_max_allowed_nifty_layers(10.5), 0)
+        self.assertEqual(app.get_max_allowed_nifty_layers(17), 3)
+        self.assertEqual(app.get_max_allowed_nifty_layers(19), 2)
+        self.assertEqual(app.get_max_allowed_nifty_layers(23), 1)
+        self.assertEqual(app.get_max_allowed_nifty_layers(26), 0)
+        self.assertEqual(app.get_max_allowed_nifty_layers(17, "STRONG_BULLISH"), 1)
+        self.assertFalse(app.validate_nifty_layer_count(2, 2)["allowed"])
+
+    def test_nifty_strong_trends_select_one_sided_defined_risk_spreads(self):
+        base = {
+            "mmi": 50,
+            "india_vix": 16,
+            "vix_allowed": True,
+            "monthly_risk_allowed": True,
+            "margin_heat_allowed": True,
+            "current_active_layers": 0,
+            "pe_sell_strike": 22600,
+            "ce_sell_strike": 25400,
+            "hedge_distance_points": 500,
+        }
+        bullish = app.select_nifty_income_strategy({**base, "trend_regime": "STRONG_BULLISH"})
+        bearish = app.select_nifty_income_strategy({**base, "trend_regime": "STRONG_BEARISH"})
+
+        self.assertEqual(bullish["selected_strategy"], "BULL_PUT_SPREAD")
+        self.assertIsNone(bullish["final_ce_sell_strike"])
+        self.assertEqual(bearish["selected_strategy"], "BEAR_CALL_SPREAD")
+        self.assertIsNone(bearish["final_pe_sell_strike"])
+
+    def test_nifty_defined_risk_validator_blocks_naked_live_sell(self):
+        naked = [
+            {
+                "tradingsymbol": "NIFTY26JUN23000PE",
+                "transaction_type": "SELL",
+                "option_type": "PE",
+                "strike": 23000,
+                "expiry_date": "2026-06-30",
+            }
+        ]
+        hedged = naked + [
+            {
+                "tradingsymbol": "NIFTY26JUN22500PE",
+                "transaction_type": "BUY",
+                "option_type": "PE",
+                "strike": 22500,
+                "expiry_date": "2026-06-30",
+            }
+        ]
+
+        self.assertFalse(app.validate_nifty_defined_risk_orders(naked)["allowed"])
+        self.assertTrue(app.validate_nifty_defined_risk_orders(hedged)["allowed"])
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app, "nifty_income_config", return_value={"allow_live_naked_nifty_sell": False}),
+        ):
+            with self.assertRaises(PermissionError):
+                app.execute_nifty_orders(naked, "LIVE_CONFIRMED", "NIFTY entry")
+
+    def test_nifty_entry_does_not_send_short_legs_after_hedge_failure(self):
+        orders = [
+            {"tradingsymbol": "NIFTY26JUN22500PE", "transaction_type": "BUY", "option_type": "PE", "strike": 22500, "expiry_date": "2026-06-30"},
+            {"tradingsymbol": "NIFTY26JUN25500CE", "transaction_type": "BUY", "option_type": "CE", "strike": 25500, "expiry_date": "2026-06-30"},
+            {"tradingsymbol": "NIFTY26JUN23000PE", "transaction_type": "SELL", "option_type": "PE", "strike": 23000, "expiry_date": "2026-06-30"},
+            {"tradingsymbol": "NIFTY26JUN25000CE", "transaction_type": "SELL", "option_type": "CE", "strike": 25000, "expiry_date": "2026-06-30"},
+        ]
+        for order in orders:
+            order.update({"exchange": "NFO", "quantity": 65, "product": "NRML", "order_type": "LIMIT", "price": 10, "validity": "DAY"})
+
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app, "nifty_income_config", return_value={"allow_live_naked_nifty_sell": False}),
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "apply_nfo_option_price_protection"),
+            patch.object(app, "send_order_with_lpp_retry", side_effect=RuntimeError("hedge rejected")) as send_order,
+            patch.object(app, "kite_error_result_with_retry", return_value={"status": "ERROR"}),
+        ):
+            results = app.execute_nifty_orders(orders, "LIVE_CONFIRMED", "NIFTY entry")
+
+        self.assertEqual(send_order.call_count, 2)
+        self.assertEqual([row["status"] for row in results[-2:]], ["BLOCKED", "BLOCKED"])
+
+    def nifty_emergency_strategy(self, **updates):
+        strategy = {
+            "entry_spot": 24000,
+            "current_mtm_pnl": -1000,
+            "max_loss": 10000,
+            "risk_utilisation_pct": 10,
+            "legs": [
+                {
+                    "tradingsymbol": "NIFTY26JUN23000PE",
+                    "option_type": "PE",
+                    "strike": 23000,
+                    "original_transaction_type": "SELL",
+                    "entry_price": 100,
+                    "current_ltp": 110,
+                    "delta": -0.10,
+                },
+                {
+                    "tradingsymbol": "NIFTY26JUN25000CE",
+                    "option_type": "CE",
+                    "strike": 25000,
+                    "original_transaction_type": "SELL",
+                    "entry_price": 100,
+                    "current_ltp": 110,
+                    "delta": 0.10,
+                },
+            ],
+        }
+        strategy.update(updates)
+        return strategy
+
+    def test_nifty_emergency_exit_triggers_on_premium_delta_strike_and_distance(self):
+        premium = self.nifty_emergency_strategy()
+        premium["legs"][0]["current_ltp"] = 200
+        delta = self.nifty_emergency_strategy()
+        delta["legs"][1]["delta"] = 0.25
+
+        self.assertEqual(
+            app.evaluate_nifty_emergency_exit(premium, 24000)["exit_reason"],
+            "EMERGENCY_SHORT_LEG_2X_PREMIUM",
+        )
+        self.assertEqual(
+            app.evaluate_nifty_emergency_exit(delta, 24000)["exit_reason"],
+            "EMERGENCY_SHORT_DELTA_25",
+        )
+        self.assertEqual(
+            app.evaluate_nifty_emergency_exit(self.nifty_emergency_strategy(), 23000)["exit_reason"],
+            "EMERGENCY_SHORT_STRIKE_TOUCHED",
+        )
+        self.assertEqual(
+            app.evaluate_nifty_emergency_exit(self.nifty_emergency_strategy(), 23300)["exit_reason"],
+            "EMERGENCY_SPOT_DISTANCE_70_PERCENT",
+        )
+
+    def test_nifty_emergency_exit_triggers_on_risk_utilisation(self):
+        strategy = self.nifty_emergency_strategy(risk_utilisation_pct=75)
+        result = app.evaluate_nifty_emergency_exit(strategy, 24000)
+        self.assertTrue(result["exit_signal"])
+        self.assertEqual(result["exit_reason"], "EMERGENCY_RISK_UTILISATION_75")
+
+    def test_nifty_credit_decay_can_book_week_one_profit(self):
+        now = app.datetime(2026, 6, 16, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
+        pair = self.nifty_pair(5, 0.5, now=now)
+        pair.update({"entry_net_credit": 10000, "current_strategy_value": 7400})
+
+        result = app.evaluate_nifty_weekly_pair_exit(pair, now)
+
+        self.assertTrue(result["exit_signal"])
+        self.assertEqual(result["exit_reason"], "WEEK1_CREDIT_DECAY_25_PERCENT")
+        self.assertAlmostEqual(result["credit_decay_pct"], 26.0)
+
+    def test_nifty_force_close_uses_earlier_of_day21_and_t_minus_7(self):
+        entry = app.datetime(2026, 6, 1, 15, 16, tzinfo=app.INDIA_TIME_ZONE)
+        expiry = date(2026, 6, 18)
+        close_at = app.calculate_nifty_force_close_datetime(
+            entry,
+            expiry,
+            {**app.NIFTY_INCOME_DEFAULT_CONFIG, "weekly_pair_force_close_time": "14:59"},
+        )
+
+        self.assertEqual(close_at.date(), date(2026, 6, 11))
+        self.assertEqual(close_at.strftime("%H:%M"), "14:59")
 
     def test_nifty_income_expected_move_pushes_close_strikes_away(self):
         result = app.validate_short_strikes_against_expected_move(
@@ -2459,6 +3156,10 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("otm-cell", html)
         self.assertIn("Scheduled Jobs", html)
         self.assertIn("NIFTY Income Entry", html)
+        self.assertIn('id="nifty-pair-include-pe"', html)
+        self.assertIn('id="nifty-pair-include-ce"', html)
+        self.assertIn("Protective BUY", html)
+        self.assertIn("300 points farther OTM", html)
 
     def nifty_pair(self, age_days, pnl_pct, margin=100000, now=None):
         now = now or app.datetime(2026, 6, 16, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
@@ -2504,7 +3205,7 @@ class PeSellStrategyTests(unittest.TestCase):
 
         self.assertFalse(before_result["exit_signal"])
         self.assertTrue(after_result["exit_signal"])
-        self.assertEqual(after_result["exit_reason"], "FORCE_CLOSE_WEEK3_14_59")
+        self.assertEqual(after_result["exit_reason"], "FORCE_CLOSE_DAY21_OR_T_MINUS_7")
 
     def test_nifty_weekly_pair_exit_orders_reverse_sell_and_buy_hedges(self):
         now = app.datetime(2026, 6, 16, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
@@ -2547,7 +3248,7 @@ class PeSellStrategyTests(unittest.TestCase):
             live = app.execute_nifty_orders(orders, "AUTO_EXIT_ONLY", "test")
         self.assertEqual(live[0]["status"], "LIVE_SENT")
 
-    def test_nifty_manual_pair_orders_use_entered_otm_and_sell_only_legs(self):
+    def test_nifty_manual_pair_orders_use_entered_otm_and_defined_risk_legs(self):
         expiry = date(2026, 7, 14)
         instruments = [
             {
@@ -2559,13 +3260,17 @@ class PeSellStrategyTests(unittest.TestCase):
                 "tradingsymbol": f"NIFTY{strike}{option_type}",
             }
             for strike, option_type in (
+                (22300, "PE"),
                 (22600, "PE"),
                 (25400, "CE"),
+                (25700, "CE"),
             )
         ]
         quote_map = {
+            "NFO:NIFTY22300PE": {"last_price": 12.0, "oi": 20000, "volume": 100},
             "NFO:NIFTY22600PE": {"last_price": 31.25, "oi": 20000, "volume": 100},
             "NFO:NIFTY25400CE": {"last_price": 33.4, "oi": 20000, "volume": 100},
+            "NFO:NIFTY25700CE": {"last_price": 15.0, "oi": 20000, "volume": 100},
         }
         config = {
             "lot_size": 65,
@@ -2585,15 +3290,16 @@ class PeSellStrategyTests(unittest.TestCase):
             lots=2,
         )
 
-        self.assertEqual([row["transaction_type"] for row in orders], ["SELL", "SELL"])
-        self.assertEqual([row["quantity"] for row in orders], [130, 130])
-        self.assertEqual([row["lot_size"] for row in orders], [65, 65])
-        self.assertEqual([row["lots"] for row in orders], [2, 2])
+        self.assertEqual([row["transaction_type"] for row in orders], ["BUY", "SELL", "BUY", "SELL"])
+        self.assertEqual([row["quantity"] for row in orders], [130, 130, 130, 130])
+        self.assertEqual([row["lot_size"] for row in orders], [65, 65, 65, 65])
+        self.assertEqual([row["lots"] for row in orders], [2, 2, 2, 2])
         self.assertEqual(
             [row["tradingsymbol"] for row in orders],
-            ["NIFTY22600PE", "NIFTY25400CE"],
+            ["NIFTY22300PE", "NIFTY22600PE", "NIFTY25700CE", "NIFTY25400CE"],
         )
-        self.assertEqual([row["price"] for row in orders], [37.5, 40.1])
+        self.assertEqual([row["price"] for row in orders], [12.0, 37.5, 15.0, 40.1])
+        self.assertEqual([row["hedge_width_points"] for row in orders], [300, 300, 300, 300])
         sell_gain = sum(
             row["max_gain_opportunity"]
             for row in previews
@@ -2613,17 +3319,21 @@ class PeSellStrategyTests(unittest.TestCase):
                 "tradingsymbol": f"NIFTY{strike}{option_type}",
             }
             for strike, option_type in (
+                (22400, "PE"),
                 (22600, "PE"),
                 (22700, "PE"),
                 (25400, "CE"),
                 (25300, "CE"),
+                (25600, "CE"),
             )
         ]
         quote_map = {
+            "NFO:NIFTY22400PE": {"last_price": 14.0, "oi": 20000, "volume": 100},
             "NFO:NIFTY22600PE": {"last_price": 31.25, "oi": 100, "volume": 0},
             "NFO:NIFTY22700PE": {"last_price": 40.0, "oi": 20000, "volume": 100},
             "NFO:NIFTY25400CE": {"last_price": 33.4, "oi": 9000, "volume": 5},
             "NFO:NIFTY25300CE": {"last_price": 45.0, "oi": 25000, "volume": 50},
+            "NFO:NIFTY25600CE": {"last_price": 18.0, "oi": 20000, "volume": 100},
         }
         config = {
             "lot_size": 65,
@@ -2642,23 +3352,164 @@ class PeSellStrategyTests(unittest.TestCase):
             lots=1,
         )
 
-        self.assertEqual([row["tradingsymbol"] for row in orders], ["NIFTY22700PE", "NIFTY25300CE"])
-        self.assertEqual([row["strike"] for row in orders], [22700, 25300])
-        self.assertEqual([row["liquidity_shift_points"] for row in previews], [100, 100])
-        self.assertEqual([row["price"] for row in orders], [48.0, 54.0])
+        self.assertEqual(
+            [row["tradingsymbol"] for row in orders],
+            ["NIFTY22400PE", "NIFTY22700PE", "NIFTY25600CE", "NIFTY25300CE"],
+        )
+        self.assertEqual([row["strike"] for row in orders], [22400, 22700, 25600, 25300])
+        self.assertEqual([row["liquidity_shift_points"] for row in previews], [0, 100, 0, 100])
+        self.assertEqual([row["price"] for row in orders], [14.0, 48.0, 18.0, 54.0])
+        self.assertEqual(abs(orders[1]["strike"] - orders[0]["strike"]), 300)
+        self.assertEqual(abs(orders[3]["strike"] - orders[2]["strike"]), 300)
 
-    def test_nifty_entry_scheduler_runs_weekday_pair_at_916(self):
-        now = app.datetime(2026, 6, 15, 9, 16, tzinfo=app.INDIA_TIME_ZONE)
+    def test_nifty_manual_pair_can_submit_only_pe_spread(self):
+        expiry = date(2026, 7, 14)
+        instruments = [
+            {
+                "name": "NIFTY",
+                "segment": "NFO-OPT",
+                "expiry": expiry,
+                "strike": strike,
+                "instrument_type": "PE",
+                "tradingsymbol": f"NIFTY{strike}PE",
+            }
+            for strike in (22300, 22600)
+        ]
+        quote_map = {
+            "NFO:NIFTY22300PE": {"last_price": 12.0, "oi": 20000, "volume": 100},
+            "NFO:NIFTY22600PE": {"last_price": 31.25, "oi": 20000, "volume": 100},
+        }
+
+        orders, _ = app.nifty_income_pair_orders_from_otm(
+            instruments,
+            expiry,
+            23989.15,
+            5.5,
+            5.5,
+            {"lot_size": 65, "strike_rounding": 100, "manual_pair_sell_markup_percent": 20},
+            quote_map,
+            lots=1,
+            include_pe=True,
+            include_ce=False,
+        )
+
+        self.assertEqual(len(orders), 2)
+        self.assertEqual([row["option_type"] for row in orders], ["PE", "PE"])
+        self.assertEqual([row["transaction_type"] for row in orders], ["BUY", "SELL"])
+        self.assertEqual([row["strike"] for row in orders], [22300, 22600])
+        self.assertTrue(app.validate_nifty_defined_risk_orders(orders)["allowed"])
+
+    def test_nifty_manual_pair_can_submit_only_ce_spread(self):
+        expiry = date(2026, 7, 14)
+        instruments = [
+            {
+                "name": "NIFTY",
+                "segment": "NFO-OPT",
+                "expiry": expiry,
+                "strike": strike,
+                "instrument_type": "CE",
+                "tradingsymbol": f"NIFTY{strike}CE",
+            }
+            for strike in (25400, 25700)
+        ]
+        quote_map = {
+            "NFO:NIFTY25400CE": {"last_price": 33.4, "oi": 20000, "volume": 100},
+            "NFO:NIFTY25700CE": {"last_price": 15.0, "oi": 20000, "volume": 100},
+        }
+
+        orders, _ = app.nifty_income_pair_orders_from_otm(
+            instruments,
+            expiry,
+            23989.15,
+            5.5,
+            5.5,
+            {"lot_size": 65, "strike_rounding": 100, "manual_pair_sell_markup_percent": 20},
+            quote_map,
+            lots=1,
+            include_pe=False,
+            include_ce=True,
+        )
+
+        self.assertEqual(len(orders), 2)
+        self.assertEqual([row["option_type"] for row in orders], ["CE", "CE"])
+        self.assertEqual([row["transaction_type"] for row in orders], ["BUY", "SELL"])
+        self.assertEqual([row["strike"] for row in orders], [25700, 25400])
+        self.assertTrue(app.validate_nifty_defined_risk_orders(orders)["allowed"])
+
+    def test_nifty_manual_pair_rejects_wrong_hedge_width(self):
+        orders = [
+            {
+                "tradingsymbol": "NIFTY26JUL22300PE",
+                "transaction_type": "BUY",
+                "option_type": "PE",
+                "strike": 22300,
+                "expiry_date": "2026-07-28",
+            },
+            {
+                "tradingsymbol": "NIFTY26JUL22700PE",
+                "transaction_type": "SELL",
+                "option_type": "PE",
+                "strike": 22700,
+                "expiry_date": "2026-07-28",
+                "hedge_width_points": 300,
+            },
+        ]
+
+        result = app.validate_nifty_defined_risk_orders(orders)
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("exactly 300 points away", result["warnings"][0])
+
+    def test_place_nifty_manual_pair_forwards_selected_side(self):
+        orders = [
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "NIFTY26JUL25700CE",
+                "quantity": 65,
+                "transaction_type": "BUY",
+            },
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "NIFTY26JUL25400CE",
+                "quantity": 65,
+                "transaction_type": "SELL",
+            },
+        ]
+        with (
+            patch.object(app, "kite_profile_nifty_income_enabled", return_value=True),
+            patch.object(
+                app,
+                "nifty_income_manual_pair_snapshot",
+                return_value={"orders": orders, "missing_ltp": []},
+            ) as snapshot,
+            patch.object(app, "execute_nifty_orders", return_value=[{"status": "LIVE_SENT"}]) as execute,
+        ):
+            result = app.place_nifty_income_manual_pair(
+                5.5,
+                5.5,
+                1,
+                include_pe=False,
+                include_ce=True,
+            )
+
+        snapshot.assert_called_once_with(5.5, 5.5, 1, False, True)
+        execute.assert_called_once_with(orders, "LIVE_CONFIRMED", "Manual NIFTY PE/CE income pair")
+        self.assertEqual(result, [{"status": "LIVE_SENT"}])
+
+    def test_nifty_entry_scheduler_runs_friday_defined_risk_at_1516(self):
+        now = app.datetime(2026, 6, 19, 15, 16, tzinfo=app.INDIA_TIME_ZONE)
         saved_states = []
         config = {
             **app.NIFTY_INCOME_DEFAULT_CONFIG,
             "enabled": True,
-            "entry_time": "09:16",
+            "entry_time": "15:16",
             "execution_mode": "SUGGESTION_ONLY",
         }
         pair_orders = [
+            {"tradingsymbol": "NIFTY22200PE", "transaction_type": "BUY", "quantity": 65},
             {"tradingsymbol": "NIFTY22700PE", "transaction_type": "SELL", "quantity": 65},
             {"tradingsymbol": "NIFTY25300CE", "transaction_type": "SELL", "quantity": 65},
+            {"tradingsymbol": "NIFTY25800CE", "transaction_type": "BUY", "quantity": 65},
         ]
 
         def save_state(**updates):
@@ -2666,28 +3517,26 @@ class PeSellStrategyTests(unittest.TestCase):
             return updates
 
         with (
+            patch.object(app, "kite_profile_nifty_income_enabled", return_value=True),
             patch.object(app, "nifty_income_config", return_value=config),
             patch.object(app, "nifty_income_state", return_value={}),
-            patch.object(app, "nifty_income_entry_schedule_state", return_value={"enabled": True, "schedule_time": "09:16"}),
+            patch.object(app, "nifty_income_entry_schedule_state", return_value={"enabled": True, "schedule_time": "15:16"}),
             patch.object(app, "save_nifty_income_state", side_effect=save_state),
             patch.object(
                 app,
                 "nifty_income_snapshot",
-                return_value={"suggestion": {"allowed": True, "pe_otm_pct": 5.5, "ce_otm_pct": 5.5}},
+                return_value={
+                    "suggestion": {"allowed": True, "selected_strategy": "IRON_CONDOR"},
+                    "entry_orders": pair_orders,
+                },
             ),
-            patch.object(
-                app,
-                "nifty_income_manual_pair_snapshot",
-                return_value={"orders": pair_orders, "missing_ltp": [], "max_gain": 1000},
-            ) as pair_snapshot,
             patch.object(app, "execute_nifty_orders", return_value=[{"status": "SUGGESTION_ONLY"}]) as execute_orders,
         ):
             result = app.run_nifty_income_entry_job(now)
 
         self.assertIsNotNone(result)
-        pair_snapshot.assert_called_once_with(5.5, 5.5, 1)
-        execute_orders.assert_called_once_with(pair_orders, "SUGGESTION_ONLY", "NIFTY weekday PE/CE SELL pair entry")
-        self.assertIn("NIFTY PE/CE SELL pair entry generated 2 leg(s)", result["message"])
+        execute_orders.assert_called_once_with(pair_orders, "SUGGESTION_ONLY", "NIFTY Friday defined-risk income entry")
+        self.assertIn("NIFTY defined-risk entry generated 4 leg(s)", result["message"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,50 @@
+[
+  {
+    "id": "stay-ujjain",
+    "name": "Stay in Ujjain",
+    "slug": "stay-in-ujjain",
+    "shortDescription": "The most convenient base when Mahakal darshan and the old-city temple circuit are the priority.",
+    "longDescription": "Ujjain reduces daily transfers and supports early starts, but rooms may sell quickly and traffic controls can change local access during Kumbh periods.",
+    "category": "Stay",
+    "city": "Ujjain",
+    "idealDuration": "2–4 nights for most family and spiritual trips.",
+    "bestFor": ["Mahakal darshan", "Elderly parents", "Short pilgrimages"],
+    "familyFriendly": true,
+    "elderlyFriendly": true,
+    "mapSearchQuery": "family hotels near Mahakaleshwar Temple Ujjain",
+    "imagePlaceholder": "/images/placeholders/ujjain-stay.webp",
+    "tags": ["Family Friendly", "Elderly Friendly", "Spiritual"]
+  },
+  {
+    "id": "stay-indore",
+    "name": "Stay in Indore",
+    "slug": "stay-in-indore",
+    "shortDescription": "A comfortable base for airport access, wider hotel choice, food and multiple day trips.",
+    "longDescription": "Indore works well for travelers who value hotel variety and dining, provided the group is comfortable with an early road or rail transfer to Ujjain.",
+    "category": "Stay",
+    "city": "Indore",
+    "idealDuration": "2–5 nights when combining Ujjain with Malwa day trips.",
+    "bestFor": ["Flight arrivals", "Working professionals", "Food lovers"],
+    "familyFriendly": true,
+    "elderlyFriendly": true,
+    "mapSearchQuery": "family hotels Vijay Nagar Indore",
+    "imagePlaceholder": "/images/placeholders/indore-stay.webp",
+    "tags": ["Family Friendly", "Food", "Day Trip"]
+  },
+  {
+    "id": "stay-bhopal",
+    "name": "Stay in Bhopal",
+    "slug": "stay-in-bhopal",
+    "shortDescription": "A strong base for Sanchi, Bhimbetka, lakes and a longer Madhya Pradesh circuit.",
+    "longDescription": "Bhopal should be treated as a separate circuit base rather than a daily commute to Ujjain. It suits travelers with five to seven days or more.",
+    "category": "Stay",
+    "city": "Bhopal",
+    "idealDuration": "2–3 nights within a longer Madhya Pradesh itinerary.",
+    "bestFor": ["Heritage circuits", "Sanchi and Bhimbetka", "Slow travel"],
+    "familyFriendly": true,
+    "elderlyFriendly": true,
+    "mapSearchQuery": "family hotels MP Nagar Bhopal",
+    "imagePlaceholder": "/images/placeholders/bhopal-stay.webp",
+    "tags": ["Family Friendly", "Heritage", "Nature"]
+  }
+]

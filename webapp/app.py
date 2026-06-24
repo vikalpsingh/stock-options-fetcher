@@ -77,6 +77,8 @@ OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_OPTION_SELL_MARKUP_PERCENT = 20.0
 DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT = 20.0
+INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT = 100.0
+INTRADAY_LOSS_LIMIT_LTP_DISCOUNT_PERCENT = 10.0
 POSITION_CLOSE_SCHEDULE_TIME = "09:20"
 POSITION_CLOSE_SCHEDULE_WINDOW_MINUTES = 10
 INCOME_GROWTH_GPT_SCHEDULE_TIME = "09:30"
@@ -213,7 +215,7 @@ COMMODITY_DMA_CACHE_SECONDS = 12 * 60 * 60
 INCOME_GROWTH_GPT_CACHE_SECONDS = 30 * 60
 INCOME_DASHBOARD_CACHE_SECONDS = 15 * 60
 CE_SELL_DASHBOARD_CACHE_SECONDS = 15 * 60
-NIFTY_INCOME_ENTRY_SCHEDULE_TIME = "09:16"
+NIFTY_INCOME_ENTRY_SCHEDULE_TIME = "15:16"
 NIFTY_INCOME_CLOSE_SCHEDULE_TIME = "14:59"
 NIFTY_INCOME_CLOSE_DAYS_BEFORE_EXPIRY = 7
 NIFTY_WEEKLY_PAIR_EXIT_INTERVAL_MINUTES = 15
@@ -221,11 +223,17 @@ NIFTY_WEEKLY_PAIR_EXIT_START_TIME = "09:15"
 NIFTY_WEEKLY_PAIR_EXIT_END_TIME = "15:30"
 NIFTY_WEEKLY_PAIR_FORCE_CLOSE_DAY = 21
 NIFTY_WEEKLY_PAIR_FORCE_CLOSE_TIME = "14:59"
+NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS = 300
 NIFTY_INCOME_SCHEDULER_LOCK = threading.Lock()
 NIFTY_INCOME_DEFAULT_CONFIG = {
     "enabled": True,
+    "timezone": "Asia/Kolkata",
     "execution_mode": "SUGGESTION_ONLY",
-    "entry_day": "WEEKDAY",
+    "entry_execution_mode": "SUGGESTION_ONLY",
+    "exit_execution_mode": "SUGGESTION_ONLY",
+    "allow_live_naked_nifty_sell": False,
+    "default_structure": "IRON_CONDOR",
+    "entry_day": "FRIDAY",
     "entry_time": NIFTY_INCOME_ENTRY_SCHEDULE_TIME,
     "expiry_target_days": 28,
     "expiry_min_days": 25,
@@ -243,7 +251,7 @@ NIFTY_INCOME_DEFAULT_CONFIG = {
     "weekly_pair_exit_run_every_minutes": NIFTY_WEEKLY_PAIR_EXIT_INTERVAL_MINUTES,
     "weekly_pair_exit_start_time": NIFTY_WEEKLY_PAIR_EXIT_START_TIME,
     "weekly_pair_exit_end_time": NIFTY_WEEKLY_PAIR_EXIT_END_TIME,
-    "weekly_pair_exit_execution_mode": "AUTO_EXIT_ONLY",
+    "weekly_pair_exit_execution_mode": "SUGGESTION_ONLY",
     "weekly_pair_exit_profit_loss_basis": "MARGIN",
     "weekly_pair_week1_profit_target_pct_of_margin": 2.0,
     "weekly_pair_week1_stop_loss_enabled": False,
@@ -260,8 +268,17 @@ NIFTY_INCOME_DEFAULT_CONFIG = {
     "min_premium_yield_on_margin_pct": 1.0,
     "ideal_premium_yield_low_pct": 1.25,
     "ideal_premium_yield_high_pct": 2.0,
-    "max_short_option_delta": 0.18,
-    "reject_short_option_delta_above": 0.22,
+    "mmi_enabled": True,
+    "mmi_greed_threshold": 60.0,
+    "mmi_fear_threshold": 40.0,
+    "use_expected_move_filter": True,
+    "expected_move_multiplier": 1.2,
+    "use_delta_filter": True,
+    "ideal_short_delta_low": 0.05,
+    "ideal_short_delta_high": 0.15,
+    "max_short_option_delta": 0.15,
+    "emergency_short_delta": 0.25,
+    "reject_short_option_delta_above": 0.20,
     "min_expected_move_multiplier": 1.2,
     "conservative_expected_move_multiplier": 1.5,
     "max_loss_to_credit_ratio": 4.0,
@@ -271,13 +288,93 @@ NIFTY_INCOME_DEFAULT_CONFIG = {
     "trade_stop_loss_pct_of_margin": 3.0,
     "monthly_loss_limit_pct_of_nifty_margin": 5.0,
     "max_consecutive_stop_losses": 2,
+    "stop_new_entries_after_consecutive_stop_losses": 2,
+    "after_one_stop_loss_size_multiplier": 0.5,
     "force_exit_day_of_month": 21,
-    "hedge_distance_points": 500,
+    "hedge_distance_points": NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS,
+    "hedge_width_default_points": 500,
+    "hedge_width_low_vix_points": 300,
+    "hedge_width_high_vix_points": 700,
+    "max_active_layers_normal": 3,
+    "max_active_layers_vix_18_22": 2,
+    "max_active_layers_vix_above_22": 1,
+    "max_active_layers_vix_above_25": 0,
+    "short_leg_premium_stop_multiple": 2.0,
+    "emergency_exit_enabled": True,
+    "emergency_exit_on_short_strike_touch": True,
+    "emergency_spot_distance_pct_to_short_strike": 70.0,
+    "week1_credit_decay_target_pct": 25.0,
+    "week2_credit_decay_target_pct": 35.0,
+    "week3_credit_decay_target_pct": 50.0,
+    "reduce_if_risk_utilisation_pct_above": 50.0,
+    "exit_if_risk_utilisation_pct_above": 75.0,
     "lot_size": 65,
     "manual_pair_sell_markup_percent": 20.0,
     "allow_high_vix_trade": False,
     "no_auto_order_without_confirmation": True,
 }
+
+
+@dataclass
+class NiftyIncomeLeg:
+    leg_id: str
+    strategy_id: str
+    tradingsymbol: str
+    exchange: str
+    option_type: str
+    strike: float
+    expiry: date
+    quantity: int
+    original_transaction_type: str
+    entry_price: float = 0.0
+    current_ltp: float = 0.0
+    delta: float | None = None
+    iv: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+    oi: int = 0
+    is_hedge: bool = False
+    remaining_quantity: int = 0
+
+
+@dataclass
+class NiftyIncomeStrategy:
+    strategy_id: str
+    structure_type: str
+    entry_datetime: datetime
+    expiry_date: date
+    entry_spot: float
+    mmi: float
+    mmi_regime: str
+    india_vix: float
+    trend_regime: str
+    expected_move_points: float
+    expected_move_pct: float
+    legs: list[NiftyIncomeLeg]
+    entry_net_credit: float
+    current_mtm_pnl: float
+    margin_required: float
+    max_gain: float
+    max_loss: float
+    risk_utilisation_pct: float = 0.0
+    active_status: str = "OPEN"
+    exit_reason: str = ""
+    force_close_datetime: datetime | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NiftyRiskDecision:
+    allowed: bool
+    selected_strategy: str
+    skip_reason: str | None = None
+    warnings: list[str] = field(default_factory=list)
+    size_multiplier: float = 1.0
+    pe_sell_strike: int | None = None
+    ce_sell_strike: int | None = None
+    pe_hedge_strike: int | None = None
+    ce_hedge_strike: int | None = None
+    strategy_selection_reason: str = ""
 DEFAULT_PE_SELL_SETTINGS = {
     "max_assignment_cash_per_stock": 600000,
     "max_portfolio_concentration_percent": 20,
@@ -371,6 +468,12 @@ INVESTING_HOLDINGS = [
     {"code": "NSE:MEGATHERM", "company": "Megatherm", "sector": "Metal", "core": "", "quantity": 400, "avg_price": 300.00},
     {"code": "NSE:NUVAMA", "company": "NUVAMA", "sector": "Capital Market", "core": "", "quantity": 0, "avg_price": 0.0},
 ]
+INVESTING_BSE_SCRIP_ALIASES = {
+    "501423": "SHAILY",
+    "516030": "PAKKA",
+    "543940": "BEACON",
+    "544278": "LAWSIKHO",
+}
 COMMODITY_ETFS = [
     {
         "key": "nasdaq",
@@ -463,11 +566,11 @@ INCOME_GROWTH_SHEET = [
 ]
 DIVIDEND_INCOME_SECURITIES = [
     {"symbol": "PGINVIT", "company": "PGINVIT", "exchange": "BSE", "holding": 0},
-    {"symbol": "IRBINVIT-IV", "company": "IRBINVIT", "exchange": "NSE", "holding": 0},
+    {"symbol": "IRBINVIT", "company": "IRBINVIT", "exchange": "NSE", "holding": 0},
 ]
 DIVIDEND_INCOME_SYMBOL_ALIASES = {
     "PGINVIT": {"PGINVIT", "PGINVIT-IV", "PGINVITIV"},
-    "IRBINVIT-IV": {"IRBINVIT-IV", "IRBINVIT", "IRBINVITIV"},
+    "IRBINVIT": {"IRBINVIT", "IRBINVIT-IV", "IRBINVITIV"},
 }
 INCOME_GROWTH_LOT_CAPS = {
     str(item.get("symbol") or "").upper(): float(item.get("lots_can_sell") or 0)
@@ -663,7 +766,7 @@ def app_db_connection() -> sqlite3.Connection:
     now_text = app_now().isoformat(timespec="seconds")
     for old_symbol, new_symbol in (
         ("PGINVIT-IV", "PGINVIT"),
-        ("IRBINVIT", "IRBINVIT-IV"),
+        ("IRBINVIT-IV", "IRBINVIT"),
     ):
         conn.execute(
             "UPDATE OR REPLACE income_growth_holdings SET symbol = ? WHERE symbol = ?",
@@ -892,16 +995,29 @@ def save_env_values(values: dict[str, str], env_path: Path = APP_ROOT / ".env") 
     env_path.write_text(env_text + ("\n" if env_text else ""), encoding="utf-8")
 
 
-def blank_kite_profile() -> dict[str, str]:
+def default_nifty_income_enabled_for_profile(profile_name: str | None) -> bool:
+    return str(profile_name or "").strip().lower() == "monika"
+
+
+def profile_flag(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def blank_kite_profile(profile_name: str | None = None) -> dict[str, Any]:
     return {
         "KITE_CONFIRM_LIVE_ORDER": "YES",
         "KITE_API_KEY": "",
         "KITE_API_SECRET": "",
         "KITE_ACCESS_TOKEN": "",
+        "NIFTY_INCOME_ENABLED": default_nifty_income_enabled_for_profile(profile_name),
     }
 
 
-def shanti_default_kite_profile() -> dict[str, str]:
+def shanti_default_kite_profile() -> dict[str, Any]:
     return {
         "KITE_CONFIRM_LIVE_ORDER": env_value("KITE_CONFIRM_LIVE_ORDER")
         or DEFAULT_KITE_ENV["KITE_CONFIRM_LIVE_ORDER"],
@@ -909,6 +1025,7 @@ def shanti_default_kite_profile() -> dict[str, str]:
         "KITE_API_SECRET": env_value("KITE_API_SECRET") or DEFAULT_KITE_ENV["KITE_API_SECRET"],
         "KITE_ACCESS_TOKEN": env_value("KITE_ACCESS_TOKEN")
         or DEFAULT_KITE_ENV["KITE_ACCESS_TOKEN"],
+        "NIFTY_INCOME_ENABLED": False,
     }
 
 
@@ -924,22 +1041,26 @@ def normalize_kite_profile_name(value: str | None) -> str:
     return DEFAULT_KITE_PROFILE
 
 
-def load_kite_profiles() -> dict[str, dict[str, str]]:
+def load_kite_profiles() -> dict[str, dict[str, Any]]:
     settings = load_app_settings()
     saved_profiles = settings.get("kite_profiles")
-    profiles = {name: blank_kite_profile() for name in KITE_PROFILE_NAMES}
+    profiles = {name: blank_kite_profile(name) for name in KITE_PROFILE_NAMES}
     profiles[DEFAULT_KITE_PROFILE] = shanti_default_kite_profile()
     if isinstance(saved_profiles, dict):
         for name in KITE_PROFILE_NAMES:
             saved_profile = saved_profiles.get(name)
             if not isinstance(saved_profile, dict):
                 continue
-            merged = blank_kite_profile()
+            merged = blank_kite_profile(name)
             if name == DEFAULT_KITE_PROFILE:
                 merged.update(shanti_default_kite_profile())
             for key in DEFAULT_KITE_ENV:
                 if key in saved_profile:
                     merged[key] = str(saved_profile.get(key) or "").strip()
+            merged["NIFTY_INCOME_ENABLED"] = profile_flag(
+                saved_profile.get("NIFTY_INCOME_ENABLED"),
+                default_nifty_income_enabled_for_profile(name),
+            )
             profiles[name] = merged
     return profiles
 
@@ -948,13 +1069,31 @@ def selected_kite_profile_name(value: str | None = None) -> str:
     return normalize_kite_profile_name(value)
 
 
-def save_kite_profile(profile_name: str, values: dict[str, str]) -> dict[str, str]:
+def kite_profile_nifty_income_enabled(
+    profile_name: str | None = None,
+    profiles: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    clean_name = selected_kite_profile_name(profile_name)
+    available_profiles = profiles if profiles is not None else load_kite_profiles()
+    profile = available_profiles.get(clean_name) or blank_kite_profile(clean_name)
+    return profile_flag(
+        profile.get("NIFTY_INCOME_ENABLED"),
+        default_nifty_income_enabled_for_profile(clean_name),
+    )
+
+
+def save_kite_profile(profile_name: str, values: dict[str, Any]) -> dict[str, Any]:
     clean_name = selected_kite_profile_name(profile_name)
     profiles = load_kite_profiles()
-    current = profiles.get(clean_name, blank_kite_profile())
+    current = profiles.get(clean_name, blank_kite_profile(clean_name))
     for key in DEFAULT_KITE_ENV:
         if key in values:
             current[key] = str(values.get(key) or "").strip()
+    if "NIFTY_INCOME_ENABLED" in values:
+        current["NIFTY_INCOME_ENABLED"] = profile_flag(
+            values.get("NIFTY_INCOME_ENABLED"),
+            default_nifty_income_enabled_for_profile(clean_name),
+        )
     if not current.get("KITE_CONFIRM_LIVE_ORDER"):
         current["KITE_CONFIRM_LIVE_ORDER"] = "YES"
     profiles[clean_name] = current
@@ -967,7 +1106,7 @@ def save_kite_profile(profile_name: str, values: dict[str, str]) -> dict[str, st
     return current
 
 
-def kite_profile_values_from_state(state: Any, access_token: str | None = None) -> dict[str, str]:
+def kite_profile_values_from_state(state: Any, access_token: str | None = None) -> dict[str, Any]:
     return {
         "KITE_CONFIRM_LIVE_ORDER": str(state.confirm_live_order or "").strip() or "YES",
         "KITE_API_KEY": str(state.api_key or "").strip(),
@@ -975,6 +1114,7 @@ def kite_profile_values_from_state(state: Any, access_token: str | None = None) 
         "KITE_ACCESS_TOKEN": str(
             access_token if access_token is not None else state.access_token or ""
         ).strip(),
+        "NIFTY_INCOME_ENABLED": bool(state.nifty_income_enabled),
     }
 
 
@@ -1227,17 +1367,19 @@ def commodity_backtest_engine(
 
 
 def nifty_income_config() -> dict[str, Any]:
-    saved = load_app_settings().get("nifty_income_strategy")
+    settings = load_app_settings()
+    saved = settings.get("nifty_income_risk_engine") or settings.get("nifty_income_strategy")
     config = dict(NIFTY_INCOME_DEFAULT_CONFIG)
     if isinstance(saved, dict):
         config.update(saved)
-    if str(config.get("entry_time") or "") == "15:22":
+    if str(config.get("entry_time") or "") in {"09:16", "15:22"}:
         config["entry_time"] = NIFTY_INCOME_ENTRY_SCHEDULE_TIME
-    if str(config.get("entry_day") or "").upper() == "FRIDAY":
-        config["entry_day"] = "WEEKDAY"
+    config["entry_day"] = "FRIDAY"
     config["enabled"] = bool(config.get("enabled", True))
     config["time_exit_enabled"] = bool(config.get("time_exit_enabled", True))
     config["weekly_pair_exit_enabled"] = bool(config.get("weekly_pair_exit_enabled", True))
+    config["allow_live_naked_nifty_sell"] = bool(config.get("allow_live_naked_nifty_sell", False))
+    config["emergency_exit_enabled"] = bool(config.get("emergency_exit_enabled", True))
     for key in (
         "expiry_target_days",
         "expiry_min_days",
@@ -1248,8 +1390,16 @@ def nifty_income_config() -> dict[str, Any]:
         "weekly_pair_exit_run_every_minutes",
         "weekly_pair_force_close_day",
         "hedge_distance_points",
+        "hedge_width_default_points",
+        "hedge_width_low_vix_points",
+        "hedge_width_high_vix_points",
         "lot_size",
         "max_consecutive_stop_losses",
+        "stop_new_entries_after_consecutive_stop_losses",
+        "max_active_layers_normal",
+        "max_active_layers_vix_18_22",
+        "max_active_layers_vix_above_22",
+        "max_active_layers_vix_above_25",
     ):
         try:
             config[key] = int(config.get(key) or NIFTY_INCOME_DEFAULT_CONFIG[key])
@@ -1262,7 +1412,11 @@ def nifty_income_config() -> dict[str, Any]:
         "ideal_premium_yield_low_pct",
         "ideal_premium_yield_high_pct",
         "max_short_option_delta",
+        "emergency_short_delta",
         "reject_short_option_delta_above",
+        "ideal_short_delta_low",
+        "ideal_short_delta_high",
+        "expected_move_multiplier",
         "min_expected_move_multiplier",
         "conservative_expected_move_multiplier",
         "max_loss_to_credit_ratio",
@@ -1278,6 +1432,14 @@ def nifty_income_config() -> dict[str, Any]:
         "weekly_pair_week3_profit_target_pct_of_margin",
         "weekly_pair_week3_stop_loss_pct_of_margin",
         "manual_pair_sell_markup_percent",
+        "short_leg_premium_stop_multiple",
+        "emergency_spot_distance_pct_to_short_strike",
+        "week1_credit_decay_target_pct",
+        "week2_credit_decay_target_pct",
+        "week3_credit_decay_target_pct",
+        "reduce_if_risk_utilisation_pct_above",
+        "exit_if_risk_utilisation_pct_above",
+        "after_one_stop_loss_size_multiplier",
     ):
         try:
             config[key] = float(config.get(key) or NIFTY_INCOME_DEFAULT_CONFIG[key])
@@ -1307,7 +1469,10 @@ def nifty_income_config() -> dict[str, Any]:
 def save_nifty_income_config(updates: dict[str, Any]) -> dict[str, Any]:
     config = nifty_income_config()
     config.update(updates)
-    save_app_settings({"nifty_income_strategy": config})
+    save_app_settings({
+        "nifty_income_strategy": config,
+        "nifty_income_risk_engine": config,
+    })
     return nifty_income_config()
 
 
@@ -1546,16 +1711,20 @@ def validate_short_strikes_against_expected_move(
 def validate_short_option_delta(
     pe_delta: Any,
     ce_delta: Any,
-    max_short_delta: float = 0.18,
-    reject_above: float = 0.22,
+    max_short_delta: float = 0.15,
+    reject_above: float = 0.20,
 ) -> dict[str, Any]:
     warnings: list[str] = []
     size_multiplier = 1.0
     for label, delta in (("PE", pe_delta), ("CE", ce_delta)):
-        if delta in (None, ""):
+        if delta in (None, "", "N/A", "NA", "--"):
             warnings.append(f"{label} delta missing.")
             continue
-        abs_delta = abs(float(delta))
+        try:
+            abs_delta = abs(float(delta))
+        except (TypeError, ValueError):
+            warnings.append(f"{label} delta invalid.")
+            continue
         if abs_delta > reject_above:
             return {
                 "allowed": False,
@@ -1574,6 +1743,162 @@ def validate_short_option_delta(
         "warnings": warnings,
         "reason": "Delta within allowed range.",
     }
+
+
+def get_max_allowed_nifty_layers(india_vix: Any, trend_regime: str = "MIXED") -> int:
+    try:
+        vix = float(india_vix)
+    except (TypeError, ValueError):
+        return 1 if str(trend_regime).upper().startswith("STRONG_") else 3
+    if vix < 11 or vix > 25:
+        layers = 0
+    elif vix <= 18:
+        layers = 3
+    elif vix <= 22:
+        layers = 2
+    else:
+        layers = 1
+    if str(trend_regime).upper().startswith("STRONG_"):
+        layers = min(layers, 1)
+    return layers
+
+
+def validate_nifty_layer_count(current_active_layers: int, max_allowed_layers: int) -> dict[str, Any]:
+    current = max(int(current_active_layers or 0), 0)
+    maximum = max(int(max_allowed_layers or 0), 0)
+    allowed = maximum > 0 and current < maximum
+    return {
+        "allowed": allowed,
+        "current_active_layers": current,
+        "max_allowed_layers": maximum,
+        "remaining_layers": max(maximum - current, 0),
+        "reason": "Layer capacity available." if allowed else "NIFTY layer limit reached.",
+    }
+
+
+def nifty_hedge_width_for_vix(india_vix: Any, config: dict[str, Any] | None = None) -> int:
+    config = config or nifty_income_config()
+    try:
+        vix = float(india_vix)
+    except (TypeError, ValueError):
+        return int(config.get("hedge_width_default_points") or 500)
+    if vix < 15:
+        return int(config.get("hedge_width_low_vix_points") or 300)
+    if vix > 22:
+        return int(config.get("hedge_width_high_vix_points") or 700)
+    return int(config.get("hedge_width_default_points") or 500)
+
+
+def validate_nifty_defined_risk_orders(
+    orders: list[dict[str, Any]],
+    allow_naked: bool = False,
+) -> dict[str, Any]:
+    if allow_naked:
+        return {"allowed": True, "warnings": [], "reason": "Naked NIFTY selling explicitly allowed."}
+    sell_legs = [
+        order for order in orders
+        if str(order.get("transaction_type") or "").upper() == "SELL"
+        and str(order.get("tradingsymbol") or "").upper().startswith("NIFTY")
+    ]
+    buy_legs = [
+        order for order in orders
+        if str(order.get("transaction_type") or "").upper() == "BUY"
+        and str(order.get("tradingsymbol") or "").upper().startswith("NIFTY")
+    ]
+    warnings: list[str] = []
+    for sell in sell_legs:
+        sell_parts = option_symbol_parts(str(sell.get("tradingsymbol") or "")) or {}
+        option_type = str(sell.get("option_type") or sell_parts.get("option_type") or "").upper()
+        strike = float(sell.get("strike") or sell_parts.get("strike") or 0)
+        expiry = str(sell.get("expiry_date") or "")
+        required_width = float(sell.get("hedge_width_points") or 0)
+        protected = False
+        for hedge in buy_legs:
+            hedge_parts = option_symbol_parts(str(hedge.get("tradingsymbol") or "")) or {}
+            hedge_type = str(hedge.get("option_type") or hedge_parts.get("option_type") or "").upper()
+            hedge_strike = float(hedge.get("strike") or hedge_parts.get("strike") or 0)
+            same_expiry = not expiry or not hedge.get("expiry_date") or str(hedge.get("expiry_date")) == expiry
+            correct_side = (option_type == "PE" and hedge_strike < strike) or (option_type == "CE" and hedge_strike > strike)
+            correct_width = not required_width or abs(hedge_strike - strike) == required_width
+            if same_expiry and hedge_type == option_type and correct_side and correct_width:
+                protected = True
+                break
+        if not protected:
+            width_note = f" exactly {required_width:.0f} points away" if required_width else ""
+            warnings.append(
+                f"{sell.get('tradingsymbol')}: matching protective {option_type} hedge{width_note} is missing."
+            )
+    return {
+        "allowed": not warnings,
+        "warnings": warnings,
+        "reason": "All short NIFTY legs are hedged." if not warnings else "Live naked NIFTY sell blocked.",
+    }
+
+
+def calculate_credit_decay_pct(entry_net_credit: float, current_strategy_value: float) -> float:
+    credit = float(entry_net_credit or 0)
+    if credit <= 0:
+        return 0.0
+    return (credit - float(current_strategy_value or 0)) / credit * 100
+
+
+def calculate_nifty_risk_utilisation_pct(current_mtm_pnl: float, max_loss: float) -> float:
+    maximum = abs(float(max_loss or 0))
+    if maximum <= 0 or float(current_mtm_pnl or 0) >= 0:
+        return 0.0
+    return abs(float(current_mtm_pnl)) / maximum * 100
+
+
+def evaluate_nifty_emergency_exit(
+    strategy: NiftyIncomeStrategy | dict[str, Any],
+    current_spot: float,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = config or nifty_income_config()
+    if not bool(config.get("emergency_exit_enabled", True)):
+        return {"exit_signal": False, "exit_reason": "", "threatened_leg": "", "details": "Emergency exit disabled."}
+    value = strategy if isinstance(strategy, dict) else strategy.__dict__
+    legs = value.get("legs") or value.get("open_legs") or []
+    entry_spot = float(value.get("entry_spot") or current_spot or 0)
+    premium_multiple = float(config.get("short_leg_premium_stop_multiple") or 2.0)
+    delta_limit = float(config.get("emergency_short_delta") or 0.25)
+    distance_pct = float(config.get("emergency_spot_distance_pct_to_short_strike") or 70.0) / 100
+    risk_utilisation = float(value.get("risk_utilisation_pct") or calculate_nifty_risk_utilisation_pct(
+        value.get("current_mtm_pnl") or 0,
+        value.get("max_loss") or 0,
+    ))
+    if risk_utilisation >= float(config.get("exit_if_risk_utilisation_pct_above") or 75):
+        return {"exit_signal": True, "exit_reason": "EMERGENCY_RISK_UTILISATION_75", "threatened_leg": "STRATEGY", "details": f"Risk utilisation {risk_utilisation:.2f}%."}
+    for leg in legs:
+        leg_value = leg if isinstance(leg, dict) else leg.__dict__
+        side = str(leg_value.get("original_transaction_type") or "").upper()
+        if side != "SELL":
+            continue
+        symbol = str(leg_value.get("tradingsymbol") or "")
+        entry_price = float(leg_value.get("entry_price") or leg_value.get("average_price") or 0)
+        current_ltp = float(leg_value.get("current_ltp") or leg_value.get("ltp") or 0)
+        if entry_price > 0 and current_ltp >= entry_price * premium_multiple:
+            return {"exit_signal": True, "exit_reason": "EMERGENCY_SHORT_LEG_2X_PREMIUM", "threatened_leg": symbol, "details": f"{current_ltp:.2f} >= {premium_multiple:.2f}x entry {entry_price:.2f}."}
+        delta = leg_value.get("delta")
+        if delta not in (None, "") and abs(float(delta)) >= delta_limit:
+            return {"exit_signal": True, "exit_reason": "EMERGENCY_SHORT_DELTA_25", "threatened_leg": symbol, "details": f"Short delta {abs(float(delta)):.2f}."}
+        option_type = str(leg_value.get("option_type") or "").upper()
+        strike = float(leg_value.get("strike") or 0)
+        if strike <= 0 or current_spot <= 0:
+            continue
+        if option_type == "PE":
+            if current_spot <= strike:
+                return {"exit_signal": True, "exit_reason": "EMERGENCY_SHORT_STRIKE_TOUCHED", "threatened_leg": symbol, "details": f"Spot {current_spot:.2f} <= PE strike {strike:.2f}."}
+            threshold = entry_spot - distance_pct * (entry_spot - strike)
+            if entry_spot > strike and current_spot <= threshold:
+                return {"exit_signal": True, "exit_reason": "EMERGENCY_SPOT_DISTANCE_70_PERCENT", "threatened_leg": symbol, "details": f"Spot crossed PE danger level {threshold:.2f}."}
+        elif option_type == "CE":
+            if current_spot >= strike:
+                return {"exit_signal": True, "exit_reason": "EMERGENCY_SHORT_STRIKE_TOUCHED", "threatened_leg": symbol, "details": f"Spot {current_spot:.2f} >= CE strike {strike:.2f}."}
+            threshold = entry_spot + distance_pct * (strike - entry_spot)
+            if strike > entry_spot and current_spot >= threshold:
+                return {"exit_signal": True, "exit_reason": "EMERGENCY_SPOT_DISTANCE_70_PERCENT", "threatened_leg": symbol, "details": f"Spot crossed CE danger level {threshold:.2f}."}
+    return {"exit_signal": False, "exit_reason": "", "threatened_leg": "", "details": "No emergency trigger."}
 
 
 def calculate_premium_yield_on_margin(net_credit: float, margin_required: float) -> float:
@@ -1659,6 +1984,8 @@ def select_nifty_income_strategy(inputs: dict[str, Any]) -> dict[str, Any]:
     skip_reason = None
     strategy = "SKIP"
     allowed = True
+    max_layers = get_max_allowed_nifty_layers(inputs.get("india_vix"), str(inputs.get("trend_regime") or "MIXED"))
+    layer_check = validate_nifty_layer_count(int(inputs.get("current_active_layers") or 0), max_layers)
     if inputs.get("event_risk_status") == "REJECT":
         allowed, strategy, skip_reason = False, "SKIP", "EVENT_RISK_REJECT"
     elif not inputs.get("vix_allowed", True):
@@ -1667,6 +1994,8 @@ def select_nifty_income_strategy(inputs: dict[str, Any]) -> dict[str, Any]:
         allowed, strategy, skip_reason = False, "SKIP_MONTHLY_RISK_LIMIT", inputs.get("monthly_risk_status")
     elif not inputs.get("margin_heat_allowed", True):
         allowed, strategy, skip_reason = False, "SKIP_MARGIN_HEAT", inputs.get("margin_heat_status")
+    elif not layer_check["allowed"]:
+        allowed, strategy, skip_reason = False, "SKIP_LAYER_LIMIT", layer_check["reason"]
     else:
         mmi = float(inputs.get("mmi") or 50)
         trend = str(inputs.get("trend_regime") or "MIXED")
@@ -1677,11 +2006,11 @@ def select_nifty_income_strategy(inputs: dict[str, Any]) -> dict[str, Any]:
         elif mmi > 60 and trend != "STRONG_BULLISH":
             strategy = "BEAR_CALL_SPREAD"
         elif trend == "STRONG_BULLISH":
-            strategy = "SKIP_CE_SELL_OR_USE_FAR_OTM_BULL_PUT_SPREAD"
-            warnings.append("Strong bullish trend; avoid close CE sell.")
+            strategy = "BULL_PUT_SPREAD"
+            warnings.append("Strong bullish trend: CE sell disabled.")
         elif trend == "STRONG_BEARISH":
-            strategy = "SKIP_PE_SELL_OR_USE_FAR_OTM_BEAR_CALL_SPREAD"
-            warnings.append("Strong bearish trend; avoid close PE sell.")
+            strategy = "BEAR_CALL_SPREAD"
+            warnings.append("Strong bearish trend: PE sell disabled.")
         else:
             strategy = "SKIP_OR_HALF_SIZE"
             warnings.append("No clean NIFTY edge; suggestion only.")
@@ -1705,6 +2034,8 @@ def select_nifty_income_strategy(inputs: dict[str, Any]) -> dict[str, Any]:
         "hedge_ce_strike": hedge_ce,
         "expiry_date": inputs.get("expiry_date"),
         "position_size_multiplier": min(float(inputs.get("position_size_multiplier") or 1), 1.0),
+        "max_allowed_layers": max_layers,
+        "current_active_layers": int(inputs.get("current_active_layers") or 0),
         "skip_reason": skip_reason,
         "warnings": warnings,
         "strategy_selection_reason": reason,
@@ -2157,6 +2488,8 @@ def nifty_income_pair_orders_from_otm(
     config: dict[str, Any] | None = None,
     quote_map: dict[str, Any] | None = None,
     lots: int = 1,
+    include_pe: bool = True,
+    include_ce: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     config = config or nifty_income_config()
     quote_map = quote_map or {}
@@ -2167,21 +2500,25 @@ def nifty_income_pair_orders_from_otm(
     sell_markup = max(0.0, float(config.get("manual_pair_sell_markup_percent") or 0.0))
     pe_strike = round_down_to_step(float(spot) * (1 - float(pe_otm_pct) / 100), rounding)
     ce_strike = round_up_to_step(float(spot) * (1 + float(ce_otm_pct) / 100), rounding)
-    legs = [
-        ("SELL", int(pe_strike), "PE", "NIFTY_PAIR"),
-        ("SELL", int(ce_strike), "CE", "NIFTY_PAIR"),
-    ]
-    orders: list[dict[str, Any]] = []
-    previews: list[dict[str, Any]] = []
-    for side, strike, option_type, tag in legs:
-        symbol = nifty_symbol_for_leg(instruments, expiry, strike, option_type)
+    if not include_pe and not include_ce:
+        raise ValueError("Select at least one NIFTY side: PE SELL or CE SELL.")
+    hedge_width = NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS
+    requested_sells: list[tuple[int, str]] = []
+    if include_pe:
+        requested_sells.append((int(pe_strike), "PE"))
+    if include_ce:
+        requested_sells.append((int(ce_strike), "CE"))
+
+    legs: list[tuple[str, int, str, str, bool, dict[str, Any]]] = []
+    for requested_strike, option_type in requested_sells:
+        seed_symbol = nifty_symbol_for_leg(instruments, expiry, requested_strike, option_type)
         seed_order = {
-            "tradingsymbol": symbol,
-            "transaction_type": side,
-            "strike": strike,
+            "tradingsymbol": seed_symbol,
+            "transaction_type": "SELL",
+            "strike": requested_strike,
             "option_type": option_type,
         }
-        adjusted_seed = (
+        adjusted_sell = (
             adjust_nifty_preview_sell_order_for_liquidity(
                 seed_order,
                 lambda lookup_symbol: quote_map.get(f"NFO:{lookup_symbol}", {}) or {},
@@ -2195,8 +2532,25 @@ def nifty_income_pair_orders_from_otm(
             if quote_map
             else seed_order
         )
-        symbol = str(adjusted_seed.get("tradingsymbol") or symbol).upper()
-        strike = int(float(adjusted_seed.get("strike") or strike))
+        sell_strike = int(float(adjusted_sell.get("strike") or requested_strike))
+        hedge_strike = (
+            sell_strike - hedge_width
+            if option_type == "PE"
+            else sell_strike + hedge_width
+        )
+        legs.extend(
+            [
+                ("BUY", hedge_strike, option_type, "NIFTY_HEDGE", True, {}),
+                ("SELL", sell_strike, option_type, "NIFTY_PAIR", False, adjusted_sell),
+            ]
+        )
+    orders: list[dict[str, Any]] = []
+    previews: list[dict[str, Any]] = []
+    for side, strike, option_type, tag, is_hedge, adjusted_seed in legs:
+        symbol = nifty_symbol_for_leg(instruments, expiry, strike, option_type)
+        if adjusted_seed:
+            symbol = str(adjusted_seed.get("tradingsymbol") or symbol).upper()
+            strike = int(float(adjusted_seed.get("strike") or strike))
         quote = quote_map.get(f"NFO:{symbol}", {}) or {}
         ltp = quote_ltp(quote)
         price_basis = ltp * (1 + sell_markup / 100) if side == "SELL" else ltp
@@ -2228,6 +2582,8 @@ def nifty_income_pair_orders_from_otm(
             "sell_markup_percent": sell_markup if side == "SELL" else 0.0,
             "lot_size": lot_size,
             "lots": lots,
+            "is_hedge": is_hedge,
+            "hedge_width_points": hedge_width,
             "original_strike": adjusted_seed.get("original_strike") or strike,
             "liquidity_shift_points": adjusted_seed.get("liquidity_shift_points") or 0,
             "liquidity_adjustment_note": adjusted_seed.get("liquidity_adjustment_note") or "",
@@ -2269,7 +2625,13 @@ def nifty_pair_liquidity_probe_quote_keys(
     return keys
 
 
-def nifty_income_manual_pair_snapshot(pe_otm_pct: float, ce_otm_pct: float, lots: int = 1) -> dict[str, Any]:
+def nifty_income_manual_pair_snapshot(
+    pe_otm_pct: float,
+    ce_otm_pct: float,
+    lots: int = 1,
+    include_pe: bool = True,
+    include_ce: bool = True,
+) -> dict[str, Any]:
     config = nifty_income_config()
     kite = kite_orders.kite_client() if kite_orders else None
     if kite is None:
@@ -2287,6 +2649,26 @@ def nifty_income_manual_pair_snapshot(pe_otm_pct: float, ce_otm_pct: float, lots
         and str(item.get("segment") or "").upper() == "NFO-OPT"
     ]
     expiry = nifty_nearest_expiry(nifty_instruments, today, config)
+    existing_short_sides: set[str] = set()
+    try:
+        clear_app_cache(("kite:positions",))
+        for position in nifty_option_positions(kite):
+            if int(float(position.get("quantity") or 0)) >= 0:
+                continue
+            parts = option_symbol_parts(str(position.get("tradingsymbol") or "").upper()) or {}
+            option_type = str(parts.get("option_type") or "").upper()
+            if option_type in {"PE", "CE"}:
+                existing_short_sides.add(option_type)
+    except Exception:
+        existing_short_sides = set()
+    effective_include_pe = bool(include_pe) and "PE" not in existing_short_sides
+    effective_include_ce = bool(include_ce) and "CE" not in existing_short_sides
+    if not effective_include_pe and not effective_include_ce:
+        existing_text = ", ".join(sorted(existing_short_sides)) or "selected side(s)"
+        raise ValueError(
+            f"No new NIFTY side is available. Existing short position already covers {existing_text}; "
+            "deselect it or close the existing position first."
+        )
     draft_orders, _ = nifty_income_pair_orders_from_otm(
         nifty_instruments,
         expiry,
@@ -2296,6 +2678,8 @@ def nifty_income_manual_pair_snapshot(pe_otm_pct: float, ce_otm_pct: float, lots
         config,
         {},
         lots,
+        effective_include_pe,
+        effective_include_ce,
     )
     quote_keys = nifty_pair_liquidity_probe_quote_keys(draft_orders, nifty_instruments, expiry)
     if quote_keys:
@@ -2312,9 +2696,20 @@ def nifty_income_manual_pair_snapshot(pe_otm_pct: float, ce_otm_pct: float, lots
         config,
         option_quotes,
         lots,
+        effective_include_pe,
+        effective_include_ce,
     )
     sell_previews = [row for row in previews if row.get("transaction_type") == "SELL"]
-    max_gain = sum(float(row.get("max_gain_opportunity") or 0) for row in sell_previews)
+    hedge_previews = [row for row in previews if row.get("transaction_type") == "BUY"]
+    gross_sell_premium = sum(
+        float(row.get("option_ltp") or 0) * int(row.get("quantity") or 0)
+        for row in sell_previews
+    )
+    hedge_cost = sum(
+        float(row.get("option_ltp") or 0) * int(row.get("quantity") or 0)
+        for row in hedge_previews
+    )
+    max_gain = max(gross_sell_premium - hedge_cost, 0.0)
     missing_ltp = [row["tradingsymbol"] for row in orders if row.get("price", 0) <= 0]
     return {
         "spot": spot,
@@ -2323,18 +2718,48 @@ def nifty_income_manual_pair_snapshot(pe_otm_pct: float, ce_otm_pct: float, lots
         "ce_otm_pct": float(ce_otm_pct),
         "orders": orders,
         "sell_legs": sell_previews,
+        "hedge_legs": hedge_previews,
         "max_gain": max_gain,
+        "gross_sell_premium": gross_sell_premium,
+        "hedge_cost": hedge_cost,
         "missing_ltp": missing_ltp,
         "lot_size": int(config.get("lot_size") or 65),
         "lots": max(1, int(float(lots or 1))),
         "quantity": int(config.get("lot_size") or 65) * max(1, int(float(lots or 1))),
-        "hedge_distance_points": int(config.get("hedge_distance_points") or 500),
+        "hedge_distance_points": NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS,
         "sell_markup_percent": float(config.get("manual_pair_sell_markup_percent") or 20.0),
+        "include_pe": effective_include_pe,
+        "include_ce": effective_include_ce,
+        "requested_include_pe": bool(include_pe),
+        "requested_include_ce": bool(include_ce),
+        "existing_short_sides": sorted(existing_short_sides),
+        "skipped_existing_sides": sorted(
+            side
+            for side, requested in (("PE", include_pe), ("CE", include_ce))
+            if requested and side in existing_short_sides
+        ),
     }
 
 
-def place_nifty_income_manual_pair(pe_otm_pct: float, ce_otm_pct: float, lots: int = 1) -> list[dict[str, Any]]:
-    snapshot = nifty_income_manual_pair_snapshot(pe_otm_pct, ce_otm_pct, lots)
+def place_nifty_income_manual_pair(
+    pe_otm_pct: float,
+    ce_otm_pct: float,
+    lots: int = 1,
+    include_pe: bool = True,
+    include_ce: bool = True,
+) -> list[dict[str, Any]]:
+    if not kite_profile_nifty_income_enabled():
+        raise PermissionError(
+            f"Nifty Income is disabled for Kite profile {selected_kite_profile_name()}. "
+            "Enable it in Kite Setup before placing a NIFTY order."
+        )
+    snapshot = nifty_income_manual_pair_snapshot(
+        pe_otm_pct,
+        ce_otm_pct,
+        lots,
+        include_pe,
+        include_ce,
+    )
     missing_ltp = snapshot.get("missing_ltp") or []
     if missing_ltp:
         raise RuntimeError(
@@ -2424,7 +2849,19 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
             and str(item.get("segment") or "").upper() == "NFO-OPT"
         ]
         expiry = nifty_nearest_expiry(nifty_instruments, entry_date, config)
-        expected = calculate_expected_move_pct(spot, 0, 0, rounding)
+        atm_strike = int(round(spot / rounding) * rounding)
+        atm_ce_symbol = nifty_symbol_for_leg(nifty_instruments, expiry, atm_strike, "CE")
+        atm_pe_symbol = nifty_symbol_for_leg(nifty_instruments, expiry, atm_strike, "PE")
+        atm_quotes = cached_kite_quote(
+            kite,
+            [f"NFO:{atm_ce_symbol}", f"NFO:{atm_pe_symbol}"],
+        )
+        expected = calculate_expected_move_pct(
+            spot,
+            quote_ltp(atm_quotes.get(f"NFO:{atm_ce_symbol}", {})),
+            quote_ltp(atm_quotes.get(f"NFO:{atm_pe_symbol}", {})),
+            rounding,
+        )
         expected_validation = validate_short_strikes_against_expected_move(
             spot,
             pe_strike,
@@ -2447,21 +2884,22 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                 "pe_sell_strike": pe_strike,
                 "ce_sell_strike": ce_strike,
                 "expiry_date": expiry,
+                "current_active_layers": len(nifty_weekly_pair_groups(positions, config)),
                 "position_size_multiplier": vix["position_size_multiplier"],
-                "hedge_distance_points": config["hedge_distance_points"],
+                "hedge_distance_points": nifty_hedge_width_for_vix(india_vix, config),
                 "warnings": vix["warnings"] + ([trend["trend_warning"]] if trend.get("trend_warning") else []),
             }
         )
         lot_size = int(config.get("lot_size") or 65)
-        hedge_distance = int(config.get("hedge_distance_points") or 500)
+        hedge_distance = nifty_hedge_width_for_vix(india_vix, config)
         legs: list[dict[str, Any]] = []
         if selector.get("final_pe_sell_strike"):
             sell = int(selector["final_pe_sell_strike"])
             hedge = int(selector.get("hedge_pe_strike") or sell - hedge_distance)
             legs.extend(
                 [
-                    ("SELL", sell, "PE"),
                     ("BUY", hedge, "PE"),
+                    ("SELL", sell, "PE"),
                 ]
             )
         if selector.get("final_ce_sell_strike"):
@@ -2469,10 +2907,11 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
             hedge = int(selector.get("hedge_ce_strike") or sell + hedge_distance)
             legs.extend(
                 [
-                    ("SELL", sell, "CE"),
                     ("BUY", hedge, "CE"),
+                    ("SELL", sell, "CE"),
                 ]
             )
+        legs.sort(key=lambda leg: 0 if leg[0] == "BUY" else 1)
         entry_orders = [
             {
                 "exchange": "NFO",
@@ -2532,7 +2971,7 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                 "expiry_date": expiry.isoformat(),
             },
         ]
-        preview_entry_orders = [
+        adjusted_preview_sells = [
             adjust_nifty_preview_sell_order_for_liquidity(
                 order,
                 lambda symbol: cached_kite_quote(kite, [f"NFO:{symbol}"]).get(f"NFO:{symbol}", {}) or {},
@@ -2540,6 +2979,25 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
             )
             for order in preview_entry_orders
         ]
+        preview_entry_orders = []
+        for sell_order in adjusted_preview_sells:
+            preview_entry_orders.append(sell_order)
+            option_type = str(sell_order.get("option_type") or "").upper()
+            sell_strike = int(float(sell_order.get("strike") or 0))
+            hedge_strike = sell_strike - hedge_distance if option_type == "PE" else sell_strike + hedge_distance
+            preview_entry_orders.append(
+                {
+                    **sell_order,
+                    "tradingsymbol": nifty_symbol_for_leg(nifty_instruments, expiry, hedge_strike, option_type),
+                    "transaction_type": "BUY",
+                    "strike": hedge_strike,
+                    "tag": "NIFTY_HEDGE",
+                    "is_hedge": True,
+                    "liquidity_shift_points": 0,
+                    "liquidity_adjustment_note": "",
+                    "liquidity_checks": [],
+                }
+            )
         option_quote_keys = [f"NFO:{order['tradingsymbol']}" for order in preview_entry_orders if order.get("tradingsymbol")]
         option_quotes = cached_kite_quote(kite, option_quote_keys) if option_quote_keys else {}
         candidate_previews = nifty_candidate_previews(
@@ -2549,6 +3007,22 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
             config,
             float(expected_validation.get("expected_move_points") or 0),
         )
+        preview_by_side = {str(row.get("side") or "").upper(): row for row in candidate_previews}
+        delta_validation = validate_short_option_delta(
+            preview_by_side.get("PE", {}).get("delta"),
+            preview_by_side.get("CE", {}).get("delta"),
+            float(config.get("max_short_option_delta") or 0.15),
+            float(config.get("reject_short_option_delta_above") or 0.20),
+        )
+        selector["warnings"] = list(selector.get("warnings") or []) + list(delta_validation.get("warnings") or [])
+        selector["delta_status"] = delta_validation.get("status")
+        selector["position_size_multiplier"] = min(
+            float(selector.get("position_size_multiplier") or 1.0),
+            float(delta_validation.get("position_size_multiplier") or 1.0),
+        )
+        if not delta_validation.get("allowed", True):
+            selector["allowed"] = False
+            selector["skip_reason"] = str(delta_validation.get("reason") or "SHORT_DELTA_REJECT")
         preview_warnings = [
             f"{row['tradingsymbol']}: {warning}"
             for row in candidate_previews
@@ -2736,15 +3210,29 @@ def parse_ist_datetime(value: Any) -> datetime | None:
         return parse_kite_market_timestamp(text)
 
 
-def nifty_force_close_datetime(entry_datetime: datetime, config: dict[str, Any]) -> datetime:
+def calculate_nifty_force_close_datetime(
+    entry_datetime: datetime,
+    expiry_date: date | None,
+    config: dict[str, Any],
+) -> datetime:
     force_day = int(config.get("weekly_pair_force_close_day") or NIFTY_WEEKLY_PAIR_FORCE_CLOSE_DAY)
     force_time = str(config.get("weekly_pair_force_close_time") or NIFTY_WEEKLY_PAIR_FORCE_CLOSE_TIME)
     hour, minute = (int(part) for part in force_time.split(":", 1))
-    force_date = nifty_previous_trading_day(entry_datetime.date() + timedelta(days=force_day))
+    day_21 = entry_datetime.date() + timedelta(days=force_day)
+    t_minus_7 = (
+        expiry_date - timedelta(days=int(config.get("force_close_days_before_expiry") or 7))
+        if isinstance(expiry_date, date)
+        else day_21
+    )
+    force_date = nifty_previous_trading_day(min(day_21, t_minus_7))
     return datetime.combine(force_date, datetime.min.time(), tzinfo=INDIA_TIME_ZONE).replace(
         hour=hour,
         minute=minute,
     )
+
+
+def nifty_force_close_datetime(entry_datetime: datetime, config: dict[str, Any]) -> datetime:
+    return calculate_nifty_force_close_datetime(entry_datetime, None, config)
 
 
 def nifty_weekly_pair_bucket(age_days: int, now: datetime, force_close_at: datetime) -> str:
@@ -2788,38 +3276,83 @@ def evaluate_nifty_weekly_pair_exit(
     current_mtm_pnl = float(pair.get("current_mtm_pnl") or pair.get("pnl") or 0)
     pnl_pct = current_mtm_pnl / margin_required * 100
     age_days = max((now.date() - entry_datetime.date()).days, 0)
-    force_close_at = nifty_force_close_datetime(entry_datetime, config)
+    expiry_date = pair.get("expiry_date")
+    if not isinstance(expiry_date, date):
+        try:
+            expiry_date = date.fromisoformat(str(expiry_date or ""))
+        except ValueError:
+            expiry_date = None
+    force_close_at = calculate_nifty_force_close_datetime(entry_datetime, expiry_date, config)
     bucket = nifty_weekly_pair_bucket(age_days, now, force_close_at)
+    entry_credit = float(pair.get("entry_net_credit") or 0)
+    current_strategy_value = float(pair.get("current_strategy_value") or 0)
+    credit_decay_pct = calculate_credit_decay_pct(entry_credit, current_strategy_value)
+    max_loss = float(pair.get("max_loss") or 0)
+    risk_utilisation_pct = calculate_nifty_risk_utilisation_pct(current_mtm_pnl, max_loss)
+    emergency_pair = {
+        **pair,
+        "entry_spot": float(pair.get("entry_spot") or pair.get("current_spot") or 0),
+        "risk_utilisation_pct": risk_utilisation_pct,
+        "max_loss": max_loss,
+        "legs": pair.get("open_legs") or pair.get("legs") or [],
+    }
+    emergency = evaluate_nifty_emergency_exit(
+        emergency_pair,
+        float(pair.get("current_spot") or 0),
+        config,
+    )
     profit_target: float | None = None
     stop_loss: float | None = None
+    credit_decay_target: float | None = None
     exit_reason = ""
     exit_signal = False
     if bucket == "FORCE_CLOSE_DUE":
         exit_signal = True
-        exit_reason = "FORCE_CLOSE_WEEK3_14_59"
+        exit_reason = "FORCE_CLOSE_DAY21_OR_T_MINUS_7"
+    elif emergency.get("exit_signal"):
+        exit_signal = True
+        exit_reason = str(emergency.get("exit_reason") or "EMERGENCY_EXIT")
     elif bucket == "WEEK1":
         profit_target = float(config.get("weekly_pair_week1_profit_target_pct_of_margin") or 2.0)
-        if pnl_pct >= profit_target:
+        credit_decay_target = float(config.get("week1_credit_decay_target_pct") or 25.0)
+        if pnl_pct >= profit_target or credit_decay_pct >= credit_decay_target:
             exit_signal = True
-            exit_reason = "WEEK1_PROFIT_TARGET_2_PERCENT"
+            exit_reason = (
+                "WEEK1_CREDIT_DECAY_25_PERCENT"
+                if credit_decay_pct >= credit_decay_target
+                else "WEEK1_PROFIT_TARGET_2_PERCENT"
+            )
     elif bucket == "WEEK2":
         profit_target = float(config.get("weekly_pair_week2_profit_target_pct_of_margin") or 2.5)
         stop_loss = float(config.get("weekly_pair_week2_stop_loss_pct_of_margin") or 5.0)
+        credit_decay_target = float(config.get("week2_credit_decay_target_pct") or 35.0)
         if bool(config.get("weekly_pair_week2_stop_loss_enabled", True)) and pnl_pct <= -abs(stop_loss):
             exit_signal = True
             exit_reason = "WEEK2_STOP_LOSS_5_PERCENT"
-        elif pnl_pct >= profit_target:
+        elif pnl_pct >= profit_target or credit_decay_pct >= credit_decay_target:
             exit_signal = True
-            exit_reason = "WEEK2_PROFIT_TARGET_2_5_PERCENT"
+            exit_reason = (
+                "WEEK2_CREDIT_DECAY_35_PERCENT"
+                if credit_decay_pct >= credit_decay_target
+                else "WEEK2_PROFIT_TARGET_2_5_PERCENT"
+            )
     else:
         profit_target = float(config.get("weekly_pair_week3_profit_target_pct_of_margin") or 3.0)
         stop_loss = float(config.get("weekly_pair_week3_stop_loss_pct_of_margin") or 5.0)
+        credit_decay_target = float(config.get("week3_credit_decay_target_pct") or 50.0)
         if bool(config.get("weekly_pair_week3_stop_loss_enabled", True)) and pnl_pct <= -abs(stop_loss):
             exit_signal = True
             exit_reason = "WEEK3_STOP_LOSS_5_PERCENT"
-        elif pnl_pct >= profit_target:
+        elif pnl_pct >= profit_target or credit_decay_pct >= credit_decay_target:
             exit_signal = True
-            exit_reason = "WEEK3_PROFIT_TARGET_3_PERCENT"
+            exit_reason = (
+                "WEEK3_CREDIT_DECAY_50_PERCENT"
+                if credit_decay_pct >= credit_decay_target
+                else "WEEK3_PROFIT_TARGET_3_PERCENT"
+            )
+    risk_warning = ""
+    if risk_utilisation_pct >= float(config.get("reduce_if_risk_utilisation_pct_above") or 50):
+        risk_warning = "REDUCE_OR_REVIEW_RISK_UTILISATION_50"
     return {
         **pair,
         "entry_datetime": entry_datetime.isoformat(),
@@ -2827,10 +3360,18 @@ def evaluate_nifty_weekly_pair_exit(
         "margin_required": margin_required,
         "current_mtm_pnl": current_mtm_pnl,
         "net_pnl_pct_of_margin": pnl_pct,
+        "entry_net_credit": entry_credit,
+        "current_strategy_value": current_strategy_value,
+        "credit_decay_pct": credit_decay_pct,
+        "max_loss": max_loss,
+        "risk_utilisation_pct": risk_utilisation_pct,
         "current_week_bucket": bucket,
         "applicable_profit_target_pct": profit_target,
+        "applicable_credit_decay_target_pct": credit_decay_target,
         "applicable_stop_loss_pct": stop_loss if bucket != "WEEK1" else None,
         "force_close_datetime": force_close_at.isoformat(),
+        "emergency_stop_status": emergency.get("exit_reason") or "CLEAR",
+        "risk_warning": risk_warning,
         "exit_signal": exit_signal,
         "exit_reason": exit_reason,
         "last_monitor_status": "EXIT_SIGNAL" if exit_signal else "NO_ACTION",
@@ -2886,6 +3427,11 @@ def nifty_weekly_pair_groups(
                 "ce_symbol": "",
                 "current_mtm_pnl": 0.0,
                 "margin_required": 0.0,
+                "entry_net_credit": 0.0,
+                "current_strategy_value": 0.0,
+                "max_loss": 0.0,
+                "entry_spot": float(position.get("entry_spot") or position.get("nifty_spot") or 0),
+                "current_spot": float(position.get("nifty_spot") or 0),
                 "warnings": [],
             },
         )
@@ -2905,16 +3451,48 @@ def nifty_weekly_pair_groups(
             "remaining_quantity": abs(quantity),
             "original_transaction_type": "SELL" if quantity < 0 else "BUY",
             "closure_transaction_type": "BUY" if quantity < 0 else "SELL",
+            "entry_price": float(position.get("average_price") or position.get("entry_price") or 0),
+            "current_ltp": float(position.get("ltp") or position.get("last_price") or 0),
         }
         group["open_legs"].append(leg)
         group["current_mtm_pnl"] += float(position.get("pnl") or 0)
         group["margin_required"] += float(position.get("margin_required") or 0)
+        premium_entry = float(leg.get("entry_price") or 0) * abs(quantity)
+        premium_current = float(leg.get("current_ltp") or 0) * abs(quantity)
+        if quantity < 0:
+            group["entry_net_credit"] += premium_entry
+            group["current_strategy_value"] += premium_current
+        else:
+            group["entry_net_credit"] -= premium_entry
+            group["current_strategy_value"] -= premium_current
     rows: list[dict[str, Any]] = []
     for group in by_expiry.values():
         has_short_pe = any(row.get("option_type") == "PE" and int(row.get("quantity") or 0) < 0 for row in group["open_legs"])
         has_short_ce = any(row.get("option_type") == "CE" and int(row.get("quantity") or 0) < 0 for row in group["open_legs"])
         if not (has_short_pe and has_short_ce):
             group["warnings"].append("Incomplete PE/CE pair. Manual review required.")
+        short_strikes = {
+            row.get("option_type"): float(row.get("strike") or (option_symbol_parts(row.get("tradingsymbol") or "") or {}).get("strike") or 0)
+            for row in group["open_legs"]
+            if int(row.get("quantity") or 0) < 0
+        }
+        hedge_strikes = {
+            row.get("option_type"): float(row.get("strike") or (option_symbol_parts(row.get("tradingsymbol") or "") or {}).get("strike") or 0)
+            for row in group["open_legs"]
+            if int(row.get("quantity") or 0) > 0
+        }
+        widths = [
+            abs(short_strikes[key] - hedge_strikes[key])
+            for key in ("PE", "CE")
+            if short_strikes.get(key) and hedge_strikes.get(key)
+        ]
+        quantities = [
+            abs(int(row.get("quantity") or 0))
+            for row in group["open_legs"]
+            if int(row.get("quantity") or 0) < 0
+        ]
+        if widths and quantities:
+            group["max_loss"] = max(widths) * min(quantities) - float(group["entry_net_credit"] or 0)
         rows.append(group)
     return rows
 
@@ -2955,8 +3533,9 @@ def nifty_weekly_pair_exit_orders_for_positions(
         evaluated = evaluate_nifty_weekly_pair_exit(pair, now, config)
         monitor_rows.append(evaluated)
         if pair.get("warnings"):
-            evaluated["last_monitor_status"] = "MANUAL_REVIEW"
-            continue
+            evaluated["warning"] = " ".join(pair.get("warnings") or [])
+            if not evaluated.get("exit_signal"):
+                evaluated["last_monitor_status"] = "MANUAL_REVIEW"
         if not evaluated.get("exit_signal"):
             continue
         pair_key = f"{evaluated['pair_id']}:{evaluated['exit_reason']}"
@@ -3016,11 +3595,36 @@ def execute_nifty_orders(
             }
             for order in orders
         ]
+    is_exit_batch = "exit" in str(reason or "").lower() or all(order.get("exit_reason") for order in orders)
+    if not is_exit_batch:
+        config = nifty_income_config()
+        risk_check = validate_nifty_defined_risk_orders(
+            orders,
+            bool(config.get("allow_live_naked_nifty_sell", False)),
+        )
+        if not risk_check["allowed"]:
+            raise PermissionError(
+                "NIFTY live entry refused: "
+                + risk_check["reason"]
+                + " "
+                + " ".join(risk_check["warnings"])
+            )
     if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
         raise PermissionError('NIFTY live order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.')
     kite = kite_orders.kite_client()
     results: list[dict[str, Any]] = []
+    protective_hedge_failed = False
     for order in orders:
+        side = str(order.get("transaction_type") or "").upper()
+        if not is_exit_batch and side == "SELL" and protective_hedge_failed:
+            results.append(
+                {
+                    "tradingsymbol": order.get("tradingsymbol"),
+                    "status": "BLOCKED",
+                    "detail": "Short leg not sent because a protective hedge order failed.",
+                }
+            )
+            continue
         order.setdefault("variety", "regular")
         order.setdefault("tag", "NIFTY_INC")
         try:
@@ -3037,10 +3641,14 @@ def execute_nifty_orders(
             )
         except Exception as exc:
             results.append(kite_error_result_with_retry(kite, order, exc, f"{order.get('tradingsymbol', '')} NIFTY order"))
+            if not is_exit_batch and side == "BUY":
+                protective_hedge_failed = True
     return results
 
 
 def run_nifty_income_entry_job(now: datetime | None = None, force: bool = False) -> dict[str, Any] | None:
+    if not kite_profile_nifty_income_enabled():
+        return None
     now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
         now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
     )
@@ -3050,7 +3658,7 @@ def run_nifty_income_entry_job(now: datetime | None = None, force: bool = False)
     if not force and (
         not config.get("enabled", True)
         or scheduled_job_is_paused(schedule_state, now)
-        or now.weekday() >= 5
+        or now.weekday() != 4
     ):
         return None
     hour, minute = (int(part) for part in str(config.get("entry_time") or NIFTY_INCOME_ENTRY_SCHEDULE_TIME).split(":", 1))
@@ -3077,32 +3685,30 @@ def run_nifty_income_entry_job(now: datetime | None = None, force: bool = False)
                 message=str(selector.get("skip_reason") or "No allowed NIFTY strategy today."),
                 entry_results=[],
             )
-        pair_snapshot = nifty_income_manual_pair_snapshot(
-            float(selector.get("pe_otm_pct") or selector.get("adjusted_pe_otm_pct") or 5.5),
-            float(selector.get("ce_otm_pct") or selector.get("adjusted_ce_otm_pct") or 5.5),
-            1,
-        )
-        orders = pair_snapshot.get("orders") or []
+        orders = snapshot.get("entry_orders") or []
         if not orders:
             return save_nifty_income_state(
                 entry_status="SKIPPED",
-                message="No NIFTY PE/CE SELL pair could be built.",
+                message="No defined-risk NIFTY structure could be built.",
                 entry_results=[],
             )
         mode = str(config.get("execution_mode") or "SUGGESTION_ONLY").upper()
         if mode == "AUTO_EXIT_ONLY":
             mode = "SUGGESTION_ONLY"
-        results = execute_nifty_orders(orders, mode, "NIFTY weekday PE/CE SELL pair entry")
+        results = execute_nifty_orders(orders, mode, "NIFTY Friday defined-risk income entry")
         return save_nifty_income_state(
             entry_status="PLACED" if any(row.get("status") == "LIVE_SENT" for row in results) else "SUGGESTION_ONLY",
             message=(
-                f"NIFTY PE/CE SELL pair entry generated {len(orders)} leg(s) at "
+                f"NIFTY defined-risk entry generated {len(orders)} leg(s) at "
                 f"{config.get('entry_time') or NIFTY_INCOME_ENTRY_SCHEDULE_TIME}. "
                 "Missing close BUY orders are handled by the Intraday Close-Order Guard."
             ),
             entry_results=results,
             last_entry_orders=orders,
-            last_entry_pair_snapshot=pair_snapshot,
+            last_entry_pair_snapshot={
+                "selected_strategy": selector.get("selected_strategy"),
+                "orders": orders,
+            },
         )
     except Exception as exc:
         return save_nifty_income_state(entry_status="ERROR", message=friendly_external_error(exc, "NIFTY entry"), entry_results=[])
@@ -3111,6 +3717,8 @@ def run_nifty_income_entry_job(now: datetime | None = None, force: bool = False)
 
 
 def run_nifty_income_time_exit_job(now: datetime | None = None, force: bool = False) -> dict[str, Any] | None:
+    if not kite_profile_nifty_income_enabled():
+        return None
     now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
         now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
     )
@@ -3160,6 +3768,8 @@ def run_nifty_income_time_exit_job(now: datetime | None = None, force: bool = Fa
 
 
 def run_nifty_weekly_pair_exit_monitor(now: datetime | None = None, force: bool = False) -> dict[str, Any] | None:
+    if not kite_profile_nifty_income_enabled():
+        return None
     now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
         now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
     )
@@ -3203,6 +3813,24 @@ def run_nifty_weekly_pair_exit_monitor(now: datetime | None = None, force: bool 
         )
         kite = kite_orders.kite_client()
         positions = enrich_nifty_positions_with_margin(kite, nifty_option_positions(kite))
+        clear_app_cache(("kite:quote:",))
+        live_quotes = cached_kite_quote(
+            kite,
+            ["NSE:NIFTY 50"] + [f"NFO:{row.get('tradingsymbol')}" for row in positions if row.get("tradingsymbol")],
+        )
+        current_spot = quote_ltp(live_quotes.get("NSE:NIFTY 50", {}))
+        for position in positions:
+            symbol = str(position.get("tradingsymbol") or "").upper()
+            quote = live_quotes.get(f"NFO:{symbol}", {}) or {}
+            fresh_ltp = quote_ltp(quote)
+            if fresh_ltp > 0:
+                position["ltp"] = fresh_ltp
+                position["last_price"] = fresh_ltp
+                average_price = float(position.get("average_price") or 0)
+                quantity = int(float(position.get("quantity") or 0))
+                position["pnl"] = (fresh_ltp - average_price) * quantity
+            position["nifty_spot"] = current_spot
+            position.setdefault("entry_spot", current_spot)
         existing = nifty_existing_exit_order_keys(kite)
         monitor_rows, orders = nifty_weekly_pair_exit_orders_for_positions(
             positions,
@@ -3286,6 +3914,7 @@ class PageState:
     access_token: str = ""
     confirm_live_order: str = ""
     kite_profile: str = field(default_factory=selected_kite_profile_name)
+    nifty_income_enabled: bool | None = None
     results: list[dict[str, Any]] | None = None
     order_book: list[dict[str, Any]] | None = None
     order_book_error: str = ""
@@ -3324,6 +3953,10 @@ class PageState:
     ce_sell_watch: list[dict[str, Any]] | None = None
     ce_sell_avoid: list[dict[str, Any]] | None = None
     research_rows: list[dict[str, Any]] | None = None
+    research_positions_rows: list[dict[str, Any]] | None = None
+    research_positions_summary: dict[str, Any] | None = None
+    research_gpt_output: str = ""
+    research_gpt_response_id: str = ""
     positions_rows: list[dict[str, Any]] | None = None
     positions_summary: dict[str, Any] | None = None
     commodity_results: list[dict[str, Any]] | None = None
@@ -4117,6 +4750,30 @@ def trading_days_remaining(expiry: date, today: date | None = None) -> int:
             days += 1
         current += timedelta(days=1)
     return days
+
+
+def next_month_start(day: date) -> date:
+    if day.month == 12:
+        return date(day.year + 1, 1, 1)
+    return date(day.year, day.month + 1, 1)
+
+
+def research_monthly_expiry_policy(today: date | None = None) -> dict[str, Any]:
+    today = today or datetime.now(INDIA_TIME_ZONE).date()
+    front_expiry = last_weekday_of_month(today.year, today.month, 1)
+    front_trading_days = trading_days_remaining(front_expiry, today)
+    roll_to_next_month = front_expiry <= today or front_trading_days < 5
+    target_month = next_month_start(today) if roll_to_next_month else date(today.year, today.month, 1)
+    target_expiry = last_weekday_of_month(target_month.year, target_month.month, 1)
+    return {
+        "as_of_date": today,
+        "front_expiry": front_expiry,
+        "front_trading_days": front_trading_days,
+        "rolled_to_next_month": roll_to_next_month,
+        "target_expiry": target_expiry,
+        "target_month_code": target_expiry.strftime("%y%b").upper(),
+        "target_month_name": target_expiry.strftime("%B %Y"),
+    }
 
 
 def expiry_summaries(symbols: list[str]) -> list[dict[str, Any]]:
@@ -6380,6 +7037,7 @@ def generate_pe_buy_to_close_order(
         "exit_status": evaluation.get("exit_status"),
         "exit_reason": evaluation.get("reason"),
         "pe_exit_score": evaluation.get("score"),
+        "skip_if_close_order_exists": True,
     }
     safe = calculateSafeLimitPrice(order, quote)
     if not safe.get("ok"):
@@ -6415,6 +7073,7 @@ def build_intraday_pe_risk_exit_orders(
     clear_app_cache(("kite:quote:", "kite:margins:equity"))
     quotes = cached_kite_quote(kite, list(dict.fromkeys(option_keys + underlying_keys)))
     available_cash = kite_available_cash(kite)
+    open_buy_orders = open_option_buy_orders_by_symbol(kite, True)
     evaluations: list[dict[str, Any]] = []
     exit_orders: list[dict[str, Any]] = []
     for position in pe_positions:
@@ -6435,6 +7094,22 @@ def build_intraday_pe_risk_exit_orders(
             available_cash,
         )
         evaluation["tradingsymbol"] = symbol
+        existing_close_order = open_buy_orders.get(symbol)
+        if existing_close_order:
+            evaluation["scheduler_action"] = "SKIP_EXISTING_CLOSE_ORDER"
+            evaluation["existing_close_order_id"] = str(
+                existing_close_order.get("order_id") or ""
+            )
+            evaluation["existing_close_price"] = float(
+                existing_close_order.get("price") or 0
+            )
+            evaluation["existing_close_pending_quantity"] = int(
+                float(
+                    existing_close_order.get("pending_quantity")
+                    or existing_close_order.get("quantity")
+                    or 0
+                )
+            )
         evaluations.append(evaluation)
         print(
             "SELL PE risk check: "
@@ -6446,7 +7121,7 @@ def build_intraday_pe_risk_exit_orders(
             f"score={evaluation.get('score')} status={evaluation.get('exit_status')} "
             f"reason={evaluation.get('reason')}"
         )
-        if evaluation.get("should_exit"):
+        if evaluation.get("should_exit") and not existing_close_order:
             exit_orders.append(generate_pe_buy_to_close_order(fresh_position, option_quote, evaluation))
     return exit_orders, evaluations
 
@@ -7432,6 +8107,66 @@ def investing_quote_candidates(code: str) -> list[str]:
     return [item for item in candidates if not (item in seen or seen.add(item))]
 
 
+def normalized_instrument_match_text(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def investing_resolved_quote_candidates(
+    item: dict[str, Any],
+    nse_instruments: list[dict[str, Any]],
+    bse_instruments: list[dict[str, Any]],
+) -> list[str]:
+    code = str(item.get("code") or "")
+    primary = investing_quote_key(code)
+    exchange, symbol = primary.split(":", 1)
+    candidates: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in candidates:
+            candidates.append(value)
+
+    if exchange == "BSE" and symbol.isdigit():
+        alias = INVESTING_BSE_SCRIP_ALIASES.get(symbol)
+        if alias:
+            add(f"BSE:{alias}")
+        for instrument in bse_instruments:
+            exchange_token = str(instrument.get("exchange_token") or "").strip()
+            instrument_token = str(instrument.get("instrument_token") or "").strip()
+            if symbol not in {exchange_token, instrument_token}:
+                continue
+            tradingsymbol = str(instrument.get("tradingsymbol") or "").strip().upper()
+            if tradingsymbol:
+                add(f"BSE:{tradingsymbol}")
+                break
+    else:
+        add(primary)
+
+    symbol_key = normalized_instrument_match_text(symbol)
+    company_key = normalized_instrument_match_text(item.get("company"))
+    lookup_keys = {key for key in (symbol_key, company_key) if key}
+    instrument_sets = (
+        (exchange, nse_instruments if exchange == "NSE" else bse_instruments),
+        ("BSE" if exchange == "NSE" else "NSE", bse_instruments if exchange == "NSE" else nse_instruments),
+    )
+    for candidate_exchange, instruments in instrument_sets:
+        for instrument in instruments:
+            tradingsymbol = str(instrument.get("tradingsymbol") or "").strip().upper()
+            if not tradingsymbol:
+                continue
+            instrument_keys = {
+                normalized_instrument_match_text(tradingsymbol),
+                normalized_instrument_match_text(instrument.get("name")),
+            }
+            if lookup_keys & instrument_keys:
+                add(f"{candidate_exchange}:{tradingsymbol}")
+                break
+
+    for candidate in investing_quote_candidates(code):
+        if not (candidate.startswith("BSE:") and candidate.split(":", 1)[1].isdigit()):
+            add(candidate)
+    return candidates
+
+
 def google_finance_link_for_code(code: str) -> str:
     quote_key = investing_quote_key(code)
     exchange, symbol = quote_key.split(":", 1)
@@ -7529,15 +8264,32 @@ def fetch_investing_news(rows: list[dict[str, Any]]) -> dict[str, dict[str, str]
 
 def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    quote_keys: list[str] = []
-    for item in INVESTING_HOLDINGS:
-        quote_keys.extend(investing_quote_candidates(str(item["code"])))
-    quote_keys = list(dict.fromkeys(quote_keys))
     raw_quotes: dict[str, Any] = {}
     quote_error = ""
+    resolved_candidates: dict[str, list[str]] = {}
     if kite_orders is not None:
         try:
-            raw_quotes = cached_kite_quote(kite_orders.kite_client(), quote_keys)
+            kite = kite_orders.kite_client()
+            try:
+                nse_instruments = cached_kite_instruments(kite, "NSE")
+            except Exception:
+                nse_instruments = []
+            try:
+                bse_instruments = cached_kite_instruments(kite, "BSE")
+            except Exception:
+                bse_instruments = []
+            quote_keys: list[str] = []
+            for item in INVESTING_HOLDINGS:
+                code = str(item["code"])
+                candidates = investing_resolved_quote_candidates(
+                    item,
+                    nse_instruments,
+                    bse_instruments,
+                )
+                resolved_candidates[code] = candidates
+                quote_keys.extend(candidates)
+            quote_keys = list(dict.fromkeys(quote_keys))
+            raw_quotes = cached_kite_quote(kite, quote_keys) if quote_keys else {}
         except Exception as exc:
             quote_error = str(exc)
     else:
@@ -7551,12 +8303,14 @@ def investing_holdings_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         avg_price = float(item.get("avg_price") or 0)
         quote = {}
         resolved_key = key
-        for candidate_key in investing_quote_candidates(code):
+        for candidate_key in resolved_candidates.get(code) or investing_quote_candidates(code):
             candidate_quote = raw_quotes.get(candidate_key, {})
             if quote_ltp(candidate_quote) > 0:
                 quote = candidate_quote
                 resolved_key = candidate_key
                 break
+        if quote and ":" in resolved_key:
+            symbol = resolved_key.split(":", 1)[1]
         cmp_value = quote_ltp(quote) if quote else 0.0
         close = float((quote.get("ohlc") or {}).get("close") or 0)
         daily_change_pct = ((cmp_value - close) / close * 100) if cmp_value > 0 and close > 0 else None
@@ -8106,6 +8860,187 @@ def best_sell_candidate_csv(force_refresh: bool = True) -> tuple[str, list[dict[
     writer.writeheader()
     writer.writerows(rows)
     return output.getvalue(), ce_top, pe_top
+
+
+def research_position_context_for_gpt(
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(
+        [
+            "tradingsymbol",
+            "underlying",
+            "option_type",
+            "quantity",
+            "position_side",
+            "average_price",
+            "current_ltp",
+            "pnl",
+            "return_on_margin_pct",
+            "captured_pct",
+            "remaining_premium",
+            "sell_pop",
+            "otm_pct",
+            "strategy_strength",
+            "margin_required",
+            "close_buy_order_pending",
+            "exit_status",
+            "exit_reason",
+        ]
+    )
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper()
+        parts = option_symbol_parts(symbol) or {}
+        quantity = int(float(row.get("quantity") or 0))
+        existing_close = row.get("existing_buy_order")
+        writer.writerow(
+            [
+                symbol,
+                parts.get("underlying") or underlying_for_symbol(symbol),
+                parts.get("option_type") or "",
+                quantity,
+                "SHORT" if quantity < 0 else "LONG",
+                fmt_number(row.get("average_price")),
+                fmt_number(row.get("ltp")),
+                fmt_number(row.get("pnl")),
+                fmt_number(row.get("return_pct")),
+                fmt_number(row.get("captured_pct")),
+                fmt_number(row.get("remaining_premium")),
+                fmt_number(row.get("sell_pop")),
+                fmt_number(row.get("otm_distance")),
+                row.get("strategy_strength") or "",
+                fmt_number(row.get("deployed")),
+                "YES" if existing_close else "NO",
+                row.get("pe_exit_status") or row.get("exit_label") or "",
+                row.get("pe_exit_reason") or row.get("exit_reason") or row.get("error") or "",
+            ]
+        )
+    return (
+        f"Position summary: {json.dumps(summary or {}, default=str)}\n"
+        f"Current option positions:\n{output.getvalue()}"
+    )
+
+
+def research_gpt_prompt_with_current_positions(
+    candidate_csv: str,
+    position_rows: list[dict[str, Any]],
+    position_summary: dict[str, Any],
+    today: date | None = None,
+) -> str:
+    position_context = research_position_context_for_gpt(position_rows, position_summary)
+    expiry_policy = research_monthly_expiry_policy(today)
+    target_expiry = expiry_policy["target_expiry"]
+    front_expiry = expiry_policy["front_expiry"]
+    expiry_instruction = (
+        f"- Mandatory expiry for every new NFO option order: {target_expiry.strftime('%d %b %Y')} "
+        f"({expiry_policy['target_month_name']}). Tradingsymbols must use "
+        f"{expiry_policy['target_month_code']} and must not use another expiry month.\n"
+    )
+    if expiry_policy["rolled_to_next_month"]:
+        expiry_instruction += (
+            f"- The front monthly expiry {front_expiry.strftime('%d %b %Y')} has only "
+            f"{expiry_policy['front_trading_days']} trading day(s) remaining, which is fewer than 5. "
+            "Do not generate front-month orders. Move all new CE/PE SELL positions to the next monthly expiry "
+            "to retain useful premium and reduce near-expiry gamma risk.\n"
+        )
+    else:
+        expiry_instruction += (
+            f"- The front monthly expiry has {expiry_policy['front_trading_days']} trading day(s) remaining, "
+            "so the current monthly contract remains eligible.\n"
+        )
+    return (
+        "Generate the final conservative Kite order CSV for new monthly income positions.\n\n"
+        f"Expiry selection as of {expiry_policy['as_of_date'].strftime('%d %b %Y')}:\n"
+        f"{expiry_instruction}\n"
+        "These are current positions. Treat them as hard portfolio context before recommending anything:\n"
+        f"{position_context}\n\n"
+        "Downside-risk rules:\n"
+        "- Do not generate an order for an exact option symbol and transaction side already present in current positions or pending close orders.\n"
+        "- Avoid adding another short option on the same underlying and same CE/PE side unless the current-position data clearly shows it is a risk-reducing replacement.\n"
+        "- Do not increase exposure where current P&L, strike breach, low POP, poor OTM distance, or strategy strength indicates elevated risk.\n"
+        "- Prefer diversification, full covered-CALL share coverage, cash-secured PUT capacity, liquid contracts, and defined exits.\n"
+        "- Current positions are informational context only. Do not generate BUY closure orders unless explicitly required to remove immediate portfolio risk.\n"
+        "- Return at most 3 CE SELL and 3 PE SELL orders. Returning fewer or only the header is valid when risk is high.\n"
+        "- The locally screened CSV may contain front-month symbols. Use it for underlying, side, coverage, quantity, and risk context only; replace near-expiry symbols with valid contracts in the mandatory target month.\n"
+        "- Return valid Kite CSV only, with no explanation or markdown.\n\n"
+        "Locally screened candidate orders:\n"
+        f"{candidate_csv}"
+    )
+
+
+def validate_research_csv_expiry(csv_text: str, expiry_policy: dict[str, Any]) -> None:
+    rows = parse_csv_text(normalize_kite_csv_input(csv_text))
+    target_expiry = expiry_policy["target_expiry"]
+    invalid_symbols: list[str] = []
+    for row in rows:
+        if str(row.get("exchange") or "").strip().upper() != "NFO":
+            continue
+        symbol = str(row.get("tradingsymbol") or "").strip().upper()
+        parts = option_symbol_parts(symbol)
+        if not parts:
+            invalid_symbols.append(symbol or "<missing symbol>")
+            continue
+        if parts["year"] != target_expiry.year or parts["month"] != target_expiry.month:
+            invalid_symbols.append(symbol)
+    if invalid_symbols:
+        raise ValueError(
+            f"Research GPT returned option symbol(s) outside mandatory "
+            f"{expiry_policy['target_month_name']} expiry: {', '.join(invalid_symbols)}"
+        )
+
+
+def generate_research_csv_with_current_positions(
+    model: str,
+    system_prompt: str,
+    today: date | None = None,
+) -> dict[str, Any]:
+    position_rows, position_summary = positions_research(True)
+    candidate_csv, ce_top, pe_top = best_sell_candidate_csv(True)
+    expiry_policy = research_monthly_expiry_policy(today)
+    prompt = research_gpt_prompt_with_current_positions(
+        candidate_csv,
+        position_rows,
+        position_summary,
+        today,
+    )
+    csv_text, output, response_id = generate_csv_with_openai(
+        prompt,
+        model,
+        system_prompt,
+    )
+    try:
+        validate_research_csv_expiry(csv_text, expiry_policy)
+    except ValueError as first_expiry_error:
+        correction_prompt = (
+            f"{prompt}\n\n"
+            "EXPIRY CORRECTION REQUIRED:\n"
+            f"The previous response violated the mandatory {expiry_policy['target_month_name']} expiry rule.\n"
+            f"{first_expiry_error}\n"
+            f"Regenerate CSV only. Every NFO option tradingsymbol must contain "
+            f"{expiry_policy['target_month_code']}. Do not return a front-month symbol.\n\n"
+            f"Previous response:\n{output}"
+        )
+        csv_text, output, repair_response_id = generate_csv_with_openai(
+            correction_prompt,
+            model,
+            system_prompt,
+        )
+        response_id = repair_response_id or response_id
+        validate_research_csv_expiry(csv_text, expiry_policy)
+    return {
+        "csv_text": csv_text,
+        "output": output,
+        "response_id": response_id,
+        "position_rows": position_rows,
+        "position_summary": position_summary,
+        "candidate_csv": candidate_csv,
+        "ce_top": ce_top,
+        "pe_top": pe_top,
+        "prompt": prompt,
+        "expiry_policy": expiry_policy,
+    }
 
 
 def run_scheduled_income_growth_gpt_job(
@@ -11602,6 +12537,79 @@ def refresh_position_buy_order_prices(
     return refreshed
 
 
+def build_intraday_loss_limit_close_orders(
+    kite: Any,
+    loss_trigger_percent: float = INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT,
+    ltp_discount_percent: float = INTRADAY_LOSS_LIMIT_LTP_DISCOUNT_PERCENT,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    positions = open_option_positions(use_cache=False)
+    positions = refresh_option_positions_with_live_ltp(positions, kite)
+    orders: list[dict[str, Any]] = []
+    evaluations: list[dict[str, Any]] = []
+    for position in positions:
+        symbol = str(position.get("tradingsymbol") or "").strip().upper()
+        parts = option_symbol_parts(symbol)
+        quantity = int(float(position.get("quantity") or 0))
+        if not parts or parts.get("option_type") not in {"CE", "PE"} or quantity >= 0:
+            continue
+        average_price = float(position.get("average_price") or 0)
+        ltp = float(position.get("ltp") or position.get("last_price") or 0)
+        if average_price <= 0 or ltp <= 0:
+            continue
+        adverse_loss_pct = ((ltp - average_price) / average_price) * 100
+        triggered = adverse_loss_pct >= float(loss_trigger_percent)
+        evaluation = {
+            "tradingsymbol": symbol,
+            "option_type": parts.get("option_type"),
+            "average_price": average_price,
+            "ltp": ltp,
+            "adverse_loss_pct": adverse_loss_pct,
+            "trigger_percent": float(loss_trigger_percent),
+            "triggered": triggered,
+            "action": "MODIFY_OR_PLACE_BUY_CLOSE" if triggered else "NO_ACTION",
+        }
+        evaluations.append(evaluation)
+        if not triggered:
+            continue
+        limit_price = floor_to_tick(
+            ltp * (1 - float(ltp_discount_percent) / 100),
+            0.05,
+        )
+        if limit_price <= 0:
+            evaluation["triggered"] = False
+            evaluation["action"] = "INVALID_LIMIT_PRICE"
+            continue
+        note = (
+            f"LOSS LIMIT: short {parts['option_type']} premium loss reached "
+            f"{adverse_loss_pct:.2f}% (trigger {float(loss_trigger_percent):.0f}%). "
+            f"BUY close order set at {float(ltp_discount_percent):.0f}% below fresh LTP "
+            f"{ltp:.2f} to manage downside risk."
+        )
+        orders.append(
+            {
+                "variety": "regular",
+                "exchange": position.get("exchange") or "NFO",
+                "tradingsymbol": symbol,
+                "transaction_type": "BUY",
+                "quantity": abs(quantity),
+                "product": position.get("product") or "NRML",
+                "order_type": "LIMIT",
+                "price": limit_price,
+                "validity": "DAY",
+                "tag": "LOSS100_EXIT",
+                "average_price": average_price,
+                "ltp": ltp,
+                "pnl": option_position_pnl(quantity, average_price, ltp),
+                "price_basis": "fresh_LTP_loss_limit",
+                "discount_percent": float(ltp_discount_percent),
+                "loss_trigger_percent": float(loss_trigger_percent),
+                "adverse_loss_pct": adverse_loss_pct,
+                "risk_note": note,
+            }
+        )
+    return orders, evaluations
+
+
 def execute_position_buy_orders(
     orders: list[dict[str, Any]],
     selected_indexes: set[int],
@@ -11629,7 +12637,35 @@ def execute_position_buy_orders(
 
     kite = kite_buy_positions.kite_client()
     results: list[dict[str, Any]] = []
+    submitted_orders: list[dict[str, Any]] = []
+    guarded_symbols = {
+        str(order.get("tradingsymbol") or "").upper()
+        for order in selected_orders
+        if order.get("skip_if_close_order_exists")
+    }
+    existing_close_orders = (
+        open_option_buy_orders_by_symbol(kite, True)
+        if guarded_symbols
+        else {}
+    )
     for order in selected_orders:
+        symbol = str(order.get("tradingsymbol") or "").upper()
+        existing_close = existing_close_orders.get(symbol)
+        if existing_close:
+            results.append(
+                {
+                    "tradingsymbol": symbol,
+                    "status": "SKIPPED_EXISTING",
+                    "order_id": existing_close.get("order_id"),
+                    "detail": (
+                        "Existing open BUY close order preserved; "
+                        f"price {float(existing_close.get('price') or 0):.2f}, "
+                        f"pending quantity {int(float(existing_close.get('pending_quantity') or existing_close.get('quantity') or 0))}."
+                    ),
+                }
+            )
+            continue
+        submitted_orders.append(order)
         try:
             if keep_existing_orders:
                 order_id = kite_buy_positions.place_order(kite, order)
@@ -11642,7 +12678,11 @@ def execute_position_buy_orders(
                     "tradingsymbol": order["tradingsymbol"],
                     "status": "LIVE_SENT",
                     "order_id": order_id,
-                    "detail": action,
+                    "detail": (
+                        f"{action}. {order.get('risk_note')}"
+                        if order.get("risk_note")
+                        else action
+                    ),
                 }
             )
         except Exception as exc:
@@ -11653,7 +12693,7 @@ def execute_position_buy_orders(
                     "detail": str(exc),
                 }
             )
-    return selected_orders, results
+    return submitted_orders, results
 
 
 def position_close_schedule_state() -> dict[str, Any]:
@@ -11850,15 +12890,15 @@ def scheduled_job_definitions() -> dict[str, dict[str, Any]]:
         },
         "intraday_position_close": {
             "name": "Intraday Close-Order Guard",
-            "purpose": "Find option positions without close BUY orders and place the missing orders.",
+            "purpose": "Maintain close BUY orders and tighten them to 10% below fresh LTP when short-option loss reaches 100%.",
             "schedule": "Every 15 min, weekdays 09:30-15:15 IST",
             "load": intraday_position_close_schedule_state,
             "save": save_intraday_position_close_schedule_state,
         },
         "nifty_income_entry": {
             "name": "NIFTY Income Entry",
-            "purpose": "Build the NIFTY PE/CE SELL pair on weekdays at market open.",
-            "schedule": f"Weekdays at {NIFTY_INCOME_ENTRY_SCHEDULE_TIME} IST",
+            "purpose": "Build a defined-risk NIFTY income structure after Friday price discovery.",
+            "schedule": f"Fridays at {NIFTY_INCOME_ENTRY_SCHEDULE_TIME} IST",
             "load": nifty_income_entry_schedule_state,
             "save": save_nifty_income_entry_schedule_state,
         },
@@ -12225,33 +13265,62 @@ def run_intraday_position_close_job(
                 position_discount_percent=position_close_discount_percent_setting(),
                 position_keep_existing_orders=True,
             )
+            loss_limit_orders, loss_limit_evaluations = build_intraday_loss_limit_close_orders(
+                kite,
+                INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT,
+                INTRADAY_LOSS_LIMIT_LTP_DISCOUNT_PERCENT,
+            )
+            loss_limit_symbols = {
+                str(order.get("tradingsymbol") or "").upper()
+                for order in loss_limit_orders
+            }
             risk_scan_error = ""
             try:
                 risk_orders, risk_evaluations = build_intraday_pe_risk_exit_orders(kite)
             except Exception as exc:
                 risk_orders, risk_evaluations = [], []
                 risk_scan_error = friendly_external_error(exc, "Strict SELL PE risk scan")
+            risk_existing_order_skips = sum(
+                1
+                for evaluation in risk_evaluations
+                if evaluation.get("scheduler_action") == "SKIP_EXISTING_CLOSE_ORDER"
+            )
             risk_symbols = {
                 str(order.get("tradingsymbol") or "").upper()
                 for order in risk_orders
-            }
+            } - loss_limit_symbols
+            risk_orders = [
+                order
+                for order in risk_orders
+                if str(order.get("tradingsymbol") or "").upper() not in loss_limit_symbols
+            ]
             default_orders: list[dict[str, Any]] = []
             try:
                 default_orders = [
                     order for order in build_position_buy_orders(state)
-                    if str(order.get("tradingsymbol") or "").upper() not in risk_symbols
+                    if str(order.get("tradingsymbol") or "").upper()
+                    not in (risk_symbols | loss_limit_symbols)
                 ]
             except ValueError as exc:
                 if "No matching positions need a new BUY order" not in str(exc):
                     raise
             submitted_orders: list[dict[str, Any]] = []
             results: list[dict[str, Any]] = []
+            if loss_limit_orders:
+                loss_submitted, loss_results = execute_position_buy_orders(
+                    loss_limit_orders,
+                    set(range(len(loss_limit_orders))),
+                    False,
+                    False,
+                )
+                submitted_orders.extend(loss_submitted)
+                results.extend(loss_results)
             if risk_orders:
                 risk_submitted, risk_results = execute_position_buy_orders(
                     risk_orders,
                     set(range(len(risk_orders))),
                     False,
-                    False,
+                    True,
                 )
                 submitted_orders.extend(risk_submitted)
                 results.extend(risk_results)
@@ -12269,30 +13338,43 @@ def run_intraday_position_close_job(
                     status="ALL_COVERED",
                     message=(
                         "All open option positions already have close BUY orders."
+                        + (
+                            f" Strict PE positions skipped because a close BUY order already exists: "
+                            f"{risk_existing_order_skips}."
+                            if risk_existing_order_skips
+                            else ""
+                        )
                         + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
                     ),
                     order_count=0,
-                    results=[],
+                    results=results,
                     pe_risk_evaluations=risk_evaluations,
+                    loss_limit_evaluations=loss_limit_evaluations,
                 )
             live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
             error_count = sum(1 for result in results if result.get("status") == "ERROR")
             status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
             pricing_details = "; ".join(
                 f"{order.get('tradingsymbol')}: LIMIT {float(order.get('price') or 0):.2f} "
-                f"({state.position_discount_percent:g}% below {order.get('price_basis') or 'price basis'})"
+                f"({float(order.get('discount_percent') or state.position_discount_percent):g}% below "
+                f"{order.get('price_basis') or 'price basis'})"
+                + (f" [{order.get('risk_note')}]" if order.get("risk_note") else "")
                 for order in submitted_orders
             )
             return save_intraday_position_close_schedule_state(
                 status=status,
                 message=(
                     f"{market_message} Missing close BUY orders placed: {live_count}; "
-                    f"strict PE exits: {len(risk_orders)}; errors: {error_count}. {pricing_details}"
+                    f"100% loss-limit overrides: {len(loss_limit_orders)}; "
+                    f"strict PE exits: {len(risk_orders)}; "
+                    f"existing close orders skipped: {risk_existing_order_skips}; "
+                    f"errors: {error_count}. {pricing_details}"
                     + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
                 ),
                 order_count=len(submitted_orders),
                 results=results,
                 pe_risk_evaluations=risk_evaluations,
+                loss_limit_evaluations=loss_limit_evaluations,
             )
         except ValueError as exc:
             message = str(exc)
@@ -13562,7 +14644,7 @@ def render_income_growth_panel(state: PageState) -> str:
     dividend_rows = list(summary.get("dividend_income_rows") or [])
     dividend_table_rows = "".join(render_income_growth_row(row) for row in dividend_rows)
     if not dividend_table_rows:
-        dividend_table_rows = '<tr><td colspan="23" class="muted-cell">Refresh Income Growth to load PGINVIT and IRBINVIT-IV market data.</td></tr>'
+        dividend_table_rows = '<tr><td colspan="23" class="muted-cell">Refresh Income Growth to load PGINVIT and IRBINVIT market data.</td></tr>'
     if not table_rows:
         table_rows = '<tr><td colspan="23" class="muted-cell">Click Refresh Income Growth to calculate covered-call capacity from your holdings sheet.</td></tr>'
     try:
@@ -13647,7 +14729,7 @@ def render_income_growth_panel(state: PageState) -> str:
       {outcome_panel}
       <section class="panel income-growth-table-panel dividend-income-panel">
         <div class="panel-title">Dividend Income</div>
-        <div class="status">Income-focused InvIT watchlist. PGINVIT (BSE) and IRBINVIT-IV (NSE) holdings are matched from the selected Kite profile; click either security to place a CNC LIMIT BUY or SELL order.</div>
+        <div class="status">Income-focused InvIT watchlist. PGINVIT (BSE) and IRBINVIT (NSE) holdings are matched from the selected Kite profile; click either security to place a CNC LIMIT BUY or SELL order.</div>
         <div class="table-wrap"><table id="dividend-income-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{dividend_table_rows}</tbody></table></div>
       </section>
       {render_income_growth_gpt_schedule_panel()}
@@ -14122,6 +15204,8 @@ def row_sell_score(row: dict[str, Any]) -> tuple[str, str]:
 
 def render_research_panel(state: PageState) -> str:
     rows = state.research_rows or []
+    position_rows = state.research_positions_rows or []
+    position_summary = state.research_positions_summary or {}
     table_rows = "".join(
         "<tr>"
         f'<td class="{strength_class(row_sell_score(row)[0])}" title="{html.escape(row_sell_score(row)[1], quote=True)}">{render_symbol_value("tradingsymbol", row.get("symbol", ""))}</td>'
@@ -14171,17 +15255,60 @@ def render_research_panel(state: PageState) -> str:
         if rows
         else ""
     )
+    position_table_rows = "".join(
+        "<tr>"
+        f"<td><strong>{html.escape(str(row.get('symbol') or ''))}</strong></td>"
+        f"<td>{html.escape(str(row.get('quantity') or 0))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('average_price')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('ltp')))}</td>"
+        f'<td class="{"pnl-positive" if float(row.get("pnl") or 0) >= 0 else "pnl-negative"}"><strong>{html.escape(fmt_number(row.get("pnl")))}</strong></td>'
+        f"<td>{html.escape(fmt_number(row.get('captured_pct')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('sell_pop')))}%</td>"
+        f"<td>{html.escape(fmt_number(row.get('otm_distance')))}%</td>"
+        f"<td>{html.escape(str(row.get('strategy_strength') or 'N/A'))}</td>"
+        f"<td>{'YES' if row.get('existing_buy_order') else 'NO'}</td>"
+        "</tr>"
+        for row in position_rows
+    )
+    position_context = (
+        '<section class="panel research-position-context">'
+        '<div class="panel-title">Current Positions Sent To GPT</div>'
+        '<div class="position-summary-strip">'
+        f'<div class="position-summary-chip"><span>Open trades</span><strong>{html.escape(str(position_summary.get("count") or len(position_rows)))}</strong></div>'
+        f'<div class="position-summary-chip"><span>Current P&amp;L</span><strong>{html.escape(fmt_number(position_summary.get("total_pnl")))}</strong></div>'
+        f'<div class="position-summary-chip"><span>Margin used</span><strong>{html.escape(fmt_number(position_summary.get("total_deployed")))}</strong></div>'
+        f'<div class="position-summary-chip"><span>Return on margin</span><strong>{html.escape(fmt_number(position_summary.get("return_pct")))}%</strong></div>'
+        '</div>'
+        '<div class="table-wrap"><table><thead><tr><th>Position</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&amp;L</th><th>Captured</th><th>POP</th><th>OTM</th><th>Strength</th><th>Close order</th></tr></thead>'
+        f"<tbody>{position_table_rows}</tbody></table></div></section>"
+        if position_rows
+        else ""
+    )
+    gpt_outcome = (
+        '<section class="panel research-gpt-outcome">'
+        '<div class="panel-title">GPT Portfolio-Aware Outcome</div>'
+        f'<div class="status">Response ID: {html.escape(state.research_gpt_response_id or "N/A")}. Current positions were included before final order selection.</div>'
+        f'<textarea class="conversation gpt-api-output" readonly>{html.escape(state.research_gpt_output)}</textarea>'
+        '</section>'
+        if state.research_gpt_output
+        else ""
+    )
     return f"""
     <form id="research-panel" method="post" action="/research/load"{'' if state.active_tab == 'research' else ' style="display:none"'}>
       {env_hidden_fields_for_render()}
+      <input type="hidden" name="research_gpt_output" value="{html.escape(state.research_gpt_output, quote=True)}">
+      <input type="hidden" name="research_gpt_response_id" value="{html.escape(state.research_gpt_response_id, quote=True)}">
       <section class="panel">
         <div class="panel-title">Research</div>
         <p class="status">Compare every trading symbol from {html.escape(default_csv_label())} for SELL CALL / SELL PUT decisions using live Kite analytics.</p>
         <div class="actions">
           <button type="submit" formaction="/research/load">Run Research on CSV Symbols</button>
           <button type="submit" formaction="/research/best-sells">Generate Best 3 PE + 3 CE SELL CSV</button>
+          <button type="submit" formaction="/research/gpt-best-sells">Generate with GPT + Current Positions</button>
         </div>
       </section>
+      {position_context}
+      {gpt_outcome}
       {table}
       <section class="panel">
         <div class="panel-title">CSV Source</div>
@@ -14269,7 +15396,9 @@ def render_position_close_schedule_panel() -> str:
         "</div>"
         f'<p class="status">{html.escape(str(intraday.get("message") or ""))} '
         f"Price rule: when average is above LTP, BUY at {discount_percent:g}% below fresh LTP; "
-        f"otherwise BUY at {discount_percent:g}% below average price. Existing close BUY orders are skipped.</p>"
+        f"otherwise BUY at {discount_percent:g}% below average price. "
+        "Risk override: when a short CE/PE premium loss reaches 100%, the guard modifies or places "
+        "the BUY close order at 10% below fresh LTP and records a LOSS LIMIT note.</p>"
         f"{intraday_details}</section>"
     )
 
@@ -15066,7 +16195,7 @@ def render_nifty_income_panel(state: PageState) -> str:
 
     def weekly_pair_monitor_rows() -> str:
         if not weekly_pair_rows:
-            return '<tr><td colspan="15">No NIFTY weekly PE/CE SELL pair found for monitor review.</td></tr>'
+            return '<tr><td colspan="20">No NIFTY defined-risk strategy found for monitor review.</td></tr>'
         return "".join(
             "<tr>"
             f"<td><strong>{html.escape(str(row.get('strategy_id') or ''))}</strong><small>{html.escape(str(row.get('pair_id') or ''))}</small></td>"
@@ -15078,11 +16207,16 @@ def render_nifty_income_panel(state: PageState) -> str:
             f"<td>{html.escape(format_buy_amount(row.get('margin_required')))}</td>"
             f'<td class="{"pnl-positive" if float(row.get("current_mtm_pnl") or 0) >= 0 else "pnl-negative"}"><strong>{html.escape(fmt_number(row.get("current_mtm_pnl")))}</strong></td>'
             f"<td>{html.escape(fmt_number(row.get('net_pnl_pct_of_margin'), 2))}%</td>"
+            f"<td>{html.escape(fmt_number(row.get('credit_decay_pct'), 2))}%</td>"
+            f"<td>{html.escape(format_buy_amount(row.get('max_loss')))}</td>"
+            f'<td class="{strength_class("RED" if float(row.get("risk_utilisation_pct") or 0) >= 75 else "YELLOW" if float(row.get("risk_utilisation_pct") or 0) >= 50 else "GREEN")}">{html.escape(fmt_number(row.get("risk_utilisation_pct"), 2))}%</td>'
             f"<td>{html.escape(str(row.get('current_week_bucket') or 'N/A'))}</td>"
             f"<td>{html.escape(fmt_number(row.get('applicable_profit_target_pct'), 2))}%</td>"
+            f"<td>{html.escape(fmt_number(row.get('applicable_credit_decay_target_pct'), 2))}%</td>"
             f"<td>{html.escape(fmt_number(row.get('applicable_stop_loss_pct'), 2) + '%') if row.get('applicable_stop_loss_pct') is not None else 'Disabled'}</td>"
             f"<td>{html.escape(str(row.get('force_close_datetime') or 'N/A'))}</td>"
-            f'<td class="{strength_class("GREEN" if row.get("exit_signal") else "YELLOW")}"><strong>{"YES" if row.get("exit_signal") else "NO"}</strong><small>{html.escape(str(row.get("exit_reason") or row.get("warning") or ""))}</small></td>'
+            f'<td class="{strength_class("GREEN" if str(row.get("emergency_stop_status") or "CLEAR") == "CLEAR" else "RED")}">{html.escape(str(row.get("emergency_stop_status") or "CLEAR"))}<small>{html.escape(str(row.get("risk_warning") or ""))}</small></td>'
+            f'<td class="{strength_class("RED" if row.get("exit_signal") else "GREEN")}"><strong>{"YES" if row.get("exit_signal") else "NO"}</strong><small>{html.escape(str(row.get("exit_reason") or row.get("warning") or ""))}</small></td>'
             f"<td>{html.escape(str(row.get('last_monitor_status') or 'N/A'))}</td>"
             "</tr>"
             for row in weekly_pair_rows
@@ -15148,7 +16282,7 @@ def render_nifty_income_panel(state: PageState) -> str:
               <div><span>Current P&amp;L</span><strong class="{'pnl-positive' if pnl_value >= 0 else 'pnl-negative'}">{html.escape(fmt_number(pnl_value))}</strong></div>
               <div><span>Strategy</span><strong>{html.escape(str(suggestion.get("selected_strategy") or "N/A"))}</strong><small>{html.escape(strategy_status)}</small></div>
               <div><span>NIFTY / MMI / VIX</span><strong>{html.escape(fmt_number(summary.get("spot")))} / {html.escape(fmt_number(summary.get("mmi")))} / {html.escape(fmt_number(summary.get("vix")))}</strong></div>
-              <div><span>Entry schedule</span><strong>Weekdays {html.escape(str(config.get("entry_time")))}</strong><small>{html.escape(str(config.get("execution_mode")))}</small></div>
+              <div><span>Entry schedule</span><strong>Friday {html.escape(str(config.get("entry_time")))}</strong><small>{html.escape(str(config.get("execution_mode")))}</small></div>
               <div><span>T-7 exit</span><strong>{html.escape(str(suggestion.get("time_exit_date") or "N/A"))} {html.escape(str(config.get("time_exit_time")))}</strong><small>{html.escape(str(config.get("time_exit_execution_mode")))}</small></div>
             </div>
           </div>
@@ -15164,18 +16298,18 @@ def render_nifty_income_panel(state: PageState) -> str:
           <small>Advanced schedule and pricing settings. Open only when you want to change automation.</small>
         </summary>
         <div class="compact-grid">
-          {render_checkbox("nifty_enabled", "Enable Friday entry schedule", bool(config.get("enabled", True)), "Builds NIFTY income entry legs on Friday 15:22 IST.")}
+          {render_checkbox("nifty_enabled", "Enable Friday entry schedule", bool(config.get("enabled", True)), "Builds defined-risk NIFTY income legs on Friday 15:16 IST.")}
           {render_checkbox("nifty_time_exit_enabled", "Enable T-7 time exit", bool(config.get("time_exit_enabled", True)), "Closes all NIFTY income legs seven days before expiry at 14:59 IST.")}
           {render_checkbox("nifty_weekly_pair_exit_enabled", "Enable 15-min pair exit monitor", bool(config.get("weekly_pair_exit_enabled", True)), "Books NIFTY weekly PE/CE pair profit or stops according to age-based margin rules.")}
           <label><span>Entry mode</span>{select_options("nifty_execution_mode", str(config.get("execution_mode") or "SUGGESTION_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
           <label><span>Time exit mode</span>{select_options("nifty_time_exit_execution_mode", str(config.get("time_exit_execution_mode") or "SUGGESTION_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
-          <label><span>15-min monitor mode</span>{select_options("nifty_weekly_pair_exit_execution_mode", str(config.get("weekly_pair_exit_execution_mode") or "AUTO_EXIT_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
-          {render_input("nifty_entry_time", "Weekday entry time", str(config.get("entry_time") or NIFTY_INCOME_ENTRY_SCHEDULE_TIME))}
+          <label><span>15-min monitor mode</span>{select_options("nifty_weekly_pair_exit_execution_mode", str(config.get("weekly_pair_exit_execution_mode") or "SUGGESTION_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
+          {render_input("nifty_entry_time", "Friday entry time", str(config.get("entry_time") or NIFTY_INCOME_ENTRY_SCHEDULE_TIME))}
           {render_input("nifty_time_exit_time", "T-7 exit time", str(config.get("time_exit_time") or NIFTY_INCOME_CLOSE_SCHEDULE_TIME))}
           {render_input("nifty_weekly_pair_force_close_time", "Pair force close time", str(config.get("weekly_pair_force_close_time") or NIFTY_WEEKLY_PAIR_FORCE_CLOSE_TIME))}
           {render_number_input("nifty_weekly_pair_exit_interval", "Pair monitor interval minutes", config.get("weekly_pair_exit_run_every_minutes") or 15, "1")}
           {render_number_input("nifty_lot_size", "NIFTY lot size", config.get("lot_size") or 65, "1")}
-          {render_number_input("nifty_hedge_distance", "Hedge distance points", config.get("hedge_distance_points") or 500, "50")}
+          {render_number_input("nifty_hedge_distance", "Hedge distance points", config.get("hedge_distance_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS, "50")}
           {render_number_input("nifty_manual_pair_sell_markup", "Manual pair SELL markup %", config.get("manual_pair_sell_markup_percent") or 20, "0.5")}
         </div>
         <div class="actions">
@@ -15191,7 +16325,7 @@ def render_nifty_income_panel(state: PageState) -> str:
           <div><span>PE sell strike</span><strong>{html.escape(str(suggestion.get("final_pe_sell_strike") or "N/A"))}</strong></div>
           <div><span>CE sell strike</span><strong>{html.escape(str(suggestion.get("final_ce_sell_strike") or "N/A"))}</strong></div>
           <div><span>PE / CE OTM</span><strong>{html.escape(fmt_number(suggestion.get("pe_otm_pct"), 2))}% / {html.escape(fmt_number(suggestion.get("ce_otm_pct"), 2))}%</strong></div>
-          <div><span>Hedge distance</span><strong>{html.escape(str(config.get("hedge_distance_points") or 500))} pts</strong></div>
+          <div><span>Hedge distance</span><strong>{html.escape(str(config.get("hedge_distance_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS))} pts</strong></div>
           <div><span>POP</span><strong>{html.escape(str(summary.get("pop") or "Defined-risk"))}</strong></div>
           <div><span>Margin</span><strong>{html.escape(str(summary.get("margin_required") or "Use Kite basket margin"))}</strong></div>
           <div><span>Net credit / max gain</span><strong>{html.escape(format_buy_amount(suggestion.get("expected_net_credit")))} / {html.escape(format_buy_amount(summary.get("max_gain")))}</strong></div>
@@ -15209,9 +16343,13 @@ def render_nifty_income_panel(state: PageState) -> str:
       </section>
       <div class="live-modal-backdrop" id="nifty-pair-order-modal">
         <div class="live-modal income-pe-order-modal-card nifty-pair-order-modal-card">
-          <h2>NIFTY PE + CE SELL Pair Review</h2>
-          <p class="status">Enter OTM percentages, refresh fresh Kite premium, then complete the 10-second pause before sending only the PE SELL and CE SELL orders.</p>
+          <h2>NIFTY Defined-Risk Income Review</h2>
+          <p class="status">Select PE, CE, or both. Every selected SELL is protected by a mandatory BUY hedge exactly {NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS} points farther OTM before the 10-second review.</p>
           <input type="hidden" name="nifty_pair_confirmed" id="nifty-pair-confirmed" value="0">
+          <div class="nifty-side-selector">
+            <label><input type="checkbox" name="nifty_pair_include_pe" id="nifty-pair-include-pe" checked> <span>PE spread</span><small>SELL PE + BUY PE hedge</small></label>
+            <label><input type="checkbox" name="nifty_pair_include_ce" id="nifty-pair-include-ce" checked> <span>CE spread</span><small>SELL CE + BUY CE hedge</small></label>
+          </div>
           <div class="compact-grid nifty-pair-input-grid">
             <label><span>PE OTM %</span><input type="number" step="0.1" min="1" max="20" name="nifty_pair_pe_otm" id="nifty-pair-pe-otm" value="{html.escape(default_pe_otm, quote=True)}"></label>
             <label><span>CE OTM %</span><input type="number" step="0.1" min="1" max="20" name="nifty_pair_ce_otm" id="nifty-pair-ce-otm" value="{html.escape(default_ce_otm, quote=True)}"></label>
@@ -15224,16 +16362,18 @@ def render_nifty_income_panel(state: PageState) -> str:
             <div><span>Max gain</span><strong id="nifty-pair-max-gain">--</strong></div>
           </div>
           <div class="nifty-pair-sections">
-            <section class="nifty-pair-leg-section">
-              <div class="leg-kicker">PE SELL</div>
+            <section class="nifty-pair-leg-section" id="nifty-pair-pe-section">
+              <div class="leg-kicker">PE VERTICAL SPREAD</div>
               <strong id="nifty-pair-pe-symbol">--</strong>
               <small id="nifty-pair-pe-detail">--</small>
+              <div class="nifty-hedge-leg"><span>Protective BUY</span><strong id="nifty-pair-pe-hedge">--</strong><small id="nifty-pair-pe-hedge-detail">300 points below SELL strike</small></div>
               <div class="leg-pop">POP <span id="nifty-pair-pe-pop">--</span></div>
             </section>
-            <section class="nifty-pair-leg-section">
-              <div class="leg-kicker">CE SELL</div>
+            <section class="nifty-pair-leg-section" id="nifty-pair-ce-section">
+              <div class="leg-kicker">CE VERTICAL SPREAD</div>
               <strong id="nifty-pair-ce-symbol">--</strong>
               <small id="nifty-pair-ce-detail">--</small>
+              <div class="nifty-hedge-leg"><span>Protective BUY</span><strong id="nifty-pair-ce-hedge">--</strong><small id="nifty-pair-ce-hedge-detail">300 points above SELL strike</small></div>
               <div class="leg-pop">POP <span id="nifty-pair-ce-pop">--</span></div>
             </section>
           </div>
@@ -15259,9 +16399,9 @@ def render_nifty_income_panel(state: PageState) -> str:
         <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&amp;L</th><th>Expiry</th><th>Product</th></tr></thead><tbody>{position_rows()}</tbody></table></div>
       </section>
       <section class="panel">
-        <div class="panel-title">NIFTY Weekly Pair Exit Monitor</div>
-        <div class="status">Runs every 15 minutes in market hours. Week 1 books profit above 2.0% of margin with no loss booking; Week 2 books above 2.5% or stops at -5%; Week 3 books above 3.0% or stops at -5%; force close is Day 21 at 14:59 IST.</div>
-        <div class="table-wrap"><table><thead><tr><th>Strategy</th><th>Expiry</th><th>PE symbol</th><th>CE symbol</th><th>Entry time</th><th>Age</th><th>Margin</th><th>MTM P&amp;L</th><th>P&amp;L % margin</th><th>Bucket</th><th>Target</th><th>Stop</th><th>Force close</th><th>Signal</th><th>Status</th></tr></thead><tbody>{weekly_pair_monitor_rows()}</tbody></table></div>
+        <div class="panel-title">NIFTY Income Risk Monitor</div>
+        <div class="status">Fresh prices are checked every 15 minutes. Force close has first priority, followed by premium/delta/strike/risk emergency exits, then age-based profit or stop rules.</div>
+        <div class="table-wrap"><table><thead><tr><th>Strategy</th><th>Expiry</th><th>PE symbol</th><th>CE symbol</th><th>Entry time</th><th>Age</th><th>Margin</th><th>MTM P&amp;L</th><th>P&amp;L % margin</th><th>Credit decay</th><th>Max loss</th><th>Risk used</th><th>Bucket</th><th>P&amp;L target</th><th>Decay target</th><th>Stop</th><th>Force close</th><th>Emergency</th><th>Exit signal</th><th>Status</th></tr></thead><tbody>{weekly_pair_monitor_rows()}</tbody></table></div>
       </section>
       <section class="panel">
         <div class="panel-title">15-Minute Monitor Closure Legs</div>
@@ -15533,7 +16673,8 @@ def render_page(state: PageState) -> bytes:
     home_market_html = render_market_topper(state) if state.active_tab == "home" else ""
     kite_profiles = load_kite_profiles()
     active_kite_profile = selected_kite_profile_name(state.kite_profile)
-    active_kite_values = kite_profiles.get(active_kite_profile, blank_kite_profile())
+    active_kite_values = kite_profiles.get(active_kite_profile, blank_kite_profile(active_kite_profile))
+    nifty_income_enabled = kite_profile_nifty_income_enabled(active_kite_profile, kite_profiles)
     active_profile_ready = all(
         str(active_kite_values.get(key) or "").strip()
         for key in ("KITE_API_KEY", "KITE_API_SECRET", "KITE_ACCESS_TOKEN")
@@ -15554,8 +16695,17 @@ def render_page(state: PageState) -> bytes:
             "KITE_CONFIRM_LIVE_ORDER": state.confirm_live_order
             if state.confirm_live_order != ""
             else active_kite_values.get("KITE_CONFIRM_LIVE_ORDER", "YES"),
+            "NIFTY_INCOME_ENABLED": (
+                state.nifty_income_enabled
+                if state.nifty_income_enabled is not None
+                else nifty_income_enabled
+            ),
         }
         kite_profiles[active_kite_profile] = active_kite_values
+        nifty_income_enabled = profile_flag(
+            active_kite_values.get("NIFTY_INCOME_ENABLED"),
+            default_nifty_income_enabled_for_profile(active_kite_profile),
+        )
     kite_profiles_json = html.escape(json.dumps(kite_profiles), quote=True)
     profile_options = "".join(
         f'<option value="{html.escape(name, quote=True)}"{" selected" if name == active_kite_profile else ""}>{html.escape(name)}</option>'
@@ -15614,6 +16764,12 @@ def render_page(state: PageState) -> bytes:
             <div class="actions compact-actions">
               <button type="submit" formaction="/kite-token/save">Save Access Token</button>
             </div>
+            {render_checkbox(
+                "nifty_income_enabled",
+                "Enable Nifty Income tab",
+                nifty_income_enabled,
+                "Profile-specific permission. Recommended only for Monika; disabled profiles cannot open or run Nifty Income orders and schedulers.",
+            )}
             {render_checkbox("show_credentials", "Show credential values", False, "Reveals KITE_API_SECRET, KITE_ACCESS_TOKEN, and OPENAI_API_KEY in this local browser page.")}
           </section>
           <section class="panel kite-setup-card token-card">
@@ -17281,6 +18437,31 @@ def render_page(state: PageState) -> bytes:
       gap: 10px;
       margin: 10px 0;
     }}
+    .nifty-side-selector {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin: 12px 0;
+    }}
+    .nifty-side-selector label {{
+      display: grid;
+      grid-template-columns: auto 1fr;
+      align-items: center;
+      gap: 3px 8px;
+      padding: 10px 12px;
+      border: 1px solid #5eead4;
+      border-radius: 8px;
+      background: #ecfdf5;
+      cursor: pointer;
+    }}
+    .nifty-side-selector label:has(input:not(:checked)) {{
+      border-color: #cbd5e1;
+      background: #f1f5f9;
+      color: #64748b;
+    }}
+    .nifty-side-selector input {{ grid-row: 1 / 3; }}
+    .nifty-side-selector span {{ font-weight: 850; }}
+    .nifty-side-selector small {{ color: #64748b; }}
     .nifty-pair-leg-section {{
       padding: 12px;
       border: 1px solid #99f6e4;
@@ -17313,8 +18494,29 @@ def render_page(state: PageState) -> bytes:
       color: #0f172a;
       font-weight: 850;
     }}
+    .nifty-hedge-leg {{
+      margin-top: 10px;
+      padding: 8px;
+      border: 1px solid #bae6fd;
+      border-radius: 7px;
+      background: #eff6ff;
+    }}
+    .nifty-hedge-leg span {{
+      color: #1d4ed8;
+      font-size: 10px;
+      font-weight: 900;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }}
+    .nifty-hedge-leg strong {{ color: #1e3a8a; font-size: 15px; }}
+    .nifty-pair-leg-section.side-disabled {{
+      opacity: 0.55;
+      border-color: #cbd5e1;
+      background: #f8fafc;
+    }}
     @media (max-width: 640px) {{
-      .nifty-pair-sections {{ grid-template-columns: 1fr; }}
+      .nifty-pair-sections,
+      .nifty-side-selector {{ grid-template-columns: 1fr; }}
     }}
     .quote-loading-state {{
       display: none;
@@ -19602,7 +20804,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {equity_tab_class}" type="button" data-tab="equity">Equity</button>
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
-      <button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>
+      {f'<button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>' if nifty_income_enabled else ''}
       <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
       <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT</button>
@@ -19834,6 +21036,7 @@ def render_page(state: PageState) -> bytes:
     const kiteLoginLink = document.getElementById('kite-login-link');
     const kiteProfileNoteName = document.getElementById('kite-profile-note-name');
     const kiteProfileNoteStatus = document.getElementById('kite-profile-note-status');
+    const niftyIncomeEnabled = document.querySelector('input[name="nifty_income_enabled"]');
     function setInputValue(id, value) {{
       const input = document.getElementById(id);
       if (input) input.value = value || '';
@@ -19858,6 +21061,9 @@ def render_page(state: PageState) -> bytes:
       setInputValue('kite-api-secret', profile.KITE_API_SECRET);
       setInputValue('kite-access-token', profile.KITE_ACCESS_TOKEN);
       setInputValue('kite-confirm-live-order', profile.KITE_CONFIRM_LIVE_ORDER || 'YES');
+      if (niftyIncomeEnabled) {{
+        niftyIncomeEnabled.checked = Boolean(profile.NIFTY_INCOME_ENABLED);
+      }}
       updateKiteLoginLink(profile.KITE_API_KEY);
       const ready = Boolean(
         String(profile.KITE_API_KEY || '').trim()
@@ -19866,9 +21072,12 @@ def render_page(state: PageState) -> bytes:
       );
       if (kiteProfileNoteName) kiteProfileNoteName.textContent = kiteProfileSelect.value;
       if (kiteProfileNoteStatus) {{
-        kiteProfileNoteStatus.textContent = ready
+        const niftyStatus = profile.NIFTY_INCOME_ENABLED
+          ? ' Nifty Income enabled.'
+          : ' Nifty Income disabled.';
+        kiteProfileNoteStatus.textContent = (ready
           ? 'profile ready for login, quotes, and order actions.'
-          : 'profile needs API key, secret, and today\\'s access token.';
+          : 'profile needs API key, secret, and today\\'s access token.') + niftyStatus;
       }}
     }}
     kiteProfileSelect && kiteProfileSelect.addEventListener('change', applySelectedKiteProfile);
@@ -20175,6 +21384,8 @@ def render_page(state: PageState) -> bytes:
     const niftyPairPeOtm = document.getElementById('nifty-pair-pe-otm');
     const niftyPairCeOtm = document.getElementById('nifty-pair-ce-otm');
     const niftyPairLots = document.getElementById('nifty-pair-lots');
+    const niftyPairIncludePe = document.getElementById('nifty-pair-include-pe');
+    const niftyPairIncludeCe = document.getElementById('nifty-pair-include-ce');
     const niftyPairConfirmed = document.getElementById('nifty-pair-confirmed');
     const niftyPairExpiry = document.getElementById('nifty-pair-expiry');
     const niftyPairSpot = document.getElementById('nifty-pair-spot');
@@ -20186,6 +21397,12 @@ def render_page(state: PageState) -> bytes:
     const niftyPairCeDetail = document.getElementById('nifty-pair-ce-detail');
     const niftyPairPePop = document.getElementById('nifty-pair-pe-pop');
     const niftyPairCePop = document.getElementById('nifty-pair-ce-pop');
+    const niftyPairPeHedge = document.getElementById('nifty-pair-pe-hedge');
+    const niftyPairCeHedge = document.getElementById('nifty-pair-ce-hedge');
+    const niftyPairPeHedgeDetail = document.getElementById('nifty-pair-pe-hedge-detail');
+    const niftyPairCeHedgeDetail = document.getElementById('nifty-pair-ce-hedge-detail');
+    const niftyPairPeSection = document.getElementById('nifty-pair-pe-section');
+    const niftyPairCeSection = document.getElementById('nifty-pair-ce-section');
     const niftyPairSummary = document.getElementById('nifty-pair-summary');
     const niftyPairLoading = document.getElementById('nifty-pair-loading');
     const niftyPairBreath = document.getElementById('nifty-pair-breath');
@@ -20387,8 +21604,17 @@ def render_page(state: PageState) -> bytes:
     }}
     function renderNiftyPairLegs(data) {{
       const sells = (data.sell_legs || []);
+      const hedges = (data.hedge_legs || []);
       const pe = sells.find((row) => row.option_type === 'PE') || {{}};
       const ce = sells.find((row) => row.option_type === 'CE') || {{}};
+      const peHedge = hedges.find((row) => row.option_type === 'PE') || {{}};
+      const ceHedge = hedges.find((row) => row.option_type === 'CE') || {{}};
+      const includePe = Boolean(data.include_pe);
+      const includeCe = Boolean(data.include_ce);
+      if (niftyPairIncludePe) niftyPairIncludePe.checked = includePe;
+      if (niftyPairIncludeCe) niftyPairIncludeCe.checked = includeCe;
+      if (niftyPairPeSection) niftyPairPeSection.classList.toggle('side-disabled', !includePe);
+      if (niftyPairCeSection) niftyPairCeSection.classList.toggle('side-disabled', !includeCe);
       if (niftyPairExpiry) niftyPairExpiry.textContent = data.expiry || '--';
       if (niftyPairSpot) niftyPairSpot.textContent = Number(data.spot || 0).toFixed(2);
       if (niftyPairLot) niftyPairLot.textContent = `${{Number(data.lots || 1).toFixed(0)}} lot(s) / ${{Number(data.quantity || 0).toFixed(0)}} qty`;
@@ -20399,12 +21625,19 @@ def render_page(state: PageState) -> bytes:
       if (niftyPairCeDetail) niftyPairCeDetail.textContent = ce.tradingsymbol ? `Strike ${{ce.strike}} | LTP ${{Number(ce.option_ltp || 0).toFixed(2)}} | Limit ${{Number(ce.price || 0).toFixed(2)}} | OTM ${{Number(ce.otm_pct || 0).toFixed(2)}}%` : '--';
       if (niftyPairPePop) niftyPairPePop.textContent = pe.pop_estimate ? `${{Number(pe.pop_estimate).toFixed(1)}}% approx` : '--';
       if (niftyPairCePop) niftyPairCePop.textContent = ce.pop_estimate ? `${{Number(ce.pop_estimate).toFixed(1)}}% approx` : '--';
+      if (niftyPairPeHedge) niftyPairPeHedge.textContent = peHedge.tradingsymbol || '--';
+      if (niftyPairCeHedge) niftyPairCeHedge.textContent = ceHedge.tradingsymbol || '--';
+      if (niftyPairPeHedgeDetail) niftyPairPeHedgeDetail.textContent = peHedge.tradingsymbol ? `BUY strike ${{peHedge.strike}} | LTP ${{Number(peHedge.option_ltp || 0).toFixed(2)}} | exactly ${{Number(data.hedge_distance_points || 300)}} points below SELL` : 'PE side not selected';
+      if (niftyPairCeHedgeDetail) niftyPairCeHedgeDetail.textContent = ceHedge.tradingsymbol ? `BUY strike ${{ceHedge.strike}} | LTP ${{Number(ceHedge.option_ltp || 0).toFixed(2)}} | exactly ${{Number(data.hedge_distance_points || 300)}} points above SELL` : 'CE side not selected';
       const missing = (data.missing_ltp || []);
+      const skipped = (data.skipped_existing_sides || []);
       if (niftyPairSummary) {{
         const markup = Number(data.sell_markup_percent || 0).toFixed(2);
+        const selectedSides = [includePe ? 'PE spread' : '', includeCe ? 'CE spread' : ''].filter(Boolean).join(' + ');
+        const skippedNote = skipped.length ? ` | Existing short ${{skipped.join(' + ')}} automatically excluded` : '';
         niftyPairSummary.textContent = missing.length
           ? `Fresh LTP missing for ${{missing.join(', ')}}. Refresh again before GO.`
-          : `SELL orders only: ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} each side | PE ${{pe.tradingsymbol || '--'}} and CE ${{ce.tradingsymbol || '--'}} at ${{markup}}% above LTP | Max gain ${{Number(data.max_gain || 0).toFixed(0)}} | PE OTM ${{Number(data.pe_otm_pct || 0).toFixed(2)}}% | CE OTM ${{Number(data.ce_otm_pct || 0).toFixed(2)}}%`;
+          : `${{selectedSides}} | ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} per leg | Every SELL has a ${{Number(data.hedge_distance_points || 300)}}-point BUY hedge | SELL limit ${{markup}}% above LTP | Net max gain ${{Number(data.max_gain || 0).toFixed(0)}} after hedge cost ${{Number(data.hedge_cost || 0).toFixed(0)}}${{skippedNote}}`;
         niftyPairSummary.classList.toggle('signal-red', missing.length > 0);
       }}
       if (niftyPairReview) niftyPairReview.disabled = missing.length > 0;
@@ -20414,12 +21647,21 @@ def render_page(state: PageState) -> bytes:
       resetNiftyPairConfirmation();
       const peOtm = Number(niftyPairPeOtm ? niftyPairPeOtm.value : 0);
       const ceOtm = Number(niftyPairCeOtm ? niftyPairCeOtm.value : 0);
+      const includePe = Boolean(niftyPairIncludePe && niftyPairIncludePe.checked);
+      const includeCe = Boolean(niftyPairIncludeCe && niftyPairIncludeCe.checked);
+      if (!includePe && !includeCe) {{
+        if (niftyPairSummary) {{
+          niftyPairSummary.textContent = 'Select at least one side: PE spread or CE spread.';
+          niftyPairSummary.classList.add('signal-red');
+        }}
+        return;
+      }}
       const lots = Math.max(1, Math.floor(Number(niftyPairLots ? niftyPairLots.value : 1) || 1));
       if (niftyPairLots) niftyPairLots.value = String(lots);
       if (niftyPairSummary) niftyPairSummary.textContent = 'Loading fresh NIFTY option premium, POP approximation, and max gain...';
       setQuoteLoading(niftyPairModal, niftyPairLoading, true, 'Revalidating NIFTY PE+CE pair...');
       try {{
-        const response = await fetch(`/nifty-income/pair-quote?pe_otm=${{encodeURIComponent(peOtm)}}&ce_otm=${{encodeURIComponent(ceOtm)}}&lots=${{encodeURIComponent(lots)}}`, {{ cache: 'no-store' }});
+        const response = await fetch(`/nifty-income/pair-quote?pe_otm=${{encodeURIComponent(peOtm)}}&ce_otm=${{encodeURIComponent(ceOtm)}}&lots=${{encodeURIComponent(lots)}}&include_pe=${{includePe ? '1' : '0'}}&include_ce=${{includeCe ? '1' : '0'}}`, {{ cache: 'no-store' }});
         const data = await response.json();
         if (!data.ok) throw new Error(data.error || 'Could not load NIFTY pair');
         renderNiftyPairLegs(data);
@@ -20441,8 +21683,12 @@ def render_page(state: PageState) -> bytes:
       refreshNiftyPairDetails();
     }});
     niftyPairRefresh && niftyPairRefresh.addEventListener('click', refreshNiftyPairDetails);
-    for (const input of [niftyPairPeOtm, niftyPairCeOtm, niftyPairLots]) {{
+    for (const input of [niftyPairPeOtm, niftyPairCeOtm, niftyPairLots, niftyPairIncludePe, niftyPairIncludeCe]) {{
       input && input.addEventListener('input', resetNiftyPairConfirmation);
+      input && input.addEventListener('change', () => {{
+        resetNiftyPairConfirmation();
+        refreshNiftyPairDetails();
+      }});
     }}
     niftyPairCancel && niftyPairCancel.addEventListener('click', () => {{
       resetNiftyPairConfirmation();
@@ -21581,6 +22827,17 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             self.send_page(state)
             return
         if parsed_url.path == "/nifty-income":
+            if not kite_profile_nifty_income_enabled():
+                self.send_page(
+                    PageState(
+                        active_tab="kite-setup",
+                        error=(
+                            f"Nifty Income is disabled for Kite profile {selected_kite_profile_name()}. "
+                            "Enable it in Kite Setup to open this strategy."
+                        ),
+                    )
+                )
+                return
             state = PageState(active_tab="nifty-income")
             try:
                 state.nifty_income_snapshot, state.console_log = call_with_console(
@@ -21622,12 +22879,25 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             return
         if parsed_url.path == "/nifty-income/pair-quote":
+            if not kite_profile_nifty_income_enabled():
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"Nifty Income is disabled for Kite profile {selected_kite_profile_name()}. "
+                            "Enable it in Kite Setup first."
+                        ),
+                    }
+                )
+                return
             query = parse_qs(parsed_url.query, keep_blank_values=True)
             try:
                 snapshot = nifty_income_manual_pair_snapshot(
                     float(first(query, "pe_otm", "5.5") or 5.5),
                     float(first(query, "ce_otm", "5.5") or 5.5),
                     int(float(first(query, "lots", "1") or 1)),
+                    first(query, "include_pe", "1") != "0",
+                    first(query, "include_ce", "1") != "0",
                 )
                 self.send_json({"ok": True, **snapshot})
             except Exception as exc:
@@ -21864,6 +23134,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             access_token=first(form, "access_token"),
             confirm_live_order=first(form, "confirm_live_order"),
             kite_profile=selected_kite_profile_name(first(form, "kite_profile")),
+            nifty_income_enabled=checked(form, "nifty_income_enabled"),
             position_dry_run=checked(form, "position_dry_run"),
             position_discount_percent=float(
                 first(
@@ -21903,6 +23174,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             income_growth_outcome_message=first(form, "income_growth_outcome_message"),
             income_growth_saved_csv_path=first(form, "income_growth_saved_csv_path"),
             income_growth_research_count=int(float(first(form, "income_growth_research_count", "0") or 0)),
+            research_gpt_output=first(form, "research_gpt_output"),
+            research_gpt_response_id=first(form, "research_gpt_response_id"),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -21923,6 +23196,17 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             else:
                 state.position_discount_percent = position_close_discount_percent_setting()
+
+        if request_path.startswith("/nifty-income") and not kite_profile_nifty_income_enabled(
+            state.kite_profile
+        ):
+            state.active_tab = "kite-setup"
+            state.error = (
+                f"Nifty Income is disabled for Kite profile {state.kite_profile}. "
+                "Enable it in Kite Setup before using this strategy."
+            )
+            self.send_page(state)
+            return
 
         try:
             if request_path == "/nfo/retry-safe-price":
@@ -22324,6 +23608,35 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     f"Research loaded {len(state.research_rows)} symbol(s). "
                     "Review it, then click Save as Today CSV if you want to use it for Trading."
                 )
+            elif request_path == "/research/gpt-best-sells":
+                outcome, generate_log = call_with_console(
+                    generate_research_csv_with_current_positions,
+                    state.openai_model,
+                    state.openai_system_prompt,
+                )
+                state.csv_text = str(outcome.get("csv_text") or "")
+                state.gpt_csv_text = state.csv_text
+                state.research_gpt_output = str(outcome.get("output") or "")
+                state.research_gpt_response_id = str(outcome.get("response_id") or "")
+                state.gpt_api_output = state.research_gpt_output
+                state.gpt_api_response_id = state.research_gpt_response_id
+                state.research_positions_rows = list(outcome.get("position_rows") or [])
+                state.research_positions_summary = dict(outcome.get("position_summary") or {})
+                state.ce_sell_top = list(outcome.get("ce_top") or [])
+                state.income_pe_top = list(outcome.get("pe_top") or [])
+                state.research_rows, research_log = call_with_console(
+                    research_csv_symbols,
+                    state.csv_text,
+                    state.csv_path,
+                )
+                state.console_log = f"{generate_log}{research_log}"
+                state.message = (
+                    "GPT reviewed the locally screened candidates with "
+                    f"{len(state.research_positions_rows)} current option position(s) as portfolio context. "
+                    f"Loaded {len(state.research_rows)} final recommendation(s) for Research. "
+                    f"Mandatory expiry: "
+                    f"{(outcome.get('expiry_policy') or {}).get('target_month_name') or 'monthly contract'}."
+                )
             elif request_path == "/income/load":
                 calculated_at = apply_income_dashboard_snapshot(state, True)
                 state.message = (
@@ -22350,13 +23663,22 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         "weekly_pair_exit_enabled": checked(form, "nifty_weekly_pair_exit_enabled"),
                         "execution_mode": first(form, "nifty_execution_mode", "SUGGESTION_ONLY"),
                         "time_exit_execution_mode": first(form, "nifty_time_exit_execution_mode", "SUGGESTION_ONLY"),
-                        "weekly_pair_exit_execution_mode": first(form, "nifty_weekly_pair_exit_execution_mode", "AUTO_EXIT_ONLY"),
+                        "weekly_pair_exit_execution_mode": first(form, "nifty_weekly_pair_exit_execution_mode", "SUGGESTION_ONLY"),
                         "entry_time": first(form, "nifty_entry_time", NIFTY_INCOME_ENTRY_SCHEDULE_TIME),
                         "time_exit_time": first(form, "nifty_time_exit_time", NIFTY_INCOME_CLOSE_SCHEDULE_TIME),
                         "weekly_pair_force_close_time": first(form, "nifty_weekly_pair_force_close_time", NIFTY_WEEKLY_PAIR_FORCE_CLOSE_TIME),
                         "weekly_pair_exit_run_every_minutes": int(float(first(form, "nifty_weekly_pair_exit_interval", "15") or 15)),
                         "lot_size": int(float(first(form, "nifty_lot_size", "65") or 65)),
-                        "hedge_distance_points": int(float(first(form, "nifty_hedge_distance", "500") or 500)),
+                        "hedge_distance_points": int(
+                            float(
+                                first(
+                                    form,
+                                    "nifty_hedge_distance",
+                                    str(NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS),
+                                )
+                                or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS
+                            )
+                        ),
                         "manual_pair_sell_markup_percent": float(first(form, "nifty_manual_pair_sell_markup", "20") or 20),
                     }
                 )
@@ -22412,6 +23734,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     float(first(form, "nifty_pair_pe_otm", "5.5") or 5.5),
                     float(first(form, "nifty_pair_ce_otm", "5.5") or 5.5),
                     int(float(first(form, "nifty_pair_lots", "1") or 1)),
+                    checked(form, "nifty_pair_include_pe"),
+                    checked(form, "nifty_pair_include_ce"),
                 )
                 state.nifty_income_results = results
                 state.nifty_income_snapshot = nifty_income_snapshot(True)
