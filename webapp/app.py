@@ -595,7 +595,7 @@ for dividend_security in DIVIDEND_INCOME_SECURITIES:
         str(dividend_security["symbol"]).upper(),
         dividend_security,
     )
-INCOME_ROLL_TRADING_DAY_THRESHOLD = 9
+MONTHLY_EXPIRY_ROLL_TRADING_DAY_THRESHOLD = 5
 INCOME_UNDERLYINGS = [
     {
         "symbol": "PFC",
@@ -2490,6 +2490,7 @@ def nifty_income_pair_orders_from_otm(
     lots: int = 1,
     include_pe: bool = True,
     include_ce: bool = True,
+    include_cover: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     config = config or nifty_income_config()
     quote_map = quote_map or {}
@@ -2538,12 +2539,9 @@ def nifty_income_pair_orders_from_otm(
             if option_type == "PE"
             else sell_strike + hedge_width
         )
-        legs.extend(
-            [
-                ("BUY", hedge_strike, option_type, "NIFTY_HEDGE", True, {}),
-                ("SELL", sell_strike, option_type, "NIFTY_PAIR", False, adjusted_sell),
-            ]
-        )
+        if include_cover:
+            legs.append(("BUY", hedge_strike, option_type, "NIFTY_HEDGE", True, {}))
+        legs.append(("SELL", sell_strike, option_type, "NIFTY_PAIR", False, adjusted_sell))
     orders: list[dict[str, Any]] = []
     previews: list[dict[str, Any]] = []
     for side, strike, option_type, tag, is_hedge, adjusted_seed in legs:
@@ -2594,6 +2592,68 @@ def nifty_income_pair_orders_from_otm(
     return orders, previews
 
 
+def calculate_nifty_manual_pair_risk(
+    previews: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sell_legs = [
+        row for row in previews
+        if str(row.get("transaction_type") or "").upper() == "SELL"
+    ]
+    buy_legs = [
+        row for row in previews
+        if str(row.get("transaction_type") or "").upper() == "BUY"
+    ]
+    gross_credit = sum(
+        float(row.get("price") or 0) * int(row.get("quantity") or 0)
+        for row in sell_legs
+    )
+    cover_cost = sum(
+        float(row.get("price") or 0) * int(row.get("quantity") or 0)
+        for row in buy_legs
+    )
+    net_credit = max(gross_credit - cover_cost, 0.0)
+    side_risks: list[float] = []
+    uncovered_sides: list[str] = []
+    unlimited_loss = False
+    for sell in sell_legs:
+        option_type = str(sell.get("option_type") or "").upper()
+        strike = float(sell.get("strike") or 0)
+        quantity = int(sell.get("quantity") or 0)
+        sell_credit = float(sell.get("price") or 0) * quantity
+        hedge = next(
+            (
+                row for row in buy_legs
+                if str(row.get("option_type") or "").upper() == option_type
+                and int(row.get("quantity") or 0) == quantity
+            ),
+            None,
+        )
+        if hedge:
+            hedge_strike = float(hedge.get("strike") or 0)
+            hedge_cost = float(hedge.get("price") or 0) * quantity
+            side_credit = max(sell_credit - hedge_cost, 0.0)
+            spread_width = abs(strike - hedge_strike)
+            side_risks.append(max(spread_width * quantity - side_credit, 0.0))
+        elif option_type == "CE":
+            unlimited_loss = True
+            uncovered_sides.append("CE")
+        elif option_type == "PE":
+            uncovered_sides.append("PE")
+            side_risks.append(max(strike * quantity - sell_credit, 0.0))
+    max_loss = None if unlimited_loss else (max(side_risks) if side_risks else 0.0)
+    return {
+        "gross_credit": gross_credit,
+        "cover_cost": cover_cost,
+        "net_credit": net_credit,
+        "max_gain": net_credit,
+        "max_loss": max_loss,
+        "max_loss_unlimited": unlimited_loss,
+        "max_loss_display": "UNLIMITED" if unlimited_loss else f"{float(max_loss or 0):.0f}",
+        "uncovered_sides": uncovered_sides,
+        "defined_risk": bool(sell_legs) and not uncovered_sides,
+    }
+
+
 def nifty_pair_liquidity_probe_quote_keys(
     orders: list[dict[str, Any]],
     instruments: list[dict[str, Any]],
@@ -2631,6 +2691,7 @@ def nifty_income_manual_pair_snapshot(
     lots: int = 1,
     include_pe: bool = True,
     include_ce: bool = True,
+    include_cover: bool = True,
 ) -> dict[str, Any]:
     config = nifty_income_config()
     kite = kite_orders.kite_client() if kite_orders else None
@@ -2680,6 +2741,7 @@ def nifty_income_manual_pair_snapshot(
         lots,
         effective_include_pe,
         effective_include_ce,
+        include_cover,
     )
     quote_keys = nifty_pair_liquidity_probe_quote_keys(draft_orders, nifty_instruments, expiry)
     if quote_keys:
@@ -2698,18 +2760,11 @@ def nifty_income_manual_pair_snapshot(
         lots,
         effective_include_pe,
         effective_include_ce,
+        include_cover,
     )
     sell_previews = [row for row in previews if row.get("transaction_type") == "SELL"]
     hedge_previews = [row for row in previews if row.get("transaction_type") == "BUY"]
-    gross_sell_premium = sum(
-        float(row.get("option_ltp") or 0) * int(row.get("quantity") or 0)
-        for row in sell_previews
-    )
-    hedge_cost = sum(
-        float(row.get("option_ltp") or 0) * int(row.get("quantity") or 0)
-        for row in hedge_previews
-    )
-    max_gain = max(gross_sell_premium - hedge_cost, 0.0)
+    risk = calculate_nifty_manual_pair_risk(previews)
     missing_ltp = [row["tradingsymbol"] for row in orders if row.get("price", 0) <= 0]
     return {
         "spot": spot,
@@ -2719,9 +2774,15 @@ def nifty_income_manual_pair_snapshot(
         "orders": orders,
         "sell_legs": sell_previews,
         "hedge_legs": hedge_previews,
-        "max_gain": max_gain,
-        "gross_sell_premium": gross_sell_premium,
-        "hedge_cost": hedge_cost,
+        "max_gain": risk["max_gain"],
+        "max_loss": risk["max_loss"],
+        "max_loss_unlimited": risk["max_loss_unlimited"],
+        "max_loss_display": risk["max_loss_display"],
+        "gross_sell_premium": risk["gross_credit"],
+        "hedge_cost": risk["cover_cost"],
+        "net_credit": risk["net_credit"],
+        "defined_risk": risk["defined_risk"],
+        "uncovered_sides": risk["uncovered_sides"],
         "missing_ltp": missing_ltp,
         "lot_size": int(config.get("lot_size") or 65),
         "lots": max(1, int(float(lots or 1))),
@@ -2730,6 +2791,8 @@ def nifty_income_manual_pair_snapshot(
         "sell_markup_percent": float(config.get("manual_pair_sell_markup_percent") or 20.0),
         "include_pe": effective_include_pe,
         "include_ce": effective_include_ce,
+        "include_cover": bool(include_cover),
+        "naked_live_allowed": bool(config.get("allow_live_naked_nifty_sell", False)),
         "requested_include_pe": bool(include_pe),
         "requested_include_ce": bool(include_ce),
         "existing_short_sides": sorted(existing_short_sides),
@@ -2747,6 +2810,7 @@ def place_nifty_income_manual_pair(
     lots: int = 1,
     include_pe: bool = True,
     include_ce: bool = True,
+    include_cover: bool = True,
 ) -> list[dict[str, Any]]:
     if not kite_profile_nifty_income_enabled():
         raise PermissionError(
@@ -2759,6 +2823,7 @@ def place_nifty_income_manual_pair(
         lots,
         include_pe,
         include_ce,
+        include_cover,
     )
     missing_ltp = snapshot.get("missing_ltp") or []
     if missing_ltp:
@@ -4762,7 +4827,10 @@ def research_monthly_expiry_policy(today: date | None = None) -> dict[str, Any]:
     today = today or datetime.now(INDIA_TIME_ZONE).date()
     front_expiry = last_weekday_of_month(today.year, today.month, 1)
     front_trading_days = trading_days_remaining(front_expiry, today)
-    roll_to_next_month = front_expiry <= today or front_trading_days < 5
+    roll_to_next_month = (
+        front_expiry <= today
+        or front_trading_days <= MONTHLY_EXPIRY_ROLL_TRADING_DAY_THRESHOLD
+    )
     target_month = next_month_start(today) if roll_to_next_month else date(today.year, today.month, 1)
     target_expiry = last_weekday_of_month(target_month.year, target_month.month, 1)
     return {
@@ -5637,11 +5705,16 @@ def open_option_positions(use_cache: bool = True) -> list[dict[str, Any]]:
     for position in positions:
         quantity = int(position.get("quantity") or 0)
         symbol = str(position.get("tradingsymbol") or "").upper()
-        if quantity == 0 or not option_symbol_parts(symbol):
+        exchange = str(position.get("exchange") or "").upper()
+        if (
+            quantity == 0
+            or exchange != "NFO"
+            or not symbol.endswith(("CE", "PE"))
+        ):
             continue
         active.append(
             {
-                "exchange": str(position.get("exchange") or ""),
+                "exchange": exchange,
                 "tradingsymbol": symbol,
                 "quantity": quantity,
                 "product": str(position.get("product") or ""),
@@ -6157,11 +6230,23 @@ def selected_trade_guardrails(orders: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def income_selected_expiry(expiries: list[date], today: date) -> tuple[date, date | None, int | None]:
-    front_expiry = expiries[0]
+def income_selected_expiry(
+    expiries: list[date],
+    today: date,
+) -> tuple[date, date | None, int | None]:
+    eligible_expiries = sorted({expiry for expiry in expiries if expiry >= today})
+    if not eligible_expiries:
+        raise ValueError("No current or future monthly option expiry is available.")
+    front_expiry = eligible_expiries[0]
     front_trading_days = trading_days_remaining(front_expiry, today)
-    if front_trading_days < INCOME_ROLL_TRADING_DAY_THRESHOLD and len(expiries) > 1:
-        return expiries[1], front_expiry, front_trading_days
+    if front_trading_days <= MONTHLY_EXPIRY_ROLL_TRADING_DAY_THRESHOLD:
+        if len(eligible_expiries) < 2:
+            raise ValueError(
+                f"Front expiry {front_expiry:%d %b %Y} has only "
+                f"{front_trading_days} trading day(s) remaining, but the next monthly "
+                "contract is not available. New option SELL candidates are blocked."
+            )
+        return eligible_expiries[1], front_expiry, front_trading_days
     return front_expiry, None, None
 
 
@@ -6186,8 +6271,9 @@ def next_monthly_pe_candidate(
     kite: Any,
     underlying: str,
     extra_otm_percent: float = 0,
+    today: date | None = None,
 ) -> dict[str, Any]:
-    today = datetime.now().date()
+    today = today or app_now().date()
     spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
     spot = quote_ltp(spot_quote)
     if spot <= 0:
@@ -6285,8 +6371,12 @@ def income_pe_order_snapshot(underlying: str, target_strike: Any = None) -> dict
     }
 
 
-def next_monthly_ce_candidate(kite: Any, underlying: str) -> dict[str, Any]:
-    today = datetime.now().date()
+def next_monthly_ce_candidate(
+    kite: Any,
+    underlying: str,
+    today: date | None = None,
+) -> dict[str, Any]:
+    today = today or app_now().date()
     spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
     spot = quote_ltp(spot_quote)
     if spot <= 0:
@@ -7148,6 +7238,151 @@ def open_option_buy_orders_by_symbol(kite: Any, force_refresh: bool = False) -> 
     return matches
 
 
+def open_option_close_orders_by_symbol_side(
+    kite: Any,
+    force_refresh: bool = False,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    if force_refresh:
+        clear_app_cache(("kite:orders",))
+    matches: dict[tuple[str, str], dict[str, Any]] = {}
+    for order in cached_kite_orders(kite):
+        symbol = str(order.get("tradingsymbol") or "").strip().upper()
+        side = str(order.get("transaction_type") or "").strip().upper()
+        status = str(order.get("status") or "").strip().upper()
+        if (
+            not symbol
+            or not symbol.endswith(("CE", "PE"))
+            or side not in {"BUY", "SELL"}
+            or status not in CANCELLABLE_ORDER_STATUSES
+        ):
+            continue
+        pending_quantity = int(
+            float(order.get("pending_quantity") or order.get("quantity") or 0)
+        )
+        if pending_quantity <= 0:
+            continue
+        matches[(symbol, side)] = {
+            "order_id": str(order.get("order_id") or ""),
+            "quantity": pending_quantity,
+            "price": float(order.get("price") or 0),
+            "status": status,
+            "transaction_type": side,
+        }
+    return matches
+
+
+def build_missing_option_close_orders(
+    kite: Any,
+    discount_percent: float | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    discount = (
+        position_close_discount_percent_setting()
+        if discount_percent is None
+        else float(discount_percent)
+    )
+    if not 0 <= discount < 100:
+        raise ValueError("Position close percentage must be between 0 and 100.")
+    positions = refresh_option_positions_with_live_ltp(
+        open_option_positions(use_cache=False),
+        kite,
+    )
+    existing = open_option_close_orders_by_symbol_side(kite, True)
+    orders: list[dict[str, Any]] = []
+    evaluations: list[dict[str, Any]] = []
+    for position in positions:
+        symbol = str(position.get("tradingsymbol") or "").strip().upper()
+        quantity = int(float(position.get("quantity") or 0))
+        if (
+            not symbol.endswith(("CE", "PE"))
+            or quantity == 0
+            or str(position.get("exchange") or "NFO").upper() != "NFO"
+        ):
+            continue
+        average_price = float(position.get("average_price") or 0)
+        ltp = float(position.get("ltp") or position.get("last_price") or 0)
+        close_side = "BUY" if quantity < 0 else "SELL"
+        existing_order = existing.get((symbol, close_side))
+        evaluation = {
+            "tradingsymbol": symbol,
+            "position_quantity": quantity,
+            "close_side": close_side,
+            "average_price": average_price,
+            "ltp": ltp,
+            "existing_close_order": bool(existing_order),
+        }
+        if existing_order:
+            evaluation.update(
+                {
+                    "action": "SKIP_EXISTING_CLOSE_ORDER",
+                    "existing_order_id": existing_order.get("order_id"),
+                    "existing_order_price": existing_order.get("price"),
+                }
+            )
+            evaluations.append(evaluation)
+            continue
+        if average_price <= 0 or ltp <= 0:
+            evaluation["action"] = "SKIP_MISSING_PRICE"
+            evaluations.append(evaluation)
+            continue
+        if close_side == "BUY":
+            price_basis = min(average_price, ltp)
+            limit_price = floor_to_tick(
+                price_basis * (1 - discount / 100),
+                0.05,
+            )
+            rule = f"{discount:g}% below min(LTP, average entry price)"
+        else:
+            price_basis = max(average_price, ltp)
+            limit_price = ceil_to_tick(
+                price_basis * (1 + discount / 100),
+                0.05,
+            )
+            rule = f"{discount:g}% above max(LTP, average entry price)"
+        if limit_price <= 0:
+            evaluation["action"] = "SKIP_INVALID_LIMIT_PRICE"
+            evaluations.append(evaluation)
+            continue
+        evaluation.update(
+            {
+                "action": f"PLACE_{close_side}_CLOSE",
+                "price": limit_price,
+                "price_basis": price_basis,
+                "pricing_rule": rule,
+            }
+        )
+        evaluations.append(evaluation)
+        orders.append(
+            {
+                "variety": "regular",
+                "exchange": "NFO",
+                "tradingsymbol": symbol,
+                "transaction_type": close_side,
+                "quantity": abs(quantity),
+                "product": position.get("product") or "NRML",
+                "order_type": "LIMIT",
+                "price": limit_price,
+                "validity": "DAY",
+                "tag": "AUTO_CLOSE",
+                "average_price": average_price,
+                "ltp": ltp,
+                "pnl": option_position_pnl(quantity, average_price, ltp),
+                "price_basis": (
+                    "min_ltp_average_price"
+                    if close_side == "BUY"
+                    else "max_ltp_average_price"
+                ),
+                "discount_percent": discount,
+                "risk_note": (
+                    f"AUTO CLOSE COVER: {close_side} {abs(quantity)} {symbol} at "
+                    f"{limit_price:.2f}; {rule}. Average {average_price:.2f}, "
+                    f"fresh LTP {ltp:.2f}."
+                ),
+                "skip_if_close_order_exists": True,
+            }
+        )
+    return orders, evaluations
+
+
 def build_position_close_buy_order(symbol: str) -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -7248,15 +7483,20 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
     available_cash = kite_available_cash(kite)
     order_lookup_error = ""
     try:
-        open_buy_orders = open_option_buy_orders_by_symbol(kite, force_refresh)
+        open_close_orders = open_option_close_orders_by_symbol_side(kite, force_refresh)
     except Exception as exc:
-        open_buy_orders = {}
-        order_lookup_error = friendly_external_error(exc, "Open BUY order check")
+        open_close_orders = {}
+        order_lookup_error = friendly_external_error(exc, "Open close-order check")
     rows: list[dict[str, Any]] = []
     total_pnl = 0.0
     total_deployed = 0.0
     for position in positions:
         symbol = position["tradingsymbol"]
+        quantity = int(position.get("quantity") or 0)
+        close_side = "BUY" if quantity < 0 else "SELL"
+        existing_close_order = open_close_orders.get((symbol.upper(), close_side))
+        pnl = float(position.get("pnl") or 0)
+        total_pnl += pnl
         try:
             data = option_analytics_for_symbol(symbol)
             decision = data.get("decision", {})
@@ -7272,10 +7512,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                 available_cash,
             )
             deployed = margin_required_for_position(kite, position)
-            pnl = float(position.get("pnl") or 0)
-            total_pnl += pnl
             total_deployed += deployed
-            existing_buy_order = open_buy_orders.get(symbol.upper())
             rows.append(
                 {
                     "symbol": symbol,
@@ -7309,11 +7546,19 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "pcr": data.get("pcr"),
                     "support": data.get("support"),
                     "resistance": data.get("resistance"),
-                    "existing_buy_order": existing_buy_order,
+                    "existing_close_order": existing_close_order,
+                    "existing_buy_order": (
+                        existing_close_order if close_side == "BUY" else None
+                    ),
+                    "close_side": close_side,
                 }
             )
         except Exception as exc:
-            existing_buy_order = open_buy_orders.get(symbol.upper())
+            try:
+                deployed = margin_required_for_position(kite, position)
+            except Exception:
+                deployed = 0.0
+            total_deployed += deployed
             rows.append(
                 {
                     "symbol": symbol,
@@ -7321,11 +7566,17 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "product": position.get("product"),
                     "average_price": position.get("average_price"),
                     "ltp": position.get("ltp"),
-                    "pnl": position.get("pnl"),
+                    "pnl": pnl,
+                    "deployed": deployed,
+                    "return_pct": (pnl / deployed * 100) if deployed > 0 else None,
                     "error": str(exc),
                     "strategy_strength": "ERROR",
                     "strategy_color": "lightcoral",
-                    "existing_buy_order": existing_buy_order,
+                    "existing_close_order": existing_close_order,
+                    "existing_buy_order": (
+                        existing_close_order if close_side == "BUY" else None
+                    ),
+                    "close_side": close_side,
                 }
             )
     breached_pe_underlyings = {
@@ -8941,7 +9192,8 @@ def research_gpt_prompt_with_current_positions(
     if expiry_policy["rolled_to_next_month"]:
         expiry_instruction += (
             f"- The front monthly expiry {front_expiry.strftime('%d %b %Y')} has only "
-            f"{expiry_policy['front_trading_days']} trading day(s) remaining, which is fewer than 5. "
+            f"{expiry_policy['front_trading_days']} trading day(s) remaining, which is "
+            f"{MONTHLY_EXPIRY_ROLL_TRADING_DAY_THRESHOLD} or fewer. "
             "Do not generate front-month orders. Move all new CE/PE SELL positions to the next monthly expiry "
             "to retain useful premium and reduce near-expiry gamma risk.\n"
         )
@@ -9758,7 +10010,7 @@ def select_valid_ce_contract(
         item
         for item in instruments
         if str(item.get("instrument_type") or "").upper() == "CE"
-        and float(item.get("strike") or 0) >= float(target_strike)
+        and float(item.get("strike") or 0) + 1e-9 >= float(target_strike)
     ]
     if not valid:
         raise ValueError("No valid CE strike available above target")
@@ -10258,7 +10510,6 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
     settings = load_ce_sell_settings()
     active_underlyings = active_position_underlyings()
     instruments = cached_kite_instruments(kite, "NFO")
-    by_symbol = {str(item.get("tradingsymbol") or "").upper(): item for item in instruments}
     news_cache: dict[str, list[dict[str, str]]] = {}
     macro_tape = ce_macro_tape_snapshot()
     redeployment_universe = []
@@ -10278,17 +10529,32 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
             }
         )
     candidates: list[dict[str, Any]] = []
+    today_date = app_now().date()
     for row in growth_rows:
         symbol = str(row.get("symbol") or "").upper()
-        option_symbol = str(row.get("candidate_ce") or "").upper()
-        instrument = by_symbol.get(option_symbol)
         holding = int(float(row.get("quantity") or 0))
         cmp_value = float(row.get("cmp") or 0)
         requested_lots = MAX_TOP3_CE_SELL_LOTS
-        if not instrument:
-            candidates.append({"stock": symbol, "holding_qty": holding, "requested_lots": requested_lots, "cmp": cmp_value, "contract_valid": False})
+        symbol_instruments = [
+            item
+            for item in instruments
+            if str(item.get("name") or "").upper() == symbol
+            and str(item.get("instrument_type") or "").upper() == "CE"
+            and isinstance(item.get("expiry"), date)
+            and item.get("expiry") >= today_date
+        ]
+        if not symbol_instruments:
+            candidates.append(
+                {
+                    "stock": symbol,
+                    "holding_qty": holding,
+                    "requested_lots": requested_lots,
+                    "cmp": cmp_value,
+                    "contract_valid": False,
+                    "reject_reasons": ["No current or future monthly CE contract is available."],
+                }
+            )
             continue
-        lot_size = int(instrument.get("lot_size") or 0)
         event_risk, event_reason = classify_pe_event_risk(symbol, news_cache)
         corporate_action = ce_corporate_action_from_news(news_cache.get(symbol, []))
         corporate_action_risk = str(corporate_action["corporate_action_risk"])
@@ -10306,13 +10572,27 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
         if corporate_action_risk == "AMBER":
             desired_otm += 1.0
         target = cmp_value * (1 + desired_otm / 100)
-        expiry = instrument.get("expiry")
+        try:
+            expiry, rolled_from_expiry, rolled_from_trading_days = income_selected_expiry(
+                [item["expiry"] for item in symbol_instruments],
+                today_date,
+            )
+        except ValueError as exc:
+            candidates.append(
+                {
+                    "stock": symbol,
+                    "holding_qty": holding,
+                    "requested_lots": requested_lots,
+                    "cmp": cmp_value,
+                    "contract_valid": False,
+                    "reject_reasons": [str(exc)],
+                }
+            )
+            continue
         same_expiry = [
-            item for item in instruments
-            if str(item.get("name") or "").upper() == symbol
-            and str(item.get("instrument_type") or "").upper() == "CE"
-            and item.get("expiry") == expiry
+            item for item in symbol_instruments if item.get("expiry") == expiry
         ]
+        lot_size = 0
         try:
             selected = select_valid_ce_contract(same_expiry, target)
             option_symbol = str(selected.get("tradingsymbol") or "").upper()
@@ -10348,6 +10628,8 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
                     "requested_lots": requested_lots, "cmp": cmp_value,
                     "target_ce_strike_zone": target, "selected_ce_strike": float(selected.get("strike") or 0),
                     "expiry": str(expiry), "option_symbol": option_symbol, "premium": premium,
+                    "rolled_from_expiry": rolled_from_expiry,
+                    "rolled_from_trading_days": rolled_from_trading_days,
                     "sell_limit_price": sell_limit, "delta": abs(float(analytics.get("delta") or 0)),
                     "sell_pop": float(analytics.get("sell_pop") or 0), "iv": float(analytics.get("iv_percent") or 0),
                     "iv_percentile": analytics.get("iv_percentile"),
@@ -11047,10 +11329,12 @@ def place_commodity_etf_order(symbol: str, allow_manual_override: bool = False) 
     }
 
 
-def commodity_etf_holdings() -> list[dict[str, Any]]:
+def commodity_etf_holdings(force_refresh: bool = False) -> list[dict[str, Any]]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     kite = kite_orders.kite_client()
+    if force_refresh:
+        clear_app_cache(("kite:holdings", "kite:positions", "kite:quote:", "kite:orders"))
     symbols = [str(item["symbol"]).upper() for item in COMMODITY_ETFS]
     all_symbols = sorted(
         {
@@ -11113,13 +11397,23 @@ def commodity_etf_holdings() -> list[dict[str, Any]]:
         profit_target_pct = commodity_profit_target_pct(item)
         rsi = commodity_etf_rsi(kite, symbol) if item.get("key") == "nasdaq" else None
         rsi_book_profit = bool(rsi is not None and rsi > 78)
+        profit_target_met = bool(
+            profit_pct is not None and profit_pct >= profit_target_pct
+        )
         book_profit = (
             quantity > 0
             and (
-                (profit_pct is not None and profit_pct >= profit_target_pct)
+                profit_target_met
                 or rsi_book_profit
             )
         )
+        book_profit_reason = ""
+        if profit_target_met:
+            book_profit_reason = (
+                f"Profit {profit_pct:.2f}% reached target {profit_target_pct:.0f}%"
+            )
+        elif rsi_book_profit:
+            book_profit_reason = f"RSI {rsi:.2f} crossed 78"
         rows.append(
             {
                 "label": item["label"],
@@ -11128,6 +11422,8 @@ def commodity_etf_holdings() -> list[dict[str, Any]]:
                 "profit_target_pct": profit_target_pct,
                 "rsi": rsi,
                 "rsi_book_profit": rsi_book_profit,
+                "profit_target_met": profit_target_met,
+                "book_profit_reason": book_profit_reason,
                 "quantity": quantity,
                 "sellable_quantity": sellable_quantity,
                 "source": "holding" if holding else ("position" if position else ""),
@@ -11153,7 +11449,11 @@ def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
     item = commodity_etf_by_symbol(symbol)
     clean_symbol = str(item["symbol"]).upper()
     holding = next(
-        (row for row in commodity_etf_holdings() if row["symbol"] == clean_symbol),
+        (
+            row
+            for row in commodity_etf_holdings(force_refresh=True)
+            if row["symbol"] == clean_symbol
+        ),
         None,
     )
     if not holding or int(holding.get("quantity") or 0) <= 0:
@@ -11167,6 +11467,25 @@ def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
     if quantity <= 0:
         raise ValueError(f"No sellable ETF holding quantity found for {clean_symbol}.")
     kite = kite_orders.kite_client()
+    clear_app_cache(("kite:orders", "kite:quote:"))
+    for existing_order in cached_kite_orders(kite):
+        if (
+            str(existing_order.get("tradingsymbol") or "").upper() == clean_symbol
+            and str(existing_order.get("transaction_type") or "").upper() == "SELL"
+            and str(existing_order.get("status") or "").upper() in CANCELLABLE_ORDER_STATUSES
+            and int(
+                float(
+                    existing_order.get("pending_quantity")
+                    or existing_order.get("quantity")
+                    or 0
+                )
+            )
+            > 0
+        ):
+            raise ValueError(
+                f"An open SELL order already exists for {clean_symbol}; "
+                "review Modify / Cancel before placing another exit."
+            )
     quote = cached_kite_quote(kite, [f"NSE:{clean_symbol}"]).get(f"NSE:{clean_symbol}", {})
     ltp = float(quote.get("last_price") or holding.get("ltp") or 0)
     if ltp <= 0:
@@ -11193,6 +11512,7 @@ def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
         "detail": (
             f"SELL full holding {quantity} {clean_symbol} LIMIT {limit_price:.2f} "
             f"(1% below LTP {ltp:.2f}). "
+            f"Objective met: {holding.get('book_profit_reason') or 'profit booking trigger'}. "
             f"Current profit {fmt_number(holding.get('profit_pct'))}%."
         ),
     }
@@ -12639,18 +12959,22 @@ def execute_position_buy_orders(
     results: list[dict[str, Any]] = []
     submitted_orders: list[dict[str, Any]] = []
     guarded_symbols = {
-        str(order.get("tradingsymbol") or "").upper()
+        (
+            str(order.get("tradingsymbol") or "").upper(),
+            str(order.get("transaction_type") or "BUY").upper(),
+        )
         for order in selected_orders
         if order.get("skip_if_close_order_exists")
     }
     existing_close_orders = (
-        open_option_buy_orders_by_symbol(kite, True)
+        open_option_close_orders_by_symbol_side(kite, True)
         if guarded_symbols
         else {}
     )
     for order in selected_orders:
         symbol = str(order.get("tradingsymbol") or "").upper()
-        existing_close = existing_close_orders.get(symbol)
+        side = str(order.get("transaction_type") or "BUY").upper()
+        existing_close = existing_close_orders.get((symbol, side))
         if existing_close:
             results.append(
                 {
@@ -12658,7 +12982,7 @@ def execute_position_buy_orders(
                     "status": "SKIPPED_EXISTING",
                     "order_id": existing_close.get("order_id"),
                     "detail": (
-                        "Existing open BUY close order preserved; "
+                        f"Existing open {side} close order preserved; "
                         f"price {float(existing_close.get('price') or 0):.2f}, "
                         f"pending quantity {int(float(existing_close.get('pending_quantity') or existing_close.get('quantity') or 0))}."
                     ),
@@ -12666,12 +12990,17 @@ def execute_position_buy_orders(
             )
             continue
         submitted_orders.append(order)
+        kite_order = {
+            key: value
+            for key, value in order.items()
+            if key in ORDER_FIELDS
+        }
         try:
             if keep_existing_orders:
-                order_id = kite_buy_positions.place_order(kite, order)
+                order_id = kite_buy_positions.place_order(kite, kite_order)
                 action = "placed"
             else:
-                order_id = kite_buy_positions.modify_or_place_order(kite, order)
+                order_id = kite_buy_positions.modify_or_place_order(kite, kite_order)
                 action = "placed_or_modified"
             results.append(
                 {
@@ -13240,9 +13569,9 @@ def run_intraday_position_close_job(
             profile=profile_name,
             status="RUNNING",
             message=(
-                "Manual run: checking open option positions and existing close BUY orders."
+                "Manual run: checking open option positions and matching BUY/SELL close orders."
                 if force
-                else "Checking open option positions and existing close BUY orders."
+                else "Checking open option positions and matching BUY/SELL close orders."
             ),
             results=[],
         )
@@ -13295,15 +13624,15 @@ def run_intraday_position_close_job(
                 if str(order.get("tradingsymbol") or "").upper() not in loss_limit_symbols
             ]
             default_orders: list[dict[str, Any]] = []
-            try:
-                default_orders = [
-                    order for order in build_position_buy_orders(state)
-                    if str(order.get("tradingsymbol") or "").upper()
-                    not in (risk_symbols | loss_limit_symbols)
-                ]
-            except ValueError as exc:
-                if "No matching positions need a new BUY order" not in str(exc):
-                    raise
+            default_orders, close_order_evaluations = build_missing_option_close_orders(
+                kite,
+                state.position_discount_percent,
+            )
+            default_orders = [
+                order for order in default_orders
+                if str(order.get("tradingsymbol") or "").upper()
+                not in (risk_symbols | loss_limit_symbols)
+            ]
             submitted_orders: list[dict[str, Any]] = []
             results: list[dict[str, Any]] = []
             if loss_limit_orders:
@@ -13337,7 +13666,7 @@ def run_intraday_position_close_job(
                 return save_intraday_position_close_schedule_state(
                     status="ALL_COVERED",
                     message=(
-                        "All open option positions already have close BUY orders."
+                        "All open option positions already have matching BUY/SELL close orders."
                         + (
                             f" Strict PE positions skipped because a close BUY order already exists: "
                             f"{risk_existing_order_skips}."
@@ -13350,13 +13679,16 @@ def run_intraday_position_close_job(
                     results=results,
                     pe_risk_evaluations=risk_evaluations,
                     loss_limit_evaluations=loss_limit_evaluations,
+                    close_order_evaluations=close_order_evaluations,
                 )
             live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
             error_count = sum(1 for result in results if result.get("status") == "ERROR")
             status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
             pricing_details = "; ".join(
                 f"{order.get('tradingsymbol')}: LIMIT {float(order.get('price') or 0):.2f} "
-                f"({float(order.get('discount_percent') or state.position_discount_percent):g}% below "
+                f"({str(order.get('transaction_type') or 'BUY').upper()} at "
+                f"{float(order.get('discount_percent') or state.position_discount_percent):g}% "
+                f"{'below' if str(order.get('transaction_type') or 'BUY').upper() == 'BUY' else 'above'} "
                 f"{order.get('price_basis') or 'price basis'})"
                 + (f" [{order.get('risk_note')}]" if order.get("risk_note") else "")
                 for order in submitted_orders
@@ -13364,7 +13696,7 @@ def run_intraday_position_close_job(
             return save_intraday_position_close_schedule_state(
                 status=status,
                 message=(
-                    f"{market_message} Missing close BUY orders placed: {live_count}; "
+                    f"{market_message} Missing BUY/SELL close orders placed: {live_count}; "
                     f"100% loss-limit overrides: {len(loss_limit_orders)}; "
                     f"strict PE exits: {len(risk_orders)}; "
                     f"existing close orders skipped: {risk_existing_order_skips}; "
@@ -13375,6 +13707,7 @@ def run_intraday_position_close_job(
                 results=results,
                 pe_risk_evaluations=risk_evaluations,
                 loss_limit_evaluations=loss_limit_evaluations,
+                close_order_evaluations=close_order_evaluations,
             )
         except ValueError as exc:
             message = str(exc)
@@ -13382,7 +13715,7 @@ def run_intraday_position_close_job(
             return save_intraday_position_close_schedule_state(
                 status=status,
                 message=(
-                    "All open option positions already have close BUY orders."
+                    "All open option positions already have matching BUY/SELL close orders."
                     if status == "ALL_COVERED"
                     else message
                 ),
@@ -13392,7 +13725,7 @@ def run_intraday_position_close_job(
         except Exception as exc:
             return save_intraday_position_close_schedule_state(
                 status="ERROR",
-                message=friendly_external_error(exc, "Intraday close BUY check"),
+                message=friendly_external_error(exc, "Intraday option close-order check"),
                 results=[],
             )
     finally:
@@ -15395,8 +15728,10 @@ def render_position_close_schedule_panel() -> str:
         f'<div class="position-summary-chip"><span>Last run</span><strong>{html.escape(str(intraday.get("last_run_at") or "Not run yet"))}</strong></div>'
         "</div>"
         f'<p class="status">{html.escape(str(intraday.get("message") or ""))} '
-        f"Price rule: when average is above LTP, BUY at {discount_percent:g}% below fresh LTP; "
-        f"otherwise BUY at {discount_percent:g}% below average price. "
+        f"Short CE/PE positions: BUY at {discount_percent:g}% below the lower of "
+        "fresh LTP or average entry price. "
+        f"Long CE/PE positions, including NIFTY covers: SELL at {discount_percent:g}% above "
+        "the higher of fresh LTP or average entry price. Existing matching close-side orders are preserved. "
         "Risk override: when a short CE/PE premium loss reaches 100%, the guard modifies or places "
         "the BUY close order at 10% below fresh LTP and records a LOSS LIMIT note.</p>"
         f"{intraday_details}</section>"
@@ -15495,12 +15830,13 @@ def render_positions_panel(
             return ""
 
     def position_identity(row: dict[str, Any]) -> str:
-        existing = row.get("existing_buy_order") or {}
+        existing = row.get("existing_close_order") or row.get("existing_buy_order") or {}
+        close_side = str(row.get("close_side") or ("BUY" if int(row.get("quantity") or 0) < 0 else "SELL"))
         marker = ""
         if existing:
             marker = (
-                '<span class="existing-buy-order">BUY ORDER PLACED</span>'
-                f'<span>BUY Qty {html.escape(str(existing.get("quantity", "")))}'
+                f'<span class="existing-buy-order">{html.escape(close_side)} ORDER PLACED</span>'
+                f'<span>{html.escape(close_side)} Qty {html.escape(str(existing.get("quantity", "")))}'
                 f' | Limit {html.escape(fmt_number(existing.get("price")))}</span>'
             )
         return (
@@ -15510,8 +15846,10 @@ def render_positions_panel(
         )
 
     def position_action(row: dict[str, Any]) -> str:
-        if row.get("existing_buy_order"):
-            return '<span class="existing-buy-action">Close BUY pending</span>'
+        existing = row.get("existing_close_order") or row.get("existing_buy_order")
+        if existing:
+            close_side = str(row.get("close_side") or ("BUY" if int(row.get("quantity") or 0) < 0 else "SELL"))
+            return f'<span class="existing-buy-action">Close {html.escape(close_side)} pending</span>'
         pe_exit = row.get("pe_exit") or {}
         if pe_exit.get("should_exit"):
             return (
@@ -15691,7 +16029,13 @@ def render_commodity_panel(state: PageState) -> str:
             f"{env_hidden_fields_for_render()}"
             f'<input type="hidden" name="commodity_symbol" value="{html.escape(str(row.get("symbol", "")), quote=True)}">'
             '<input type="hidden" name="commodity_confirmed" value="0">'
-            '<button type="submit" class="book-profit-button">BOOK profit</button>'
+            f'<input type="hidden" class="commodity-order-label" value="SELL full holding {html.escape(str(row.get("sellable_quantity") or row.get("quantity") or 0), quote=True)} {html.escape(str(row.get("symbol", "")), quote=True)}">'
+            f'<input type="hidden" class="commodity-order-reason" value="{html.escape(str(row.get("book_profit_reason") or "Profit objective met"), quote=True)}">'
+            f'<input type="hidden" class="commodity-order-detail" value="Avg {html.escape(fmt_number(row.get("average_price")), quote=True)} | LTP {html.escape(fmt_number(row.get("ltp")), quote=True)} | P&amp;L {html.escape(fmt_number(row.get("pnl")), quote=True)} | Return {html.escape(fmt_number(row.get("profit_pct")), quote=True)}%">'
+            '<div class="commodity-objective-met">'
+            f'<strong>Objective met</strong><span>{html.escape(str(row.get("book_profit_reason") or ""))}</span>'
+            '<button type="submit" class="book-profit-button">Sell full holding</button>'
+            '</div>'
             "</form>"
             if row.get("book_profit")
             else (
@@ -16301,6 +16645,7 @@ def render_nifty_income_panel(state: PageState) -> str:
           {render_checkbox("nifty_enabled", "Enable Friday entry schedule", bool(config.get("enabled", True)), "Builds defined-risk NIFTY income legs on Friday 15:16 IST.")}
           {render_checkbox("nifty_time_exit_enabled", "Enable T-7 time exit", bool(config.get("time_exit_enabled", True)), "Closes all NIFTY income legs seven days before expiry at 14:59 IST.")}
           {render_checkbox("nifty_weekly_pair_exit_enabled", "Enable 15-min pair exit monitor", bool(config.get("weekly_pair_exit_enabled", True)), "Books NIFTY weekly PE/CE pair profit or stops according to age-based margin rules.")}
+          {render_checkbox("nifty_allow_live_naked", "Allow uncovered manual NIFTY SELL", bool(config.get("allow_live_naked_nifty_sell", False)), "High risk. Required only when Protective covers is unchecked in the manual review. Uncovered CE maximum loss is unlimited.")}
           <label><span>Entry mode</span>{select_options("nifty_execution_mode", str(config.get("execution_mode") or "SUGGESTION_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
           <label><span>Time exit mode</span>{select_options("nifty_time_exit_execution_mode", str(config.get("time_exit_execution_mode") or "SUGGESTION_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
           <label><span>15-min monitor mode</span>{select_options("nifty_weekly_pair_exit_execution_mode", str(config.get("weekly_pair_exit_execution_mode") or "SUGGESTION_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
@@ -16344,11 +16689,12 @@ def render_nifty_income_panel(state: PageState) -> str:
       <div class="live-modal-backdrop" id="nifty-pair-order-modal">
         <div class="live-modal income-pe-order-modal-card nifty-pair-order-modal-card">
           <h2>NIFTY Defined-Risk Income Review</h2>
-          <p class="status">Select PE, CE, or both. Every selected SELL is protected by a mandatory BUY hedge exactly {NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS} points farther OTM before the 10-second review.</p>
+          <p class="status">Select PE, CE, or both. Protective BUY covers are recommended and selected by default. Uncovered CE risk is unlimited.</p>
           <input type="hidden" name="nifty_pair_confirmed" id="nifty-pair-confirmed" value="0">
           <div class="nifty-side-selector">
             <label><input type="checkbox" name="nifty_pair_include_pe" id="nifty-pair-include-pe" checked> <span>PE spread</span><small>SELL PE + BUY PE hedge</small></label>
             <label><input type="checkbox" name="nifty_pair_include_ce" id="nifty-pair-include-ce" checked> <span>CE spread</span><small>SELL CE + BUY CE hedge</small></label>
+            <label><input type="checkbox" name="nifty_pair_include_cover" id="nifty-pair-include-cover" checked> <span>Protective covers</span><small>Include {NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS}-point BUY legs</small></label>
           </div>
           <div class="compact-grid nifty-pair-input-grid">
             <label><span>PE OTM %</span><input type="number" step="0.1" min="1" max="20" name="nifty_pair_pe_otm" id="nifty-pair-pe-otm" value="{html.escape(default_pe_otm, quote=True)}"></label>
@@ -16359,7 +16705,8 @@ def render_nifty_income_panel(state: PageState) -> str:
             <div><span>Expiry</span><strong id="nifty-pair-expiry">--</strong></div>
             <div><span>NIFTY Spot</span><strong id="nifty-pair-spot">--</strong></div>
             <div><span>Lots / Qty</span><strong id="nifty-pair-lot">--</strong></div>
-            <div><span>Max gain</span><strong id="nifty-pair-max-gain">--</strong></div>
+            <div><span>Net credit / Max gain</span><strong id="nifty-pair-max-gain">--</strong></div>
+            <div><span>Maximum loss</span><strong id="nifty-pair-max-loss">--</strong></div>
           </div>
           <div class="nifty-pair-sections">
             <section class="nifty-pair-leg-section" id="nifty-pair-pe-section">
@@ -20195,6 +20542,25 @@ def render_page(state: PageState) -> bytes:
       cursor: pointer;
       white-space: nowrap;
     }}
+    .commodity-objective-met {{
+      display: grid;
+      gap: 4px;
+      min-width: 190px;
+      padding: 8px;
+      border: 1px solid #86efac;
+      border-radius: 8px;
+      background: #dcfce7;
+    }}
+    .commodity-objective-met strong {{
+      color: #166534;
+      font-size: 12px;
+      text-transform: uppercase;
+    }}
+    .commodity-objective-met span {{
+      color: #166534;
+      font-size: 12px;
+      line-height: 1.3;
+    }}
     .price-step-button[data-price-step="-3"] {{
       background: #fee2e2;
       color: #991b1b;
@@ -20986,8 +21352,9 @@ def render_page(state: PageState) -> bytes:
   </div>
   <div class="live-modal-backdrop" id="commodity-confirm-modal">
     <div class="live-modal">
-      <h2>Validate again to the price?</h2>
-      <p>This commodity ETF order will be sent to Kite. Breathe in, breathe out, then confirm.</p>
+      <h2 id="commodity-modal-title">Validate ETF order</h2>
+      <p id="commodity-modal-reason">This commodity ETF order will be sent to Kite after fresh server-side validation.</p>
+      <div class="income-equity-order-summary" id="commodity-modal-detail">Review order details.</div>
       <div class="breath-circle"></div>
       <div class="breath-text" id="commodity-breath-text">Breathe in</div>
       <div class="countdown" id="commodity-countdown">10</div>
@@ -21340,6 +21707,9 @@ def render_page(state: PageState) -> bytes:
     const tradeNews = document.getElementById('trade-news');
     const tradeGuardrails = document.getElementById('trade-guardrails');
     const commodityModal = document.getElementById('commodity-confirm-modal');
+    const commodityModalTitle = document.getElementById('commodity-modal-title');
+    const commodityModalReason = document.getElementById('commodity-modal-reason');
+    const commodityModalDetail = document.getElementById('commodity-modal-detail');
     const commodityCancel = document.getElementById('commodity-cancel');
     const commodityGood = document.getElementById('commodity-good');
     const commodityCountdown = document.getElementById('commodity-countdown');
@@ -21386,11 +21756,13 @@ def render_page(state: PageState) -> bytes:
     const niftyPairLots = document.getElementById('nifty-pair-lots');
     const niftyPairIncludePe = document.getElementById('nifty-pair-include-pe');
     const niftyPairIncludeCe = document.getElementById('nifty-pair-include-ce');
+    const niftyPairIncludeCover = document.getElementById('nifty-pair-include-cover');
     const niftyPairConfirmed = document.getElementById('nifty-pair-confirmed');
     const niftyPairExpiry = document.getElementById('nifty-pair-expiry');
     const niftyPairSpot = document.getElementById('nifty-pair-spot');
     const niftyPairLot = document.getElementById('nifty-pair-lot');
     const niftyPairMaxGain = document.getElementById('nifty-pair-max-gain');
+    const niftyPairMaxLoss = document.getElementById('nifty-pair-max-loss');
     const niftyPairPeSymbol = document.getElementById('nifty-pair-pe-symbol');
     const niftyPairPeDetail = document.getElementById('nifty-pair-pe-detail');
     const niftyPairCeSymbol = document.getElementById('nifty-pair-ce-symbol');
@@ -21611,14 +21983,22 @@ def render_page(state: PageState) -> bytes:
       const ceHedge = hedges.find((row) => row.option_type === 'CE') || {{}};
       const includePe = Boolean(data.include_pe);
       const includeCe = Boolean(data.include_ce);
+      const includeCover = Boolean(data.include_cover);
       if (niftyPairIncludePe) niftyPairIncludePe.checked = includePe;
       if (niftyPairIncludeCe) niftyPairIncludeCe.checked = includeCe;
+      if (niftyPairIncludeCover) niftyPairIncludeCover.checked = includeCover;
       if (niftyPairPeSection) niftyPairPeSection.classList.toggle('side-disabled', !includePe);
       if (niftyPairCeSection) niftyPairCeSection.classList.toggle('side-disabled', !includeCe);
       if (niftyPairExpiry) niftyPairExpiry.textContent = data.expiry || '--';
       if (niftyPairSpot) niftyPairSpot.textContent = Number(data.spot || 0).toFixed(2);
       if (niftyPairLot) niftyPairLot.textContent = `${{Number(data.lots || 1).toFixed(0)}} lot(s) / ${{Number(data.quantity || 0).toFixed(0)}} qty`;
-      if (niftyPairMaxGain) niftyPairMaxGain.textContent = Number(data.max_gain || 0).toFixed(0);
+      if (niftyPairMaxGain) niftyPairMaxGain.textContent = `${{Number(data.net_credit || 0).toFixed(0)}} / ${{Number(data.max_gain || 0).toFixed(0)}}`;
+      if (niftyPairMaxLoss) {{
+        niftyPairMaxLoss.textContent = data.max_loss_unlimited
+          ? 'UNLIMITED'
+          : Number(data.max_loss || 0).toFixed(0);
+        niftyPairMaxLoss.classList.toggle('signal-red', Boolean(data.max_loss_unlimited || !data.defined_risk));
+      }}
       if (niftyPairPeSymbol) niftyPairPeSymbol.textContent = pe.tradingsymbol || '--';
       if (niftyPairPeDetail) niftyPairPeDetail.textContent = pe.tradingsymbol ? `Strike ${{pe.strike}} | LTP ${{Number(pe.option_ltp || 0).toFixed(2)}} | Limit ${{Number(pe.price || 0).toFixed(2)}} | OTM ${{Number(pe.otm_pct || 0).toFixed(2)}}%` : '--';
       if (niftyPairCeSymbol) niftyPairCeSymbol.textContent = ce.tradingsymbol || '--';
@@ -21627,20 +22007,24 @@ def render_page(state: PageState) -> bytes:
       if (niftyPairCePop) niftyPairCePop.textContent = ce.pop_estimate ? `${{Number(ce.pop_estimate).toFixed(1)}}% approx` : '--';
       if (niftyPairPeHedge) niftyPairPeHedge.textContent = peHedge.tradingsymbol || '--';
       if (niftyPairCeHedge) niftyPairCeHedge.textContent = ceHedge.tradingsymbol || '--';
-      if (niftyPairPeHedgeDetail) niftyPairPeHedgeDetail.textContent = peHedge.tradingsymbol ? `BUY strike ${{peHedge.strike}} | LTP ${{Number(peHedge.option_ltp || 0).toFixed(2)}} | exactly ${{Number(data.hedge_distance_points || 300)}} points below SELL` : 'PE side not selected';
-      if (niftyPairCeHedgeDetail) niftyPairCeHedgeDetail.textContent = ceHedge.tradingsymbol ? `BUY strike ${{ceHedge.strike}} | LTP ${{Number(ceHedge.option_ltp || 0).toFixed(2)}} | exactly ${{Number(data.hedge_distance_points || 300)}} points above SELL` : 'CE side not selected';
+      if (niftyPairPeHedgeDetail) niftyPairPeHedgeDetail.textContent = peHedge.tradingsymbol ? `BUY strike ${{peHedge.strike}} | LTP ${{Number(peHedge.option_ltp || 0).toFixed(2)}} | exactly ${{Number(data.hedge_distance_points || 300)}} points below SELL` : (includePe && !includeCover ? 'Protective PE cover not selected' : 'PE side not selected');
+      if (niftyPairCeHedgeDetail) niftyPairCeHedgeDetail.textContent = ceHedge.tradingsymbol ? `BUY strike ${{ceHedge.strike}} | LTP ${{Number(ceHedge.option_ltp || 0).toFixed(2)}} | exactly ${{Number(data.hedge_distance_points || 300)}} points above SELL` : (includeCe && !includeCover ? 'Protective CE cover not selected - unlimited loss risk' : 'CE side not selected');
       const missing = (data.missing_ltp || []);
       const skipped = (data.skipped_existing_sides || []);
       if (niftyPairSummary) {{
         const markup = Number(data.sell_markup_percent || 0).toFixed(2);
         const selectedSides = [includePe ? 'PE spread' : '', includeCe ? 'CE spread' : ''].filter(Boolean).join(' + ');
         const skippedNote = skipped.length ? ` | Existing short ${{skipped.join(' + ')}} automatically excluded` : '';
+        const coverNote = includeCover
+          ? `Protective ${{Number(data.hedge_distance_points || 300)}}-point BUY covers included`
+          : `NO protective covers | Max loss ${{data.max_loss_unlimited ? 'UNLIMITED' : Number(data.max_loss || 0).toFixed(0)}}`;
+        const nakedBlocked = !includeCover && !data.naked_live_allowed;
         niftyPairSummary.textContent = missing.length
           ? `Fresh LTP missing for ${{missing.join(', ')}}. Refresh again before GO.`
-          : `${{selectedSides}} | ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} per leg | Every SELL has a ${{Number(data.hedge_distance_points || 300)}}-point BUY hedge | SELL limit ${{markup}}% above LTP | Net max gain ${{Number(data.max_gain || 0).toFixed(0)}} after hedge cost ${{Number(data.hedge_cost || 0).toFixed(0)}}${{skippedNote}}`;
-        niftyPairSummary.classList.toggle('signal-red', missing.length > 0);
+          : `${{selectedSides}} | ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} per leg | ${{coverNote}} | SELL limit ${{markup}}% above LTP | Net credit / max gain ${{Number(data.max_gain || 0).toFixed(0)}}${{skippedNote}}${{nakedBlocked ? ' | Live uncovered entry is disabled by risk settings' : ''}}`;
+        niftyPairSummary.classList.toggle('signal-red', missing.length > 0 || nakedBlocked || Boolean(data.max_loss_unlimited));
       }}
-      if (niftyPairReview) niftyPairReview.disabled = missing.length > 0;
+      if (niftyPairReview) niftyPairReview.disabled = missing.length > 0 || (!includeCover && !data.naked_live_allowed);
     }}
     async function refreshNiftyPairDetails() {{
       if (!niftyPairModal) return;
@@ -21649,6 +22033,7 @@ def render_page(state: PageState) -> bytes:
       const ceOtm = Number(niftyPairCeOtm ? niftyPairCeOtm.value : 0);
       const includePe = Boolean(niftyPairIncludePe && niftyPairIncludePe.checked);
       const includeCe = Boolean(niftyPairIncludeCe && niftyPairIncludeCe.checked);
+      const includeCover = Boolean(niftyPairIncludeCover && niftyPairIncludeCover.checked);
       if (!includePe && !includeCe) {{
         if (niftyPairSummary) {{
           niftyPairSummary.textContent = 'Select at least one side: PE spread or CE spread.';
@@ -21661,7 +22046,7 @@ def render_page(state: PageState) -> bytes:
       if (niftyPairSummary) niftyPairSummary.textContent = 'Loading fresh NIFTY option premium, POP approximation, and max gain...';
       setQuoteLoading(niftyPairModal, niftyPairLoading, true, 'Revalidating NIFTY PE+CE pair...');
       try {{
-        const response = await fetch(`/nifty-income/pair-quote?pe_otm=${{encodeURIComponent(peOtm)}}&ce_otm=${{encodeURIComponent(ceOtm)}}&lots=${{encodeURIComponent(lots)}}&include_pe=${{includePe ? '1' : '0'}}&include_ce=${{includeCe ? '1' : '0'}}`, {{ cache: 'no-store' }});
+        const response = await fetch(`/nifty-income/pair-quote?pe_otm=${{encodeURIComponent(peOtm)}}&ce_otm=${{encodeURIComponent(ceOtm)}}&lots=${{encodeURIComponent(lots)}}&include_pe=${{includePe ? '1' : '0'}}&include_ce=${{includeCe ? '1' : '0'}}&include_cover=${{includeCover ? '1' : '0'}}`, {{ cache: 'no-store' }});
         const data = await response.json();
         if (!data.ok) throw new Error(data.error || 'Could not load NIFTY pair');
         renderNiftyPairLegs(data);
@@ -21683,7 +22068,7 @@ def render_page(state: PageState) -> bytes:
       refreshNiftyPairDetails();
     }});
     niftyPairRefresh && niftyPairRefresh.addEventListener('click', refreshNiftyPairDetails);
-    for (const input of [niftyPairPeOtm, niftyPairCeOtm, niftyPairLots, niftyPairIncludePe, niftyPairIncludeCe]) {{
+    for (const input of [niftyPairPeOtm, niftyPairCeOtm, niftyPairLots, niftyPairIncludePe, niftyPairIncludeCe, niftyPairIncludeCover]) {{
       input && input.addEventListener('input', resetNiftyPairConfirmation);
       input && input.addEventListener('change', () => {{
         resetNiftyPairConfirmation();
@@ -22316,6 +22701,14 @@ def render_page(state: PageState) -> bytes:
       commodityModal.style.display = 'none';
       stopCommodityCountdown();
     }}
+    function populateCommodityModal(form) {{
+      const label = form.querySelector('.commodity-order-label');
+      const reason = form.querySelector('.commodity-order-reason');
+      const detail = form.querySelector('.commodity-order-detail');
+      if (commodityModalTitle) commodityModalTitle.textContent = label && label.value ? label.value : 'Validate ETF order';
+      if (commodityModalReason) commodityModalReason.textContent = reason && reason.value ? reason.value : 'Fresh validation will run before this order is sent.';
+      if (commodityModalDetail) commodityModalDetail.textContent = detail && detail.value ? detail.value : 'Review the ETF order before continuing.';
+    }}
     placeForm && placeForm.addEventListener('submit', (event) => {{
       const submitter = event.submitter;
       if (!submitter || submitter.id !== 'execute-selected-button') {{
@@ -22371,6 +22764,7 @@ def render_page(state: PageState) -> bytes:
         const confirmed = form.querySelector('input[name="commodity_confirmed"]');
         if (confirmed && confirmed.value === '1') return;
         event.preventDefault();
+        populateCommodityModal(form);
         openCommodityModal(form);
       }});
     }}
@@ -22898,6 +23292,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     int(float(first(query, "lots", "1") or 1)),
                     first(query, "include_pe", "1") != "0",
                     first(query, "include_ce", "1") != "0",
+                    first(query, "include_cover", "1") != "0",
                 )
                 self.send_json({"ok": True, **snapshot})
             except Exception as exc:
@@ -23661,6 +24056,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         "enabled": checked(form, "nifty_enabled"),
                         "time_exit_enabled": checked(form, "nifty_time_exit_enabled"),
                         "weekly_pair_exit_enabled": checked(form, "nifty_weekly_pair_exit_enabled"),
+                        "allow_live_naked_nifty_sell": checked(form, "nifty_allow_live_naked"),
                         "execution_mode": first(form, "nifty_execution_mode", "SUGGESTION_ONLY"),
                         "time_exit_execution_mode": first(form, "nifty_time_exit_execution_mode", "SUGGESTION_ONLY"),
                         "weekly_pair_exit_execution_mode": first(form, "nifty_weekly_pair_exit_execution_mode", "SUGGESTION_ONLY"),
@@ -23736,6 +24132,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     int(float(first(form, "nifty_pair_lots", "1") or 1)),
                     checked(form, "nifty_pair_include_pe"),
                     checked(form, "nifty_pair_include_ce"),
+                    checked(form, "nifty_pair_include_cover"),
                 )
                 state.nifty_income_results = results
                 state.nifty_income_snapshot = nifty_income_snapshot(True)

@@ -461,7 +461,7 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("Return at most 3 CE SELL and 3 PE SELL", prompt)
         self.assertIn("Mandatory expiry for every new NFO option order: 28 Jul 2026", prompt)
         self.assertIn("Tradingsymbols must use 26JUL", prompt)
-        self.assertIn("fewer than 5", prompt)
+        self.assertIn("5 or fewer", prompt)
 
     def test_research_monthly_expiry_rolls_to_july_when_under_five_trading_days(self):
         policy = app.research_monthly_expiry_policy(date(2026, 6, 24))
@@ -472,13 +472,207 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual(policy["target_expiry"], date(2026, 7, 28))
         self.assertEqual(policy["target_month_code"], "26JUL")
 
-    def test_research_monthly_expiry_keeps_front_month_at_five_trading_days(self):
+    def test_research_monthly_expiry_rolls_at_five_trading_days(self):
         policy = app.research_monthly_expiry_policy(date(2026, 6, 23))
 
         self.assertEqual(policy["front_trading_days"], 5)
-        self.assertFalse(policy["rolled_to_next_month"])
-        self.assertEqual(policy["target_expiry"], date(2026, 6, 30))
-        self.assertEqual(policy["target_month_code"], "26JUN")
+        self.assertTrue(policy["rolled_to_next_month"])
+        self.assertEqual(policy["target_expiry"], date(2026, 7, 28))
+        self.assertEqual(policy["target_month_code"], "26JUL")
+
+    def test_monthly_expiry_policy_keeps_front_month_above_five_days(self):
+        selected, rolled_from, remaining = app.income_selected_expiry(
+            [date(2026, 6, 30), date(2026, 7, 28)],
+            date(2026, 6, 22),
+        )
+
+        self.assertEqual(selected, date(2026, 6, 30))
+        self.assertIsNone(rolled_from)
+        self.assertIsNone(remaining)
+
+    def test_monthly_expiry_policy_rolls_to_next_month_at_five_days(self):
+        selected, rolled_from, remaining = app.income_selected_expiry(
+            [date(2026, 6, 30), date(2026, 7, 28)],
+            date(2026, 6, 23),
+        )
+
+        self.assertEqual(selected, date(2026, 7, 28))
+        self.assertEqual(rolled_from, date(2026, 6, 30))
+        self.assertEqual(remaining, 5)
+
+    def test_monthly_expiry_policy_blocks_when_next_month_is_unavailable(self):
+        with self.assertRaisesRegex(ValueError, "next monthly contract is not available"):
+            app.income_selected_expiry(
+                [date(2026, 6, 30)],
+                date(2026, 6, 23),
+            )
+
+    def test_next_monthly_pe_candidate_uses_july_at_five_trading_days(self):
+        kite = object()
+        instruments = [
+            {
+                "name": "PFC",
+                "instrument_type": "PE",
+                "expiry": date(2026, 6, 30),
+                "strike": 900,
+                "tradingsymbol": "PFC26JUN900PE",
+                "lot_size": 1300,
+            },
+            {
+                "name": "PFC",
+                "instrument_type": "PE",
+                "expiry": date(2026, 7, 28),
+                "strike": 900,
+                "tradingsymbol": "PFC26JUL900PE",
+                "lot_size": 1300,
+            },
+        ]
+        with (
+            patch.object(
+                app,
+                "cached_kite_quote",
+                return_value={"NSE:PFC": {"last_price": 1000}},
+            ),
+            patch.object(app, "cached_kite_instruments", return_value=instruments),
+        ):
+            result = app.next_monthly_pe_candidate(
+                kite,
+                "PFC",
+                today=date(2026, 6, 23),
+            )
+
+        self.assertEqual(result["symbol"], "PFC26JUL900PE")
+        self.assertEqual(result["expiry"], date(2026, 7, 28))
+        self.assertEqual(result["rolled_from_expiry"], date(2026, 6, 30))
+        self.assertEqual(result["rolled_from_trading_days"], 5)
+
+    def test_next_monthly_ce_candidate_uses_july_at_five_trading_days(self):
+        kite = object()
+        instruments = [
+            {
+                "name": "PFC",
+                "instrument_type": "CE",
+                "expiry": date(2026, 6, 30),
+                "strike": 1100,
+                "tradingsymbol": "PFC26JUN1100CE",
+                "lot_size": 1300,
+            },
+            {
+                "name": "PFC",
+                "instrument_type": "CE",
+                "expiry": date(2026, 7, 28),
+                "strike": 1100,
+                "tradingsymbol": "PFC26JUL1100CE",
+                "lot_size": 1300,
+            },
+        ]
+        with (
+            patch.object(
+                app,
+                "cached_kite_quote",
+                return_value={"NSE:PFC": {"last_price": 1000}},
+            ),
+            patch.object(app, "cached_kite_instruments", return_value=instruments),
+        ):
+            result = app.next_monthly_ce_candidate(
+                kite,
+                "PFC",
+                today=date(2026, 6, 23),
+            )
+
+        self.assertEqual(result["symbol"], "PFC26JUL1100CE")
+        self.assertEqual(result["expiry"], date(2026, 7, 28))
+        self.assertEqual(result["rolled_from_expiry"], date(2026, 6, 30))
+        self.assertEqual(result["rolled_from_trading_days"], 5)
+
+    def test_trading_ce_scan_replaces_stale_front_month_candidate_at_five_days(self):
+        kite = object()
+        growth_rows = [
+            {
+                "symbol": "PFC",
+                "candidate_ce": "PFC26JUN110CE",
+                "quantity": 1300,
+                "cmp": 100,
+                "core": "N",
+                "input_month": 0,
+                "input_1w": 0,
+                "input_today": 0,
+                "avg_price": 80,
+            }
+        ]
+        instruments = [
+            {
+                "name": "PFC",
+                "instrument_type": "CE",
+                "expiry": date(2026, 6, 30),
+                "strike": 110,
+                "tradingsymbol": "PFC26JUN110CE",
+                "lot_size": 1300,
+            },
+            {
+                "name": "PFC",
+                "instrument_type": "CE",
+                "expiry": date(2026, 7, 28),
+                "strike": 110,
+                "tradingsymbol": "PFC26JUL110CE",
+                "lot_size": 1300,
+            },
+        ]
+        settings = {
+            **app.DEFAULT_CE_SELL_SETTINGS,
+            "default_otm_percent": 10,
+            "core_otm_add_percent": 0,
+            "price_markup_percent": 20,
+        }
+        with (
+            patch.object(
+                app,
+                "kite_orders",
+                Namespace(kite_client=lambda: kite),
+            ),
+            patch.object(app, "app_now", return_value=app.datetime(2026, 6, 23, 10, 0)),
+            patch.object(app, "income_growth_candidates", return_value=(growth_rows, {})),
+            patch.object(app, "load_ce_sell_settings", return_value=settings),
+            patch.object(app, "active_position_underlyings", return_value=set()),
+            patch.object(app, "cached_kite_instruments", return_value=instruments),
+            patch.object(app, "classify_pe_event_risk", return_value=("GREEN", "No event")),
+            patch.object(
+                app,
+                "ce_corporate_action_from_news",
+                return_value={
+                    "corporate_action_risk": "GREEN",
+                    "corporate_action_type": "NONE",
+                    "corporate_action_detail": "",
+                },
+            ),
+            patch.object(
+                app,
+                "ce_macro_tape_snapshot",
+                return_value={"risk": "GREEN", "detail": "Stable"},
+            ),
+            patch.object(app, "ce_macro_beta_buffer", return_value=0),
+            patch.object(
+                app,
+                "cached_kite_quote",
+                return_value={"NFO:PFC26JUL110CE": {"last_price": 5}},
+            ),
+            patch.object(
+                app,
+                "option_analytics_for_symbol",
+                return_value={"delta": 0.1, "sell_pop": 90, "iv_percent": 25},
+            ),
+            patch.object(
+                app,
+                "rank_ce_sell_candidates",
+                side_effect=lambda candidates, _settings: (candidates, [], []),
+            ),
+        ):
+            top, _, _ = app.build_live_ce_sell_rankings()
+
+        self.assertEqual(top[0]["option_symbol"], "PFC26JUL110CE")
+        self.assertEqual(top[0]["expiry"], "2026-07-28")
+        self.assertEqual(top[0]["rolled_from_expiry"], date(2026, 6, 30))
+        self.assertEqual(top[0]["rolled_from_trading_days"], 5)
 
     def test_generate_research_csv_with_current_positions_calls_gpt_with_positions(self):
         positions = [{"symbol": "PFC26JUN400PE", "quantity": -1300, "pnl": 500}]
@@ -642,9 +836,9 @@ class PeSellStrategyTests(unittest.TestCase):
         run_at = app.datetime(2026, 6, 12, 9, 45, 10, tzinfo=app.INDIA_TIME_ZONE)
         built_states = []
 
-        def build_orders(state):
-            built_states.append(state)
-            return [order]
+        def build_orders(_kite, discount):
+            built_states.append(discount)
+            return [order], []
 
         with (
             patch.object(app, "intraday_position_close_schedule_state", side_effect=read_schedule),
@@ -658,7 +852,7 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
             patch.object(app, "build_intraday_loss_limit_close_orders", return_value=([], [])),
             patch.object(app, "build_intraday_pe_risk_exit_orders", return_value=([], [])),
-            patch.object(app, "build_position_buy_orders", side_effect=build_orders),
+            patch.object(app, "build_missing_option_close_orders", side_effect=build_orders),
             patch.object(app, "execute_position_buy_orders", return_value=([order], [result])),
         ):
             first = app.run_intraday_position_close_job(run_at)
@@ -666,9 +860,289 @@ class PeSellStrategyTests(unittest.TestCase):
 
         self.assertEqual(first["status"], "PLACED")
         self.assertEqual(first["run_count_today"], 1)
-        self.assertEqual(built_states[0].position_discount_percent, 35.0)
+        self.assertEqual(built_states[0], 35.0)
         self.assertIn("35% below LTP", first["message"])
         self.assertIsNone(second)
+
+    def test_missing_close_orders_cover_short_stock_and_long_nifty_options(self):
+        positions = [
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "HAVELLS26JUL1300CE",
+                "quantity": -500,
+                "product": "NRML",
+                "average_price": 10.0,
+                "ltp": 8.0,
+            },
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "NIFTY2672122500PE",
+                "quantity": 65,
+                "product": "NRML",
+                "average_price": 18.45,
+                "ltp": 18.20,
+            },
+        ]
+        with (
+            patch.object(app, "open_option_positions", return_value=positions),
+            patch.object(app, "refresh_option_positions_with_live_ltp", return_value=positions),
+            patch.object(app, "open_option_close_orders_by_symbol_side", return_value={}),
+        ):
+            orders, evaluations = app.build_missing_option_close_orders(
+                object(),
+                20,
+            )
+
+        self.assertEqual(len(orders), 2)
+        short_close, long_close = orders
+        self.assertEqual(short_close["transaction_type"], "BUY")
+        self.assertEqual(short_close["price"], 6.4)
+        self.assertEqual(short_close["price_basis"], "min_ltp_average_price")
+        self.assertEqual(long_close["tradingsymbol"], "NIFTY2672122500PE")
+        self.assertEqual(long_close["transaction_type"], "SELL")
+        self.assertEqual(long_close["quantity"], 65)
+        self.assertEqual(long_close["price"], 22.15)
+        self.assertEqual(long_close["price_basis"], "max_ltp_average_price")
+        self.assertIn("20% above max", long_close["risk_note"])
+        self.assertEqual(
+            [row["action"] for row in evaluations],
+            ["PLACE_BUY_CLOSE", "PLACE_SELL_CLOSE"],
+        )
+
+    def test_missing_close_orders_apply_lower_basis_to_nifty_short_pe_and_ce(self):
+        positions = [
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "NIFTY2672122600PE",
+                "quantity": -65,
+                "product": "NRML",
+                "average_price": 20.35,
+                "ltp": 20.35,
+            },
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "NIFTY2672125100CE",
+                "quantity": -65,
+                "product": "NRML",
+                "average_price": 49.10,
+                "ltp": 44.10,
+            },
+        ]
+        with (
+            patch.object(app, "open_option_positions", return_value=positions),
+            patch.object(
+                app,
+                "refresh_option_positions_with_live_ltp",
+                return_value=positions,
+            ),
+            patch.object(app, "open_option_close_orders_by_symbol_side", return_value={}),
+        ):
+            orders, evaluations = app.build_missing_option_close_orders(object(), 20)
+
+        self.assertEqual(len(orders), 2)
+        self.assertEqual([row["transaction_type"] for row in orders], ["BUY", "BUY"])
+        self.assertEqual([row["quantity"] for row in orders], [65, 65])
+        self.assertEqual(orders[0]["price"], 16.25)
+        self.assertEqual(orders[1]["price"], 35.25)
+        self.assertEqual(
+            [row["price_basis"] for row in orders],
+            ["min_ltp_average_price", "min_ltp_average_price"],
+        )
+        self.assertEqual(
+            [row["price_basis"] for row in evaluations],
+            [20.35, 44.10],
+        )
+
+    def test_open_option_positions_includes_stock_and_weekly_nifty_options(self):
+        positions = [
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "NIFTY2672122600PE",
+                "quantity": -65,
+                "product": "NRML",
+                "average_price": 20.35,
+                "last_price": 20.35,
+                "pnl": 0,
+            },
+            {
+                "exchange": "NFO",
+                "tradingsymbol": "HAVELLS26JUL1300CE",
+                "quantity": -500,
+                "product": "NRML",
+                "average_price": 10,
+                "last_price": 8,
+                "pnl": 1000,
+            },
+            {
+                "exchange": "NSE",
+                "tradingsymbol": "HAVELLS",
+                "quantity": 100,
+                "product": "CNC",
+                "average_price": 1000,
+                "last_price": 1100,
+                "pnl": 10000,
+            },
+        ]
+        kite = Namespace(positions=lambda: {"net": positions})
+        with patch.object(
+            app,
+            "kite_orders",
+            Namespace(kite_client=lambda: kite),
+        ):
+            result = app.open_option_positions(use_cache=False)
+
+        self.assertEqual(
+            [row["tradingsymbol"] for row in result],
+            ["NIFTY2672122600PE", "HAVELLS26JUL1300CE"],
+        )
+
+    def test_positions_research_keeps_weekly_nifty_when_analytics_is_unavailable(self):
+        position = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY2672122600PE",
+            "quantity": -65,
+            "product": "NRML",
+            "average_price": 20.35,
+            "ltp": 20.35,
+            "pnl": 0,
+        }
+        existing = {
+            "order_id": "NIFTY-BUY-1",
+            "quantity": 65,
+            "price": 16.25,
+        }
+        with (
+            patch.object(app, "open_option_positions", return_value=[position]),
+            patch.object(
+                app,
+                "refresh_option_positions_with_live_ltp",
+                return_value=[position],
+            ),
+            patch.object(app, "kite_available_cash", return_value=1000000),
+            patch.object(
+                app,
+                "open_option_close_orders_by_symbol_side",
+                return_value={("NIFTY2672122600PE", "BUY"): existing},
+            ),
+            patch.object(
+                app,
+                "option_analytics_for_symbol",
+                side_effect=ValueError("Weekly index analytics unavailable"),
+            ),
+            patch.object(app, "margin_required_for_position", return_value=50000),
+            patch.object(
+                app,
+                "kite_orders",
+                Namespace(kite_client=lambda: object()),
+            ),
+        ):
+            rows, summary = app.positions_research(True)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], "NIFTY2672122600PE")
+        self.assertEqual(rows[0]["close_side"], "BUY")
+        self.assertEqual(rows[0]["existing_close_order"], existing)
+        self.assertEqual(rows[0]["deployed"], 50000)
+        self.assertIn("Weekly index analytics unavailable", rows[0]["error"])
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["total_deployed"], 50000)
+
+    def test_missing_close_order_requires_matching_transaction_side(self):
+        position = {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY2672122500PE",
+            "quantity": 65,
+            "product": "NRML",
+            "average_price": 18.45,
+            "ltp": 18.20,
+        }
+        with (
+            patch.object(app, "open_option_positions", return_value=[position]),
+            patch.object(
+                app,
+                "refresh_option_positions_with_live_ltp",
+                return_value=[position],
+            ),
+            patch.object(
+                app,
+                "open_option_close_orders_by_symbol_side",
+                return_value={
+                    ("NIFTY2672122500PE", "BUY"): {"order_id": "wrong-side"}
+                },
+            ),
+        ):
+            orders, evaluations = app.build_missing_option_close_orders(object(), 20)
+
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["transaction_type"], "SELL")
+        self.assertEqual(evaluations[0]["action"], "PLACE_SELL_CLOSE")
+
+        with (
+            patch.object(app, "open_option_positions", return_value=[position]),
+            patch.object(
+                app,
+                "refresh_option_positions_with_live_ltp",
+                return_value=[position],
+            ),
+            patch.object(
+                app,
+                "open_option_close_orders_by_symbol_side",
+                return_value={
+                    ("NIFTY2672122500PE", "SELL"): {
+                        "order_id": "correct-side",
+                        "price": 22.15,
+                    }
+                },
+            ),
+        ):
+            orders, evaluations = app.build_missing_option_close_orders(object(), 20)
+
+        self.assertEqual(orders, [])
+        self.assertEqual(evaluations[0]["action"], "SKIP_EXISTING_CLOSE_ORDER")
+
+    def test_long_nifty_close_sell_is_submitted_with_clean_kite_payload(self):
+        order = {
+            "variety": "regular",
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY2672122500PE",
+            "transaction_type": "SELL",
+            "quantity": 65,
+            "product": "NRML",
+            "order_type": "LIMIT",
+            "price": 22.15,
+            "validity": "DAY",
+            "tag": "AUTO_CLOSE",
+            "average_price": 18.45,
+            "ltp": 18.20,
+            "risk_note": "AUTO CLOSE COVER",
+            "skip_if_close_order_exists": True,
+        }
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
+            patch.object(app, "open_option_close_orders_by_symbol_side", return_value={}),
+            patch.object(
+                app.kite_buy_positions,
+                "place_order",
+                return_value="NIFTY-CLOSE-1",
+            ) as place,
+        ):
+            submitted, results = app.execute_position_buy_orders(
+                [order],
+                {0},
+                False,
+                True,
+            )
+
+        payload = place.call_args.args[1]
+        self.assertEqual(payload["transaction_type"], "SELL")
+        self.assertEqual(payload["quantity"], 65)
+        self.assertEqual(payload["price"], 22.15)
+        self.assertNotIn("risk_note", payload)
+        self.assertNotIn("average_price", payload)
+        self.assertEqual(submitted, [order])
+        self.assertEqual(results[0]["status"], "LIVE_SENT")
+        self.assertEqual(results[0]["order_id"], "NIFTY-CLOSE-1")
 
     def test_intraday_loss_limit_builds_buy_at_ten_percent_below_fresh_ltp(self):
         positions = [
@@ -805,8 +1279,8 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.object(app.kite_buy_positions, "kite_client", return_value=object()),
             patch.object(
                 app,
-                "open_option_buy_orders_by_symbol",
-                return_value={"NAUKRI26JUL940PE": existing_order},
+                "open_option_close_orders_by_symbol_side",
+                return_value={("NAUKRI26JUL940PE", "BUY"): existing_order},
             ),
             patch.object(app.kite_buy_positions, "place_order") as place,
             patch.object(app.kite_buy_positions, "modify_or_place_order") as modify,
@@ -867,7 +1341,7 @@ class PeSellStrategyTests(unittest.TestCase):
             patch.object(app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")),
             patch.object(app, "build_intraday_loss_limit_close_orders", return_value=([loss_order], [{"triggered": True}])),
             patch.object(app, "build_intraday_pe_risk_exit_orders", return_value=([], [])),
-            patch.object(app, "build_position_buy_orders", side_effect=ValueError("No matching positions need a new BUY order")),
+            patch.object(app, "build_missing_option_close_orders", return_value=([], [])),
             patch.object(app, "execute_position_buy_orders", side_effect=execute),
         ):
             result = app.run_intraday_position_close_job(run_at)
@@ -1065,7 +1539,8 @@ class PeSellStrategyTests(unittest.TestCase):
             output = app.render_position_close_schedule_panel()
 
         self.assertIn("saved BUY Preview discount of 27.5%", output)
-        self.assertIn("BUY at 27.5% below fresh LTP", output)
+        self.assertIn("BUY at 27.5% below the lower of", output)
+        self.assertIn("SELL at 27.5% above", output)
 
     def test_kite_runtime_error_redirects_to_kite_setup(self):
         state = app.PageState(
@@ -2244,6 +2719,85 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("<th>Avg Buy Price</th>", output)
         self.assertIn("<td>238.96</td>", output)
 
+    def test_commodity_holding_objective_met_shows_full_sell_action(self):
+        state = app.PageState(active_tab="commodity")
+        state.commodity_holdings = [
+            {
+                "symbol": "SILVERBEES",
+                "label": "Nippon India Silver ETF",
+                "quantity": 125,
+                "sellable_quantity": 125,
+                "average_price": 200.0,
+                "ltp": 245.0,
+                "source": "holding",
+                "investment": 25000.0,
+                "market_value": 30625.0,
+                "pnl": 5625.0,
+                "profit_pct": 22.5,
+                "profit_target_pct": 20,
+                "book_profit": True,
+                "book_profit_reason": "Profit 22.50% reached target 20%",
+            }
+        ]
+
+        output = app.render_commodity_panel(state)
+
+        self.assertIn("Objective met", output)
+        self.assertIn("Profit 22.50% reached target 20%", output)
+        self.assertIn("Sell full holding", output)
+        self.assertIn("SELL full holding 125 SILVERBEES", output)
+
+    def test_commodity_sell_rejects_duplicate_open_sell_order(self):
+        holding = {
+            "symbol": "SILVERBEES",
+            "quantity": 125,
+            "sellable_quantity": 125,
+            "average_price": 200.0,
+            "ltp": 245.0,
+            "profit_pct": 22.5,
+            "book_profit": True,
+            "book_profit_reason": "Profit 22.50% reached target 20%",
+        }
+        duplicate = {
+            "tradingsymbol": "SILVERBEES",
+            "transaction_type": "SELL",
+            "status": "OPEN",
+            "pending_quantity": 125,
+        }
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app, "commodity_etf_holdings", return_value=[holding]) as holdings,
+            patch.object(app.kite_orders, "kite_client", return_value=object()),
+            patch.object(app, "cached_kite_orders", return_value=[duplicate]),
+            patch.object(app.kite_orders, "place_order") as place,
+        ):
+            with self.assertRaisesRegex(ValueError, "open SELL order already exists"):
+                app.place_commodity_etf_sell_order("SILVERBEES")
+
+        holdings.assert_called_once_with(force_refresh=True)
+        place.assert_not_called()
+
+    def test_commodity_sell_revalidates_objective_before_order(self):
+        holding = {
+            "symbol": "SILVERBEES",
+            "quantity": 125,
+            "sellable_quantity": 125,
+            "average_price": 238.96,
+            "ltp": 215.0,
+            "profit_pct": -10.03,
+            "book_profit": False,
+        }
+        with (
+            patch.dict(app.os.environ, {"KITE_CONFIRM_LIVE_ORDER": "YES"}),
+            patch.object(app, "commodity_etf_holdings", return_value=[holding]) as holdings,
+            patch.object(app.kite_orders, "place_order") as place,
+        ):
+            with self.assertRaisesRegex(ValueError, "below BOOK profit threshold 20%"):
+                app.place_commodity_etf_sell_order("SILVERBEES")
+
+        holdings.assert_called_once_with(force_refresh=True)
+        place.assert_not_called()
+
     def test_score_is_capped_at_100(self):
         result = app.score_pe_sell_candidate(candidate())
         self.assertLessEqual(result["final_pe_score"], 100)
@@ -3158,8 +3712,10 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertIn("NIFTY Income Entry", html)
         self.assertIn('id="nifty-pair-include-pe"', html)
         self.assertIn('id="nifty-pair-include-ce"', html)
+        self.assertIn('id="nifty-pair-include-cover"', html)
+        self.assertIn('id="nifty-pair-max-loss"', html)
         self.assertIn("Protective BUY", html)
-        self.assertIn("300 points farther OTM", html)
+        self.assertIn("Protective covers", html)
 
     def nifty_pair(self, age_days, pnl_pct, margin=100000, now=None):
         now = now or app.datetime(2026, 6, 16, 10, 0, tzinfo=app.INDIA_TIME_ZONE)
@@ -3436,6 +3992,68 @@ class PeSellStrategyTests(unittest.TestCase):
         self.assertEqual([row["strike"] for row in orders], [25700, 25400])
         self.assertTrue(app.validate_nifty_defined_risk_orders(orders)["allowed"])
 
+    def test_nifty_manual_pair_can_preview_sell_legs_without_covers(self):
+        expiry = date(2026, 7, 14)
+        instruments = [
+            {
+                "name": "NIFTY",
+                "segment": "NFO-OPT",
+                "expiry": expiry,
+                "strike": strike,
+                "instrument_type": option_type,
+                "tradingsymbol": f"NIFTY{strike}{option_type}",
+            }
+            for strike, option_type in ((22600, "PE"), (25400, "CE"))
+        ]
+        quote_map = {
+            "NFO:NIFTY22600PE": {"last_price": 31.25, "oi": 20000, "volume": 100},
+            "NFO:NIFTY25400CE": {"last_price": 33.4, "oi": 20000, "volume": 100},
+        }
+
+        orders, previews = app.nifty_income_pair_orders_from_otm(
+            instruments,
+            expiry,
+            23989.15,
+            5.5,
+            5.5,
+            {"lot_size": 65, "strike_rounding": 100, "manual_pair_sell_markup_percent": 20},
+            quote_map,
+            include_cover=False,
+        )
+
+        self.assertEqual(len(orders), 2)
+        self.assertEqual([row["transaction_type"] for row in orders], ["SELL", "SELL"])
+        self.assertFalse(any(row["is_hedge"] for row in previews))
+        self.assertFalse(app.validate_nifty_defined_risk_orders(orders)["allowed"])
+
+    def test_nifty_manual_pair_risk_calculates_defined_risk_max_gain_and_loss(self):
+        previews = [
+            {"transaction_type": "BUY", "option_type": "PE", "strike": 22300, "price": 12, "quantity": 65},
+            {"transaction_type": "SELL", "option_type": "PE", "strike": 22600, "price": 37.5, "quantity": 65},
+            {"transaction_type": "BUY", "option_type": "CE", "strike": 25700, "price": 15, "quantity": 65},
+            {"transaction_type": "SELL", "option_type": "CE", "strike": 25400, "price": 40.1, "quantity": 65},
+        ]
+
+        risk = app.calculate_nifty_manual_pair_risk(previews)
+
+        self.assertTrue(risk["defined_risk"])
+        self.assertFalse(risk["max_loss_unlimited"])
+        self.assertAlmostEqual(risk["max_gain"], 3289.0)
+        self.assertAlmostEqual(risk["max_loss"], 17868.5)
+
+    def test_nifty_manual_pair_risk_marks_uncovered_ce_loss_unlimited(self):
+        previews = [
+            {"transaction_type": "SELL", "option_type": "PE", "strike": 22600, "price": 37.5, "quantity": 65},
+            {"transaction_type": "SELL", "option_type": "CE", "strike": 25400, "price": 40.1, "quantity": 65},
+        ]
+
+        risk = app.calculate_nifty_manual_pair_risk(previews)
+
+        self.assertFalse(risk["defined_risk"])
+        self.assertTrue(risk["max_loss_unlimited"])
+        self.assertIsNone(risk["max_loss"])
+        self.assertEqual(risk["max_loss_display"], "UNLIMITED")
+
     def test_nifty_manual_pair_rejects_wrong_hedge_width(self):
         orders = [
             {
@@ -3492,7 +4110,7 @@ class PeSellStrategyTests(unittest.TestCase):
                 include_ce=True,
             )
 
-        snapshot.assert_called_once_with(5.5, 5.5, 1, False, True)
+        snapshot.assert_called_once_with(5.5, 5.5, 1, False, True, True)
         execute.assert_called_once_with(orders, "LIVE_CONFIRMED", "Manual NIFTY PE/CE income pair")
         self.assertEqual(result, [{"status": "LIVE_SENT"}])
 

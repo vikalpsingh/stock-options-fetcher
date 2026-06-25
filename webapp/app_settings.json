@@ -20,33 +20,57 @@
   "income_growth_gpt_scheduler": {
     "csv_path": "C:\\Coding\\NSE\\stock-options-fetcher\\17Jun2026.csv",
     "enabled": true,
-    "last_attempt_date": "2026-06-17",
-    "last_run_at": "17 Jun 2026 09:30:25 IST",
-    "message": "NSE market timestamp verified at 09:30:25 IST. Saved CSV text to 17Jun2026.csv. Ready for Research and Trading preview.",
+    "last_attempt_date": "2026-06-25",
+    "last_run_at": "25 Jun 2026 09:30:21 IST",
+    "message": "OpenAI returned an empty response.\n\nResponse ID: resp_0913011972582555006a3ca7e5b8c4819f808c3f4694017716\nModel: gpt-5.5-2026-04-23\n\nOpenAI raw output preview:\n{\n  \"id\": \"resp_0913011972582555006a3ca7e5b8c4819f808c3f4694017716\",\n  \"object\": \"response\",\n  \"creat",
     "order_count": 7,
     "output_preview": "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\nNFO,PGEL26JUN530CE,950,SELL,NRML,LIMIT,21.15,DAY\nNFO,ETERNAL26JUN272.5CE,2425,SELL,NRML,LIMIT,1.3,DAY\nNFO,UNITDSPR26JUN1380CE,400,SELL,NRML,LIMIT,3.6,DAY\nNFO,NAUKRI26JUN1090CE,375,SELL,NRML,LIMIT,4.65,DAY\nNFO,MAZDOCK26JUN2660CE,200,SELL,NRML,LIMIT,15.1,DAY\nNFO,BAJFINANCE26JUN990CE,750,SELL,NRML,LIMIT,6.35,DAY\nNFO,TITAN26JUN4450CE,175,SELL,NRML,LIMIT,26.2,DAY",
     "paused_until": "",
     "profile": "Monika",
     "response_id": "resp_0e9a3b0264b4b9b9006a321beae71c819c9daccd030f91c2e5",
     "schedule_time": "09:30",
-    "status": "SAVED"
+    "status": "ERROR"
   },
   "intraday_position_close_scheduler": {
+    "close_order_evaluations": [
+      {
+        "action": "SKIP_EXISTING_CLOSE_ORDER",
+        "average_price": 20.35,
+        "close_side": "BUY",
+        "existing_close_order": true,
+        "existing_order_id": "260625221633925",
+        "existing_order_price": 16.25,
+        "ltp": 20.35,
+        "position_quantity": -65,
+        "tradingsymbol": "NIFTY2672122600PE"
+      },
+      {
+        "action": "SKIP_EXISTING_CLOSE_ORDER",
+        "average_price": 49.1,
+        "close_side": "BUY",
+        "existing_close_order": true,
+        "existing_order_id": "260625221633938",
+        "existing_order_price": 34.9,
+        "ltp": 37.95,
+        "position_quantity": -65,
+        "tradingsymbol": "NIFTY2672125100CE"
+      }
+    ],
     "enabled": true,
     "end_time": "15:15",
     "interval_minutes": 15,
-    "last_run_at": "24 Jun 2026 14:45:03 IST",
-    "last_slot": "14:45",
-    "last_slot_key": "2026-06-24:14:45",
+    "last_run_at": "25 Jun 2026 15:00:10 IST",
+    "last_slot": "15:00",
+    "last_slot_key": "2026-06-25:15:00",
     "loss_limit_evaluations": [],
-    "message": "All open option positions already have close BUY orders.",
+    "message": "All open option positions already have matching BUY/SELL close orders.",
     "order_count": 0,
     "paused_until": "",
     "pe_risk_evaluations": [],
-    "profile": "Shanti",
+    "profile": "Monika",
     "results": [],
     "run_count_today": 8,
-    "run_date": "2026-06-24",
+    "run_date": "2026-06-25",
     "start_time": "09:30",
     "status": "ALL_COVERED"
   },
@@ -59,18 +83,18 @@
       "NIFTY_INCOME_ENABLED": false
     },
     "Monika": {
-      "KITE_ACCESS_TOKEN": "lC2y1M52FutAVihVveHuhC1CIISQgoPd",
+      "KITE_ACCESS_TOKEN": "ccrz7kgLsb4Gr9LO7TmiXsJVBYJhiWFV",
       "KITE_API_KEY": "tnaa26kee3iza58w",
       "KITE_API_SECRET": "pk55c56ih0ak3pd6cfmk24z14yt22946",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
       "NIFTY_INCOME_ENABLED": true
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "zNYieFzLvIAI5S9Yh7OD4DMSc9q5AzLM",
+      "KITE_ACCESS_TOKEN": "ccrz7kgLsb4Gr9LO7TmiXsJVBYJhiWFV",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
-      "NIFTY_INCOME_ENABLED": false
+      "NIFTY_INCOME_ENABLED": true
     },
     "Vikalp": {
       "KITE_ACCESS_TOKEN": "",
@@ -176,9 +200,9 @@
       "selected_strategy": "BEAR_CALL_SPREAD"
     },
     "last_entry_run_at": "23 Jun 2026 17:21:20 IST",
-    "last_exit_run_at": "23 Jun 2026 17:21:38 IST",
-    "last_weekly_pair_exit_run_at": "23 Jun 2026 17:21:54 IST",
-    "last_weekly_pair_exit_slot": "2026-06-23 17:21",
+    "last_exit_run_at": "25 Jun 2026 15:04:42 IST",
+    "last_weekly_pair_exit_run_at": "25 Jun 2026 15:00:11 IST",
+    "last_weekly_pair_exit_slot": "2026-06-25 15:00",
     "message": "No NIFTY position is due for T-7 time exit.",
     "open_strategies": [],
     "time_exit_status": "NO_DUE_EXITS",
@@ -187,16 +211,17 @@
     "weekly_pair_exit_results": [],
     "weekly_pair_exit_status": "NO_SIGNAL"
   },
+  "position_close_discount_percent": 20.0,
   "position_close_scheduler": {
     "enabled": true,
-    "last_attempt_date": "2026-06-17",
-    "last_run_at": "17 Jun 2026 09:25:52 IST",
-    "message": "No matching positions need a new BUY order after filters. Options with an existing open BUY close order were skipped.",
+    "last_attempt_date": "2026-06-25",
+    "last_run_at": "25 Jun 2026 09:25:15 IST",
+    "message": "Scheduled close BUY authentication failed: open Kite Setup, confirm the active profile, and regenerate today's access token.",
     "paused_until": "",
-    "profile": "Monika",
+    "profile": "Shanti",
     "results": [],
     "schedule_time": "09:20",
-    "status": "NO_ORDERS"
+    "status": "ERROR"
   },
-  "selected_kite_profile": "Shanti"
+  "selected_kite_profile": "Monika"
 }

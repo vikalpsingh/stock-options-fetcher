@@ -1,0 +1,4 @@
+exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity
+NFO,PGEL26JUN570CE,950,SELL,NRML,LIMIT,3.1,DAY
+NFO,ETERNAL26JUN285CE,2425,SELL,NRML,LIMIT,0.1,DAY
+NFO,HAVELLS26JUN1380CE,500,SELL,NRML,LIMIT,3.4,DAY
