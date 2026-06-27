@@ -565,11 +565,11 @@ INCOME_GROWTH_SHEET = [
     {"symbol": "WAAREEENER", "holding": 130, "times_lot": 0.74, "lots_can_sell": 1.0, "cmp": 3129.1, "call_strike": 3379, "value": 406783, "to_sell": 192.5, "lot_size": 175, "gap_pct": 8, "put_down_pct": 24.29, "pe": 2879, "week_52": -23.52, "one_year": 9.7, "month": -0.23, "week_1": 4.86, "today": 0.0},
 ]
 DIVIDEND_INCOME_SECURITIES = [
-    {"symbol": "PGINVIT", "company": "PGINVIT", "exchange": "BSE", "holding": 0},
+    {"symbol": "PGINVIT-IV", "company": "PGINVIT", "exchange": "NSE", "exchanges": ["NSE", "BSE"], "holding": 0},
     {"symbol": "IRBINVIT", "company": "IRBINVIT", "exchange": "NSE", "holding": 0},
 ]
 DIVIDEND_INCOME_SYMBOL_ALIASES = {
-    "PGINVIT": {"PGINVIT", "PGINVIT-IV", "PGINVITIV"},
+    "PGINVIT-IV": {"PGINVIT-IV", "PGINVIT", "PGINVITIV"},
     "IRBINVIT": {"IRBINVIT", "IRBINVIT-IV", "IRBINVITIV"},
 }
 INCOME_GROWTH_LOT_CAPS = {
@@ -683,6 +683,15 @@ def dividend_income_security(symbol: str) -> dict[str, Any] | None:
     return None
 
 
+def dividend_income_exchanges(item: dict[str, Any]) -> list[str]:
+    exchanges = item.get("exchanges")
+    if isinstance(exchanges, (list, tuple, set)):
+        values = [str(exchange or "").upper() for exchange in exchanges if exchange]
+    else:
+        values = [str(item.get("exchange") or "NSE").upper()]
+    return list(dict.fromkeys(exchange for exchange in values if exchange))
+
+
 def app_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(APP_DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -765,7 +774,7 @@ def app_db_connection() -> sqlite3.Connection:
             )
     now_text = app_now().isoformat(timespec="seconds")
     for old_symbol, new_symbol in (
-        ("PGINVIT-IV", "PGINVIT"),
+        ("PGINVIT", "PGINVIT-IV"),
         ("IRBINVIT-IV", "IRBINVIT"),
     ):
         conn.execute(
@@ -8647,8 +8656,9 @@ def dividend_income_rows(
 ) -> list[dict[str, Any]]:
     quote_keys = sorted(
         {
-            f"{str(item.get('exchange') or 'NSE').upper()}:{alias}"
+            f"{exchange}:{alias}"
             for item in DIVIDEND_INCOME_SECURITIES
+            for exchange in dividend_income_exchanges(item)
             for alias in DIVIDEND_INCOME_SYMBOL_ALIASES.get(
                 str(item["symbol"]).upper(),
                 {str(item["symbol"]).upper()},
@@ -8677,21 +8687,25 @@ def dividend_income_rows(
     for item in DIVIDEND_INCOME_SECURITIES:
         symbol = str(item["symbol"]).upper()
         exchange = str(item.get("exchange") or "NSE").upper()
+        exchanges = dividend_income_exchanges(item)
         stored = stored_holdings.get(symbol, {})
         actual = next(
             (
-                actual_by_symbol.get((exchange, alias_key))
+                actual_by_symbol.get((candidate_exchange, alias_key))
+                for candidate_exchange in exchanges
                 for alias_key in dividend_income_alias_keys(symbol)
-                if actual_by_symbol.get((exchange, alias_key))
+                if actual_by_symbol.get((candidate_exchange, alias_key))
             ),
             {},
         )
+        actual_exchange = str(actual.get("exchange") or exchange).upper()
         quote = next(
             (
-                quotes.get(f"{exchange}:{alias}")
+                quotes.get(f"{candidate_exchange}:{alias}")
+                for candidate_exchange in [actual_exchange, *exchanges]
                 for alias in DIVIDEND_INCOME_SYMBOL_ALIASES.get(symbol, {symbol})
-                if quotes.get(f"{exchange}:{alias}")
-                and quote_ltp(quotes.get(f"{exchange}:{alias}", {}))
+                if quotes.get(f"{candidate_exchange}:{alias}")
+                and quote_ltp(quotes.get(f"{candidate_exchange}:{alias}", {}))
             ),
             {},
         )
@@ -8713,7 +8727,7 @@ def dividend_income_rows(
         rows.append(
             {
                 "symbol": symbol,
-                "exchange": exchange,
+                "exchange": actual_exchange if actual else exchange,
                 "company": str(item.get("company") or symbol),
                 "holding_source": holding_source,
                 "quantity": holding,
@@ -10925,8 +10939,9 @@ def income_growth_equity_snapshot(symbol: str) -> dict[str, Any]:
         raise ValueError(f"{clean_symbol} is not an Income Growth stock.")
     kite = kite_orders.kite_client()
     exchange = str((dividend_security or {}).get("exchange") or "NSE").upper()
+    exchanges = dividend_income_exchanges(dividend_security) if dividend_security else [exchange]
     aliases = DIVIDEND_INCOME_SYMBOL_ALIASES.get(clean_symbol, {clean_symbol})
-    quote_keys = [f"{exchange}:{alias}" for alias in aliases]
+    quote_keys = [f"{candidate_exchange}:{alias}" for candidate_exchange in exchanges for alias in aliases]
     try:
         quotes = kite.quote(quote_keys)
         holdings = kite.holdings()
@@ -10945,12 +10960,14 @@ def income_growth_equity_snapshot(symbol: str) -> dict[str, Any]:
         (
             item
             for item in holdings
-            if str(item.get("exchange") or "NSE").upper() == exchange
+            if str(item.get("exchange") or "NSE").upper() in exchanges
             and normalize_security_lookup_key(item.get("tradingsymbol"))
             in dividend_income_alias_keys(clean_symbol)
         ),
         {},
     )
+    if holding:
+        exchange = str(holding.get("exchange") or exchange).upper()
     actual_quantity = int(float(holding.get("quantity") or 0))
     average_price = float(holding.get("average_price") or 0)
     if average_price <= 0:
@@ -11002,14 +11019,15 @@ def place_income_growth_equity_order(
     if clean_quantity <= 0:
         raise ValueError("Equity quantity must be greater than zero.")
     snapshot = income_growth_equity_snapshot(clean_symbol)
+    kite_symbol = str(snapshot.get("symbol") or clean_symbol).upper()
     if clean_side == "SELL" and clean_quantity > int(snapshot.get("quantity") or 0):
         raise ValueError(
             f"SELL quantity {clean_quantity} exceeds current Kite holding "
-            f"{int(snapshot.get('quantity') or 0)} for {clean_symbol}."
+            f"{int(snapshot.get('quantity') or 0)} for {kite_symbol}."
         )
     ltp = float(snapshot.get("ltp") or 0)
     if ltp <= 0:
-        raise ValueError(f"Could not read current LTP for {clean_symbol}.")
+        raise ValueError(f"Could not read current LTP for {kite_symbol}.")
     try:
         requested_price = float(limit_price or 0)
     except (TypeError, ValueError) as exc:
@@ -11026,7 +11044,7 @@ def place_income_growth_equity_order(
     order = {
         "variety": "regular",
         "exchange": str(snapshot.get("exchange") or "NSE").upper(),
-        "tradingsymbol": clean_symbol,
+        "tradingsymbol": kite_symbol,
         "transaction_type": clean_side,
         "quantity": clean_quantity,
         "product": "CNC",
@@ -11039,7 +11057,7 @@ def place_income_growth_equity_order(
     order_id = kite_orders.place_order(kite, order)
     invalidate_kite_trade_cache()
     return {
-        "tradingsymbol": clean_symbol,
+        "tradingsymbol": kite_symbol,
         "status": "LIVE_SENT",
         "order_id": order_id,
         "detail": (
@@ -14977,7 +14995,7 @@ def render_income_growth_panel(state: PageState) -> str:
     dividend_rows = list(summary.get("dividend_income_rows") or [])
     dividend_table_rows = "".join(render_income_growth_row(row) for row in dividend_rows)
     if not dividend_table_rows:
-        dividend_table_rows = '<tr><td colspan="23" class="muted-cell">Refresh Income Growth to load PGINVIT and IRBINVIT market data.</td></tr>'
+        dividend_table_rows = '<tr><td colspan="23" class="muted-cell">Refresh Income Growth to load PGINVIT-IV and IRBINVIT market data.</td></tr>'
     if not table_rows:
         table_rows = '<tr><td colspan="23" class="muted-cell">Click Refresh Income Growth to calculate covered-call capacity from your holdings sheet.</td></tr>'
     try:
@@ -15062,7 +15080,7 @@ def render_income_growth_panel(state: PageState) -> str:
       {outcome_panel}
       <section class="panel income-growth-table-panel dividend-income-panel">
         <div class="panel-title">Dividend Income</div>
-        <div class="status">Income-focused InvIT watchlist. PGINVIT (BSE) and IRBINVIT (NSE) holdings are matched from the selected Kite profile; click either security to place a CNC LIMIT BUY or SELL order.</div>
+        <div class="status">Income-focused InvIT watchlist. PGINVIT-IV and IRBINVIT holdings are matched from the selected Kite profile; click either security to place a CNC LIMIT BUY or SELL order.</div>
         <div class="table-wrap"><table id="dividend-income-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{dividend_table_rows}</tbody></table></div>
       </section>
       {render_income_growth_gpt_schedule_panel()}

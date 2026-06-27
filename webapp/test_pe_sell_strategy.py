@@ -3055,7 +3055,7 @@ class PeSellStrategyTests(unittest.TestCase):
         state.income_growth_summary = {
             "dividend_income_rows": [
                 {
-                    "symbol": "PGINVIT",
+                    "symbol": "PGINVIT-IV",
                     "company": "PGINVIT",
                     "quantity": 0,
                     "avg_price": 0,
@@ -3085,7 +3085,7 @@ class PeSellStrategyTests(unittest.TestCase):
 
         self.assertIn("Dividend Income", output)
         self.assertIn('id="dividend-income-table"', output)
-        self.assertIn('data-symbol="PGINVIT"', output)
+        self.assertIn('data-symbol="PGINVIT-IV"', output)
         self.assertIn('data-symbol="IRBINVIT"', output)
         self.assertIn('id="income-equity-limit-price"', output)
         self.assertIn("CNC LIMIT BUY or SELL", output)
@@ -3098,8 +3098,8 @@ class PeSellStrategyTests(unittest.TestCase):
             def holdings(self):
                 return [
                     {
-                        "exchange": "BSE",
-                        "tradingsymbol": "PGINVIT",
+                        "exchange": "NSE",
+                        "tradingsymbol": "PGINVIT-IV",
                         "quantity": 100,
                         "average_price": 93.825,
                         "last_price": 93.79,
@@ -3121,22 +3121,22 @@ class PeSellStrategyTests(unittest.TestCase):
             rows = app.dividend_income_rows(FakeKite(), {})
 
         by_symbol = {row["symbol"]: row for row in rows}
-        self.assertEqual(by_symbol["PGINVIT"]["quantity"], 100)
-        self.assertEqual(by_symbol["PGINVIT"]["exchange"], "BSE")
-        self.assertEqual(by_symbol["PGINVIT"]["avg_price"], 93.825)
-        self.assertEqual(by_symbol["PGINVIT"]["cmp"], 93.79)
-        self.assertEqual(by_symbol["PGINVIT"]["invested_amount"], 9382.5)
-        self.assertEqual(by_symbol["PGINVIT"]["market_value"], 9379.0)
-        self.assertAlmostEqual(by_symbol["PGINVIT"]["pnl"], -3.5)
-        self.assertEqual(by_symbol["PGINVIT"]["holding_source"], "Kite profile: Shanti")
+        self.assertEqual(by_symbol["PGINVIT-IV"]["quantity"], 100)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["exchange"], "NSE")
+        self.assertEqual(by_symbol["PGINVIT-IV"]["avg_price"], 93.825)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["cmp"], 93.79)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["invested_amount"], 9382.5)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["market_value"], 9379.0)
+        self.assertAlmostEqual(by_symbol["PGINVIT-IV"]["pnl"], -3.5)
+        self.assertEqual(by_symbol["PGINVIT-IV"]["holding_source"], "Kite profile: Shanti")
         self.assertEqual(by_symbol["IRBINVIT"]["quantity"], 150)
         self.assertEqual(by_symbol["IRBINVIT"]["exchange"], "NSE")
         self.assertEqual(by_symbol["IRBINVIT"]["avg_price"], 60.2167)
 
     def test_income_growth_equity_order_uses_requested_limit_price(self):
         snapshot = {
-            "symbol": "PGINVIT",
-            "exchange": "BSE",
+            "symbol": "PGINVIT-IV",
+            "exchange": "NSE",
             "quantity": 0,
             "average_price": 0,
             "ltp": 101.2,
@@ -3159,8 +3159,8 @@ class PeSellStrategyTests(unittest.TestCase):
             result = app.place_income_growth_equity_order("PGINVIT", "BUY", 10, 100.03)
 
         self.assertEqual(result["status"], "LIVE_SENT")
-        self.assertEqual(placed["tradingsymbol"], "PGINVIT")
-        self.assertEqual(placed["exchange"], "BSE")
+        self.assertEqual(placed["tradingsymbol"], "PGINVIT-IV")
+        self.assertEqual(placed["exchange"], "NSE")
         self.assertEqual(placed["product"], "CNC")
         self.assertEqual(placed["order_type"], "LIMIT")
         self.assertEqual(placed["price"], 100.05)
