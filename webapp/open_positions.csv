@@ -1,0 +1,4 @@
+position_id,entry_date,symbol,tradingsymbol,option_type,strike,expiry,quantity,lot_size,entry_premium,current_premium,target_exit_premium,warning_premium,hard_stop_premium,underlying_entry_price,current_underlying_price,status,reason,last_checked_at
+PFC26JUL420PE-1300,2026-06-29,PFC,PFC26JUL420PE,PE,420.0,2026-07-28,-1300,1300,6.75,10.0,1.6875,13.5,20.25,0,0,OPEN,Premium is between target and risk thresholds.,2026-06-29T10:46:43
+PFC26JUL470CE-1300,2026-06-29,PFC,PFC26JUL470CE,CE,470.0,2026-07-28,-1300,1300,5.0,2.75,2.5,10.0,15.0,0,0,OPEN,Premium is between target and risk thresholds.,2026-06-29T10:46:43
+TATACONSUM26JUL1240CE-550,2026-06-29,TATACONSUM,TATACONSUM26JUL1240CE,CE,1240.0,2026-07-28,-550,550,4.15,6.65,2.075,8.3,12.450000000000001,0,0,OPEN,Premium is between target and risk thresholds.,2026-06-29T10:46:43

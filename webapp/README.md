@@ -22,6 +22,14 @@ npm run dev
 
 The site runs at `http://localhost:3000`.
 
+## Python Risk Tests
+
+```bash
+python -m pytest tests -v
+```
+
+The risk tests use mock data only and do not call Kite or the internet.
+
 ## Production (Ubuntu + PM2 + Nginx)
 
 ```bash

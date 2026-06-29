@@ -1,0 +1,31 @@
+{
+  "CORE_COMPOUNDER": {
+    "purpose": "Long-term wealth creation. Avoid capping upside aggressively.",
+    "symbols": ["TITAN", "TATACONSUM", "CAMS", "CDSL", "NAUKRI"],
+    "rules": [
+      "CE allowed only if conservative",
+      "Prefer far OTM CE",
+      "Avoid CE near breakout",
+      "PE allowed only if valuation and trend are favorable"
+    ]
+  },
+  "INCOME_STOCK": {
+    "purpose": "Regular covered-call income.",
+    "symbols": ["PFC", "NTPC", "HAVELLS", "UNITDSPR"],
+    "rules": [
+      "CE allowed with normal filters",
+      "PE allowed if cash-secured and no breakdown"
+    ]
+  },
+  "HIGH_VOLATILITY_GROWTH": {
+    "purpose": "Higher growth but higher risk.",
+    "symbols": ["PGEL", "ETERNAL", "WAAREE", "WAAREEENER", "MAZDOCK"],
+    "rules": [
+      "Reduce quantity by 50%",
+      "Wider strikes required",
+      "Avoid trading during high VIX",
+      "Mandatory stop-loss",
+      "No PE sell if stock is below EMA50"
+    ]
+  }
+}

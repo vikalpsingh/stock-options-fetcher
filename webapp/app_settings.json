@@ -18,59 +18,104 @@
     "WAAREEENER"
   ],
   "income_growth_gpt_scheduler": {
-    "csv_path": "C:\\Coding\\NSE\\stock-options-fetcher\\17Jun2026.csv",
+    "csv_path": "C:\\Coding\\NSE\\stock-options-fetcher\\29Jun2026.csv",
     "enabled": true,
-    "last_attempt_date": "2026-06-25",
-    "last_run_at": "25 Jun 2026 09:30:21 IST",
-    "message": "OpenAI returned an empty response.\n\nResponse ID: resp_0913011972582555006a3ca7e5b8c4819f808c3f4694017716\nModel: gpt-5.5-2026-04-23\n\nOpenAI raw output preview:\n{\n  \"id\": \"resp_0913011972582555006a3ca7e5b8c4819f808c3f4694017716\",\n  \"object\": \"response\",\n  \"creat",
-    "order_count": 7,
-    "output_preview": "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\nNFO,PGEL26JUN530CE,950,SELL,NRML,LIMIT,21.15,DAY\nNFO,ETERNAL26JUN272.5CE,2425,SELL,NRML,LIMIT,1.3,DAY\nNFO,UNITDSPR26JUN1380CE,400,SELL,NRML,LIMIT,3.6,DAY\nNFO,NAUKRI26JUN1090CE,375,SELL,NRML,LIMIT,4.65,DAY\nNFO,MAZDOCK26JUN2660CE,200,SELL,NRML,LIMIT,15.1,DAY\nNFO,BAJFINANCE26JUN990CE,750,SELL,NRML,LIMIT,6.35,DAY\nNFO,TITAN26JUN4450CE,175,SELL,NRML,LIMIT,26.2,DAY",
+    "last_attempt_date": "2026-06-29",
+    "last_run_at": "29 Jun 2026 09:30:13 IST",
+    "message": "NSE market timestamp verified at 09:30:14 IST. Saved CSV text to 29Jun2026.csv. Ready for Research and Trading preview.",
+    "order_count": 3,
+    "output_preview": "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\nNFO,PGEL26JUL530CE,950,SELL,NRML,LIMIT,0,DAY\nNFO,UNITDSPR26JUL1380CE,400,SELL,NRML,LIMIT,0,DAY\nNFO,BAJFINANCE26JUL990CE,750,SELL,NRML,LIMIT,0,DAY",
     "paused_until": "",
-    "profile": "Monika",
-    "response_id": "resp_0e9a3b0264b4b9b9006a321beae71c819c9daccd030f91c2e5",
+    "profile": "Shanti",
+    "response_id": "resp_0c2be32ac04fb7c0006a41ee030bd081a38747f55d48a5b0c3",
     "schedule_time": "09:30",
-    "status": "ERROR"
+    "status": "SAVED"
   },
   "intraday_position_close_scheduler": {
     "close_order_evaluations": [
       {
         "action": "SKIP_EXISTING_CLOSE_ORDER",
-        "average_price": 20.35,
+        "average_price": 6.75,
         "close_side": "BUY",
         "existing_close_order": true,
-        "existing_order_id": "260625221633925",
-        "existing_order_price": 16.25,
-        "ltp": 20.35,
-        "position_quantity": -65,
-        "tradingsymbol": "NIFTY2672122600PE"
+        "existing_order_id": "260629150297985",
+        "existing_order_price": 5.4,
+        "ltp": 8.9,
+        "position_quantity": -1300,
+        "tradingsymbol": "PFC26JUL420PE"
       },
       {
         "action": "SKIP_EXISTING_CLOSE_ORDER",
-        "average_price": 49.1,
+        "average_price": 4.15,
         "close_side": "BUY",
         "existing_close_order": true,
-        "existing_order_id": "260625221633938",
-        "existing_order_price": 34.9,
-        "ltp": 37.95,
-        "position_quantity": -65,
-        "tradingsymbol": "NIFTY2672125100CE"
+        "existing_order_id": "260629150298025",
+        "existing_order_price": 3.3,
+        "ltp": 5.0,
+        "position_quantity": -550,
+        "tradingsymbol": "TATACONSUM26JUL1240CE"
       }
     ],
     "enabled": true,
     "end_time": "15:15",
     "interval_minutes": 15,
-    "last_run_at": "25 Jun 2026 15:00:10 IST",
-    "last_slot": "15:00",
-    "last_slot_key": "2026-06-25:15:00",
-    "loss_limit_evaluations": [],
-    "message": "All open option positions already have matching BUY/SELL close orders.",
+    "last_run_at": "29 Jun 2026 14:15:19 IST",
+    "last_slot": "14:15",
+    "last_slot_key": "2026-06-29:14:15",
+    "loss_limit_evaluations": [
+      {
+        "action": "NO_ACTION",
+        "adverse_loss_pct": 31.85185185185186,
+        "average_price": 6.75,
+        "hard_stop_price": 20.25,
+        "hard_stop_triggered": false,
+        "ltp": 8.9,
+        "option_type": "PE",
+        "tradingsymbol": "PFC26JUL420PE",
+        "trigger_percent": 100.0,
+        "triggered": false
+      },
+      {
+        "action": "NO_ACTION",
+        "adverse_loss_pct": 20.481927710843365,
+        "average_price": 4.15,
+        "hard_stop_price": 12.450000000000001,
+        "hard_stop_triggered": false,
+        "ltp": 5.0,
+        "option_type": "CE",
+        "tradingsymbol": "TATACONSUM26JUL1240CE",
+        "trigger_percent": 100.0,
+        "triggered": false
+      }
+    ],
+    "message": "All open option positions already have matching BUY/SELL close orders. Strict PE positions skipped because a close BUY order already exists: 1.",
     "order_count": 0,
     "paused_until": "",
-    "pe_risk_evaluations": [],
-    "profile": "Monika",
+    "pe_risk_evaluations": [
+      {
+        "action": "BUY_TO_CLOSE",
+        "allow_new_pe_same_underlying": false,
+        "assignment_allowed": false,
+        "captured_percent": -31.85185185185186,
+        "cash_covered": false,
+        "existing_close_order_id": "260629150297985",
+        "existing_close_pending_quantity": 1300,
+        "existing_close_price": 5.4,
+        "exit_status": "CASH_RISK_EXIT",
+        "otm_percent": 1.431588828913406,
+        "reason": "PE not fully cash secured",
+        "required_cash": 491400.0,
+        "scheduler_action": "SKIP_EXISTING_CLOSE_ORDER",
+        "score": 50,
+        "score_status": "ORANGE_REVIEW",
+        "should_exit": true,
+        "tradingsymbol": "PFC26JUL420PE"
+      }
+    ],
+    "profile": "Shanti",
     "results": [],
-    "run_count_today": 8,
-    "run_date": "2026-06-25",
+    "run_count_today": 20,
+    "run_date": "2026-06-29",
     "start_time": "09:30",
     "status": "ALL_COVERED"
   },
@@ -83,14 +128,14 @@
       "NIFTY_INCOME_ENABLED": false
     },
     "Monika": {
-      "KITE_ACCESS_TOKEN": "ccrz7kgLsb4Gr9LO7TmiXsJVBYJhiWFV",
+      "KITE_ACCESS_TOKEN": "Nns6FYtKqs7ZstV1c7EOBd34jDgpai14",
       "KITE_API_KEY": "tnaa26kee3iza58w",
       "KITE_API_SECRET": "pk55c56ih0ak3pd6cfmk24z14yt22946",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
       "NIFTY_INCOME_ENABLED": true
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "ccrz7kgLsb4Gr9LO7TmiXsJVBYJhiWFV",
+      "KITE_ACCESS_TOKEN": "nfW7i698K21jq3vA6N7Rqn9lrnH8yyC8",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
@@ -201,8 +246,8 @@
     },
     "last_entry_run_at": "23 Jun 2026 17:21:20 IST",
     "last_exit_run_at": "25 Jun 2026 15:04:42 IST",
-    "last_weekly_pair_exit_run_at": "25 Jun 2026 15:00:11 IST",
-    "last_weekly_pair_exit_slot": "2026-06-25 15:00",
+    "last_weekly_pair_exit_run_at": "29 Jun 2026 14:15:20 IST",
+    "last_weekly_pair_exit_slot": "2026-06-29 14:15",
     "message": "No NIFTY position is due for T-7 time exit.",
     "open_strategies": [],
     "time_exit_status": "NO_DUE_EXITS",
@@ -214,8 +259,8 @@
   "position_close_discount_percent": 20.0,
   "position_close_scheduler": {
     "enabled": true,
-    "last_attempt_date": "2026-06-25",
-    "last_run_at": "25 Jun 2026 09:25:15 IST",
+    "last_attempt_date": "2026-06-29",
+    "last_run_at": "29 Jun 2026 09:23:09 IST",
     "message": "Scheduled close BUY authentication failed: open Kite Setup, confirm the active profile, and regenerate today's access token.",
     "paused_until": "",
     "profile": "Shanti",
@@ -223,5 +268,5 @@
     "schedule_time": "09:20",
     "status": "ERROR"
   },
-  "selected_kite_profile": "Monika"
+  "selected_kite_profile": "Shanti"
 }
