@@ -53,3 +53,54 @@ def test_control_loss_builds_buy_order_at_ten_percent_below_hard_stop():
     assert orders[0]["transaction_type"] == "BUY"
     assert orders[0]["price"] == 13.5
     assert orders[0]["tag"] == "CTRL_LOSS"
+
+
+def test_missing_close_guard_builds_sell_order_for_long_buy_position():
+    position = {
+        "exchange": "NFO",
+        "tradingsymbol": "NIFTY26JUL22200PE",
+        "quantity": 65,
+        "product": "NRML",
+        "average_price": 18.45,
+        "ltp": 18.20,
+    }
+    with patch.object(app, "open_option_positions", return_value=[position]), patch.object(
+        app, "refresh_option_positions_with_live_ltp", return_value=[position]
+    ), patch.object(app, "open_option_close_orders_by_symbol_side", return_value={}):
+        orders, evaluations = app.build_missing_option_close_orders(kite=None, discount_percent=20)
+
+    assert evaluations[0]["action"] == "PLACE_SELL_CLOSE"
+    assert orders[0]["tradingsymbol"] == "NIFTY26JUL22200PE"
+    assert orders[0]["transaction_type"] == "SELL"
+    assert orders[0]["quantity"] == 65
+    assert orders[0]["price"] == 22.15
+    assert orders[0]["price_basis"] == "max_ltp_average_price"
+    assert "20% above max(LTP, average entry price)" in orders[0]["risk_note"]
+
+
+def test_missing_close_guard_skips_long_position_with_existing_sell_close_order():
+    position = {
+        "exchange": "NFO",
+        "tradingsymbol": "NIFTY26JUL22200PE",
+        "quantity": 65,
+        "product": "NRML",
+        "average_price": 18.45,
+        "ltp": 18.20,
+    }
+    existing = {
+        ("NIFTY26JUL22200PE", "SELL"): {
+            "order_id": "123",
+            "quantity": 65,
+            "price": 22.15,
+            "status": "OPEN",
+            "transaction_type": "SELL",
+        }
+    }
+    with patch.object(app, "open_option_positions", return_value=[position]), patch.object(
+        app, "refresh_option_positions_with_live_ltp", return_value=[position]
+    ), patch.object(app, "open_option_close_orders_by_symbol_side", return_value=existing):
+        orders, evaluations = app.build_missing_option_close_orders(kite=None, discount_percent=20)
+
+    assert orders == []
+    assert evaluations[0]["action"] == "SKIP_EXISTING_CLOSE_ORDER"
+    assert evaluations[0]["close_side"] == "SELL"

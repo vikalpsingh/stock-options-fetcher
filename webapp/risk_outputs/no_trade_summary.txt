@@ -1,2 +1,2 @@
-Approved trades: 3
-Rejected trades: 0
+Approved trades: 1
+Rejected trades: 4

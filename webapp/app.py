@@ -21,6 +21,7 @@ import hmac
 import html
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -44,6 +45,32 @@ from zoneinfo import ZoneInfo
 import risk_config
 from risk_engine import RiskVetoEngine, evaluate_and_write_orders, write_risk_outputs
 from position_lifecycle import PositionLifecycleManager, days_to_expiry, recommended_action_for_status
+from nifty_no_trade import (
+    DEFAULT_NIFTY_NO_TRADE_REGIME,
+    NoTradeDecision,
+    evaluate_nifty_no_trade_regime,
+    no_trade_reason_messages,
+)
+from nifty_tactical import (
+    NIFTY_TACTICAL_DEFAULT_CONFIG,
+    classify_nifty_market_regime,
+    select_nifty_tactical_strategy,
+    tactical_audit_row,
+    tactical_config,
+    validate_nifty_income_allocation,
+    validate_spread_credit_quality,
+)
+from nifty_options_engine.config import NIFTY_OPTIONS_ENGINE_CONFIG
+from nifty_options_engine.workflow import (
+    build_capital_router,
+    build_strategy_recommendation,
+    build_trade_unlock_panel,
+    scan_nifty_spread_alternatives,
+    validate_active_nifty_hedges,
+    validate_nifty_data_quality,
+)
+
+logger = logging.getLogger(__name__)
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -80,6 +107,7 @@ APP_DB_PATH = APP_ROOT / "vikalp_income.db"
 RISK_OUTPUT_DIR = APP_ROOT / "risk_outputs"
 OPEN_POSITIONS_PATH = APP_ROOT / "open_positions.csv"
 TRADE_JOURNAL_PATH = APP_ROOT / "trade_journal.csv"
+NIFTY_NO_TRADE_AUDIT_PATH = APP_ROOT / "nifty_no_trade_audit.csv"
 OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_OPTION_SELL_MARKUP_PERCENT = 20.0
@@ -236,6 +264,7 @@ NIFTY_INCOME_SCHEDULER_LOCK = threading.Lock()
 NIFTY_INCOME_DEFAULT_CONFIG = {
     "enabled": True,
     "timezone": "Asia/Kolkata",
+    "mode": "REGIME_BASED_TACTICAL_SPREAD",
     "execution_mode": "SUGGESTION_ONLY",
     "entry_execution_mode": "SUGGESTION_ONLY",
     "exit_execution_mode": "SUGGESTION_ONLY",
@@ -249,6 +278,7 @@ NIFTY_INCOME_DEFAULT_CONFIG = {
     "strike_rounding": 100,
     "friday_holiday_action": "PREVIOUS_TRADING_DAY",
     "time_exit_enabled": True,
+    "use_existing_hedge_positions": True,
     "time_exit_days_before_expiry": NIFTY_INCOME_CLOSE_DAYS_BEFORE_EXPIRY,
     "time_exit_time": NIFTY_INCOME_CLOSE_SCHEDULE_TIME,
     "time_exit_execution_mode": "SUGGESTION_ONLY",
@@ -303,6 +333,52 @@ NIFTY_INCOME_DEFAULT_CONFIG = {
     "hedge_width_default_points": 500,
     "hedge_width_low_vix_points": 300,
     "hedge_width_high_vix_points": 700,
+    "nifty_dynamic_hedge_width": {
+        "enabled": True,
+        "default_width_points": 300,
+        "strike_rounding": 100,
+        "vix_width_rules": [
+            {"min_vix": 0, "max_vix": 14, "hedge_width_points": 300, "action": "ALLOW"},
+            {"min_vix": 14, "max_vix": 18, "hedge_width_points": 400, "action": "ALLOW"},
+            {"min_vix": 18, "max_vix": 22, "hedge_width_points": 500, "action": "ALLOW"},
+            {"min_vix": 22, "max_vix": 24, "hedge_width_points": 600, "action": "ALLOW_REDUCED_SIZE"},
+            {"min_vix": 24, "max_vix": 999, "hedge_width_points": 700, "action": "SKIP_OR_MANUAL_REVIEW"},
+        ],
+        "high_vix_size_multiplier": 0.5,
+        "skip_if_vix_above": 24,
+        "allow_high_vix_manual_override": False,
+        "allow_asymmetric_hedge_width": False,
+    },
+    "nifty_confidence_score": {
+        "enabled": True,
+        "score_full_size_threshold": 85,
+        "score_half_size_threshold": 70,
+        "score_preview_only_threshold": 60,
+        "score_no_trade_below": 60,
+        "hard_block_overrides_score": True,
+        "weights": {
+            "mmi": 15,
+            "india_vix": 15,
+            "trend": 15,
+            "delta": 15,
+            "expected_move": 10,
+            "premium_yield": 10,
+            "open_interest": 8,
+            "market_breadth": 7,
+            "event_risk": 5,
+        },
+        "labels": {
+            "excellent_min": 85,
+            "good_min": 70,
+            "cautious_min": 60,
+        },
+        "position_size": {
+            "excellent_multiplier": 1.0,
+            "good_multiplier": 0.5,
+            "cautious_multiplier": 0.0,
+            "poor_multiplier": 0.0,
+        },
+    },
     "max_active_layers_normal": 3,
     "max_active_layers_vix_18_22": 2,
     "max_active_layers_vix_above_22": 1,
@@ -320,6 +396,9 @@ NIFTY_INCOME_DEFAULT_CONFIG = {
     "manual_pair_sell_markup_percent": 20.0,
     "allow_high_vix_trade": False,
     "no_auto_order_without_confirmation": True,
+    "nifty_no_trade_regime": DEFAULT_NIFTY_NO_TRADE_REGIME,
+    "nifty_income_strategy": NIFTY_TACTICAL_DEFAULT_CONFIG,
+    "nifty_options_engine": NIFTY_OPTIONS_ENGINE_CONFIG,
 }
 
 
@@ -369,6 +448,19 @@ class NiftyIncomeStrategy:
     exit_reason: str = ""
     force_close_datetime: datetime | None = None
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NiftyConfidenceScore:
+    score: int
+    label: str
+    action: str
+    position_size_multiplier: float
+    component_scores: dict[str, float]
+    hard_blocks: list[str]
+    warnings: list[str]
+    recommendation: str
+    explanation: str
 
 
 @dataclass
@@ -1389,12 +1481,47 @@ def nifty_income_config() -> dict[str, Any]:
     config = dict(NIFTY_INCOME_DEFAULT_CONFIG)
     if isinstance(saved, dict):
         config.update(saved)
+    no_trade_saved = config.get("nifty_no_trade_regime")
+    no_trade_config = dict(DEFAULT_NIFTY_NO_TRADE_REGIME)
+    if isinstance(no_trade_saved, dict):
+        no_trade_config.update(no_trade_saved)
+    config["nifty_no_trade_regime"] = no_trade_config
+    dynamic_hedge_saved = config.get("nifty_dynamic_hedge_width")
+    dynamic_hedge_config = copy.deepcopy(NIFTY_INCOME_DEFAULT_CONFIG["nifty_dynamic_hedge_width"])
+    if isinstance(dynamic_hedge_saved, dict):
+        dynamic_hedge_config.update(dynamic_hedge_saved)
+    config["nifty_dynamic_hedge_width"] = dynamic_hedge_config
+    confidence_saved = config.get("nifty_confidence_score")
+    confidence_config = copy.deepcopy(NIFTY_INCOME_DEFAULT_CONFIG["nifty_confidence_score"])
+    if isinstance(confidence_saved, dict):
+        for key, value in confidence_saved.items():
+            if isinstance(value, dict) and isinstance(confidence_config.get(key), dict):
+                merged_value = dict(confidence_config[key])
+                merged_value.update(value)
+                confidence_config[key] = merged_value
+            else:
+                confidence_config[key] = value
+    config["nifty_confidence_score"] = confidence_config
+    tactical_saved = config.get("nifty_income_strategy")
+    tactical_merged = copy.deepcopy(NIFTY_TACTICAL_DEFAULT_CONFIG)
+    if isinstance(tactical_saved, dict):
+        tactical_merged.update(tactical_saved)
+    config["nifty_income_strategy"] = tactical_merged
+    engine_saved = config.get("nifty_options_engine")
+    engine_merged = copy.deepcopy(NIFTY_OPTIONS_ENGINE_CONFIG)
+    if isinstance(engine_saved, dict):
+        engine_merged.update(engine_saved)
+    config["nifty_options_engine"] = engine_merged
+    config["mode"] = str(config.get("mode") or tactical_merged.get("mode") or "REGIME_BASED_TACTICAL_SPREAD")
+    config["entry_execution_mode"] = str(config.get("entry_execution_mode") or tactical_merged.get("entry_execution_mode") or "SUGGESTION_ONLY")
+    config["exit_execution_mode"] = str(config.get("exit_execution_mode") or tactical_merged.get("exit_execution_mode") or "SUGGESTION_ONLY")
     if str(config.get("entry_time") or "") in {"09:16", "15:22"}:
         config["entry_time"] = NIFTY_INCOME_ENTRY_SCHEDULE_TIME
     config["entry_day"] = "FRIDAY"
     config["enabled"] = bool(config.get("enabled", True))
     config["time_exit_enabled"] = bool(config.get("time_exit_enabled", True))
     config["weekly_pair_exit_enabled"] = bool(config.get("weekly_pair_exit_enabled", True))
+    config["use_existing_hedge_positions"] = bool(config.get("use_existing_hedge_positions", True))
     config["allow_live_naked_nifty_sell"] = bool(config.get("allow_live_naked_nifty_sell", False))
     config["emergency_exit_enabled"] = bool(config.get("emergency_exit_enabled", True))
     for key in (
@@ -1793,17 +1920,94 @@ def validate_nifty_layer_count(current_active_layers: int, max_allowed_layers: i
     }
 
 
-def nifty_hedge_width_for_vix(india_vix: Any, config: dict[str, Any] | None = None) -> int:
+def get_dynamic_hedge_width(india_vix: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
     config = config or nifty_income_config()
+    dynamic_config = copy.deepcopy(NIFTY_INCOME_DEFAULT_CONFIG["nifty_dynamic_hedge_width"])
+    saved_dynamic = config.get("nifty_dynamic_hedge_width")
+    if isinstance(saved_dynamic, dict):
+        dynamic_config.update(saved_dynamic)
+    default_width = int(dynamic_config.get("default_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS)
+    if not bool(dynamic_config.get("enabled", True)):
+        return {
+            "allowed": True,
+            "india_vix": None,
+            "hedge_width_points": int(config.get("hedge_distance_points") or default_width),
+            "pe_hedge_width_points": int(config.get("hedge_distance_points") or default_width),
+            "ce_hedge_width_points": int(config.get("hedge_distance_points") or default_width),
+            "size_multiplier": 1.0,
+            "vix_hedge_regime": "STATIC_CONFIG",
+            "action": "ALLOW",
+            "warning": "Dynamic hedge width disabled. Static hedge distance used.",
+            "skip_reason": None,
+        }
     try:
         vix = float(india_vix)
     except (TypeError, ValueError):
-        return int(config.get("hedge_width_default_points") or 500)
-    if vix < 15:
-        return int(config.get("hedge_width_low_vix_points") or 300)
-    if vix > 22:
-        return int(config.get("hedge_width_high_vix_points") or 700)
-    return int(config.get("hedge_width_default_points") or 500)
+        return {
+            "allowed": True,
+            "india_vix": None,
+            "hedge_width_points": default_width,
+            "pe_hedge_width_points": default_width,
+            "ce_hedge_width_points": default_width,
+            "size_multiplier": 1.0,
+            "vix_hedge_regime": "VIX_MISSING",
+            "action": "ALLOW",
+            "warning": "India VIX missing. Default hedge width used.",
+            "skip_reason": None,
+        }
+    selected_rule = None
+    for rule in dynamic_config.get("vix_width_rules") or []:
+        try:
+            min_vix = float(rule.get("min_vix") or 0)
+            max_vix = float(rule.get("max_vix") or 999)
+        except (TypeError, ValueError):
+            continue
+        if min_vix <= vix < max_vix or (vix == max_vix and max_vix == 24):
+            selected_rule = rule
+            break
+    if selected_rule is None:
+        selected_rule = {"hedge_width_points": default_width, "action": "ALLOW"}
+    width = int(selected_rule.get("hedge_width_points") or default_width)
+    action = str(selected_rule.get("action") or "ALLOW").upper()
+    if vix < 14:
+        regime = "LOW_NORMAL_VIX"
+    elif vix < 18:
+        regime = "MODERATE_VIX"
+    elif vix < 22:
+        regime = "HIGH_VIX"
+    elif vix <= 24:
+        regime = "VERY_HIGH_VIX"
+    else:
+        regime = "EXTREME_VIX"
+    size_multiplier = 1.0
+    warning = None
+    skip_reason = None
+    allowed = True
+    if action == "ALLOW_REDUCED_SIZE":
+        size_multiplier = float(dynamic_config.get("high_vix_size_multiplier") or 0.5)
+        warning = f"India VIX {vix:.2f}: hedge width {width} points and size reduced by 50%."
+    elif action == "SKIP_OR_MANUAL_REVIEW":
+        allowed = bool(dynamic_config.get("allow_high_vix_manual_override", False))
+        skip_reason = f"India VIX {vix:.2f} above {float(dynamic_config.get('skip_if_vix_above') or 24):.2f}. New NIFTY income trade skipped or requires manual review."
+        warning = skip_reason
+    else:
+        warning = f"India VIX {vix:.2f}: hedge width {width} points."
+    return {
+        "allowed": allowed,
+        "india_vix": vix,
+        "hedge_width_points": width,
+        "pe_hedge_width_points": width,
+        "ce_hedge_width_points": width,
+        "size_multiplier": size_multiplier,
+        "vix_hedge_regime": regime,
+        "action": action,
+        "warning": warning,
+        "skip_reason": skip_reason,
+    }
+
+
+def nifty_hedge_width_for_vix(india_vix: Any, config: dict[str, Any] | None = None) -> int:
+    return int(get_dynamic_hedge_width(india_vix, config).get("hedge_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS)
 
 
 def validate_nifty_defined_risk_orders(
@@ -1996,7 +2200,338 @@ def validate_monthly_kill_switch(
     }
 
 
+def _confidence_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = config or nifty_income_config()
+    saved = source.get("nifty_confidence_score") if isinstance(source, dict) else None
+    merged = copy.deepcopy(NIFTY_INCOME_DEFAULT_CONFIG["nifty_confidence_score"])
+    if isinstance(saved, dict):
+        for key, value in saved.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                inner = dict(merged[key])
+                inner.update(value)
+                merged[key] = inner
+            else:
+                merged[key] = value
+    return merged
+
+
+def _score_value(value: Any) -> float | None:
+    try:
+        if value in (None, "", "N/A", "NA", "--"):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _nifty_strategy_family(selected_strategy: Any) -> str:
+    strategy = str(selected_strategy or "").upper()
+    if "BULL_PUT" in strategy or (("PE" in strategy or "PUT" in strategy) and "CE" not in strategy and "CALL" not in strategy):
+        return "BULL_PUT_SPREAD"
+    if "BEAR_CALL" in strategy or (("CE" in strategy or "CALL" in strategy) and "PE" not in strategy and "PUT" not in strategy):
+        return "BEAR_CALL_SPREAD"
+    if "IRON" in strategy or "PAIR" in strategy or ("PE" in strategy and "CE" in strategy):
+        return "IRON_CONDOR"
+    if strategy == "NO_TRADE":
+        return "NO_TRADE"
+    return strategy or "UNKNOWN"
+
+
+def _nifty_confidence_label_action(score: int, hard_blocks: list[str], config: dict[str, Any]) -> tuple[str, str, float]:
+    position_size = config.get("position_size") if isinstance(config.get("position_size"), dict) else {}
+    if hard_blocks and bool(config.get("hard_block_overrides_score", True)):
+        return "NO_TRADE", "NO_TRADE", 0.0
+    if score >= int(config.get("score_full_size_threshold") or 85):
+        return "EXCELLENT", "FULL_SIZE", float(position_size.get("excellent_multiplier", 1.0))
+    if score >= int(config.get("score_half_size_threshold") or 70):
+        return "GOOD", "HALF_SIZE", float(position_size.get("good_multiplier", 0.5))
+    if score >= int(config.get("score_preview_only_threshold") or 60):
+        return "CAUTIOUS_PREVIEW_ONLY", "PREVIEW_ONLY", float(position_size.get("cautious_multiplier", 0.0))
+    return "NO_TRADE", "NO_TRADE", float(position_size.get("poor_multiplier", 0.0))
+
+
+def calculate_nifty_confidence_score(
+    inputs: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> NiftyConfidenceScore:
+    score_config = _confidence_config(config)
+    weights = score_config.get("weights") if isinstance(score_config.get("weights"), dict) else {}
+    selected_strategy = _nifty_strategy_family(inputs.get("selected_strategy"))
+    hard_blocks = [str(item) for item in (inputs.get("hard_block_reasons") or []) if str(item).strip()]
+    warnings: list[str] = [str(item) for item in (inputs.get("warnings") or []) if str(item).strip()]
+    components: dict[str, float] = {}
+
+    def weight(name: str, fallback: float) -> float:
+        return float(weights.get(name, fallback))
+
+    mmi_weight = weight("mmi", 15)
+    mmi = _score_value(inputs.get("mmi"))
+    if mmi is None:
+        components["mmi"] = 0.0
+        warnings.append("MMI missing.")
+    elif selected_strategy == "IRON_CONDOR" and 40 <= mmi <= 60:
+        components["mmi"] = mmi_weight
+    elif selected_strategy == "BULL_PUT_SPREAD" and mmi > 60:
+        components["mmi"] = mmi_weight
+    elif selected_strategy == "BEAR_CALL_SPREAD" and mmi < 40:
+        components["mmi"] = mmi_weight
+    else:
+        components["mmi"] = min(5.0, mmi_weight)
+        warnings.append("MMI is not strongly aligned with selected NIFTY strategy.")
+
+    vix_weight = weight("india_vix", 15)
+    india_vix = _score_value(inputs.get("india_vix"))
+    if india_vix is None:
+        components["india_vix"] = min(5.0, vix_weight)
+        warnings.append("India VIX missing.")
+    elif india_vix < 11:
+        components["india_vix"] = 0.0
+        hard_blocks.append("LOW_VIX")
+    elif india_vix <= 18:
+        components["india_vix"] = vix_weight
+    elif india_vix <= 22:
+        components["india_vix"] = min(10.0, vix_weight)
+    elif india_vix <= 24:
+        components["india_vix"] = min(5.0, vix_weight)
+        warnings.append("India VIX is high; size should be reduced.")
+    else:
+        components["india_vix"] = 0.0
+        hard_blocks.append("HIGH_VIX")
+
+    trend_weight = weight("trend", 15)
+    trend = str(inputs.get("trend_regime") or "").upper()
+    if not trend or trend in {"N/A", "UNKNOWN"}:
+        components["trend"] = min(5.0, trend_weight)
+        warnings.append("Trend regime missing.")
+    elif selected_strategy == "IRON_CONDOR" and trend in {"SIDEWAYS", "MIXED"}:
+        components["trend"] = trend_weight
+    elif selected_strategy == "BULL_PUT_SPREAD" and trend in {"BULLISH", "STRONG_BULLISH"}:
+        components["trend"] = trend_weight
+    elif selected_strategy == "BEAR_CALL_SPREAD" and trend in {"BEARISH", "STRONG_BEARISH"}:
+        components["trend"] = trend_weight
+    elif (selected_strategy == "BULL_PUT_SPREAD" and trend in {"STRONG_BEARISH", "BEARISH"}) or (
+        selected_strategy == "BEAR_CALL_SPREAD" and trend in {"STRONG_BULLISH", "BULLISH"}
+    ) or (selected_strategy == "IRON_CONDOR" and trend in {"STRONG_BULLISH", "STRONG_BEARISH"}):
+        components["trend"] = 0.0
+        hard_blocks.append("TREND_AGAINST_STRATEGY")
+    else:
+        components["trend"] = min(10.0, trend_weight)
+        warnings.append("Trend is only mildly aligned with selected NIFTY strategy.")
+
+    delta_weight = weight("delta", 15)
+    deltas: list[float] = []
+    if selected_strategy in {"IRON_CONDOR", "BULL_PUT_SPREAD"}:
+        pe_delta = _score_value(inputs.get("pe_delta"))
+        if pe_delta is not None:
+            deltas.append(abs(pe_delta))
+    if selected_strategy in {"IRON_CONDOR", "BEAR_CALL_SPREAD"}:
+        ce_delta = _score_value(inputs.get("ce_delta"))
+        if ce_delta is not None:
+            deltas.append(abs(ce_delta))
+    if not deltas:
+        components["delta"] = min(7.0, delta_weight)
+        warnings.append("Short-leg delta missing.")
+    elif any(delta > 0.20 for delta in deltas):
+        components["delta"] = 0.0
+        hard_blocks.append("DELTA_TOO_HIGH")
+    elif all(delta <= 0.12 for delta in deltas):
+        components["delta"] = delta_weight
+    elif all(delta <= 0.15 for delta in deltas):
+        components["delta"] = min(12.0, delta_weight)
+    else:
+        components["delta"] = min(6.0, delta_weight)
+        warnings.append("One short-leg delta is above 0.15.")
+
+    expected_weight = weight("expected_move", 10)
+    multiples: list[float] = []
+    if selected_strategy in {"IRON_CONDOR", "BULL_PUT_SPREAD"}:
+        value = _score_value(inputs.get("expected_move_multiple_pe"))
+        if value is not None:
+            multiples.append(value)
+    if selected_strategy in {"IRON_CONDOR", "BEAR_CALL_SPREAD"}:
+        value = _score_value(inputs.get("expected_move_multiple_ce"))
+        if value is not None:
+            multiples.append(value)
+    if not multiples:
+        components["expected_move"] = min(5.0, expected_weight)
+        warnings.append("Expected move buffer missing.")
+    elif any(value < 1.0 for value in multiples):
+        components["expected_move"] = 0.0
+        hard_blocks.append("EXPECTED_MOVE_TOO_CLOSE")
+    elif all(value >= 1.5 for value in multiples):
+        components["expected_move"] = expected_weight
+    elif all(value >= 1.2 for value in multiples):
+        components["expected_move"] = min(8.0, expected_weight)
+    else:
+        components["expected_move"] = min(4.0, expected_weight)
+        warnings.append("One short strike is only 1.0-1.2x expected move away.")
+
+    premium_weight = weight("premium_yield", 10)
+    premium_yield = _score_value(inputs.get("premium_yield_on_margin_pct"))
+    if premium_yield is None:
+        components["premium_yield"] = 0.0
+        warnings.append("Premium yield missing.")
+    elif premium_yield < 0.8:
+        components["premium_yield"] = 0.0
+        hard_blocks.append("POOR_PREMIUM_YIELD")
+    elif premium_yield < 1.0:
+        components["premium_yield"] = min(4.0, premium_weight)
+        warnings.append("Premium yield is below 1%.")
+    elif premium_yield < 1.5:
+        components["premium_yield"] = min(8.0, premium_weight)
+    else:
+        components["premium_yield"] = premium_weight
+
+    oi_weight = weight("open_interest", 8)
+    oi_status = str(inputs.get("oi_validation_status") or "").upper()
+    if not oi_status or oi_status in {"N/A", "UNKNOWN"}:
+        components["open_interest"] = min(4.0, oi_weight)
+        warnings.append("Open interest validation missing.")
+    elif "SUPPORT" in oi_status or "GOOD" in oi_status or "GREEN" in oi_status:
+        components["open_interest"] = oi_weight
+    elif "AGAINST" in oi_status or "RED" in oi_status:
+        components["open_interest"] = min(2.0, oi_weight)
+        warnings.append("Open interest is against selected strikes.")
+    else:
+        components["open_interest"] = min(5.0, oi_weight)
+
+    breadth_weight = weight("market_breadth", 7)
+    breadth = str(inputs.get("breadth_regime") or "").upper()
+    if not breadth or breadth in {"N/A", "UNKNOWN"}:
+        components["market_breadth"] = min(4.0, breadth_weight)
+        warnings.append("Market breadth missing.")
+    elif selected_strategy == "BULL_PUT_SPREAD" and breadth in {"STRONG", "BULLISH", "POSITIVE"}:
+        components["market_breadth"] = breadth_weight
+    elif selected_strategy == "BEAR_CALL_SPREAD" and breadth in {"WEAK", "BEARISH", "NEGATIVE"}:
+        components["market_breadth"] = breadth_weight
+    elif selected_strategy == "IRON_CONDOR" and breadth in {"MIXED", "NEUTRAL"}:
+        components["market_breadth"] = breadth_weight
+    elif breadth in {"MIXED", "NEUTRAL", "MILD_SUPPORT"}:
+        components["market_breadth"] = min(5.0, breadth_weight)
+    else:
+        components["market_breadth"] = min(2.0, breadth_weight)
+        warnings.append("Market breadth is against selected strategy.")
+
+    event_weight = weight("event_risk", 5)
+    event_status = str(inputs.get("event_risk_status") or "").upper()
+    if not event_status or event_status in {"N/A", "UNKNOWN"}:
+        components["event_risk"] = min(3.0, event_weight)
+        warnings.append("Event calendar missing.")
+    elif event_status in {"MAJOR_WITHIN_3_DAYS", "MAJOR_EVENT_WITHIN_3_DAYS", "BLOCK", "REJECT"}:
+        components["event_risk"] = 0.0
+        hard_blocks.append("EVENT_RISK")
+    elif event_status in {"WITHIN_5_DAYS", "EVENT_WITHIN_5_DAYS", "WARNING"}:
+        components["event_risk"] = min(2.0, event_weight)
+        warnings.append("Event risk within 5 trading days.")
+    else:
+        components["event_risk"] = event_weight
+
+    hard_blocks = list(dict.fromkeys(hard_blocks))
+    warnings = list(dict.fromkeys(warnings))
+    score = int(round(max(0.0, min(100.0, sum(float(value) for value in components.values())))))
+    label, action, multiplier = _nifty_confidence_label_action(score, hard_blocks, score_config)
+    recommendation = "NO_TRADE" if action == "NO_TRADE" else selected_strategy
+    if hard_blocks and bool(score_config.get("hard_block_overrides_score", True)):
+        explanation = "Trade blocked because: " + ", ".join(hard_blocks) + "."
+    elif action == "FULL_SIZE":
+        explanation = "Confidence is strong across regime, risk, premium and liquidity checks."
+    elif action == "HALF_SIZE":
+        explanation = "Setup is tradable, but sizing is reduced because one or more checks are not ideal."
+    elif action == "PREVIEW_ONLY":
+        explanation = "Setup is only suitable for review; do not auto-generate a fresh entry order."
+    else:
+        explanation = "Score is below the NIFTY income threshold; no fresh entry."
+    decision = NiftyConfidenceScore(
+        score=score,
+        label=label,
+        action=action,
+        position_size_multiplier=multiplier,
+        component_scores=components,
+        hard_blocks=hard_blocks,
+        warnings=warnings,
+        recommendation=recommendation,
+        explanation=explanation,
+    )
+    logger.info(
+        "NIFTY_CONFIDENCE_SCORE_CALCULATED",
+        extra={
+            "selected_strategy": selected_strategy,
+            "score": decision.score,
+            "label": decision.label,
+            "action": decision.action,
+            "component_scores": decision.component_scores,
+            "hard_blocks": decision.hard_blocks,
+            "warnings": decision.warnings,
+        },
+    )
+    if decision.action == "NO_TRADE":
+        logger.warning(
+            "NIFTY_CONFIDENCE_BLOCKED_ENTRY",
+            extra={
+                "score": decision.score,
+                "hard_blocks": decision.hard_blocks,
+                "explanation": decision.explanation,
+            },
+        )
+    return decision
+
+
+def nifty_confidence_to_dict(decision: NiftyConfidenceScore | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(decision, NiftyConfidenceScore):
+        return {
+            "score": decision.score,
+            "label": decision.label,
+            "action": decision.action,
+            "position_size_multiplier": decision.position_size_multiplier,
+            "component_scores": decision.component_scores,
+            "hard_blocks": decision.hard_blocks,
+            "warnings": decision.warnings,
+            "recommendation": decision.recommendation,
+            "explanation": decision.explanation,
+        }
+    return dict(decision or {})
+
+
+def apply_nifty_confidence_audit_fields(
+    orders: list[dict[str, Any]],
+    confidence: NiftyConfidenceScore | dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    value = nifty_confidence_to_dict(confidence)
+    if not value:
+        return orders
+    for order in orders:
+        order.update(
+            {
+                "confidence_score": value.get("score"),
+                "confidence_label": value.get("label"),
+                "confidence_action": value.get("action"),
+                "confidence_position_size_multiplier": value.get("position_size_multiplier"),
+                "confidence_component_scores": json.dumps(value.get("component_scores") or {}, sort_keys=True),
+                "confidence_hard_blocks": "|".join(str(item) for item in (value.get("hard_blocks") or [])),
+                "confidence_warnings": "|".join(str(item) for item in (value.get("warnings") or [])),
+                "confidence_recommendation": value.get("recommendation"),
+                "confidence_explanation": value.get("explanation"),
+            }
+        )
+    return orders
+
+
 def select_nifty_income_strategy(inputs: dict[str, Any]) -> dict[str, Any]:
+    upstream_no_trade = inputs.get("no_trade_decision")
+    if isinstance(upstream_no_trade, dict) and upstream_no_trade.get("no_trade"):
+        reasons = list(upstream_no_trade.get("reasons") or [])
+        return {
+            "allowed": False,
+            "selected_strategy": "NO_TRADE",
+            "skip_reason": upstream_no_trade.get("blocking_reason") or "NO_TRADE",
+            "strategy_selection_reason": " ".join(no_trade_reason_messages(reasons)) or "No trade gate blocked entry.",
+            "warnings": no_trade_reason_messages(reasons),
+            "position_size_multiplier": 0.0,
+            "hedge_pe_strike": None,
+            "hedge_ce_strike": None,
+            "no_trade": True,
+            "no_trade_decision": upstream_no_trade,
+        }
     warnings = list(inputs.get("warnings") or [])
     skip_reason = None
     strategy = "SKIP"
@@ -2014,31 +2549,43 @@ def select_nifty_income_strategy(inputs: dict[str, Any]) -> dict[str, Any]:
     elif not layer_check["allowed"]:
         allowed, strategy, skip_reason = False, "SKIP_LAYER_LIMIT", layer_check["reason"]
     else:
-        mmi = float(inputs.get("mmi") or 50)
-        trend = str(inputs.get("trend_regime") or "MIXED")
-        if trend == "SIDEWAYS" and 40 <= mmi <= 60:
-            strategy = "IRON_CONDOR"
-        elif mmi < 40 and trend != "STRONG_BEARISH":
-            strategy = "BULL_PUT_SPREAD"
-        elif mmi > 60 and trend != "STRONG_BULLISH":
-            strategy = "BEAR_CALL_SPREAD"
-        elif trend == "STRONG_BULLISH":
-            strategy = "BULL_PUT_SPREAD"
-            warnings.append("Strong bullish trend: CE sell disabled.")
-        elif trend == "STRONG_BEARISH":
-            strategy = "BEAR_CALL_SPREAD"
-            warnings.append("Strong bearish trend: PE sell disabled.")
-        else:
-            strategy = "SKIP_OR_HALF_SIZE"
-            warnings.append("No clean NIFTY edge; suggestion only.")
+        regime = classify_nifty_market_regime(
+            {
+                "nifty_spot": inputs.get("nifty_spot"),
+                "nifty_20ema": inputs.get("nifty_20ema"),
+                "nifty_50ema": inputs.get("nifty_50ema"),
+                "trend_regime": inputs.get("trend_regime"),
+                "india_vix": inputs.get("india_vix"),
+                "intraday_change_pct": inputs.get("intraday_change_pct"),
+                "gap_pct": inputs.get("gap_pct"),
+                "breadth_regime": inputs.get("breadth_regime"),
+                "previous_20day_high": inputs.get("previous_20day_high"),
+                "rsi_14": inputs.get("rsi_14"),
+                "adx_14": inputs.get("adx_14"),
+            }
+        )
+        tactical = select_nifty_tactical_strategy(
+            {
+                **regime,
+                "nifty_spot": inputs.get("nifty_spot"),
+                "nifty_20ema": inputs.get("nifty_20ema"),
+                "india_vix": inputs.get("india_vix"),
+                "mmi": inputs.get("mmi"),
+                "event_risk_status": inputs.get("event_risk_status"),
+            },
+            (inputs.get("config") or {}).get("nifty_income_strategy") if isinstance(inputs.get("config"), dict) else None,
+        )
+        strategy = str(tactical.get("selected_strategy") or "NO_TRADE")
+        if not tactical.get("allowed", False):
+            allowed, skip_reason = False, str(tactical.get("skip_reason") or tactical.get("reason") or "TACTICAL_NO_TRADE")
+        warnings.append(str(tactical.get("reason") or regime.get("reason") or "Regime-based tactical strategy selected."))
     hedge_distance = int(inputs.get("hedge_distance_points") or 500)
     pe_sell = inputs.get("pe_sell_strike")
     ce_sell = inputs.get("ce_sell_strike")
     hedge_pe = int(pe_sell) - hedge_distance if pe_sell and strategy in {"IRON_CONDOR", "BULL_PUT_SPREAD"} else None
     hedge_ce = int(ce_sell) + hedge_distance if ce_sell and strategy in {"IRON_CONDOR", "BEAR_CALL_SPREAD"} else None
     reason = (
-        f"{strategy} selected from MMI {inputs.get('mmi')}, trend {inputs.get('trend_regime')}, "
-        f"VIX {inputs.get('india_vix')} and expected-move buffers."
+        f"{strategy} selected from tactical regime {inputs.get('trend_regime')}, VIX {inputs.get('india_vix')} and credit filters."
         if allowed
         else f"NIFTY strategy skipped: {skip_reason}."
     )
@@ -2076,6 +2623,56 @@ def save_nifty_income_state(**updates: Any) -> dict[str, Any]:
     state.update(updates)
     save_app_settings({"nifty_income_state": state})
     return state
+
+
+def append_nifty_no_trade_audit(decision: dict[str, Any] | NoTradeDecision, source: str = "ENTRY") -> None:
+    value = decision.to_dict() if isinstance(decision, NoTradeDecision) else dict(decision or {})
+    inputs = value.get("inputs_snapshot") if isinstance(value.get("inputs_snapshot"), dict) else {}
+    fieldnames = [
+        "timestamp",
+        "source",
+        "no_trade_status",
+        "no_trade_blocking_reason",
+        "no_trade_all_reasons",
+        "india_vix",
+        "premium_yield_on_margin_pct",
+        "event_risk_status",
+        "next_major_event",
+        "days_to_event",
+        "trend_regime",
+        "breakout_status",
+        "breakdown_status",
+        "consecutive_stop_losses_this_month",
+        "monthly_nifty_pnl",
+        "monthly_loss_pct_of_nifty_margin",
+        "evaluated_at",
+    ]
+    next_event = inputs.get("next_major_event") or {}
+    row = {
+        "timestamp": datetime.now(INDIA_TIME_ZONE).isoformat(),
+        "source": source,
+        "no_trade_status": "NO_TRADE" if value.get("no_trade") else "TRADE_ALLOWED",
+        "no_trade_blocking_reason": value.get("blocking_reason") or "",
+        "no_trade_all_reasons": "|".join(str(item) for item in (value.get("reasons") or [])),
+        "india_vix": inputs.get("india_vix", ""),
+        "premium_yield_on_margin_pct": inputs.get("premium_yield_on_margin_pct", ""),
+        "event_risk_status": "BLOCK" if next_event else "OK",
+        "next_major_event": next_event.get("event_type") or next_event.get("type") or "",
+        "days_to_event": next_event.get("trading_days_to_event", ""),
+        "trend_regime": inputs.get("trend_regime", ""),
+        "breakout_status": inputs.get("breakout_status", ""),
+        "breakdown_status": inputs.get("breakdown_status", ""),
+        "consecutive_stop_losses_this_month": inputs.get("consecutive_stop_losses_this_month", ""),
+        "monthly_nifty_pnl": inputs.get("monthly_nifty_pnl", ""),
+        "monthly_loss_pct_of_nifty_margin": inputs.get("monthly_loss_pct_of_nifty_margin", ""),
+        "evaluated_at": value.get("evaluated_at") or "",
+    }
+    file_exists = NIFTY_NO_TRADE_AUDIT_PATH.exists()
+    with NIFTY_NO_TRADE_AUDIT_PATH.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def nifty_income_entry_schedule_state() -> dict[str, Any]:
@@ -2288,6 +2885,177 @@ def nifty_symbol_for_leg(
     if matches:
         return str(matches[0].get("tradingsymbol") or "").upper()
     return f"NIFTY{expiry.strftime('%d%b').upper()}{int(strike)}{option_type}"
+
+
+def _coerce_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d %b %Y", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _empty_nifty_long_hedge_coverage(min_quantity: int = 0) -> dict[str, Any]:
+    return {
+        "has_long_pe": False,
+        "has_long_ce": False,
+        "long_pe": None,
+        "long_ce": None,
+        "coverage_status": "NONE",
+        "min_quantity": int(min_quantity or 0),
+        "warnings": [],
+    }
+
+
+def _nifty_position_with_contract_details(
+    position: dict[str, Any],
+    instruments_by_symbol: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    symbol = str(position.get("tradingsymbol") or "").upper().strip()
+    if not symbol.startswith("NIFTY") or not symbol.endswith(("PE", "CE")):
+        return None
+    instrument = (instruments_by_symbol or {}).get(symbol) or {}
+    option_type = str(
+        instrument.get("instrument_type")
+        or position.get("option_type")
+        or (option_symbol_parts(symbol) or {}).get("option_type")
+        or symbol[-2:]
+    ).upper()
+    if option_type not in {"PE", "CE"}:
+        return None
+    expiry = _coerce_date(
+        instrument.get("expiry")
+        or position.get("expiry")
+        or position.get("expiry_date")
+    )
+    if expiry is None:
+        parts = option_symbol_parts(symbol)
+        if parts:
+            expiry = expiry_date_for_parts(parts)
+    strike = numeric_int(
+        instrument.get("strike")
+        or position.get("strike")
+        or ((option_symbol_parts(symbol) or {}).get("strike"))
+    )
+    if expiry is None or strike <= 0:
+        return None
+    quantity = int(float(position.get("quantity") or 0))
+    return {
+        "exchange": str(position.get("exchange") or "NFO").upper(),
+        "tradingsymbol": symbol,
+        "quantity": quantity,
+        "product": str(position.get("product") or "NRML"),
+        "average_price": float(position.get("average_price") or 0),
+        "ltp": float(position.get("ltp") or position.get("last_price") or 0),
+        "pnl": float(position.get("pnl") or 0),
+        "option_type": option_type,
+        "strike": float(strike),
+        "expiry": expiry.isoformat(),
+        "is_existing_hedge": True,
+    }
+
+
+def _nifty_hedge_coverage_status(has_pe: bool, has_ce: bool) -> str:
+    if has_pe and has_ce:
+        return "BOTH_COVERED"
+    if has_pe:
+        return "PE_ONLY"
+    if has_ce:
+        return "CE_ONLY"
+    return "NONE"
+
+
+def get_existing_nifty_long_hedges(
+    expiry_date: date | str,
+    min_quantity: int | None = None,
+    instruments: list[dict[str, Any]] | None = None,
+    positions: list[dict[str, Any]] | None = None,
+    use_cache: bool = False,
+) -> dict[str, Any]:
+    """Find existing long NIFTY PE/CE positions that can act as hedge cover."""
+    target_expiry = _coerce_date(expiry_date)
+    required_qty = int(min_quantity or 0)
+    coverage = _empty_nifty_long_hedge_coverage(required_qty)
+    if target_expiry is None:
+        coverage["warnings"].append("NIFTY hedge lookup skipped because expiry is missing.")
+        return coverage
+    instruments_by_symbol = {
+        str(item.get("tradingsymbol") or "").upper(): item
+        for item in (instruments or [])
+        if str(item.get("tradingsymbol") or "").strip()
+    }
+    try:
+        raw_positions = positions if positions is not None else open_option_positions(use_cache=use_cache)
+    except Exception as exc:
+        coverage["warnings"].append(f"Could not load NIFTY hedge positions: {exc}")
+        return coverage
+    candidates: list[dict[str, Any]] = []
+    for position in raw_positions or []:
+        if str(position.get("exchange") or "").upper() != "NFO":
+            continue
+        try:
+            quantity = int(float(position.get("quantity") or 0))
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity <= 0:
+            continue
+        row = _nifty_position_with_contract_details(position, instruments_by_symbol)
+        if not row:
+            continue
+        row_expiry = _coerce_date(row.get("expiry"))
+        if row_expiry != target_expiry:
+            continue
+        if required_qty and quantity < required_qty:
+            coverage["warnings"].append(
+                f"{row['tradingsymbol']} ignored: long quantity {quantity} is below required {required_qty}."
+            )
+            continue
+        candidates.append(row)
+
+    pe_candidates = [row for row in candidates if row.get("option_type") == "PE"]
+    ce_candidates = [row for row in candidates if row.get("option_type") == "CE"]
+    long_pe = min(pe_candidates, key=lambda row: float(row.get("strike") or 0), default=None)
+    long_ce = max(ce_candidates, key=lambda row: float(row.get("strike") or 0), default=None)
+    coverage["long_pe"] = long_pe
+    coverage["long_ce"] = long_ce
+    coverage["has_long_pe"] = bool(long_pe)
+    coverage["has_long_ce"] = bool(long_ce)
+    coverage["coverage_status"] = _nifty_hedge_coverage_status(bool(long_pe), bool(long_ce))
+    return coverage
+
+
+def _existing_nifty_hedge_for_side(
+    coverage: dict[str, Any] | None,
+    option_type: str,
+    sell_strike: int,
+    required_quantity: int,
+) -> dict[str, Any] | None:
+    if not coverage:
+        return None
+    key = "long_pe" if option_type == "PE" else "long_ce"
+    hedge = coverage.get(key)
+    if not isinstance(hedge, dict):
+        return None
+    try:
+        hedge_qty = int(float(hedge.get("quantity") or 0))
+        hedge_strike = float(hedge.get("strike") or 0)
+    except (TypeError, ValueError):
+        return None
+    if hedge_qty < int(required_quantity or 0):
+        return None
+    if option_type == "PE" and not hedge_strike < float(sell_strike):
+        return None
+    if option_type == "CE" and not hedge_strike > float(sell_strike):
+        return None
+    return hedge
 
 
 NIFTY_INCOME_MIN_OI_FOR_PREVIEW = 10000
@@ -2508,11 +3276,26 @@ def nifty_income_pair_orders_from_otm(
     include_pe: bool = True,
     include_ce: bool = True,
     include_cover: bool = True,
+    india_vix: Any = None,
+    confidence_size_multiplier: float | None = None,
+    existing_hedge_coverage: dict[str, Any] | None = None,
+    use_existing_hedges: bool | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     config = config or nifty_income_config()
     quote_map = quote_map or {}
     lot_size = int(config.get("lot_size") or 65)
+    use_existing_hedges = (
+        bool(config.get("use_existing_hedge_positions", True))
+        if use_existing_hedges is None
+        else bool(use_existing_hedges)
+    )
+    hedge_decision = get_dynamic_hedge_width(india_vix, config)
     lots = max(1, int(float(lots or 1)))
+    original_lots = lots
+    if hedge_decision.get("action") == "ALLOW_REDUCED_SIZE" and lots > 1:
+        lots = max(1, int(math.floor(lots * float(hedge_decision.get("size_multiplier") or 0.5))))
+    if confidence_size_multiplier is not None and 0 < float(confidence_size_multiplier) < 1 and lots > 1:
+        lots = max(1, int(math.floor(lots * float(confidence_size_multiplier))))
     quantity = lot_size * lots
     rounding = int(config.get("strike_rounding") or 100)
     sell_markup = max(0.0, float(config.get("manual_pair_sell_markup_percent") or 0.0))
@@ -2521,7 +3304,15 @@ def nifty_income_pair_orders_from_otm(
     ce_strike = round_up_to_step(float(spot) * (1 + float(ce_otm_pct) / 100), rounding)
     if not include_pe and not include_ce:
         raise ValueError("Select at least one NIFTY side: PE SELL or CE SELL.")
-    hedge_width = NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS
+    if use_existing_hedges and existing_hedge_coverage is None and instruments:
+        existing_hedge_coverage = get_existing_nifty_long_hedges(
+            expiry,
+            quantity,
+            instruments=instruments,
+            use_cache=False,
+        )
+    existing_hedge_coverage = existing_hedge_coverage or _empty_nifty_long_hedge_coverage(quantity)
+    hedge_width = int(hedge_decision.get("hedge_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS)
     requested_sells: list[tuple[int, str]] = []
     if include_pe:
         requested_sells.append((int(pe_strike), "PE"))
@@ -2557,7 +3348,19 @@ def nifty_income_pair_orders_from_otm(
             if option_type == "PE"
             else sell_strike + hedge_width
         )
-        if include_cover:
+        existing_hedge = (
+            _existing_nifty_hedge_for_side(
+                existing_hedge_coverage,
+                option_type,
+                sell_strike,
+                quantity,
+            )
+            if use_existing_hedges
+            else None
+        )
+        if existing_hedge:
+            legs.append(("BUY", int(float(existing_hedge.get("strike") or hedge_strike)), option_type, "NIFTY_EXISTING_HEDGE", True, existing_hedge))
+        elif include_cover:
             legs.append(("BUY", hedge_strike, option_type, "NIFTY_HEDGE", True, {}))
         legs.append(("SELL", sell_strike, option_type, "NIFTY_PAIR", False, adjusted_sell))
     orders: list[dict[str, Any]] = []
@@ -2567,10 +3370,14 @@ def nifty_income_pair_orders_from_otm(
         if adjusted_seed:
             symbol = str(adjusted_seed.get("tradingsymbol") or symbol).upper()
             strike = int(float(adjusted_seed.get("strike") or strike))
+        is_existing_hedge = bool(adjusted_seed.get("is_existing_hedge"))
         quote = quote_map.get(f"NFO:{symbol}", {}) or {}
-        ltp = quote_ltp(quote)
+        ltp = quote_ltp(quote) or (float(adjusted_seed.get("ltp") or 0) if is_existing_hedge else 0.0)
         if ltp > 0 and side == "SELL":
             price = ceil_to_tick(ltp * (1 + sell_markup / 100), 0.05)
+        elif is_existing_hedge:
+            # Existing hedges are already owned; use a zero incremental hedge cost for the new spread preview.
+            price = 0.0
         elif ltp > 0:
             # Protective hedges are intentionally placed below LTP so they do not fill immediately.
             price = max(0.05, floor_to_tick(max(0.05, ltp * (1 - protective_buy_discount / 100)), 0.05))
@@ -2604,14 +3411,28 @@ def nifty_income_pair_orders_from_otm(
             "protective_buy_discount_percent": protective_buy_discount if side == "BUY" else 0.0,
             "lot_size": lot_size,
             "lots": lots,
+            "original_lots": original_lots,
             "is_hedge": is_hedge,
+            "existing_hedge": is_existing_hedge,
+            "existing_hedge_average_price": float(adjusted_seed.get("average_price") or 0) if is_existing_hedge else 0.0,
+            "existing_hedge_cost_excluded": is_existing_hedge,
+            "skip_kite_order": is_existing_hedge,
             "hedge_width_points": hedge_width,
+            "pe_hedge_width_points": int(hedge_decision.get("pe_hedge_width_points") or hedge_width),
+            "ce_hedge_width_points": int(hedge_decision.get("ce_hedge_width_points") or hedge_width),
+            "india_vix": hedge_decision.get("india_vix"),
+            "vix_hedge_regime": hedge_decision.get("vix_hedge_regime"),
+            "hedge_action": hedge_decision.get("action"),
+            "size_multiplier": hedge_decision.get("size_multiplier"),
+            "dynamic_hedge_warning": hedge_decision.get("warning"),
+            "dynamic_hedge_skip_reason": hedge_decision.get("skip_reason"),
             "original_strike": adjusted_seed.get("original_strike") or strike,
             "liquidity_shift_points": adjusted_seed.get("liquidity_shift_points") or 0,
             "liquidity_adjustment_note": adjusted_seed.get("liquidity_adjustment_note") or "",
             "liquidity_checks": adjusted_seed.get("liquidity_checks") or [],
         }
-        orders.append(order)
+        if not is_existing_hedge:
+            orders.append(order)
         previews.append(order)
     return orders, previews
 
@@ -2729,10 +3550,14 @@ def nifty_income_manual_pair_snapshot(
     kite = kite_orders.kite_client() if kite_orders else None
     if kite is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
-    quotes = cached_kite_quote(kite, ["NSE:NIFTY 50"])
+    quotes = cached_kite_quote(kite, ["NSE:NIFTY 50", "NSE:INDIA VIX"])
     spot = quote_ltp(quotes.get("NSE:NIFTY 50", {}))
     if spot <= 0:
         raise RuntimeError("Could not load fresh NIFTY spot from Kite.")
+    india_vix = quote_ltp(quotes.get("NSE:INDIA VIX", {}))
+    if india_vix <= 0:
+        india_vix = None
+    hedge_decision = get_dynamic_hedge_width(india_vix, config)
     today = datetime.now(INDIA_TIME_ZONE).date()
     instruments = cached_kite_instruments(kite, "NFO")
     nifty_instruments = [
@@ -2742,6 +3567,7 @@ def nifty_income_manual_pair_snapshot(
         and str(item.get("segment") or "").upper() == "NFO-OPT"
     ]
     expiry = nifty_nearest_expiry(nifty_instruments, today, config)
+    use_existing_hedges = bool(config.get("use_existing_hedge_positions", True))
     existing_short_sides: set[str] = set()
     try:
         clear_app_cache(("kite:positions",))
@@ -2762,6 +3588,18 @@ def nifty_income_manual_pair_snapshot(
             f"No new NIFTY side is available. Existing short position already covers {existing_text}; "
             "deselect it or close the existing position first."
         )
+    lot_size = int(config.get("lot_size") or 65)
+    requested_lots = min(2, max(1, int(float(lots or 1))))
+    existing_hedge_coverage = (
+        get_existing_nifty_long_hedges(
+            expiry,
+            lot_size * requested_lots,
+            instruments=nifty_instruments,
+            use_cache=False,
+        )
+        if use_existing_hedges
+        else _empty_nifty_long_hedge_coverage(lot_size * requested_lots)
+    )
     draft_orders, _ = nifty_income_pair_orders_from_otm(
         nifty_instruments,
         expiry,
@@ -2770,10 +3608,13 @@ def nifty_income_manual_pair_snapshot(
         ce_otm_pct,
         config,
         {},
-        lots,
+        requested_lots,
         effective_include_pe,
         effective_include_ce,
         include_cover,
+        india_vix,
+        existing_hedge_coverage=existing_hedge_coverage,
+        use_existing_hedges=use_existing_hedges,
     )
     quote_keys = nifty_pair_liquidity_probe_quote_keys(draft_orders, nifty_instruments, expiry)
     if quote_keys:
@@ -2789,17 +3630,137 @@ def nifty_income_manual_pair_snapshot(
         ce_otm_pct,
         config,
         option_quotes,
-        lots,
+        requested_lots,
         effective_include_pe,
         effective_include_ce,
         include_cover,
+        india_vix,
+        existing_hedge_coverage=existing_hedge_coverage,
+        use_existing_hedges=use_existing_hedges,
     )
     sell_previews = [row for row in previews if row.get("transaction_type") == "SELL"]
     hedge_previews = [row for row in previews if row.get("transaction_type") == "BUY"]
     risk = calculate_nifty_manual_pair_risk(previews)
+    max_loss_to_credit_ratio = (
+        float(risk["max_loss"] or 0) / float(risk["net_credit"] or 0)
+        if risk.get("max_loss") is not None and float(risk.get("net_credit") or 0) > 0
+        else None
+    )
+    sell_by_type = {
+        str(row.get("option_type") or "").upper(): row
+        for row in previews
+        if str(row.get("transaction_type") or "").upper() == "SELL"
+    }
+    selected_strategy = (
+        "IRON_CONDOR"
+        if effective_include_pe and effective_include_ce
+        else "BULL_PUT_SPREAD"
+        if effective_include_pe
+        else "BEAR_CALL_SPREAD"
+    )
+    confidence = calculate_nifty_confidence_score(
+        {
+            "selected_strategy": selected_strategy,
+            "mmi": None,
+            "india_vix": india_vix,
+            "vix_regime": hedge_decision.get("vix_hedge_regime"),
+            "trend_regime": "UNKNOWN",
+            "pe_delta": sell_by_type.get("PE", {}).get("delta"),
+            "ce_delta": sell_by_type.get("CE", {}).get("delta"),
+            "expected_move_multiple_pe": None,
+            "expected_move_multiple_ce": None,
+            "premium_yield_on_margin_pct": risk["return_on_margin_pct"],
+            "oi_validation_status": (
+                "GOOD"
+                if all(
+                    int(float((option_quotes.get(f"NFO:{row.get('tradingsymbol')}", {}) or {}).get("oi") or 0)) >= NIFTY_INCOME_MIN_OI_FOR_PREVIEW
+                    for row in sell_by_type.values()
+                )
+                else "UNKNOWN"
+            ),
+            "breadth_regime": "UNKNOWN",
+            "event_risk_status": "UNKNOWN",
+            "hard_block_reasons": (
+                [str(hedge_decision.get("skip_reason") or "HIGH_VIX")]
+                if not hedge_decision.get("allowed", True)
+                else []
+            ),
+        },
+        config,
+    )
+    if confidence.action == "HALF_SIZE" and lots > 1:
+        half_lots = max(1, int(math.floor(max(1, int(float(lots or 1))) * float(confidence.position_size_multiplier or 0.5))))
+        existing_hedge_coverage = (
+            get_existing_nifty_long_hedges(
+                expiry,
+                lot_size * half_lots,
+                instruments=nifty_instruments,
+                use_cache=False,
+            )
+            if use_existing_hedges
+            else _empty_nifty_long_hedge_coverage(lot_size * half_lots)
+        )
+        orders, previews = nifty_income_pair_orders_from_otm(
+            nifty_instruments,
+            expiry,
+            spot,
+            pe_otm_pct,
+            ce_otm_pct,
+            config,
+            option_quotes,
+            lots,
+            effective_include_pe,
+            effective_include_ce,
+            include_cover,
+            india_vix,
+            confidence.position_size_multiplier,
+            existing_hedge_coverage=existing_hedge_coverage,
+            use_existing_hedges=use_existing_hedges,
+        )
+        sell_previews = [row for row in previews if row.get("transaction_type") == "SELL"]
+        hedge_previews = [row for row in previews if row.get("transaction_type") == "BUY"]
+        risk = calculate_nifty_manual_pair_risk(previews)
+        max_loss_to_credit_ratio = (
+            float(risk["max_loss"] or 0) / float(risk["net_credit"] or 0)
+            if risk.get("max_loss") is not None and float(risk.get("net_credit") or 0) > 0
+            else None
+        )
+    orders = apply_nifty_confidence_audit_fields(orders, confidence)
+    previews = apply_nifty_confidence_audit_fields(previews, confidence)
+    sell_previews = [row for row in previews if row.get("transaction_type") == "SELL"]
+    hedge_previews = [row for row in previews if row.get("transaction_type") == "BUY"]
+    generated_hedge_sides = {
+        str(row.get("option_type") or "").upper()
+        for row in hedge_previews
+        if not row.get("existing_hedge")
+    }
+    existing_hedge_sides = {
+        str(row.get("option_type") or "").upper()
+        for row in hedge_previews
+        if row.get("existing_hedge")
+    }
+    selected_sides = {
+        side
+        for side, selected in (("PE", effective_include_pe), ("CE", effective_include_ce))
+        if selected
+    }
+    covered_sides = generated_hedge_sides | existing_hedge_sides
+    uncovered_sides = sorted(selected_sides - covered_sides)
+    coverage_status = _nifty_hedge_coverage_status("PE" in existing_hedge_sides, "CE" in existing_hedge_sides)
+    if existing_hedge_sides == selected_sides and selected_sides:
+        hedge_coverage_message = "Existing long PE and CE hedges found. New protective BUY legs are not required." if selected_sides == {"PE", "CE"} else "Existing long hedge found for the selected NIFTY side. New protective BUY leg is not required."
+    elif existing_hedge_sides == {"CE"} and "PE" in selected_sides:
+        hedge_coverage_message = "Existing long CE hedge found. Only PE hedge will be added."
+    elif existing_hedge_sides == {"PE"} and "CE" in selected_sides:
+        hedge_coverage_message = "Existing long PE hedge found. Only CE hedge will be added."
+    elif existing_hedge_sides:
+        hedge_coverage_message = "Existing long NIFTY hedge found for one selected side; missing selected sides still need protective BUY legs."
+    else:
+        hedge_coverage_message = "No existing long NIFTY hedge found. Protective BUY legs will be generated when covers are enabled."
     missing_ltp = [row["tradingsymbol"] for row in orders if row.get("price", 0) <= 0]
     return {
         "spot": spot,
+        "india_vix": india_vix,
         "expiry": expiry.isoformat(),
         "pe_otm_pct": float(pe_otm_pct),
         "ce_otm_pct": float(ce_otm_pct),
@@ -2815,18 +3776,47 @@ def nifty_income_manual_pair_snapshot(
         "gross_sell_premium": risk["gross_credit"],
         "hedge_cost": risk["cover_cost"],
         "net_credit": risk["net_credit"],
+        "max_loss_to_credit_ratio": max_loss_to_credit_ratio,
+        "risk_reward_status": (
+            "REJECT_CONFIDENCE_NO_TRADE"
+            if confidence.action == "NO_TRADE"
+            else "PREVIEW_ONLY"
+            if confidence.action == "PREVIEW_ONLY"
+            else
+            "REJECT_PREMIUM_YIELD"
+            if risk["margin_required"] and (risk["net_credit"] / risk["margin_required"] * 100) < float(config.get("min_premium_yield_on_margin_pct") or 0.8)
+            else "REJECT_MAX_LOSS_TO_CREDIT"
+            if max_loss_to_credit_ratio is not None and max_loss_to_credit_ratio > float(config.get("max_loss_to_credit_ratio") or 4.0)
+            else "OK"
+        ),
         "defined_risk": risk["defined_risk"],
-        "uncovered_sides": risk["uncovered_sides"],
+        "uncovered_sides": uncovered_sides,
         "missing_ltp": missing_ltp,
         "lot_size": int(config.get("lot_size") or 65),
-        "lots": max(1, int(float(lots or 1))),
-        "quantity": int(config.get("lot_size") or 65) * max(1, int(float(lots or 1))),
-        "hedge_distance_points": NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS,
+        "lots": int((orders[0].get("lots") if orders else max(1, int(float(lots or 1)))) or 1),
+        "quantity": int((orders[0].get("quantity") if orders else int(config.get("lot_size") or 65) * max(1, int(float(lots or 1)))) or 0),
+        "hedge_distance_points": int(hedge_decision.get("hedge_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS),
+        "pe_hedge_width_points": int(hedge_decision.get("pe_hedge_width_points") or hedge_decision.get("hedge_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS),
+        "ce_hedge_width_points": int(hedge_decision.get("ce_hedge_width_points") or hedge_decision.get("hedge_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS),
+        "vix_hedge_regime": hedge_decision.get("vix_hedge_regime"),
+        "hedge_action": hedge_decision.get("action"),
+        "size_multiplier": hedge_decision.get("size_multiplier"),
+        "dynamic_hedge_warning": hedge_decision.get("warning"),
+        "dynamic_hedge_skip_reason": hedge_decision.get("skip_reason"),
+        "dynamic_hedge_allowed": hedge_decision.get("allowed"),
         "sell_markup_percent": float(config.get("manual_pair_sell_markup_percent") or 20.0),
         "protective_buy_discount_percent": float(config.get("manual_pair_sell_markup_percent") or 20.0),
         "include_pe": effective_include_pe,
         "include_ce": effective_include_ce,
         "include_cover": bool(include_cover),
+        "use_existing_hedges": use_existing_hedges,
+        "existing_hedge_coverage": existing_hedge_coverage,
+        "existing_hedge_sides": sorted(existing_hedge_sides),
+        "generated_hedge_sides": sorted(generated_hedge_sides),
+        "hedge_coverage_status": coverage_status,
+        "hedge_coverage_message": hedge_coverage_message,
+        "coverage_all_selected_sides_covered": not uncovered_sides,
+        "hedge_coverage_warnings": existing_hedge_coverage.get("warnings") or [],
         "naked_live_allowed": bool(config.get("allow_live_naked_nifty_sell", False)),
         "requested_include_pe": bool(include_pe),
         "requested_include_ce": bool(include_ce),
@@ -2836,6 +3826,7 @@ def nifty_income_manual_pair_snapshot(
             for side, requested in (("PE", include_pe), ("CE", include_ce))
             if requested and side in existing_short_sides
         ),
+        "confidence_score": nifty_confidence_to_dict(confidence),
     }
 
 
@@ -2846,6 +3837,7 @@ def place_nifty_income_manual_pair(
     include_pe: bool = True,
     include_ce: bool = True,
     include_cover: bool = True,
+    allow_uncovered_override: bool = False,
 ) -> list[dict[str, Any]]:
     if not kite_profile_nifty_income_enabled():
         raise PermissionError(
@@ -2866,8 +3858,37 @@ def place_nifty_income_manual_pair(
             "Could not place NIFTY pair because fresh LTP is missing for: "
             + ", ".join(str(item) for item in missing_ltp)
         )
+    if not snapshot.get("dynamic_hedge_allowed", True):
+        raise PermissionError(
+            str(snapshot.get("dynamic_hedge_skip_reason") or "Dynamic hedge rule blocked this NIFTY entry.")
+        )
+    uncovered_sides = [str(item) for item in (snapshot.get("uncovered_sides") or []) if str(item).strip()]
+    uncovered_acknowledged = bool(allow_uncovered_override)
+    if uncovered_sides and not snapshot.get("naked_live_allowed") and not uncovered_acknowledged:
+        raise PermissionError(
+            "NIFTY live entry blocked because selected side(s) are uncovered: "
+            + ", ".join(uncovered_sides)
+            + ". Enable protective covers, use existing hedge positions, or acknowledge uncovered NIFTY risk explicitly."
+        )
+    if str(snapshot.get("risk_reward_status") or "OK") != "OK":
+        confidence = snapshot.get("confidence_score") if isinstance(snapshot.get("confidence_score"), dict) else {}
+        if str(confidence.get("action") or "") in {"NO_TRADE", "PREVIEW_ONLY"}:
+            raise PermissionError(
+                f"NIFTY confidence gate blocked live entry: {confidence.get('label') or snapshot.get('risk_reward_status')}. "
+                f"{confidence.get('explanation') or 'Review the confidence score before placing fresh NIFTY income orders.'}"
+            )
+        raise PermissionError(
+            f"NIFTY pair risk/reward rejected: {snapshot.get('risk_reward_status')}. "
+            f"Premium yield {fmt_number(snapshot.get('return_on_margin_pct'), 2)}%, "
+            f"max loss / credit {fmt_number(snapshot.get('max_loss_to_credit_ratio'), 2)}."
+        )
     orders = snapshot.get("orders") or []
-    return execute_nifty_orders(orders, "LIVE_CONFIRMED", "Manual NIFTY PE/CE income pair")
+    return execute_nifty_orders(
+        orders,
+        "LIVE_CONFIRMED",
+        "Manual NIFTY PE/CE income pair",
+        allow_uncovered_override=uncovered_acknowledged,
+    )
 
 
 def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
@@ -2896,6 +3917,12 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
         "weekly_pair_exit_orders": [],
         "market_regime": {},
         "scheduled_jobs": [],
+        "trade_unlock": {},
+        "spread_alternatives": [],
+        "strategy_recommendation": {},
+        "hedge_integrity": {},
+        "data_quality": {},
+        "capital_router": [],
         "warnings": [],
     }
     try:
@@ -2914,6 +3941,8 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
             result["warnings"].append("NIFTY spot unavailable; using placeholder until refresh succeeds.")
         if india_vix <= 0:
             india_vix = None
+        hedge_decision = get_dynamic_hedge_width(india_vix, config)
+        if india_vix is None:
             result["warnings"].append("India VIX missing.")
         mmi_value = cached_value("market-mmi:nifty-income", fetch_mmi_snapshot, TOP_QUOTE_CACHE_SECONDS).get("value", 50)
         if mmi_value in (None, ""):
@@ -2975,8 +4004,12 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
         selector = select_nifty_income_strategy(
             {
                 "mmi": mmi_value,
+                "nifty_spot": spot,
+                "nifty_20ema": None,
+                "nifty_50ema": None,
                 "india_vix": india_vix,
                 "trend_regime": trend["trend_regime"],
+                "event_risk_status": "OK",
                 "vix_allowed": vix["allowed"],
                 "vix_skip_reason": vix.get("skip_reason"),
                 "monthly_risk_allowed": True,
@@ -2985,32 +4018,72 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                 "ce_sell_strike": ce_strike,
                 "expiry_date": expiry,
                 "current_active_layers": len(nifty_weekly_pair_groups(positions, config)),
-                "position_size_multiplier": vix["position_size_multiplier"],
-                "hedge_distance_points": nifty_hedge_width_for_vix(india_vix, config),
-                "warnings": vix["warnings"] + ([trend["trend_warning"]] if trend.get("trend_warning") else []),
+                "position_size_multiplier": min(
+                    float(vix.get("position_size_multiplier") or 1.0),
+                    float(hedge_decision.get("size_multiplier") or 1.0),
+                ),
+                "hedge_distance_points": int(hedge_decision.get("hedge_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS),
+                "warnings": vix["warnings"]
+                + ([trend["trend_warning"]] if trend.get("trend_warning") else [])
+                + ([hedge_decision.get("warning")] if hedge_decision.get("warning") else []),
+                "config": config,
             }
         )
         lot_size = int(config.get("lot_size") or 65)
-        hedge_distance = nifty_hedge_width_for_vix(india_vix, config)
+        hedge_distance = int(hedge_decision.get("hedge_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS)
+        dynamic_hedge_meta = {
+            "hedge_width_points": hedge_distance,
+            "pe_hedge_width_points": int(hedge_decision.get("pe_hedge_width_points") or hedge_distance),
+            "ce_hedge_width_points": int(hedge_decision.get("ce_hedge_width_points") or hedge_distance),
+            "india_vix": hedge_decision.get("india_vix"),
+            "vix_hedge_regime": hedge_decision.get("vix_hedge_regime"),
+            "hedge_action": hedge_decision.get("action"),
+            "size_multiplier": hedge_decision.get("size_multiplier"),
+            "dynamic_hedge_warning": hedge_decision.get("warning"),
+            "dynamic_hedge_skip_reason": hedge_decision.get("skip_reason"),
+        }
+        if not hedge_decision.get("allowed", True):
+            selector["allowed"] = False
+            selector["selected_strategy"] = "NO_TRADE"
+            selector["skip_reason"] = hedge_decision.get("skip_reason") or "DYNAMIC_HEDGE_HIGH_VIX_REJECT"
+            selector["warnings"] = list(selector.get("warnings") or []) + [str(hedge_decision.get("skip_reason") or "Dynamic hedge rule blocked new entry.")]
+        use_existing_hedges = bool(config.get("use_existing_hedge_positions", True))
+        existing_hedge_coverage = (
+            get_existing_nifty_long_hedges(
+                expiry,
+                lot_size,
+                instruments=nifty_instruments,
+                use_cache=False,
+            )
+            if use_existing_hedges
+            else _empty_nifty_long_hedge_coverage(lot_size)
+        )
+        selector["use_existing_hedge_positions"] = use_existing_hedges
+        selector["existing_hedge_coverage_status"] = existing_hedge_coverage.get("coverage_status")
+        selector["existing_hedge_warnings"] = existing_hedge_coverage.get("warnings") or []
+        logger.info(
+            "NIFTY_EXISTING_HEDGE_COVERAGE",
+            extra={
+                "use_existing_hedges": use_existing_hedges,
+                "coverage_status": existing_hedge_coverage.get("coverage_status"),
+                "min_quantity": existing_hedge_coverage.get("min_quantity"),
+                "has_long_pe": existing_hedge_coverage.get("has_long_pe"),
+                "has_long_ce": existing_hedge_coverage.get("has_long_ce"),
+            },
+        )
         legs: list[dict[str, Any]] = []
         if selector.get("final_pe_sell_strike"):
             sell = int(selector["final_pe_sell_strike"])
             hedge = int(selector.get("hedge_pe_strike") or sell - hedge_distance)
-            legs.extend(
-                [
-                    ("BUY", hedge, "PE"),
-                    ("SELL", sell, "PE"),
-                ]
-            )
+            if not _existing_nifty_hedge_for_side(existing_hedge_coverage, "PE", sell, lot_size):
+                legs.append(("BUY", hedge, "PE"))
+            legs.append(("SELL", sell, "PE"))
         if selector.get("final_ce_sell_strike"):
             sell = int(selector["final_ce_sell_strike"])
             hedge = int(selector.get("hedge_ce_strike") or sell + hedge_distance)
-            legs.extend(
-                [
-                    ("BUY", hedge, "CE"),
-                    ("SELL", sell, "CE"),
-                ]
-            )
+            if not _existing_nifty_hedge_for_side(existing_hedge_coverage, "CE", sell, lot_size):
+                legs.append(("BUY", hedge, "CE"))
+            legs.append(("SELL", sell, "CE"))
         legs.sort(key=lambda leg: 0 if leg[0] == "BUY" else 1)
         entry_orders = [
             {
@@ -3030,6 +4103,7 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                 "mmi_selected_otm_pct": pe_otm if option_type == "PE" else ce_otm,
                 "entry_date": entry_date.isoformat(),
                 "expiry_date": expiry.isoformat(),
+                **dynamic_hedge_meta,
             }
             for side, strike, option_type in legs
         ]
@@ -3051,6 +4125,7 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                 "mmi_selected_otm_pct": pe_otm,
                 "entry_date": entry_date.isoformat(),
                 "expiry_date": expiry.isoformat(),
+                **dynamic_hedge_meta,
             },
             {
                 "exchange": "NFO",
@@ -3069,6 +4144,7 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                 "mmi_selected_otm_pct": ce_otm,
                 "entry_date": entry_date.isoformat(),
                 "expiry_date": expiry.isoformat(),
+                **dynamic_hedge_meta,
             },
         ]
         adjusted_preview_sells = [
@@ -3085,19 +4161,45 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
             option_type = str(sell_order.get("option_type") or "").upper()
             sell_strike = int(float(sell_order.get("strike") or 0))
             hedge_strike = sell_strike - hedge_distance if option_type == "PE" else sell_strike + hedge_distance
-            preview_entry_orders.append(
-                {
-                    **sell_order,
-                    "tradingsymbol": nifty_symbol_for_leg(nifty_instruments, expiry, hedge_strike, option_type),
-                    "transaction_type": "BUY",
-                    "strike": hedge_strike,
-                    "tag": "NIFTY_HEDGE",
-                    "is_hedge": True,
-                    "liquidity_shift_points": 0,
-                    "liquidity_adjustment_note": "",
-                    "liquidity_checks": [],
-                }
+            existing_hedge = _existing_nifty_hedge_for_side(
+                existing_hedge_coverage,
+                option_type,
+                sell_strike,
+                lot_size,
             )
+            if existing_hedge:
+                preview_entry_orders.append(
+                    {
+                        **sell_order,
+                        "tradingsymbol": str(existing_hedge.get("tradingsymbol") or "").upper(),
+                        "transaction_type": "BUY",
+                        "strike": float(existing_hedge.get("strike") or hedge_strike),
+                        "tag": "NIFTY_EXISTING_HEDGE",
+                        "is_hedge": True,
+                        "existing_hedge": True,
+                        "option_ltp": float(existing_hedge.get("ltp") or 0),
+                        "price": 0,
+                        "liquidity_shift_points": 0,
+                        "liquidity_adjustment_note": "Existing long NIFTY hedge reused; no duplicate BUY hedge generated.",
+                        "liquidity_checks": [],
+                        **dynamic_hedge_meta,
+                    }
+                )
+            else:
+                preview_entry_orders.append(
+                    {
+                        **sell_order,
+                        "tradingsymbol": nifty_symbol_for_leg(nifty_instruments, expiry, hedge_strike, option_type),
+                        "transaction_type": "BUY",
+                        "strike": hedge_strike,
+                        "tag": "NIFTY_HEDGE",
+                        "is_hedge": True,
+                        "liquidity_shift_points": 0,
+                        "liquidity_adjustment_note": "",
+                        "liquidity_checks": [],
+                        **dynamic_hedge_meta,
+                    }
+                )
         option_quote_keys = [f"NFO:{order['tradingsymbol']}" for order in preview_entry_orders if order.get("tradingsymbol")]
         option_quotes = cached_kite_quote(kite, option_quote_keys) if option_quote_keys else {}
         candidate_previews = nifty_candidate_previews(
@@ -3107,6 +4209,25 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
             config,
             float(expected_validation.get("expected_move_points") or 0),
         )
+        tactical_cfg = tactical_config(config.get("nifty_income_strategy") if isinstance(config.get("nifty_income_strategy"), dict) else None)
+        for row in candidate_previews:
+            spread_width = abs(float(row.get("hedge_strike") or row.get("strike") or 0) - float(row.get("strike") or 0))
+            credit_check = validate_spread_credit_quality(
+                {
+                    "spread_width_points": spread_width,
+                    "net_credit_points": row.get("net_credit") or 0,
+                },
+                tactical_cfg,
+            )
+            row.update(
+                {
+                    "spread_width_points": credit_check["spread_width_points"],
+                    "credit_pct_of_spread_width": credit_check["credit_pct_of_spread_width"],
+                    "credit_quality": credit_check["credit_quality"],
+                    "credit_quality_reason": credit_check["reason"],
+                    "tactical_credit_accepted": credit_check["accepted"],
+                }
+            )
         preview_by_side = {str(row.get("side") or "").upper(): row for row in candidate_previews}
         delta_validation = validate_short_option_delta(
             preview_by_side.get("PE", {}).get("delta"),
@@ -3137,6 +4258,243 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
         ]
         estimated_margin = sum(numeric_losses)
         premium_yield = (max_gain / estimated_margin * 100) if estimated_margin > 0 else 0.0
+        tactical_credit_rejections = [
+            row for row in candidate_previews
+            if row.get("tactical_credit_accepted") is False
+        ]
+        if tactical_credit_rejections and tactical_cfg.get("no_trade_if_credit_too_low", True):
+            selector["allowed"] = False
+            selector["selected_strategy"] = "NO_TRADE"
+            selector["skip_reason"] = "TACTICAL_CREDIT_TOO_LOW"
+            selector["strategy_selection_reason"] = "No Trade: defined-risk NIFTY spread credit is below 8% of spread width."
+            selector["warnings"] = list(selector.get("warnings") or []) + [
+                f"{row.get('side')} credit {fmt_number(row.get('credit_pct_of_spread_width'), 2)}% is below tactical minimum."
+                for row in tactical_credit_rejections
+            ]
+            entry_orders = []
+        max_loss_to_credit_ratio = (
+            estimated_margin / max_gain
+            if estimated_margin > 0 and max_gain > 0
+            else None
+        )
+        monthly_nifty_pnl = float(state.get("monthly_nifty_pnl") or result["summary"].get("pnl") or 0)
+        monthly_loss_pct = (
+            monthly_nifty_pnl / estimated_margin * 100
+            if estimated_margin > 0
+            else 0.0
+        )
+        total_monthly_income_target = float(config.get("total_monthly_income_target") or 0) or 100000.0
+        current_nifty_income = float(state.get("monthly_nifty_realised_income") or state.get("monthly_nifty_pnl") or 0)
+        allocation_check = validate_nifty_income_allocation(
+            total_monthly_income_target,
+            current_nifty_income,
+            total_monthly_income_target,
+            tactical_cfg,
+        )
+        if not allocation_check.get("allowed", True):
+            selector["allowed"] = False
+            selector["selected_strategy"] = "NO_TRADE"
+            selector["skip_reason"] = "NIFTY_ALLOCATION_LIMIT"
+            selector["strategy_selection_reason"] = allocation_check["reason"]
+            selector["warnings"] = list(selector.get("warnings") or []) + [allocation_check["reason"]]
+            entry_orders = []
+        representative_credit = None
+        if candidate_previews:
+            representative_credit = min(
+                candidate_previews,
+                key=lambda row: float(row.get("credit_pct_of_spread_width") or 0),
+            )
+        tactical_audit = tactical_audit_row(
+            {
+                "regime": trend["trend_regime"],
+            },
+            {
+                "selected_strategy": selector.get("selected_strategy"),
+                "skip_reason": selector.get("skip_reason"),
+                "reason": selector.get("strategy_selection_reason"),
+            },
+            representative_credit,
+            allocation_check,
+            tactical_cfg,
+        )
+        no_trade_inputs = {
+            "india_vix": india_vix,
+            "premium_yield_on_margin_pct": premium_yield,
+            "event_calendar": state.get("event_calendar") or config.get("event_calendar") or [],
+            "current_date": datetime.now(INDIA_TIME_ZONE).date().isoformat(),
+            "trend_regime": trend["trend_regime"],
+            "breakout_status": trend["trend_regime"] == "STRONG_BULLISH",
+            "breakdown_status": trend["trend_regime"] == "STRONG_BEARISH",
+            "consecutive_stop_losses_this_month": state.get("consecutive_stop_losses_this_month")
+            or state.get("consecutive_stop_losses")
+            or 0,
+            "monthly_nifty_pnl": monthly_nifty_pnl,
+            "nifty_strategy_margin": estimated_margin,
+            "monthly_loss_pct_of_nifty_margin": monthly_loss_pct,
+            "execution_mode": config.get("execution_mode"),
+        }
+        no_trade_decision = evaluate_nifty_no_trade_regime(
+            no_trade_inputs,
+            config.get("nifty_no_trade_regime") if isinstance(config.get("nifty_no_trade_regime"), dict) else None,
+        )
+        logger.info(
+            "NIFTY_NO_TRADE_EVALUATED",
+            extra={
+                "inputs_snapshot": no_trade_decision.inputs_snapshot,
+                "reasons": no_trade_decision.reasons,
+                "allowed": no_trade_decision.allowed,
+            },
+        )
+        oi_values = [int(float(row.get("oi") or 0)) for row in candidate_previews]
+        oi_status = (
+            "GOOD"
+            if oi_values and all(value >= NIFTY_INCOME_MIN_OI_FOR_PREVIEW for value in oi_values)
+            else "NEUTRAL"
+            if oi_values and any(value > 0 for value in oi_values)
+            else "UNKNOWN"
+        )
+        next_event = (
+            no_trade_decision.inputs_snapshot.get("next_major_event")
+            if isinstance(no_trade_decision.inputs_snapshot, dict)
+            else {}
+        ) or {}
+        event_days = next_event.get("trading_days_to_event") if isinstance(next_event, dict) else None
+        event_status = (
+            "MAJOR_WITHIN_3_DAYS"
+            if event_days is not None and int(float(event_days)) <= 3
+            else "WITHIN_5_DAYS"
+            if next_event
+            else "OK"
+        )
+        hard_block_reasons = list(no_trade_decision.reasons or [])
+        if tactical_credit_rejections and tactical_cfg.get("no_trade_if_credit_too_low", True):
+            hard_block_reasons.append("POOR_TACTICAL_CREDIT")
+        if not allocation_check.get("allowed", True):
+            hard_block_reasons.append("NIFTY_INCOME_ALLOCATION_LIMIT")
+        if not hedge_decision.get("allowed", True):
+            hard_block_reasons.append(str(hedge_decision.get("skip_reason") or "HIGH_VIX"))
+        confidence_score = calculate_nifty_confidence_score(
+            {
+                "selected_strategy": selector.get("selected_strategy"),
+                "mmi": mmi_value,
+                "mmi_regime": mmi_base.get("mmi_regime"),
+                "india_vix": india_vix,
+                "vix_regime": vix.get("vix_regime"),
+                "trend_regime": trend.get("trend_regime"),
+                "pe_delta": preview_by_side.get("PE", {}).get("delta"),
+                "ce_delta": preview_by_side.get("CE", {}).get("delta"),
+                "expected_move_multiple_pe": preview_by_side.get("PE", {}).get("expected_move_multiple"),
+                "expected_move_multiple_ce": preview_by_side.get("CE", {}).get("expected_move_multiple"),
+                "premium_yield_on_margin_pct": premium_yield,
+                "oi_validation_status": oi_status,
+                "breadth_regime": "UNKNOWN",
+                "event_risk_status": event_status,
+                "hard_block_reasons": hard_block_reasons,
+            },
+            config,
+        )
+        confidence_dict = nifty_confidence_to_dict(confidence_score)
+        selector["confidence_score"] = confidence_dict
+        selector["position_size_multiplier"] = min(
+            float(selector.get("position_size_multiplier") or 1.0),
+            float(confidence_score.position_size_multiplier or 0.0)
+            if confidence_score.action in {"HALF_SIZE", "PREVIEW_ONLY", "NO_TRADE"}
+            else 1.0,
+        )
+        if confidence_score.action == "NO_TRADE":
+            selector["allowed"] = False
+            selector["selected_strategy"] = "NO_TRADE"
+            selector["skip_reason"] = "NIFTY_CONFIDENCE_NO_TRADE"
+            selector["strategy_selection_reason"] = confidence_score.explanation
+            selector["warnings"] = list(selector.get("warnings") or []) + [confidence_score.explanation]
+            entry_orders = []
+        elif confidence_score.action == "PREVIEW_ONLY":
+            selector["allowed"] = False
+            selector["skip_reason"] = "NIFTY_CONFIDENCE_PREVIEW_ONLY"
+            selector["warnings"] = list(selector.get("warnings") or []) + [confidence_score.explanation]
+            entry_orders = []
+        else:
+            entry_orders = apply_nifty_confidence_audit_fields(entry_orders, confidence_score)
+        if tactical_credit_rejections and tactical_cfg.get("no_trade_if_credit_too_low", True):
+            entry_orders = []
+        if not allocation_check.get("allowed", True):
+            entry_orders = []
+        preview_entry_orders = apply_nifty_confidence_audit_fields(preview_entry_orders, confidence_score)
+        candidate_previews = apply_nifty_confidence_audit_fields(candidate_previews, confidence_score)
+        if no_trade_decision.no_trade:
+            logger.warning(
+                "NIFTY_NO_TRADE_BLOCKED",
+                extra={
+                    "blocking_reason": no_trade_decision.blocking_reason,
+                    "reasons": no_trade_decision.reasons,
+                },
+            )
+            selector["allowed"] = False
+            selector["selected_strategy"] = "NO_TRADE"
+            selector["skip_reason"] = no_trade_decision.blocking_reason
+            selector["no_trade"] = True
+            selector["no_trade_blocking_reason"] = no_trade_decision.blocking_reason
+            selector["no_trade_all_reasons"] = no_trade_decision.reasons
+            selector["strategy_selection_reason"] = " ".join(no_trade_reason_messages(no_trade_decision.reasons))
+            selector["warnings"] = list(selector.get("warnings") or []) + no_trade_reason_messages(no_trade_decision.reasons)
+            entry_orders = []
+        hedge_integrity = validate_active_nifty_hedges(positions)
+        if hedge_integrity.get("block_new_entries"):
+            selector["allowed"] = False
+            selector["selected_strategy"] = "NO_TRADE"
+            selector["skip_reason"] = "NIFTY_HEDGE_INTEGRITY_CRITICAL"
+            selector["strategy_selection_reason"] = "New NIFTY entries blocked because an active short option is not fully hedged."
+            selector["warnings"] = list(selector.get("warnings") or []) + ["Active NIFTY hedge integrity is critical. Add hedge or exit before new entries."]
+            entry_orders = []
+        data_quality = validate_nifty_data_quality(
+            {
+                "nifty_spot": spot,
+                "india_vix": india_vix,
+                "option_ltp": any(float(row.get("option_ltp") or 0) > 0 for row in candidate_previews),
+                "bid_ask": any(float(row.get("bid") or 0) > 0 and float(row.get("ask") or 0) > 0 for row in candidate_previews),
+                "sell_delta": any(row.get("delta") not in (None, "", "N/A") for row in candidate_previews),
+                "hedge_delta": any(row.get("hedge_delta") not in (None, "", "N/A") for row in candidate_previews),
+                "expected_move": expected.get("expected_move_points"),
+                "expiry": expiry,
+                "instrument_symbol": any(row.get("tradingsymbol") for row in candidate_previews),
+                "margin_estimate": estimated_margin,
+                "last_refreshed_at": datetime.now(INDIA_TIME_ZONE).strftime("%d %b %Y %H:%M:%S IST"),
+            }
+        )
+        if data_quality.get("status") == "BLOCKED":
+            entry_orders = []
+        trade_unlock = build_trade_unlock_panel(
+            summary={
+                "net_credit": net_credit,
+                "premium_yield_on_margin_pct": premium_yield,
+                "vix": india_vix,
+            },
+            suggestion=selector,
+            candidate_previews=candidate_previews,
+            confidence_score=confidence_dict,
+            no_trade_decision=no_trade_decision.to_dict(),
+            config=config.get("nifty_options_engine") if isinstance(config.get("nifty_options_engine"), dict) else None,
+        )
+        alternatives = scan_nifty_spread_alternatives(
+            {
+                "selected_strategy": selector.get("selected_strategy"),
+                "confidence_score": confidence_dict.get("score"),
+                "expiry": expiry.isoformat() if expiry else "",
+                "dte": "21-35",
+            },
+            candidate_previews,
+            config.get("nifty_options_engine") if isinstance(config.get("nifty_options_engine"), dict) else None,
+        )
+        strategy_recommendation = build_strategy_recommendation(
+            unlock_panel=trade_unlock,
+            alternatives=alternatives,
+            confidence_score=confidence_dict,
+            hedge_integrity=hedge_integrity,
+            data_quality=data_quality,
+        )
+        capital_router = build_capital_router(
+            bool(selector.get("selected_strategy") == "NO_TRADE" or no_trade_decision.no_trade or trade_unlock.get("blocked")),
+        )
         due_exits = nifty_time_exit_orders_for_positions(positions, config)
         weekly_pair_rows, weekly_pair_orders = nifty_weekly_pair_exit_orders_for_positions(
             positions,
@@ -3186,9 +4544,16 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                     "net_credit": net_credit,
                     "max_gain": max_gain,
                     "max_loss": estimated_margin,
+                    "max_loss_to_credit_ratio": max_loss_to_credit_ratio,
                     "premium_yield_on_margin_pct": premium_yield,
+                    "monthly_loss_pct_of_nifty_margin": monthly_loss_pct,
+                    "nifty_income_allocation_pct": allocation_check.get("nifty_income_allocation_pct"),
+                    "nifty_income_allocation_status": allocation_check.get("status"),
+                    "tactical_mode": tactical_cfg.get("mode"),
+                    **dynamic_hedge_meta,
                 },
                 "market_regime": {
+                    "mode": tactical_cfg.get("mode"),
                     "nifty_spot": spot,
                     "nifty_futures": "N/A",
                     "mmi": mmi_value,
@@ -3200,6 +4565,7 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                     "dma_20": "N/A",
                     "dma_50": "N/A",
                     "trend_regime": trend["trend_regime"],
+                    "tactical_regime": tactical_audit.get("market_regime"),
                     "market_breadth": "N/A",
                     "banknifty_confirmation": "N/A",
                     "atm_straddle_price": expected["atm_straddle_price"],
@@ -3209,6 +4575,9 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                 },
                 "suggestion": {
                     **selector,
+                    "nifty_mode": tactical_cfg.get("mode"),
+                    "tactical_audit": tactical_audit,
+                    "nifty_income_allocation": allocation_check,
                     "spot": spot,
                     "mmi_regime": mmi_base["mmi_regime"],
                     "pe_otm_pct": pe_otm,
@@ -3220,9 +4589,13 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                     "estimated_margin": estimated_margin,
                     "estimated_target_profit": estimated_margin * float(config.get("trade_target_profit_pct_of_margin") or 2.5) / 100,
                     "estimated_stop_loss": estimated_margin * float(config.get("trade_stop_loss_pct_of_margin") or 3.0) / 100,
+                    "max_loss_to_credit_ratio": max_loss_to_credit_ratio,
+                    **dynamic_hedge_meta,
                     "entry_time": config["entry_time"],
                     "time_exit_date": scheduled_nifty_time_exit_date(expiry, int(config["time_exit_days_before_expiry"])).isoformat(),
                     "time_exit_time": config["time_exit_time"],
+                    "no_trade_decision": no_trade_decision.to_dict(),
+                    "confidence_score": confidence_dict,
                 },
                 "entry_orders": entry_orders,
                 "candidate_previews": candidate_previews,
@@ -3230,6 +4603,15 @@ def nifty_income_snapshot(force: bool = False) -> dict[str, Any]:
                 "weekly_pair_exit_rows": weekly_pair_rows,
                 "weekly_pair_exit_orders": weekly_pair_orders,
                 "scheduled_jobs": job_rows,
+                "no_trade_decision": no_trade_decision.to_dict(),
+                "confidence_score": confidence_dict,
+                "tactical_audit": tactical_audit,
+                "trade_unlock": trade_unlock,
+                "spread_alternatives": alternatives,
+                "strategy_recommendation": strategy_recommendation,
+                "hedge_integrity": hedge_integrity,
+                "data_quality": data_quality,
+                "capital_router": capital_router,
                 "warnings": result["warnings"] + selector.get("warnings", []) + preview_warnings,
             }
         )
@@ -3682,6 +5064,7 @@ def execute_nifty_orders(
     orders: list[dict[str, Any]],
     mode: str,
     reason: str,
+    allow_uncovered_override: bool = False,
 ) -> list[dict[str, Any]]:
     if not orders:
         return []
@@ -3700,7 +5083,7 @@ def execute_nifty_orders(
         config = nifty_income_config()
         risk_check = validate_nifty_defined_risk_orders(
             orders,
-            bool(config.get("allow_live_naked_nifty_sell", False)),
+            bool(config.get("allow_live_naked_nifty_sell", False)) or bool(allow_uncovered_override),
         )
         if not risk_check["allowed"]:
             raise PermissionError(
@@ -3780,9 +5163,18 @@ def run_nifty_income_entry_job(now: datetime | None = None, force: bool = False)
         snapshot = nifty_income_snapshot(True)
         selector = snapshot.get("suggestion") or {}
         if not selector.get("allowed", False):
+            no_trade_decision = selector.get("no_trade_decision") or snapshot.get("no_trade_decision") or {}
+            if selector.get("no_trade") or (
+                isinstance(no_trade_decision, dict) and no_trade_decision.get("no_trade")
+            ):
+                append_nifty_no_trade_audit(no_trade_decision, "SCHEDULED_ENTRY")
             return save_nifty_income_state(
                 entry_status="SKIPPED",
-                message=str(selector.get("skip_reason") or "No allowed NIFTY strategy today."),
+                message=str(
+                    selector.get("strategy_selection_reason")
+                    or selector.get("skip_reason")
+                    or "No allowed NIFTY strategy today."
+                ),
                 entry_results=[],
             )
         orders = snapshot.get("entry_orders") or []
@@ -5760,6 +7152,9 @@ def open_option_positions(use_cache: bool = True) -> list[dict[str, Any]]:
                 "average_price": float(position.get("average_price") or 0),
                 "ltp": float(position.get("last_price") or position.get("ltp") or 0),
                 "pnl": float(position.get("pnl") or 0),
+                "expiry": position.get("expiry") or position.get("expiry_date"),
+                "strike": position.get("strike"),
+                "option_type": position.get("option_type"),
             }
         )
     return active
@@ -17062,6 +18457,12 @@ def render_nifty_income_panel(state: PageState) -> str:
         "market_regime": {},
         "scheduled_jobs": [],
         "warnings": [],
+        "trade_unlock": {},
+        "spread_alternatives": [],
+        "strategy_recommendation": {},
+        "hedge_integrity": {},
+        "data_quality": {},
+        "capital_router": [],
     }
     config = snapshot.get("config") or nifty_income_config()
     schedule_state = snapshot.get("state") or nifty_income_state()
@@ -17077,6 +18478,15 @@ def render_nifty_income_panel(state: PageState) -> str:
     scheduled_jobs = snapshot.get("scheduled_jobs") or []
     warnings = snapshot.get("warnings") or []
     error = state.nifty_income_error or str(snapshot.get("error") or "")
+    no_trade_decision = snapshot.get("no_trade_decision") or suggestion.get("no_trade_decision") or {}
+    confidence_score = snapshot.get("confidence_score") or suggestion.get("confidence_score") or {}
+    tactical_audit = snapshot.get("tactical_audit") or suggestion.get("tactical_audit") or {}
+    trade_unlock = snapshot.get("trade_unlock") or {}
+    spread_alternatives = snapshot.get("spread_alternatives") or []
+    strategy_recommendation = snapshot.get("strategy_recommendation") or {}
+    hedge_integrity = snapshot.get("hedge_integrity") or {}
+    data_quality = snapshot.get("data_quality") or {}
+    capital_router = snapshot.get("capital_router") or []
 
     def select_options(name: str, value: str, options: list[str]) -> str:
         safe_name = html.escape(name, quote=True)
@@ -17122,6 +18532,7 @@ def render_nifty_income_panel(state: PageState) -> str:
     def regime_cards() -> str:
         fields = [
             ("NIFTY spot", market_regime.get("nifty_spot")),
+            ("Mode", market_regime.get("mode") or tactical_audit.get("nifty_mode")),
             ("NIFTY futures", market_regime.get("nifty_futures")),
             ("MMI", market_regime.get("mmi")),
             ("MMI regime", market_regime.get("mmi_regime")),
@@ -17132,6 +18543,7 @@ def render_nifty_income_panel(state: PageState) -> str:
             ("20 DMA", market_regime.get("dma_20")),
             ("50 DMA", market_regime.get("dma_50")),
             ("Trend", market_regime.get("trend_regime")),
+            ("Tactical regime", market_regime.get("tactical_regime") or tactical_audit.get("market_regime")),
             ("Expected move", f"{fmt_number(market_regime.get('expected_move_points'))} pts / {fmt_number(market_regime.get('expected_move_pct'))}%"),
         ]
         return "".join(
@@ -17141,7 +18553,7 @@ def render_nifty_income_panel(state: PageState) -> str:
 
     def candidate_rows() -> str:
         if not candidate_previews:
-            return '<tr><td colspan="20">No PE/CE candidate preview available. Refresh NIFTY Snapshot after Kite setup is ready.</td></tr>'
+            return '<tr><td colspan="22">No PE/CE candidate preview available. Refresh NIFTY Snapshot after Kite setup is ready.</td></tr>'
         return "".join(
             f'<tr class="nifty-preview-row nifty-preview-{html.escape(str(row.get("side") or "").lower(), quote=True)}">'
             f"<td><strong>{html.escape(str(row.get('side') or ''))} SELL</strong><small>Pair leg</small></td>"
@@ -17162,6 +18574,8 @@ def render_nifty_income_panel(state: PageState) -> str:
             f"<td>{html.escape(format_buy_amount(row.get('premium_value_per_lot')))}</td>"
             f"<td>{html.escape(format_buy_amount(row.get('max_gain_opportunity')))}</td>"
             f"<td>{html.escape(format_buy_amount(row.get('margin_required')) if isinstance(row.get('margin_required'), (int, float)) else str(row.get('margin_required') or 'N/A'))}</td>"
+            f'<td class="nifty-key-cell"><strong>{html.escape(fmt_number(row.get("credit_pct_of_spread_width"), 2))}%</strong><small>{html.escape(fmt_number(row.get("spread_width_points"), 0))} pts width</small></td>'
+            f'<td class="{strength_class("GREEN" if str(row.get("credit_quality")) in {"GOOD", "EXCELLENT"} else "YELLOW" if str(row.get("credit_quality")) == "ACCEPTABLE" else "RED")}"><strong>{html.escape(str(row.get("credit_quality") or "N/A"))}</strong><small>{html.escape(str(row.get("credit_quality_reason") or ""))}</small></td>'
             f"<td>{html.escape(fmt_number(row.get('premium_yield_on_margin_pct'), 2))}%</td>"
             f'<td class="{strength_class(row.get("risk_status"))}"><strong>{html.escape(str(row.get("risk_status") or "N/A"))}</strong><small>{html.escape(str(row.get("selection_reason") or ""))}</small></td>'
             "</tr>"
@@ -17215,6 +18629,393 @@ def render_nifty_income_panel(state: PageState) -> str:
             for job in scheduled_jobs
         )
 
+    def no_trade_gate_card() -> str:
+        decision = no_trade_decision if isinstance(no_trade_decision, dict) else {}
+        inputs = decision.get("inputs_snapshot") if isinstance(decision.get("inputs_snapshot"), dict) else {}
+        reasons = [str(item) for item in (decision.get("reasons") or []) if str(item).strip()]
+        messages = no_trade_reason_messages(reasons) if reasons else []
+        status_text = "NO TRADE" if decision.get("no_trade") else "TRADE ALLOWED"
+        status_badge = "avoid" if decision.get("no_trade") else "good"
+        next_event = inputs.get("next_major_event") if isinstance(inputs.get("next_major_event"), dict) else {}
+        event_label = "None within window"
+        if next_event:
+            event_type = next_event.get("event_type") or next_event.get("type") or "Event"
+            event_days = next_event.get("trading_days_to_event")
+            event_label = f"{event_type} in {event_days} trading day(s)" if event_days is not None else str(event_type)
+        reason_html = "".join(f"<li>{html.escape(message)}</li>" for message in messages)
+        if not reason_html:
+            reason_html = "<li>No hard no-trade reason triggered.</li>"
+        return f"""
+        <section class="panel nifty-no-trade-panel">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">No Trade Gate</div>
+              <p class="status">Capital preservation check before any fresh NIFTY income entry. Exit jobs remain allowed.</p>
+            </div>
+            <span class="score-badge {status_badge}">{html.escape(status_text)}</span>
+          </div>
+          <div class="income-equity-metrics">
+            <div><span>Blocking reason</span><strong>{html.escape(str(decision.get("blocking_reason") or "Clear"))}</strong></div>
+            <div><span>India VIX</span><strong>{html.escape(fmt_number(inputs.get("india_vix"), 2))}</strong></div>
+            <div><span>Premium yield / margin</span><strong>{html.escape(fmt_number(inputs.get("premium_yield_on_margin_pct"), 2))}%</strong></div>
+            <div><span>Major event</span><strong>{html.escape(event_label)}</strong></div>
+            <div><span>Trend filter</span><strong>{html.escape(str(inputs.get("trend_regime") or "N/A"))}</strong></div>
+            <div><span>Stop-loss streak</span><strong>{html.escape(str(inputs.get("consecutive_stop_losses_this_month") or 0))}</strong></div>
+            <div><span>Monthly NIFTY P&amp;L</span><strong>{html.escape(fmt_number(inputs.get("monthly_nifty_pnl")))}</strong></div>
+            <div><span>Monthly loss used</span><strong>{html.escape(fmt_number(inputs.get("monthly_loss_pct_of_nifty_margin"), 2))}%</strong></div>
+          </div>
+          <ul class="nifty-warning-list">{reason_html}</ul>
+        </section>
+        """
+
+    def confidence_score_card() -> str:
+        confidence = nifty_confidence_to_dict(confidence_score)
+        if not confidence:
+            return ""
+        label = str(confidence.get("label") or "N/A")
+        action = str(confidence.get("action") or "N/A")
+        score = confidence.get("score")
+        badge_class = (
+            "good"
+            if action == "FULL_SIZE"
+            else "ok"
+            if action == "HALF_SIZE"
+            else "risky"
+            if action == "PREVIEW_ONLY"
+            else "avoid"
+        )
+        components = confidence.get("component_scores") if isinstance(confidence.get("component_scores"), dict) else {}
+        component_html = "".join(
+            f"<div><span>{html.escape(str(name).replace('_', ' ').title())}</span><strong>{html.escape(fmt_number(value, 0))}</strong></div>"
+            for name, value in components.items()
+        )
+        hard_blocks = [str(item) for item in (confidence.get("hard_blocks") or []) if str(item).strip()]
+        warnings_list = [str(item) for item in (confidence.get("warnings") or []) if str(item).strip()]
+        hard_html = "".join(f"<li>{html.escape(item)}</li>" for item in hard_blocks) or "<li>No hard block.</li>"
+        warning_html = "".join(f"<li>{html.escape(item)}</li>" for item in warnings_list[:6]) or "<li>No material warning.</li>"
+        return f"""
+        <section class="panel nifty-confidence-panel">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">NIFTY Confidence Score</div>
+              <p class="status">{html.escape(str(confidence.get("explanation") or "Score controls fresh NIFTY entry sizing. Exit jobs remain allowed."))}</p>
+            </div>
+            <span class="score-badge {badge_class}">{html.escape(str(score if score is not None else "N/A"))}/100</span>
+          </div>
+          <div class="income-equity-metrics">
+            <div><span>Label</span><strong>{html.escape(label)}</strong></div>
+            <div><span>Action</span><strong>{html.escape(action)}</strong></div>
+            <div><span>Recommended</span><strong>{html.escape(str(confidence.get("recommendation") or "N/A"))}</strong></div>
+            <div><span>Size multiplier</span><strong>{html.escape(fmt_number(confidence.get("position_size_multiplier"), 2))}x</strong></div>
+          </div>
+          <div class="income-equity-metrics nifty-confidence-components">{component_html}</div>
+          <div class="nifty-confidence-lists">
+            <div><strong>Hard blocks</strong><ul class="nifty-warning-list">{hard_html}</ul></div>
+            <div><strong>Warnings</strong><ul class="nifty-warning-list">{warning_html}</ul></div>
+          </div>
+        </section>
+        """
+
+    def trade_unlock_panel_html() -> str:
+        unlock = trade_unlock if isinstance(trade_unlock, dict) else {}
+        if not unlock:
+            return ""
+        blocked = bool(unlock.get("blocked"))
+        status_class = "avoid" if blocked else "good"
+        status_text = "BLOCKED" if blocked else "OPEN"
+        missing = [str(item) for item in (unlock.get("missing_data_fields") or []) if str(item).strip()]
+        checks = unlock.get("checks") if isinstance(unlock.get("checks"), dict) else {}
+        missing_html = (
+            "".join(f'<span class="score-badge avoid">{html.escape(item)}</span>' for item in missing)
+            if missing
+            else '<span class="score-badge good">None</span>'
+        )
+        checks_html = "".join(
+            f'<div><span>{html.escape(str(name).replace("_", " ").title())}</span><strong class="{"pnl-positive" if ok else "pnl-negative"}">{html.escape("YES" if ok else "NO")}</strong></div>'
+            for name, ok in checks.items()
+        )
+        if not checks_html:
+            checks_html = '<div><span>Low-VIX exception checks</span><strong>N/A</strong></div>'
+        return f"""
+        <section class="panel nifty-unlock-panel">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">Trade Unlock Panel</div>
+              <p class="status">Shows exactly what must improve before a NIFTY trade becomes acceptable.</p>
+            </div>
+            <span class="score-badge {status_class}">{status_text}</span>
+          </div>
+          <div class="income-equity-metrics">
+            <div><span>Blocking reason</span><strong>{html.escape(str(unlock.get("blocking_reason") or "Clear"))}</strong></div>
+            <div><span>Premium yield</span><strong>{html.escape(fmt_number(unlock.get("current_premium_yield_on_margin_pct"), 2))}%</strong><small>Required {html.escape(fmt_number(unlock.get("required_premium_yield_on_margin_pct"), 2))}%</small></div>
+            <div><span>Net credit</span><strong>{html.escape(fmt_number(unlock.get("current_credit_points"), 2))} pts</strong><small>Required {html.escape(fmt_number(unlock.get("required_credit_points"), 2))} pts</small></div>
+            <div><span>Credit gap</span><strong>{html.escape(fmt_number(unlock.get("credit_gap_points"), 2))} pts</strong></div>
+            <div><span>Low-VIX exception</span><strong>{'USED' if unlock.get("low_vix_exception_used") else 'NO'}</strong></div>
+            <div><span>Yield gate</span><strong>{html.escape(str(unlock.get("yield_gate_reason") or "N/A"))}</strong></div>
+          </div>
+          <div class="nifty-unlock-message">{html.escape(str(unlock.get("unlock_message") or ""))}</div>
+          <div class="nifty-chip-row"><strong>Missing data:</strong> {missing_html}</div>
+          <div class="income-equity-metrics nifty-confidence-components">{checks_html}</div>
+        </section>
+        """
+
+    def spread_alternatives_panel_html() -> str:
+        alternatives = spread_alternatives if isinstance(spread_alternatives, list) else []
+        if not alternatives:
+            rows = '<tr><td colspan="13">No alternative spread scan is available. Refresh NIFTY Engine Preview.</td></tr>'
+        else:
+            rows = "".join(
+                "<tr>"
+                f'<td><span class="score-badge {"good" if row.get("allowed") else "avoid"}">{"OK" if row.get("allowed") else "BLOCK"}</span></td>'
+                f"<td><strong>{html.escape(str(row.get('strategy') or 'N/A'))}</strong><small>{html.escape(str(row.get('side') or ''))}</small></td>"
+                f"<td>{html.escape(str(row.get('expiry') or 'N/A'))}<small>{html.escape(str(row.get('dte') or ''))}</small></td>"
+                f"<td>{html.escape(str(row.get('short_strike') or 'N/A'))}</td>"
+                f"<td>{html.escape(str(row.get('hedge_strike') or 'N/A'))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('width'), 0))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('net_credit_points'), 2))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('credit_pct_of_width'), 2))}%</td>"
+                f"<td>{html.escape(fmt_number(row.get('premium_yield_on_margin_pct'), 2))}%</td>"
+                f"<td>{html.escape(format_buy_amount(row.get('max_gain')))}</td>"
+                f"<td>{html.escape(format_buy_amount(row.get('max_loss')))}</td>"
+                f"<td>{html.escape(str(row.get('liquidity_status') or 'N/A'))}</td>"
+                f"<td>{html.escape(str(row.get('rejection_reason') or ''))}</td>"
+                "</tr>"
+                for row in alternatives
+            )
+        return (
+            '<section class="panel nifty-alternatives-panel">'
+            '<div class="panel-title">Best Alternative Spread Candidates</div>'
+            '<p class="status">Ranks wider/narrower defined-risk candidates by credit quality, yield, confidence, and liquidity. This is the scan list before taking fresh NIFTY risk.</p>'
+            '<div class="table-wrap"><table><thead><tr><th>Status</th><th>Strategy</th><th>Expiry</th><th>Short</th><th>Hedge</th><th>Width</th><th>Credit</th><th>Credit %</th><th>Yield</th><th>Max gain</th><th>Max loss</th><th>Liquidity</th><th>Reason</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table></div></section>"
+        )
+
+    def strategy_recommendation_panel_html() -> str:
+        rec = strategy_recommendation if isinstance(strategy_recommendation, dict) else {}
+        if not rec:
+            return ""
+        action = str(rec.get("recommended_action") or "N/A")
+        action_class = "good" if action == "TRADE_ALLOWED" else "ok" if action == "SCAN_WHEEL" else "avoid"
+        return f"""
+        <section class="panel nifty-recommendation-panel">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">Strategy Recommendation</div>
+              <p class="status">{html.escape(str(rec.get("reason") or "Decision combines No-Trade gate, data quality, hedge integrity, confidence, and alternatives."))}</p>
+            </div>
+            <span class="score-badge {action_class}">{html.escape(action)}</span>
+          </div>
+          <div class="income-equity-metrics">
+            <div><span>Recommended strategy</span><strong>{html.escape(str(rec.get("recommended_strategy") or "N/A"))}</strong></div>
+            <div><span>Confidence</span><strong>{html.escape(fmt_number(rec.get("confidence_score"), 0))}/100</strong></div>
+            <div><span>Risk summary</span><strong>{html.escape(str(rec.get("risk_summary") or "N/A"))}</strong></div>
+            <div><span>Next step</span><strong>{html.escape(str(rec.get("next_step") or "N/A"))}</strong></div>
+          </div>
+        </section>
+        """
+
+    def hedge_integrity_panel_html() -> str:
+        hedge = hedge_integrity if isinstance(hedge_integrity, dict) else {}
+        if not hedge:
+            return ""
+        status = str(hedge.get("status") or "N/A")
+        status_class = "avoid" if status == "CRITICAL" else "risky" if status == "HIGH" else "good"
+        rows_data = hedge.get("rows") if isinstance(hedge.get("rows"), list) else []
+        if not rows_data:
+            rows = '<tr><td colspan="8">No active NIFTY short positions requiring hedge validation.</td></tr>'
+        else:
+            rows = "".join(
+                "<tr>"
+                f"<td>{html.escape(str(row.get('short_symbol') or ''))}</td>"
+                f"<td>{html.escape(str(row.get('hedge_symbol') or 'Missing'))}</td>"
+                f'<td><span class="score-badge {"good" if row.get("hedge_status") == "OK" else "avoid"}">{html.escape(str(row.get("hedge_status") or ""))}</span></td>'
+                f"<td>{html.escape(str(row.get('short_quantity') or 0))}</td>"
+                f"<td>{html.escape(str(row.get('hedge_quantity') or 0))}</td>"
+                f"<td>{'YES' if row.get('quantity_match') else 'NO'}</td>"
+                f"<td>{'YES' if row.get('expiry_match') else 'NO'}</td>"
+                f"<td>{html.escape(str(row.get('action_required') or ''))}</td>"
+                "</tr>"
+                for row in rows_data
+            )
+        return (
+            '<section class="panel nifty-hedge-integrity-panel">'
+            '<div class="nifty-dashboard-head"><div><div class="panel-title">Hedge Integrity Check</div>'
+            '<p class="status">Validates that active NIFTY short legs have same-expiry protective long legs before allowing new entries.</p></div>'
+            f'<span class="score-badge {status_class}">{html.escape(status)}</span></div>'
+            '<div class="table-wrap"><table><thead><tr><th>Short</th><th>Hedge</th><th>Status</th><th>Short qty</th><th>Hedge qty</th><th>Qty match</th><th>Expiry match</th><th>Action</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table></div></section>"
+        )
+
+    def data_quality_panel_html() -> str:
+        dq = data_quality if isinstance(data_quality, dict) else {}
+        if not dq:
+            return ""
+        status = str(dq.get("status") or "N/A")
+        status_class = "good" if status == "GOOD" else "ok" if status == "PARTIAL" else "avoid"
+        missing = [str(item) for item in (dq.get("missing_fields") or []) if str(item).strip()]
+        missing_html = ", ".join(missing) if missing else "None"
+        return f"""
+        <section class="panel nifty-data-quality-panel">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">Data Quality Gate</div>
+              <p class="status">Live NIFTY orders require fresh spot, VIX, option price, bid/ask, delta, expected move, expiry, symbol, and margin estimate.</p>
+            </div>
+            <span class="score-badge {status_class}">{html.escape(status)}</span>
+          </div>
+          <div class="income-equity-metrics">
+            <div><span>Live order</span><strong>{'ENABLED' if dq.get("live_order_enabled") else 'DISABLED'}</strong></div>
+            <div><span>Preview</span><strong>{'ALLOWED' if dq.get("preview_allowed") else 'BLOCKED'}</strong></div>
+            <div><span>Last refreshed</span><strong>{html.escape(str(dq.get("last_refreshed_at") or "N/A"))}</strong></div>
+            <div><span>Missing fields</span><strong>{html.escape(missing_html)}</strong></div>
+          </div>
+        </section>
+        """
+
+    def capital_router_panel_html() -> str:
+        routes = capital_router if isinstance(capital_router, list) else []
+        if not routes:
+            return ""
+        rows = "".join(
+            "<tr>"
+            f"<td><strong>{html.escape(str(row.get('module') or ''))}</strong></td>"
+            f"<td>{html.escape(str(row.get('candidate') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('expected_premium_yield') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('margin_required') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('max_risk') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('confidence_score') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('action') or ''))}</td>"
+            "</tr>"
+            for row in routes
+        )
+        return (
+            '<section class="panel nifty-capital-router-panel"><div class="panel-title">Capital Router</div>'
+            '<p class="status">If NIFTY is blocked, capital should rotate to safer Wheel, Covered Call, or Cash paths instead of forcing a trade.</p>'
+            '<div class="table-wrap"><table><thead><tr><th>Module</th><th>Candidate</th><th>Yield</th><th>Margin</th><th>Max risk</th><th>Confidence</th><th>Action</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table></div></section>"
+        )
+
+    def nifty_number(value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def decision_gate_panel_html() -> str:
+        decision = no_trade_decision if isinstance(no_trade_decision, dict) else {}
+        unlock = trade_unlock if isinstance(trade_unlock, dict) else {}
+        confidence = nifty_confidence_to_dict(confidence_score)
+        inputs = decision.get("inputs_snapshot") if isinstance(decision.get("inputs_snapshot"), dict) else {}
+        reasons = [str(item) for item in (decision.get("reasons") or []) if str(item).strip()]
+        messages = no_trade_reason_messages(reasons) if reasons else []
+        hard_blocks = [str(item) for item in (confidence.get("hard_blocks") or []) if str(item).strip()]
+        warnings_list = [str(item) for item in (confidence.get("warnings") or []) if str(item).strip()]
+        action = str(confidence.get("action") or "N/A")
+        blocked = bool(decision.get("no_trade")) or bool(unlock.get("blocked")) or action in {"NO_TRADE", "PREVIEW_ONLY"}
+        badge_class = "avoid" if blocked else "good"
+        badge_text = "NO TRADE / WAIT" if blocked else "ENTRY GATE OPEN"
+        reason_items = messages + hard_blocks + warnings_list[:3]
+        reason_html = "".join(f"<li>{html.escape(item)}</li>" for item in reason_items if item) or "<li>No hard gate is blocking fresh NIFTY entries.</li>"
+        missing = [str(item) for item in (unlock.get("missing_data_fields") or []) if str(item).strip()]
+        missing_html = ", ".join(missing[:8]) if missing else "None"
+        return f"""
+        <section class="panel nifty-decision-gate">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">Decision Gate</div>
+              <p class="status">One stop check for no-trade rules, entry unlocks, and confidence. Exits remain allowed even when fresh entries are blocked.</p>
+            </div>
+            <span class="score-badge {badge_class}">{html.escape(badge_text)}</span>
+          </div>
+          <div class="income-equity-metrics">
+            <div><span>Blocking reason</span><strong>{html.escape(str(decision.get("blocking_reason") or unlock.get("blocking_reason") or "Clear"))}</strong></div>
+            <div><span>Confidence</span><strong>{html.escape(str(confidence.get("score") if confidence.get("score") is not None else "N/A"))}/100</strong><small>{html.escape(str(confidence.get("label") or "N/A"))} | {html.escape(action)}</small></div>
+            <div><span>Premium yield</span><strong>{html.escape(fmt_number(unlock.get("current_premium_yield_on_margin_pct") or inputs.get("premium_yield_on_margin_pct"), 2))}%</strong><small>Required {html.escape(fmt_number(unlock.get("required_premium_yield_on_margin_pct"), 2))}%</small></div>
+            <div><span>Net credit gap</span><strong>{html.escape(fmt_number(unlock.get("credit_gap_points"), 2))} pts</strong><small>Credit {html.escape(fmt_number(unlock.get("current_credit_points"), 2))} / required {html.escape(fmt_number(unlock.get("required_credit_points"), 2))}</small></div>
+            <div><span>India VIX</span><strong>{html.escape(fmt_number(inputs.get("india_vix") or summary.get("vix"), 2))}</strong></div>
+            <div><span>Missing data</span><strong>{html.escape(missing_html)}</strong></div>
+          </div>
+          <ul class="nifty-warning-list">{reason_html}</ul>
+        </section>
+        """
+
+    def recommendation_workbench_html() -> str:
+        rec = strategy_recommendation if isinstance(strategy_recommendation, dict) else {}
+        dq = data_quality if isinstance(data_quality, dict) else {}
+        alternatives = spread_alternatives if isinstance(spread_alternatives, list) else []
+        action = str(rec.get("recommended_action") or ("TRADE_ALLOWED" if suggestion.get("allowed") else "WAIT"))
+        action_class = "good" if action == "TRADE_ALLOWED" else "ok" if action in {"SCAN_WHEEL", "WAIT"} else "avoid"
+        dq_status = str(dq.get("status") or "N/A")
+        dq_class = "good" if dq_status == "GOOD" else "ok" if dq_status == "PARTIAL" else "avoid"
+        missing = [str(item) for item in (dq.get("missing_fields") or []) if str(item).strip()]
+        alt_rows = alternatives[:5]
+        if alt_rows:
+            rows = "".join(
+                "<tr>"
+                f'<td><span class="score-badge {"good" if row.get("allowed") else "avoid"}">{"OK" if row.get("allowed") else "BLOCK"}</span></td>'
+                f"<td><strong>{html.escape(str(row.get('strategy') or 'N/A'))}</strong><small>{html.escape(str(row.get('side') or ''))}</small></td>"
+                f"<td>{html.escape(str(row.get('expiry') or 'N/A'))}</td>"
+                f"<td>{html.escape(str(row.get('short_strike') or 'N/A'))} / {html.escape(str(row.get('hedge_strike') or 'N/A'))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('credit_pct_of_width'), 2))}%</td>"
+                f"<td>{html.escape(fmt_number(row.get('premium_yield_on_margin_pct'), 2))}%</td>"
+                f"<td>{html.escape(format_buy_amount(row.get('max_gain')))}</td>"
+                f"<td>{html.escape(format_buy_amount(row.get('max_loss')))}</td>"
+                f"<td>{html.escape(str(row.get('rejection_reason') or row.get('liquidity_status') or ''))}</td>"
+                "</tr>"
+                for row in alt_rows
+            )
+        else:
+            rows = '<tr><td colspan="9">No alternative spread scan is available. Refresh NIFTY Engine Preview.</td></tr>'
+        return f"""
+        <section class="panel nifty-recommendation-workbench">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">Strategy Recommendation</div>
+              <p class="status">{html.escape(str(rec.get("reason") or "Combines data quality, no-trade rules, hedge integrity, confidence, and alternative spreads."))}</p>
+            </div>
+            <span class="score-badge {action_class}">{html.escape(action)}</span>
+          </div>
+          <div class="income-equity-metrics">
+            <div><span>Recommended strategy</span><strong>{html.escape(str(rec.get("recommended_strategy") or suggestion.get("selected_strategy") or "N/A"))}</strong></div>
+            <div><span>Next step</span><strong>{html.escape(str(rec.get("next_step") or "Review spread candidates"))}</strong></div>
+            <div><span>Data quality</span><strong class="score-badge {dq_class}">{html.escape(dq_status)}</strong><small>{html.escape(", ".join(missing[:5]) if missing else "No missing critical field")}</small></div>
+            <div><span>Risk summary</span><strong>{html.escape(str(rec.get("risk_summary") or strategy_status))}</strong></div>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>Status</th><th>Strategy</th><th>Expiry</th><th>Short / hedge</th><th>Credit %</th><th>Yield</th><th>Max gain</th><th>Max loss</th><th>Why</th></tr></thead><tbody>{rows}</tbody></table></div>
+        </section>
+        """
+
+    def weekly_pair_monitor_summary_html() -> str:
+        rows_data = weekly_pair_rows if isinstance(weekly_pair_rows, list) else []
+        monitored = len(rows_data)
+        exit_signals = sum(1 for row in rows_data if row.get("exit_signal"))
+        mtm = sum(nifty_number(row.get("current_mtm_pnl")) for row in rows_data)
+        max_risk_used = max((nifty_number(row.get("risk_utilisation_pct")) for row in rows_data), default=0.0)
+        next_force_close = next((str(row.get("force_close_datetime")) for row in rows_data if row.get("force_close_datetime")), "N/A")
+        status_class = "avoid" if exit_signals else "ok" if max_risk_used >= 50 else "good"
+        return f"""
+        <section class="panel nifty-risk-monitor-summary">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">NIFTY Income Risk Monitor Summary</div>
+              <p class="status">15-minute exit monitor condensed for quick action. Open details only when you need the full audit table.</p>
+            </div>
+            <span class="score-badge {status_class}">{'EXIT SIGNAL' if exit_signals else 'CLEAR'}</span>
+          </div>
+          <div class="income-equity-metrics">
+            <div><span>Strategies monitored</span><strong>{html.escape(str(monitored))}</strong></div>
+            <div><span>Exit signals</span><strong>{html.escape(str(exit_signals))}</strong></div>
+            <div><span>MTM P&amp;L</span><strong class="{'pnl-positive' if mtm >= 0 else 'pnl-negative'}">{html.escape(fmt_number(mtm))}</strong></div>
+            <div><span>Max risk used</span><strong>{html.escape(fmt_number(max_risk_used, 2))}%</strong></div>
+            <div><span>Next force close</span><strong>{html.escape(next_force_close)}</strong></div>
+          </div>
+          <details class="nifty-monitor-details">
+            <summary>Show detailed NIFTY risk monitor rows</summary>
+            <div class="table-wrap"><table><thead><tr><th>Strategy</th><th>Expiry</th><th>PE symbol</th><th>CE symbol</th><th>Entry time</th><th>Age</th><th>Margin</th><th>MTM P&amp;L</th><th>P&amp;L % margin</th><th>Credit decay</th><th>Max loss</th><th>Risk used</th><th>Bucket</th><th>P&amp;L target</th><th>Decay target</th><th>Stop</th><th>Force close</th><th>Emergency</th><th>Exit signal</th><th>Status</th></tr></thead><tbody>{weekly_pair_monitor_rows()}</tbody></table></div>
+          </details>
+        </section>
+        """
+
     strategy_status = "Allowed" if suggestion.get("allowed") else "Blocked / wait"
     strategy_badge = "good" if suggestion.get("allowed") else "avoid"
     pnl_value = float(summary.get("pnl") or 0)
@@ -17226,16 +19027,57 @@ def render_nifty_income_panel(state: PageState) -> str:
     results = state.nifty_income_results or schedule_state.get("entry_results") or schedule_state.get("exit_results")
     default_pe_otm = fmt_number(suggestion.get("pe_otm_pct") or 5.5, 2)
     default_ce_otm = fmt_number(suggestion.get("ce_otm_pct") or 5.5, 2)
+    dynamic_hedge_width = (
+        summary.get("hedge_width_points")
+        or suggestion.get("hedge_width_points")
+        or config.get("hedge_distance_points")
+        or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS
+    )
+    dynamic_hedge_action = summary.get("hedge_action") or suggestion.get("hedge_action") or "ALLOW"
+    dynamic_hedge_regime = summary.get("vix_hedge_regime") or suggestion.get("vix_hedge_regime") or "N/A"
+    dynamic_size_multiplier = summary.get("size_multiplier") or suggestion.get("size_multiplier") or 1.0
+    dynamic_warning = summary.get("dynamic_hedge_warning") or suggestion.get("dynamic_hedge_warning") or ""
+    engine_config = config.get("nifty_options_engine") if isinstance(config.get("nifty_options_engine"), dict) else {}
+    live_enabled = bool(engine_config.get("live_order_enabled", False))
+    manual_required = bool(engine_config.get("require_manual_confirmation", True))
+    engine_mode = str(engine_config.get("mode") or config.get("mode") or "REGIME_BASED_TACTICAL_SPREAD")
+    order_mode = str(engine_config.get("entry_execution_mode") or config.get("entry_execution_mode") or "SUGGESTION_ONLY")
+    min_credit = engine_config.get("min_credit_pct_of_spread_width") or tactical_audit.get("min_credit_pct_of_spread_width") or 8.0
+    max_lots = engine_config.get("max_lots_per_trade") or 1
+    engine_cards = f"""
+      <div class="nifty-engine-grid">
+        <div class="nifty-engine-card primary">
+          <span>Engine</span>
+          <strong>{html.escape(engine_mode)}</strong>
+          <small>No naked NIFTY shorts. Defined-risk spreads only.</small>
+        </div>
+        <div class="nifty-engine-card">
+          <span>Regime decision</span>
+          <strong>{html.escape(str(suggestion.get("selected_strategy") or "NO_TRADE"))}</strong>
+          <small>{html.escape(str(suggestion.get("strategy_selection_reason") or suggestion.get("reason") or "Regime decides spread type."))}</small>
+        </div>
+        <div class="nifty-engine-card">
+          <span>Risk gate</span>
+          <strong>{html.escape(strategy_status)}</strong>
+          <small>Credit >= {html.escape(fmt_number(min_credit, 1))}% of width, DTE 21-35, delta 0.12-0.18.</small>
+        </div>
+        <div class="nifty-engine-card">
+          <span>Order mode</span>
+          <strong>{html.escape(order_mode)}</strong>
+          <small>Live enabled: {"YES" if live_enabled else "NO"} | Manual confirm: {"YES" if manual_required else "NO"}</small>
+        </div>
+      </div>
+    """
     return f"""
     <form id="nifty-income-panel" method="post" action="/nifty-income/load"{panel_style}>
       {env_hidden_fields_for_render()}
       <section class="panel nifty-hero-panel">
         <div>
-          <div class="panel-title">Nifty Income</div>
-          <p class="status">Defined-risk NIFTY income engine: Friday entry, T-7 time exit, MMI/VIX/trend strike selection, and scheduler controls.</p>
+          <div class="panel-title">NIFTY Options Tactical Spread Engine</div>
+          <p class="status">Regime-based NIFTY option selling with defined risk only: Bull Put Spread, Bear Call Spread, or Iron Condor. No naked NIFTY selling by default.</p>
         </div>
         <div class="actions">
-          <button type="submit" formaction="/nifty-income/load">Refresh NIFTY Snapshot</button>
+          <button type="submit" formaction="/nifty-income/load">Refresh Engine Preview</button>
           <button type="submit" formaction="/nifty-income/run-entry">Run Entry Now</button>
           <button type="submit" formaction="/nifty-income/run-exit" class="secondary">Run T-7 Exit Now</button>
           <button type="submit" formaction="/nifty-income/run-pair-exit" class="secondary">Run Pair Monitor Now</button>
@@ -17244,29 +19086,39 @@ def render_nifty_income_panel(state: PageState) -> str:
       <section class="panel nifty-dashboard-panel">
         <div class="nifty-dashboard-head">
           <div>
-            <div class="panel-title">NIFTY Income Strategy Preview</div>
-            <p class="status">Use this first: position exposure, MMI/VIX regime, upcoming Friday strikes, and premium opportunity in one view.</p>
+            <div class="panel-title">Tactical Spread Command Center</div>
+            <p class="status">Use this as the main NIFTY decision screen: market regime, allowed structure, credit quality, margin heat, and order readiness.</p>
           </div>
           <span class="score-badge {strategy_badge}">{html.escape(strategy_status)}</span>
         </div>
+        {engine_cards}
         <div class="nifty-dashboard-layout">
+          <div class="nifty-section-card">
+            <div class="nifty-section-title">Market Regime</div>
+            <div class="income-equity-metrics nifty-regime-grid">{regime_cards()}</div>
+          </div>
           <div class="nifty-section-card">
             <div class="nifty-section-title">Account &amp; Schedule</div>
             <div class="nifty-summary-cards">
               <div><span>Active positions</span><strong>{html.escape(str(summary.get("active_positions") or 0))}</strong></div>
               <div><span>Current P&amp;L</span><strong class="{'pnl-positive' if pnl_value >= 0 else 'pnl-negative'}">{html.escape(fmt_number(pnl_value))}</strong></div>
+              <div><span>Mode</span><strong>{html.escape(str(tactical_audit.get("nifty_mode") or config.get("mode") or "REGIME_BASED_TACTICAL_SPREAD"))}</strong><small>Suggestion-first</small></div>
               <div><span>Strategy</span><strong>{html.escape(str(suggestion.get("selected_strategy") or "N/A"))}</strong><small>{html.escape(strategy_status)}</small></div>
               <div><span>NIFTY / MMI / VIX</span><strong>{html.escape(fmt_number(summary.get("spot")))} / {html.escape(fmt_number(summary.get("mmi")))} / {html.escape(fmt_number(summary.get("vix")))}</strong></div>
+              <div><span>Dynamic hedge</span><strong>{html.escape(str(dynamic_hedge_width))} pts</strong><small>{html.escape(str(dynamic_hedge_regime))}</small></div>
+              <div><span>Hedge action</span><strong>{html.escape(str(dynamic_hedge_action))}</strong><small>Size x {html.escape(fmt_number(dynamic_size_multiplier, 2))}</small></div>
+              <div><span>NIFTY income share</span><strong>{html.escape(fmt_number(summary.get("nifty_income_allocation_pct"), 2))}%</strong><small>{html.escape(str(summary.get("nifty_income_allocation_status") or "N/A"))}</small></div>
               <div><span>Entry schedule</span><strong>Friday {html.escape(str(config.get("entry_time")))}</strong><small>{html.escape(str(config.get("execution_mode")))}</small></div>
               <div><span>T-7 exit</span><strong>{html.escape(str(suggestion.get("time_exit_date") or "N/A"))} {html.escape(str(config.get("time_exit_time")))}</strong><small>{html.escape(str(config.get("time_exit_execution_mode")))}</small></div>
+              <div><span>Max lots / trade</span><strong>{html.escape(str(max_lots))}</strong><small>NIFTY engine cap</small></div>
             </div>
-          </div>
-          <div class="nifty-section-card">
-            <div class="nifty-section-title">Market Regime</div>
-            <div class="income-equity-metrics nifty-regime-grid">{regime_cards()}</div>
           </div>
         </div>
       </section>
+      {decision_gate_panel_html()}
+      {recommendation_workbench_html()}
+      {hedge_integrity_panel_html()}
+      {capital_router_panel_html()}
       <details class="panel nifty-config-panel">
         <summary>
           <span>Execution Controls</span>
@@ -17276,6 +19128,7 @@ def render_nifty_income_panel(state: PageState) -> str:
           {render_checkbox("nifty_enabled", "Enable Friday entry schedule", bool(config.get("enabled", True)), "Builds defined-risk NIFTY income legs on Friday 15:16 IST.")}
           {render_checkbox("nifty_time_exit_enabled", "Enable T-7 time exit", bool(config.get("time_exit_enabled", True)), "Closes all NIFTY income legs seven days before expiry at 14:59 IST.")}
           {render_checkbox("nifty_weekly_pair_exit_enabled", "Enable 15-min pair exit monitor", bool(config.get("weekly_pair_exit_enabled", True)), "Books NIFTY weekly PE/CE pair profit or stops according to age-based margin rules.")}
+          {render_checkbox("nifty_use_existing_hedges", "Use existing hedge positions", bool(config.get("use_existing_hedge_positions", True)), "Reuse long NIFTY PE/CE positions as cover and skip duplicate protective BUY legs.")}
           {render_checkbox("nifty_allow_live_naked", "Allow uncovered manual NIFTY SELL", bool(config.get("allow_live_naked_nifty_sell", False)), "High risk. Required only when Protective covers is unchecked in the manual review. Uncovered CE maximum loss is unlimited.")}
           <label><span>Entry mode</span>{select_options("nifty_execution_mode", str(config.get("execution_mode") or "SUGGESTION_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
           <label><span>Time exit mode</span>{select_options("nifty_time_exit_execution_mode", str(config.get("time_exit_execution_mode") or "SUGGESTION_ONLY"), ["SUGGESTION_ONLY", "LIVE_CONFIRMED", "AUTO_EXIT_ONLY"])}</label>
@@ -17293,7 +19146,7 @@ def render_nifty_income_panel(state: PageState) -> str:
         </div>
       </details>
       <section class="panel nifty-decision-panel">
-        <div class="panel-title">Strategy Decision</div>
+        <div class="panel-title">Strategy Decision &amp; Risk Contract</div>
         <div class="income-equity-metrics">
           <div><span>MMI regime</span><strong>{html.escape(str(suggestion.get("mmi_regime") or "N/A"))}</strong></div>
           <div><span>VIX regime</span><strong>{html.escape(str(suggestion.get("vix_regime") or "N/A"))}</strong></div>
@@ -17301,36 +19154,56 @@ def render_nifty_income_panel(state: PageState) -> str:
           <div><span>PE sell strike</span><strong>{html.escape(str(suggestion.get("final_pe_sell_strike") or "N/A"))}</strong></div>
           <div><span>CE sell strike</span><strong>{html.escape(str(suggestion.get("final_ce_sell_strike") or "N/A"))}</strong></div>
           <div><span>PE / CE OTM</span><strong>{html.escape(fmt_number(suggestion.get("pe_otm_pct"), 2))}% / {html.escape(fmt_number(suggestion.get("ce_otm_pct"), 2))}%</strong></div>
-          <div><span>Hedge distance</span><strong>{html.escape(str(config.get("hedge_distance_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS))} pts</strong></div>
+          <div><span>Dynamic hedge width</span><strong>{html.escape(str(dynamic_hedge_width))} pts</strong><small>{html.escape(str(dynamic_hedge_action))}</small></div>
           <div><span>POP</span><strong>{html.escape(str(summary.get("pop") or "Defined-risk"))}</strong></div>
           <div><span>Margin</span><strong>{html.escape(str(summary.get("margin_required") or "Use Kite basket margin"))}</strong></div>
           <div><span>Net credit / max gain</span><strong>{html.escape(format_buy_amount(suggestion.get("expected_net_credit")))} / {html.escape(format_buy_amount(summary.get("max_gain")))}</strong></div>
           <div><span>Target / Stop</span><strong>{html.escape(format_buy_amount(suggestion.get("estimated_target_profit")))} / {html.escape(format_buy_amount(suggestion.get("estimated_stop_loss")))}</strong></div>
+          <div><span>Max loss / credit</span><strong>{html.escape(fmt_number(summary.get("max_loss_to_credit_ratio") or suggestion.get("max_loss_to_credit_ratio"), 2))}</strong></div>
+          <div><span>Credit quality</span><strong>{html.escape(str(tactical_audit.get("credit_quality") or "N/A"))}</strong><small>{html.escape(fmt_number(tactical_audit.get("credit_pct_of_spread_width"), 2))}% of width</small></div>
+          <div><span>Profit target</span><strong>{html.escape(fmt_number(tactical_audit.get("profit_booking_credit_decay_pct"), 0))}% credit decay</strong></div>
+          <div><span>Stop loss</span><strong>{html.escape(fmt_number(tactical_audit.get("stop_loss_credit_multiple"), 2))}x credit</strong></div>
         </div>
-        {f'<ul class="nifty-warning-list">{warnings_html}</ul>' if warnings_html else '<p class="status">No hard warnings in the latest NIFTY snapshot.</p>'}
+        {f'<ul class="nifty-warning-list">{warnings_html}</ul>' if warnings_html else f'<p class="status">{html.escape(str(dynamic_warning or "No hard warnings in the latest NIFTY snapshot."))}</p>'}
       </section>
       <section class="panel">
-        <div class="panel-title">Upcoming Friday Preview</div>
-        <div class="status">Shows probable PE/CE SELL candidates. Naked max gain is informational only; live strategy uses defined-risk hedge legs.</div>
+        <div class="panel-title">Spread Candidates</div>
+        <div class="status">Candidate PE/CE spreads chosen by regime and risk filters. Review the table, then build the tactical order only if the gate and recommendation agree.</div>
         <div class="actions">
-          <button type="button" id="nifty-pair-open" data-pe-otm="{html.escape(default_pe_otm, quote=True)}" data-ce-otm="{html.escape(default_ce_otm, quote=True)}">Place PE + CE Pair</button>
+          <button type="button" id="nifty-pair-open" data-pe-otm="{html.escape(default_pe_otm, quote=True)}" data-ce-otm="{html.escape(default_ce_otm, quote=True)}">Build Tactical Spread Order</button>
         </div>
-        <div class="table-wrap nifty-preview-wrap"><table class="nifty-preview-table"><thead><tr><th>Side</th><th>Expiry</th><th>Option / Hedge</th><th>Strike</th><th>NIFTY</th><th>OTM</th><th>MMI OTM</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>IV</th><th>OI</th><th>Chg OI</th><th>Volume</th><th>Premium / lot</th><th>Max gain</th><th>Margin / max loss</th><th>Yield</th><th>Risk</th></tr></thead><tbody>{candidate_rows()}</tbody></table></div>
+        <div class="table-wrap nifty-preview-wrap"><table class="nifty-preview-table"><thead><tr><th>Side</th><th>Expiry</th><th>Option / Hedge</th><th>Strike</th><th>NIFTY</th><th>OTM</th><th>MMI OTM</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>IV</th><th>OI</th><th>Chg OI</th><th>Volume</th><th>Premium / lot</th><th>Max gain</th><th>Margin / max loss</th><th>Credit % / width</th><th>Credit quality</th><th>Yield</th><th>Risk</th></tr></thead><tbody>{candidate_rows()}</tbody></table></div>
       </section>
       <div class="live-modal-backdrop" id="nifty-pair-order-modal">
         <div class="live-modal income-pe-order-modal-card nifty-pair-order-modal-card">
-          <h2>NIFTY Defined-Risk Income Review</h2>
-          <p class="status">Select PE, CE, or both. Protective BUY covers are recommended and selected by default. Uncovered CE risk is unlimited.</p>
+          <h2>NIFTY Tactical Spread Order Review</h2>
+          <p class="status">The engine selects PE/CE strikes from the current regime. Protective covers are recommended; uncovered NIFTY SELL legs can carry very large loss, especially on the CE side.</p>
           <input type="hidden" name="nifty_pair_confirmed" id="nifty-pair-confirmed" value="0">
+          <input type="hidden" name="nifty_pair_pe_otm" id="nifty-pair-pe-otm" value="{html.escape(default_pe_otm, quote=True)}">
+          <input type="hidden" name="nifty_pair_ce_otm" id="nifty-pair-ce-otm" value="{html.escape(default_ce_otm, quote=True)}">
           <div class="nifty-side-selector">
-            <label><input type="checkbox" name="nifty_pair_include_pe" id="nifty-pair-include-pe" checked> <span>PE spread</span><small>SELL PE + BUY PE hedge</small></label>
-            <label><input type="checkbox" name="nifty_pair_include_ce" id="nifty-pair-include-ce" checked> <span>CE spread</span><small>SELL CE + BUY CE hedge</small></label>
-            <label><input type="checkbox" name="nifty_pair_include_cover" id="nifty-pair-include-cover" checked> <span>Protective covers</span><small>Include {NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS}-point BUY legs</small></label>
+            <label><input type="checkbox" name="nifty_pair_include_pe" id="nifty-pair-include-pe" checked> <span>PE side</span><small>SELL PE; hedge optional</small></label>
+            <label><input type="checkbox" name="nifty_pair_include_ce" id="nifty-pair-include-ce" checked> <span>CE side</span><small>SELL CE; hedge optional</small></label>
+            <label><input type="checkbox" name="nifty_pair_include_cover" id="nifty-pair-include-cover" checked> <span>Protective covers</span><small>Recommended dynamic BUY hedge legs</small></label>
           </div>
-          <div class="compact-grid nifty-pair-input-grid">
-            <label><span>PE OTM %</span><input type="number" step="0.1" min="1" max="20" name="nifty_pair_pe_otm" id="nifty-pair-pe-otm" value="{html.escape(default_pe_otm, quote=True)}"></label>
-            <label><span>CE OTM %</span><input type="number" step="0.1" min="1" max="20" name="nifty_pair_ce_otm" id="nifty-pair-ce-otm" value="{html.escape(default_ce_otm, quote=True)}"></label>
-            <label><span>Lots</span><input type="number" step="1" min="1" max="20" name="nifty_pair_lots" id="nifty-pair-lots" value="1"></label>
+          <section class="nifty-uncovered-risk" id="nifty-pair-uncovered-risk">
+            <div class="leg-kicker">Uncovered risk acknowledgement</div>
+            <strong>Protective covers are OFF.</strong>
+            <p>Live SELL legs without BUY hedges can create very large losses; uncovered CE risk can be unlimited. Use this only when you already hold external hedges or intentionally accept naked NIFTY risk.</p>
+            <label class="nifty-risk-ack"><input type="checkbox" name="nifty_pair_uncovered_ack" id="nifty-pair-uncovered-ack"> I understand and accept uncovered NIFTY risk for this order.</label>
+          </section>
+          <section class="nifty-pair-coverage-section">
+            <div class="leg-kicker">Existing Hedge Coverage</div>
+            <strong id="nifty-pair-coverage-status">Checking...</strong>
+            <div class="income-equity-metrics">
+              <div><span>Existing PE hedge</span><strong id="nifty-pair-existing-pe">--</strong></div>
+              <div><span>Existing CE hedge</span><strong id="nifty-pair-existing-ce">--</strong></div>
+              <div><span>Protective legs to add</span><strong id="nifty-pair-protective-plan">--</strong></div>
+            </div>
+            <p class="status" id="nifty-pair-coverage-message">Existing hedge reuse follows the NIFTY setup checkbox.</p>
+          </section>
+          <div class="compact-grid nifty-pair-input-grid nifty-pair-lots-only">
+            <label><span>Lots</span><select name="nifty_pair_lots" id="nifty-pair-lots"><option value="1" selected>1 lot</option><option value="2">2 lots</option></select><small>Maximum 2 lots for this tactical flow.</small></label>
           </div>
           <div class="income-pe-modal-grid">
             <div><span>Expiry</span><strong id="nifty-pair-expiry">--</strong></div>
@@ -17346,14 +19219,14 @@ def render_nifty_income_panel(state: PageState) -> str:
               <div class="leg-kicker">PE VERTICAL SPREAD</div>
               <strong id="nifty-pair-pe-symbol">--</strong>
               <small id="nifty-pair-pe-detail">--</small>
-              <div class="nifty-hedge-leg"><span>Protective BUY</span><strong id="nifty-pair-pe-hedge">--</strong><small id="nifty-pair-pe-hedge-detail">300 points below SELL strike</small></div>
+              <div class="nifty-hedge-leg"><span>Protective BUY</span><strong id="nifty-pair-pe-hedge">--</strong><small id="nifty-pair-pe-hedge-detail">Dynamic width below SELL strike</small></div>
               <div class="leg-pop">POP <span id="nifty-pair-pe-pop">--</span></div>
             </section>
             <section class="nifty-pair-leg-section" id="nifty-pair-ce-section">
               <div class="leg-kicker">CE VERTICAL SPREAD</div>
               <strong id="nifty-pair-ce-symbol">--</strong>
               <small id="nifty-pair-ce-detail">--</small>
-              <div class="nifty-hedge-leg"><span>Protective BUY</span><strong id="nifty-pair-ce-hedge">--</strong><small id="nifty-pair-ce-hedge-detail">300 points above SELL strike</small></div>
+              <div class="nifty-hedge-leg"><span>Protective BUY</span><strong id="nifty-pair-ce-hedge">--</strong><small id="nifty-pair-ce-hedge-detail">Dynamic width above SELL strike</small></div>
               <div class="leg-pop">POP <span id="nifty-pair-ce-pop">--</span></div>
             </section>
           </div>
@@ -17371,23 +19244,10 @@ def render_nifty_income_panel(state: PageState) -> str:
         </div>
       </div>
       <section class="panel">
-        <div class="panel-title">Generated Friday Entry Legs</div>
-        <div class="table-wrap"><table><thead><tr><th>Side</th><th>Symbol</th><th>Qty</th><th>Type</th><th>Price</th><th>Expiry</th><th>Strategy</th><th>Exit date</th><th>Tag</th></tr></thead><tbody>{order_rows(entry_orders)}</tbody></table></div>
-      </section>
-      <section class="panel">
         <div class="panel-title">Active NIFTY Positions</div>
         <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&amp;L</th><th>Expiry</th><th>Product</th></tr></thead><tbody>{position_rows()}</tbody></table></div>
       </section>
-      <section class="panel">
-        <div class="panel-title">NIFTY Income Risk Monitor</div>
-        <div class="status">Fresh prices are checked every 15 minutes. Force close has first priority, followed by premium/delta/strike/risk emergency exits, then age-based profit or stop rules.</div>
-        <div class="table-wrap"><table><thead><tr><th>Strategy</th><th>Expiry</th><th>PE symbol</th><th>CE symbol</th><th>Entry time</th><th>Age</th><th>Margin</th><th>MTM P&amp;L</th><th>P&amp;L % margin</th><th>Credit decay</th><th>Max loss</th><th>Risk used</th><th>Bucket</th><th>P&amp;L target</th><th>Decay target</th><th>Stop</th><th>Force close</th><th>Emergency</th><th>Exit signal</th><th>Status</th></tr></thead><tbody>{weekly_pair_monitor_rows()}</tbody></table></div>
-      </section>
-      <section class="panel">
-        <div class="panel-title">15-Minute Monitor Closure Legs</div>
-        <div class="status">Only exit orders are generated. SELL legs reverse to BUY; BUY hedges reverse to SELL. Existing pending exit orders are skipped.</div>
-        <div class="table-wrap"><table><thead><tr><th>Side</th><th>Symbol</th><th>Qty</th><th>Type</th><th>Price</th><th>Expiry</th><th>Reason</th><th>Exit date</th><th>Tag</th></tr></thead><tbody>{order_rows(weekly_pair_orders)}</tbody></table></div>
-      </section>
+      {weekly_pair_monitor_summary_html()}
       <section class="panel">
         <div class="panel-title">Due T-7 Closure Legs</div>
         <div class="status">SELL legs reverse to BUY; BUY hedges reverse to SELL. Duplicate closure generations are skipped.</div>
@@ -19222,6 +21082,42 @@ def render_page(state: PageState) -> bytes:
       gap: 12px;
       align-items: stretch;
     }}
+    .nifty-engine-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 10px 0 12px;
+    }}
+    .nifty-engine-card {{
+      min-height: 92px;
+      padding: 13px 14px;
+      border: 1px solid #bde8e3;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #f8fafc 0%, #f0fdfa 100%);
+      box-shadow: 0 12px 28px rgba(15, 118, 110, 0.08);
+    }}
+    .nifty-engine-card.primary {{
+      border-color: #5eead4;
+      background: linear-gradient(135deg, #ecfeff 0%, #ccfbf1 100%);
+    }}
+    .nifty-engine-card span,
+    .nifty-engine-card small {{
+      display: block;
+      color: #64748b;
+      font-size: 10px;
+      font-weight: 900;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }}
+    .nifty-engine-card strong {{
+      display: block;
+      margin: 6px 0;
+      color: #083344;
+      font-size: 16px;
+      font-weight: 950;
+      line-height: 1.12;
+      overflow-wrap: anywhere;
+    }}
     .nifty-section-card {{
       border: 1px solid #c7ece8;
       border-radius: 12px;
@@ -19442,6 +21338,63 @@ def render_page(state: PageState) -> bytes:
     .nifty-side-selector input {{ grid-row: 1 / 3; }}
     .nifty-side-selector span {{ font-weight: 850; }}
     .nifty-side-selector small {{ color: #64748b; }}
+    .nifty-pair-coverage-section {{
+      margin: 10px 0;
+      padding: 12px;
+      border: 1px solid #99f6e4;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #f0fdfa, #f8fafc);
+      text-align: left;
+    }}
+    .nifty-pair-coverage-section > strong {{
+      display: block;
+      margin: 4px 0 8px;
+      color: #0f766e;
+      font-size: 18px;
+    }}
+    .nifty-pair-coverage-section .income-equity-metrics {{
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin: 6px 0;
+    }}
+    .nifty-uncovered-risk {{
+      display: none;
+      margin: 10px 0;
+      padding: 12px;
+      border: 1px solid #fca5a5;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #fff1f2, #fff7ed);
+      color: #7f1d1d;
+      text-align: left;
+    }}
+    .nifty-uncovered-risk.active {{
+      display: block;
+    }}
+    .nifty-uncovered-risk strong {{
+      display: block;
+      font-size: 16px;
+      margin: 4px 0;
+    }}
+    .nifty-risk-ack {{
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 9px 10px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.7);
+      font-weight: 800;
+    }}
+    .nifty-pair-lots-only {{
+      grid-template-columns: minmax(160px, 240px);
+      justify-content: center;
+    }}
+    .nifty-pair-lots-only select {{
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      font-weight: 850;
+      background: #ffffff;
+    }}
     .nifty-pair-leg-section {{
       padding: 12px;
       border: 1px solid #99f6e4;
@@ -21745,6 +23698,7 @@ def render_page(state: PageState) -> bytes:
       .home-hero {{ grid-template-columns: 1fr; }}
       .income-equity-metrics {{ grid-template-columns: repeat(2, minmax(110px, 1fr)); }}
       .nifty-dashboard-layout {{ grid-template-columns: 1fr; }}
+      .nifty-engine-grid {{ grid-template-columns: 1fr; }}
       .nifty-summary-cards {{ grid-template-columns: 1fr; }}
       .nifty-regime-grid {{ grid-template-columns: 1fr; }}
       .nifty-dashboard-head {{ align-items: flex-start; flex-direction: column; }}
@@ -22406,6 +24360,8 @@ def render_page(state: PageState) -> bytes:
     const niftyPairIncludePe = document.getElementById('nifty-pair-include-pe');
     const niftyPairIncludeCe = document.getElementById('nifty-pair-include-ce');
     const niftyPairIncludeCover = document.getElementById('nifty-pair-include-cover');
+    const niftyPairUncoveredAck = document.getElementById('nifty-pair-uncovered-ack');
+    const niftyPairUncoveredRisk = document.getElementById('nifty-pair-uncovered-risk');
     const niftyPairConfirmed = document.getElementById('nifty-pair-confirmed');
     const niftyPairExpiry = document.getElementById('nifty-pair-expiry');
     const niftyPairSpot = document.getElementById('nifty-pair-spot');
@@ -22424,6 +24380,11 @@ def render_page(state: PageState) -> bytes:
     const niftyPairCeHedge = document.getElementById('nifty-pair-ce-hedge');
     const niftyPairPeHedgeDetail = document.getElementById('nifty-pair-pe-hedge-detail');
     const niftyPairCeHedgeDetail = document.getElementById('nifty-pair-ce-hedge-detail');
+    const niftyPairCoverageStatus = document.getElementById('nifty-pair-coverage-status');
+    const niftyPairExistingPe = document.getElementById('nifty-pair-existing-pe');
+    const niftyPairExistingCe = document.getElementById('nifty-pair-existing-ce');
+    const niftyPairProtectivePlan = document.getElementById('nifty-pair-protective-plan');
+    const niftyPairCoverageMessage = document.getElementById('nifty-pair-coverage-message');
     const niftyPairPeSection = document.getElementById('nifty-pair-pe-section');
     const niftyPairCeSection = document.getElementById('nifty-pair-ce-section');
     const niftyPairSummary = document.getElementById('nifty-pair-summary');
@@ -22632,12 +24593,24 @@ def render_page(state: PageState) -> bytes:
       const ce = sells.find((row) => row.option_type === 'CE') || {{}};
       const peHedge = hedges.find((row) => row.option_type === 'PE') || {{}};
       const ceHedge = hedges.find((row) => row.option_type === 'CE') || {{}};
+      const coverage = data.existing_hedge_coverage || {{}};
       const includePe = Boolean(data.include_pe);
       const includeCe = Boolean(data.include_ce);
       const includeCover = Boolean(data.include_cover);
+      const hedgeLabel = (row) => {{
+        if (!row || !row.tradingsymbol) return '--';
+        const prefix = row.existing_hedge ? 'EXISTING ' : 'NEW ';
+        return `${{prefix}}${{row.tradingsymbol}} | Qty ${{Number(row.quantity || 0).toFixed(0)}} | Strike ${{row.strike || '--'}} | LTP ${{Number(row.option_ltp || row.ltp || 0).toFixed(2)}}`;
+      }};
+      const existingLabel = (row) => {{
+        if (!row || !row.tradingsymbol) return 'None found';
+        return `${{row.tradingsymbol}} | Qty ${{Number(row.quantity || 0).toFixed(0)}} | Avg ${{Number(row.average_price || 0).toFixed(2)}} | LTP ${{Number(row.ltp || 0).toFixed(2)}} | Exp ${{row.expiry || '--'}} | Strike ${{row.strike || '--'}}`;
+      }};
       if (niftyPairIncludePe) niftyPairIncludePe.checked = includePe;
       if (niftyPairIncludeCe) niftyPairIncludeCe.checked = includeCe;
       if (niftyPairIncludeCover) niftyPairIncludeCover.checked = includeCover;
+      if (niftyPairUncoveredRisk) niftyPairUncoveredRisk.classList.toggle('active', !includeCover);
+      if (niftyPairUncoveredAck && includeCover) niftyPairUncoveredAck.checked = false;
       if (niftyPairPeSection) niftyPairPeSection.classList.toggle('side-disabled', !includePe);
       if (niftyPairCeSection) niftyPairCeSection.classList.toggle('side-disabled', !includeCe);
       if (niftyPairExpiry) niftyPairExpiry.textContent = data.expiry || '--';
@@ -22669,25 +24642,57 @@ def render_page(state: PageState) -> bytes:
       if (niftyPairCePop) niftyPairCePop.textContent = ce.pop_estimate ? `${{Number(ce.pop_estimate).toFixed(1)}}% approx` : '--';
       if (niftyPairPeHedge) niftyPairPeHedge.textContent = peHedge.tradingsymbol || '--';
       if (niftyPairCeHedge) niftyPairCeHedge.textContent = ceHedge.tradingsymbol || '--';
-      if (niftyPairPeHedgeDetail) niftyPairPeHedgeDetail.textContent = peHedge.tradingsymbol ? `BUY strike ${{peHedge.strike}} | LTP ${{Number(peHedge.option_ltp || 0).toFixed(2)}} | Limit ${{Number(peHedge.price || 0).toFixed(2)}} | ${{Number(peHedge.protective_buy_discount_percent || data.protective_buy_discount_percent || 0).toFixed(2)}}% below LTP | exactly ${{Number(data.hedge_distance_points || 300)}} points below SELL` : (includePe && !includeCover ? 'Protective PE cover not selected' : 'PE side not selected');
-      if (niftyPairCeHedgeDetail) niftyPairCeHedgeDetail.textContent = ceHedge.tradingsymbol ? `BUY strike ${{ceHedge.strike}} | LTP ${{Number(ceHedge.option_ltp || 0).toFixed(2)}} | Limit ${{Number(ceHedge.price || 0).toFixed(2)}} | ${{Number(ceHedge.protective_buy_discount_percent || data.protective_buy_discount_percent || 0).toFixed(2)}}% below LTP | exactly ${{Number(data.hedge_distance_points || 300)}} points above SELL` : (includeCe && !includeCover ? 'Protective CE cover not selected - unlimited loss risk' : 'CE side not selected');
+      const peHedgeWidth = Number(data.pe_hedge_width_points || data.hedge_distance_points || 300);
+      const ceHedgeWidth = Number(data.ce_hedge_width_points || data.hedge_distance_points || 300);
+      if (niftyPairPeHedgeDetail) niftyPairPeHedgeDetail.textContent = peHedge.tradingsymbol ? (peHedge.existing_hedge ? `Existing PE hedge reused | Strike ${{peHedge.strike}} | Qty ${{Number(peHedge.quantity || 0).toFixed(0)}} | LTP ${{Number(peHedge.option_ltp || 0).toFixed(2)}} | No new BUY order` : `BUY strike ${{peHedge.strike}} | LTP ${{Number(peHedge.option_ltp || 0).toFixed(2)}} | Limit ${{Number(peHedge.price || 0).toFixed(2)}} | ${{Number(peHedge.protective_buy_discount_percent || data.protective_buy_discount_percent || 0).toFixed(2)}}% below LTP | ${{peHedgeWidth}} points below SELL`) : (includePe && !includeCover ? 'Protective PE cover not selected' : 'PE side not selected');
+      if (niftyPairCeHedgeDetail) niftyPairCeHedgeDetail.textContent = ceHedge.tradingsymbol ? (ceHedge.existing_hedge ? `Existing CE hedge reused | Strike ${{ceHedge.strike}} | Qty ${{Number(ceHedge.quantity || 0).toFixed(0)}} | LTP ${{Number(ceHedge.option_ltp || 0).toFixed(2)}} | No new BUY order` : `BUY strike ${{ceHedge.strike}} | LTP ${{Number(ceHedge.option_ltp || 0).toFixed(2)}} | Limit ${{Number(ceHedge.price || 0).toFixed(2)}} | ${{Number(ceHedge.protective_buy_discount_percent || data.protective_buy_discount_percent || 0).toFixed(2)}}% below LTP | ${{ceHedgeWidth}} points above SELL`) : (includeCe && !includeCover ? 'Protective CE cover not selected - unlimited loss risk' : 'CE side not selected');
+      if (niftyPairCoverageStatus) niftyPairCoverageStatus.textContent = `${{data.hedge_coverage_status || coverage.coverage_status || 'NONE'}} | Reuse ${{data.use_existing_hedges ? 'enabled' : 'disabled'}}`;
+      if (niftyPairExistingPe) niftyPairExistingPe.textContent = existingLabel(coverage.long_pe);
+      if (niftyPairExistingCe) niftyPairExistingCe.textContent = existingLabel(coverage.long_ce);
+      if (niftyPairProtectivePlan) {{
+        const plan = [];
+        if (includePe) plan.push(peHedge.existing_hedge ? 'PE covered by existing long' : peHedge.tradingsymbol ? 'Add PE BUY hedge' : 'PE uncovered');
+        if (includeCe) plan.push(ceHedge.existing_hedge ? 'CE covered by existing long' : ceHedge.tradingsymbol ? 'Add CE BUY hedge' : 'CE uncovered');
+        niftyPairProtectivePlan.textContent = plan.join(' | ') || '--';
+      }}
+      if (niftyPairCoverageMessage) niftyPairCoverageMessage.textContent = data.hedge_coverage_message || 'No existing hedge coverage message.';
       const missing = (data.missing_ltp || []);
       const skipped = (data.skipped_existing_sides || []);
+      const dynamicBlocked = data.dynamic_hedge_allowed === false;
+      const riskRejected = data.risk_reward_status && data.risk_reward_status !== 'OK';
+      const confidence = data.confidence_score || {{}};
+      const confidenceAction = String(confidence.action || '');
+      const confidenceBlocked = confidenceAction === 'NO_TRADE' || confidenceAction === 'PREVIEW_ONLY';
       if (niftyPairSummary) {{
         const markup = Number(data.sell_markup_percent || 0).toFixed(2);
         const selectedSides = [includePe ? 'PE spread' : '', includeCe ? 'CE spread' : ''].filter(Boolean).join(' + ');
         const skippedNote = skipped.length ? ` | Existing short ${{skipped.join(' + ')}} automatically excluded` : '';
         const buyDiscount = Number(data.protective_buy_discount_percent || 0).toFixed(2);
+        const existingSides = data.existing_hedge_sides || [];
         const coverNote = includeCover
-          ? `Protective ${{Number(data.hedge_distance_points || 300)}}-point BUY covers included at ${{buyDiscount}}% below LTP`
+          ? `Protective cover: ${{hedgeLabel(peHedge)}} | ${{hedgeLabel(ceHedge)}}`
+          : existingSides.length
+          ? `Existing hedge cover in use: ${{hedgeLabel(peHedge)}} | ${{hedgeLabel(ceHedge)}}`
           : `NO protective covers | Max loss ${{data.max_loss_unlimited ? 'UNLIMITED' : Number(data.max_loss || 0).toFixed(0)}}`;
-        const nakedBlocked = !includeCover && !data.naked_live_allowed;
+        const uncoveredSides = data.uncovered_sides || [];
+        const uncoveredAcknowledged = Boolean(niftyPairUncoveredAck && niftyPairUncoveredAck.checked);
+        const nakedBlocked = uncoveredSides.length > 0 && !data.naked_live_allowed && !uncoveredAcknowledged;
+        const dynamicNote = data.dynamic_hedge_warning ? ` | ${{data.dynamic_hedge_warning}}` : '';
+        const riskNote = riskRejected ? ` | Risk/reward rejected: ${{data.risk_reward_status}}` : '';
+        const confidenceNote = confidence.score !== undefined
+          ? ` | Confidence ${{confidence.score}}/100 ${{confidence.label || ''}} ${{confidence.action || ''}}`
+          : '';
+        const confidenceReason = confidenceBlocked && confidence.explanation ? ` | ${{confidence.explanation}}` : '';
+        const ackNote = uncoveredSides.length > 0 && !includeCover && uncoveredAcknowledged
+          ? ' | Uncovered NIFTY risk acknowledged for this order'
+          : '';
         niftyPairSummary.textContent = missing.length
           ? `Fresh LTP missing for ${{missing.join(', ')}}. Refresh again before GO.`
-          : `${{selectedSides}} | ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} per leg | ${{coverNote}} | SELL limit ${{markup}}% above LTP | Net credit ${{Number(data.max_gain || 0).toFixed(0)}} | Est. margin ${{data.max_loss_unlimited ? 'UNLIMITED' : Number(data.margin_required || data.max_loss || 0).toFixed(0)}} | Return ${{data.max_loss_unlimited ? 'N/A' : Number(data.return_on_margin_pct || 0).toFixed(2) + '%'}}${{skippedNote}}${{nakedBlocked ? ' | Live uncovered entry is disabled by risk settings' : ''}}`;
-        niftyPairSummary.classList.toggle('signal-red', missing.length > 0 || nakedBlocked || Boolean(data.max_loss_unlimited));
+          : `${{selectedSides}} | ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} per leg | ${{coverNote}} | SELL limit ${{markup}}% above LTP | Net credit ${{Number(data.max_gain || 0).toFixed(0)}} | Est. margin ${{data.max_loss_unlimited ? 'UNLIMITED' : Number(data.margin_required || data.max_loss || 0).toFixed(0)}} | Return ${{data.max_loss_unlimited ? 'N/A' : Number(data.return_on_margin_pct || 0).toFixed(2) + '%'}}${{confidenceNote}}${{confidenceReason}}${{dynamicNote}}${{riskNote}}${{skippedNote}}${{ackNote}}${{nakedBlocked ? ' | Acknowledge uncovered risk or enable protective covers' : ''}}`;
+        niftyPairSummary.classList.toggle('signal-red', missing.length > 0 || nakedBlocked || dynamicBlocked || riskRejected || confidenceBlocked || Boolean(data.max_loss_unlimited));
       }}
-      if (niftyPairReview) niftyPairReview.disabled = missing.length > 0 || (!includeCover && !data.naked_live_allowed);
+      const uncoveredAcknowledged = Boolean(niftyPairUncoveredAck && niftyPairUncoveredAck.checked);
+      if (niftyPairReview) niftyPairReview.disabled = missing.length > 0 || dynamicBlocked || riskRejected || confidenceBlocked || ((data.uncovered_sides || []).length > 0 && !data.naked_live_allowed && !uncoveredAcknowledged);
     }}
     async function refreshNiftyPairDetails() {{
       if (!niftyPairModal) return;
@@ -22704,7 +24709,7 @@ def render_page(state: PageState) -> bytes:
         }}
         return;
       }}
-      const lots = Math.max(1, Math.floor(Number(niftyPairLots ? niftyPairLots.value : 1) || 1));
+      const lots = Math.min(2, Math.max(1, Math.floor(Number(niftyPairLots ? niftyPairLots.value : 1) || 1)));
       if (niftyPairLots) niftyPairLots.value = String(lots);
       if (niftyPairSummary) niftyPairSummary.textContent = 'Loading fresh NIFTY option premium, POP approximation, and max gain...';
       setQuoteLoading(niftyPairModal, niftyPairLoading, true, 'Revalidating NIFTY PE+CE pair...');
@@ -22731,7 +24736,7 @@ def render_page(state: PageState) -> bytes:
       refreshNiftyPairDetails();
     }});
     niftyPairRefresh && niftyPairRefresh.addEventListener('click', refreshNiftyPairDetails);
-    for (const input of [niftyPairPeOtm, niftyPairCeOtm, niftyPairLots, niftyPairIncludePe, niftyPairIncludeCe, niftyPairIncludeCover]) {{
+    for (const input of [niftyPairPeOtm, niftyPairCeOtm, niftyPairLots, niftyPairIncludePe, niftyPairIncludeCe, niftyPairIncludeCover, niftyPairUncoveredAck]) {{
       input && input.addEventListener('input', resetNiftyPairConfirmation);
       input && input.addEventListener('change', () => {{
         resetNiftyPairConfirmation();
@@ -23956,7 +25961,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 snapshot = nifty_income_manual_pair_snapshot(
                     float(first(query, "pe_otm", "5.5") or 5.5),
                     float(first(query, "ce_otm", "5.5") or 5.5),
-                    int(float(first(query, "lots", "1") or 1)),
+                    min(2, max(1, int(float(first(query, "lots", "1") or 1)))),
                     first(query, "include_pe", "1") != "0",
                     first(query, "include_ce", "1") != "0",
                     first(query, "include_cover", "1") != "0",
@@ -24776,6 +26781,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         "enabled": checked(form, "nifty_enabled"),
                         "time_exit_enabled": checked(form, "nifty_time_exit_enabled"),
                         "weekly_pair_exit_enabled": checked(form, "nifty_weekly_pair_exit_enabled"),
+                        "use_existing_hedge_positions": checked(form, "nifty_use_existing_hedges"),
                         "allow_live_naked_nifty_sell": checked(form, "nifty_allow_live_naked"),
                         "execution_mode": first(form, "nifty_execution_mode", "SUGGESTION_ONLY"),
                         "time_exit_execution_mode": first(form, "nifty_time_exit_execution_mode", "SUGGESTION_ONLY"),
@@ -24849,10 +26855,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     place_nifty_income_manual_pair,
                     float(first(form, "nifty_pair_pe_otm", "5.5") or 5.5),
                     float(first(form, "nifty_pair_ce_otm", "5.5") or 5.5),
-                    int(float(first(form, "nifty_pair_lots", "1") or 1)),
+                    min(2, max(1, int(float(first(form, "nifty_pair_lots", "1") or 1)))),
                     checked(form, "nifty_pair_include_pe"),
                     checked(form, "nifty_pair_include_ce"),
                     checked(form, "nifty_pair_include_cover"),
+                    checked(form, "nifty_pair_uncovered_ack"),
                 )
                 state.nifty_income_results = results
                 state.nifty_income_snapshot = nifty_income_snapshot(True)
