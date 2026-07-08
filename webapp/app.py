@@ -9220,6 +9220,17 @@ def build_missing_option_close_orders(
         average_price = float(position.get("average_price") or 0)
         ltp = float(position.get("ltp") or position.get("last_price") or 0)
         close_side = "BUY" if quantity < 0 else "SELL"
+        parts_for_dte = option_symbol_parts(symbol)
+        if parts_for_dte:
+            expiry_for_dte = expiry_date_for_parts(parts_for_dte)
+            dte_gate_allowed, trading_dte = intraday_hard_stop_trading_days_allowed(
+                expiry_for_dte,
+                app_now().date(),
+            )
+            calendar_dte = max((expiry_for_dte - app_now().date()).days, 0)
+        else:
+            expiry_for_dte = None
+            dte_gate_allowed, trading_dte, calendar_dte = False, None, None
         existing_order = existing.get((symbol, close_side))
         evaluation = {
             "tradingsymbol": symbol,
@@ -9227,6 +9238,10 @@ def build_missing_option_close_orders(
             "close_side": close_side,
             "average_price": average_price,
             "ltp": ltp,
+            "expiry": expiry_for_dte.isoformat() if expiry_for_dte else "",
+            "dte": trading_dte,
+            "calendar_dte": calendar_dte,
+            "hard_stop_dte_allowed": dte_gate_allowed,
             "existing_close_order": bool(existing_order),
         }
         probability_risk = build_option_probability_risk(position)
@@ -9246,7 +9261,35 @@ def build_missing_option_close_orders(
             evaluations.append(evaluation)
             continue
         if close_side == "BUY":
-            if probability_risk.probability_risk_state in {"PANIC", "FORCE_EXIT"}:
+            if not dte_gate_allowed:
+                evaluation.update(
+                    {
+                        "dte_gate_applied": True,
+                        "dte_gate_reason": (
+                            f"Risk exits are gated because trading DTE is "
+                            f"{trading_dte if trading_dte is not None else 'unknown'}"
+                            + (
+                                f" (calendar DTE {calendar_dte})"
+                                if calendar_dte is not None
+                                else ""
+                            )
+                            + (
+                                f"; placing only the basic BUY close at {discount:g}% below "
+                                "min(LTP, average entry price)."
+                            )
+                        ),
+                    }
+                )
+                price_basis = min(average_price, ltp)
+                limit_price = floor_to_tick(
+                    price_basis * (1 - discount / 100),
+                    0.05,
+                )
+                rule = (
+                    f"{discount:g}% below min(LTP, average entry price); "
+                    f"risk exits gated until trading DTE {INTRADAY_HARD_STOP_START_DTE} or fewer"
+                )
+            elif probability_risk.probability_risk_state in {"PANIC", "FORCE_EXIT"}:
                 parts = option_symbol_parts(symbol)
                 if parts:
                     expiry = expiry_date_for_parts(parts)
@@ -9317,7 +9360,10 @@ def build_missing_option_close_orders(
                 price_basis * (1 + discount / 100),
                 0.05,
             )
-            rule = f"{discount:g}% above max(LTP, average entry price)"
+            rule = (
+                f"{discount:g}% above max(LTP, average entry price); "
+                f"standard SELL close for open BUY position"
+            )
         if limit_price <= 0:
             evaluation["action"] = "SKIP_INVALID_LIMIT_PRICE"
             evaluations.append(evaluation)
@@ -9365,6 +9411,9 @@ def build_missing_option_close_orders(
                 "probability_touch_pct": probability_risk.probability_touch_pct,
                 "expected_move_multiple": probability_risk.expected_move_multiple,
                 "premium_multiple": probability_risk.premium_multiple,
+                "dte": trading_dte,
+                "calendar_dte": calendar_dte,
+                "hard_stop_dte_allowed": dte_gate_allowed,
                 "skip_if_close_order_exists": True,
             }
         )
@@ -16341,6 +16390,42 @@ def run_intraday_position_close_job(
                     + (f", +{extra_count} more" if extra_count > 0 else "")
                     + "."
                 )
+            dte_passive_downgrades = [
+                evaluation
+                for evaluation in close_order_evaluations
+                if evaluation.get("dte_gate_applied")
+            ]
+            dte_passive_message = ""
+            if dte_passive_downgrades:
+                downgraded_symbols = ", ".join(
+                    f"{evaluation.get('tradingsymbol')} "
+                    f"(trading DTE {evaluation.get('dte') if evaluation.get('dte') is not None else 'unknown'})"
+                    for evaluation in dte_passive_downgrades[:5]
+                )
+                extra_count = len(dte_passive_downgrades) - 5
+                dte_passive_message = (
+                    " Aggressive risk exits downgraded to default passive close "
+                    f"orders until trading DTE <= {INTRADAY_HARD_STOP_START_DTE}: "
+                    f"{downgraded_symbols}"
+                    + (f", +{extra_count} more" if extra_count > 0 else "")
+                    + "."
+                )
+            passive_buy_close_count = sum(
+                1
+                for evaluation in close_order_evaluations
+                if str(evaluation.get("action") or "") == "PLACE_BUY_CLOSE"
+            )
+            passive_sell_close_count = sum(
+                1
+                for evaluation in close_order_evaluations
+                if str(evaluation.get("action") or "") == "PLACE_SELL_CLOSE"
+            )
+            passive_close_message = ""
+            if passive_buy_close_count or passive_sell_close_count:
+                passive_close_message = (
+                    f" Passive close candidates: BUY {passive_buy_close_count}, "
+                    f"SELL {passive_sell_close_count}."
+                )
             submitted_orders: list[dict[str, Any]] = []
             results: list[dict[str, Any]] = []
             if loss_limit_orders:
@@ -16371,10 +16456,16 @@ def run_intraday_position_close_job(
                 submitted_orders.extend(default_submitted)
                 results.extend(default_results)
             if not submitted_orders:
+                no_order_message = (
+                    "No close orders placed because open option positions are outside the intraday "
+                    f"close-order trading-DTE window."
+                    if dte_guard_skips
+                    else "All open option positions already have matching BUY/SELL close orders."
+                )
                 return save_intraday_position_close_schedule_state(
-                    status="ALL_COVERED",
+                    status="DTE_GATED" if dte_guard_skips else "ALL_COVERED",
                     message=(
-                        "All open option positions already have matching BUY/SELL close orders."
+                        no_order_message
                         + (
                             f" Strict PE positions skipped because a close BUY order already exists: "
                             f"{risk_existing_order_skips}."
@@ -16383,6 +16474,8 @@ def run_intraday_position_close_job(
                         )
                         + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
                         + dte_guard_message
+                        + dte_passive_message
+                        + passive_close_message
                     ),
                     order_count=0,
                     results=results,
@@ -16412,6 +16505,8 @@ def run_intraday_position_close_job(
                     f"errors: {error_count}. {pricing_details}"
                     + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
                     + dte_guard_message
+                    + dte_passive_message
+                    + passive_close_message
                 ),
                 order_count=len(submitted_orders),
                 results=results,
