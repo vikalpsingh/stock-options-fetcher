@@ -29,6 +29,30 @@ def test_intraday_guard_uses_hard_stop_price_when_crossed():
     assert "HARD STOP CONTROL" in orders[0]["risk_note"]
 
 
+def test_intraday_guard_does_not_chase_spike_above_entry_before_hard_stop():
+    position = {
+        "exchange": "NFO",
+        "tradingsymbol": "NAUKRI26JUL950PE",
+        "quantity": -550,
+        "product": "NRML",
+        "average_price": 8.15,
+        "ltp": 12.95,
+    }
+    with patch.object(app, "open_option_positions", return_value=[position]), patch.object(
+        app, "refresh_option_positions_with_live_ltp", return_value=[position]
+    ):
+        orders, evaluations = app.build_intraday_loss_limit_close_orders(
+            kite=None,
+            loss_trigger_percent=50,
+            ltp_discount_percent=20,
+        )
+
+    assert orders == []
+    assert evaluations[0]["action"] == "SKIP_SPIKE_ABOVE_ENTRY"
+    assert evaluations[0]["skipped_limit_price"] == 10.35
+    assert "above entry premium" in evaluations[0]["skip_reason"]
+
+
 def test_control_loss_builds_buy_order_at_ten_percent_below_hard_stop():
     rows = [
         {

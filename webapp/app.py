@@ -35,7 +35,7 @@ from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -114,6 +114,7 @@ DEFAULT_OPTION_SELL_MARKUP_PERCENT = 20.0
 DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT = 20.0
 INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT = 100.0
 INTRADAY_LOSS_LIMIT_LTP_DISCOUNT_PERCENT = 10.0
+INTRADAY_HARD_STOP_START_DTE = 9
 CONTROL_LOSS_HARD_STOP_DISCOUNT_PERCENT = 10.0
 POSITION_CLOSE_SCHEDULE_TIME = "09:20"
 POSITION_CLOSE_SCHEDULE_WINDOW_MINUTES = 10
@@ -250,7 +251,12 @@ INVESTING_52W_CACHE_SECONDS = 24 * 60 * 60
 COMMODITY_DMA_CACHE_SECONDS = 12 * 60 * 60
 INCOME_GROWTH_GPT_CACHE_SECONDS = 30 * 60
 INCOME_DASHBOARD_CACHE_SECONDS = 15 * 60
-CE_SELL_DASHBOARD_CACHE_SECONDS = 15 * 60
+# Covered-call candidate ranking uses live stock CMP for strike/OTM decisions.
+# Keep this short so the Trading tab cannot act on stale prices for long.
+CE_SELL_DASHBOARD_CACHE_SECONDS = 30
+CE_SELL_POPUP_POSITION_CACHE_SECONDS = 10
+CE_SELL_POPUP_QUOTE_CACHE_SECONDS = 10
+TRADE_NEWS_CACHE_SECONDS = 5 * 60
 NIFTY_INCOME_ENTRY_SCHEDULE_TIME = "15:16"
 NIFTY_INCOME_CLOSE_SCHEDULE_TIME = "14:59"
 NIFTY_INCOME_CLOSE_DAYS_BEFORE_EXPIRY = 7
@@ -475,6 +481,39 @@ class NiftyRiskDecision:
     pe_hedge_strike: int | None = None
     ce_hedge_strike: int | None = None
     strategy_selection_reason: str = ""
+
+
+@dataclass
+class OptionProbabilityRisk:
+    symbol: str
+    underlying: str
+    option_type: str
+    position_side: str
+    strike: float | None
+    expiry: date | None
+    dte: int | None
+    spot: float | None
+    avg_price: float | None
+    ltp: float | None
+    bid: float | None
+    ask: float | None
+    delta: float | None
+    iv: float | None
+    distance_to_strike_points: float | None
+    distance_to_strike_pct: float | None
+    expected_move_points: float | None
+    expected_move_pct: float | None
+    expected_move_multiple: float | None
+    probability_expiry_itm_pct: float | None
+    probability_touch_pct: float | None
+    premium_multiple: float | None
+    dte_bucket: str
+    probability_risk_state: str
+    recommended_action: str
+    reason: str
+    warnings: list[str] = field(default_factory=list)
+
+
 DEFAULT_PE_SELL_SETTINGS = {
     "max_assignment_cash_per_stock": 600000,
     "max_portfolio_concentration_percent": 20,
@@ -5400,6 +5439,7 @@ class PageState:
     selected_indexes: set[int] | None = None
     no_ltp_price: bool = True
     keep_existing_orders: bool = False
+    override_soft_risk_blocks: bool = False
     dry_run: bool = True
     api_key: str = ""
     api_secret: str = ""
@@ -6248,6 +6288,12 @@ def trading_days_remaining(expiry: date, today: date | None = None) -> int:
     return days
 
 
+def intraday_hard_stop_trading_days_allowed(expiry: date, today: date | None = None) -> tuple[bool, int]:
+    """Return whether hard-stop price execution is inside the trading-day expiry window."""
+    trading_dte = trading_days_remaining(expiry, today or app_now().date())
+    return trading_dte <= INTRADAY_HARD_STOP_START_DTE, trading_dte
+
+
 def next_month_start(day: date) -> date:
     if day.month == 12:
         return date(day.year + 1, 1, 1)
@@ -6339,6 +6385,293 @@ def bs_greeks(spot: float, strike: float, years: float, rate: float, iv: float, 
             + rate * strike * math.exp(-rate * years) * normal_cdf(-d2)
         ) / 365
     return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
+def calculate_distance_to_strike(
+    spot: float | None,
+    strike: float | None,
+    option_type: str,
+) -> tuple[float | None, float | None]:
+    if spot is None or strike is None or spot <= 0 or strike <= 0:
+        return None, None
+    if str(option_type).upper() == "PE":
+        points = spot - strike
+    else:
+        points = strike - spot
+    return points, (points / spot) * 100
+
+
+def classify_dte_bucket(dte: int | None) -> str:
+    if dte is None:
+        return "UNKNOWN"
+    if dte <= 7:
+        return "EXPIRY_WEEK"
+    if dte <= 14:
+        return "NEAR"
+    if dte <= 30:
+        return "MONTHLY"
+    return "FAR"
+
+
+def calculate_probability_expiry_itm(
+    option_type: str,
+    delta: float | None = None,
+    spot: float | None = None,
+    strike: float | None = None,
+    dte: int | None = None,
+    iv: float | None = None,
+    rate: float = 0.06,
+) -> float | None:
+    option_type = str(option_type).upper()
+    if delta is not None and math.isfinite(delta):
+        return min(100.0, max(0.0, abs(delta) * 100))
+    if not spot or not strike or not dte or not iv or spot <= 0 or strike <= 0 or dte <= 0 or iv <= 0:
+        return None
+    years = dte / 365
+    try:
+        d1 = bs_d1(spot, strike, years, rate, iv)
+        d2 = d1 - iv * math.sqrt(years)
+    except (ValueError, ZeroDivisionError):
+        return None
+    probability = normal_cdf(d2) if option_type == "CE" else normal_cdf(-d2)
+    return min(100.0, max(0.0, probability * 100))
+
+
+def calculate_probability_touch(
+    probability_expiry_itm_pct: float | None,
+    delta: float | None = None,
+) -> float | None:
+    if probability_expiry_itm_pct is None:
+        return None
+    touch = probability_expiry_itm_pct * 2
+    if delta is not None and abs(delta) >= 0.25:
+        touch = max(touch, 50.0)
+    return min(100.0, max(0.0, touch))
+
+
+def calculate_expected_move_multiple(
+    distance_points: float | None,
+    expected_move_points: float | None,
+) -> float | None:
+    if distance_points is None or expected_move_points is None or expected_move_points <= 0:
+        return None
+    return distance_points / expected_move_points
+
+
+def _quote_best_bid_ask(quote: dict[str, Any] | None) -> tuple[float | None, float | None]:
+    if not isinstance(quote, dict):
+        return None, None
+    depth = quote.get("depth") if isinstance(quote.get("depth"), dict) else {}
+    bid = _optional_float((depth.get("buy") or [{}])[0].get("price") if depth.get("buy") else None)
+    ask = _optional_float((depth.get("sell") or [{}])[0].get("price") if depth.get("sell") else None)
+    return bid, ask
+
+
+def _option_probability_fields(risk: OptionProbabilityRisk) -> dict[str, Any]:
+    return {
+        "probability_risk_state": risk.probability_risk_state,
+        "probability_recommended_action": risk.recommended_action,
+        "probability_reason": risk.reason,
+        "probability_warnings": "; ".join(risk.warnings),
+        "probability_expiry_itm_pct": risk.probability_expiry_itm_pct,
+        "probability_touch_pct": risk.probability_touch_pct,
+        "expected_move_points": risk.expected_move_points,
+        "expected_move_pct": risk.expected_move_pct,
+        "expected_move_multiple": risk.expected_move_multiple,
+        "distance_to_strike_points": risk.distance_to_strike_points,
+        "distance_to_strike_pct": risk.distance_to_strike_pct,
+        "premium_multiple": risk.premium_multiple,
+        "dte": risk.dte,
+        "dte_bucket": risk.dte_bucket,
+        "position_side": risk.position_side,
+    }
+
+
+def classify_probability_risk(risk: OptionProbabilityRisk) -> OptionProbabilityRisk:
+    warnings = list(risk.warnings)
+    if risk.position_side != "SHORT":
+        risk.probability_risk_state = "SAFE"
+        risk.recommended_action = "LONG_POSITION_INFO"
+        risk.reason = "Long option position; monitor with regular P&L rules."
+        risk.warnings = warnings
+        return risk
+
+    dte = risk.dte
+    delta_abs = abs(risk.delta) if risk.delta is not None else None
+    touch = risk.probability_touch_pct
+    em_multiple = risk.expected_move_multiple
+    distance_pct = risk.distance_to_strike_pct
+    premium_multiple = risk.premium_multiple
+    strike_touched = distance_pct is not None and distance_pct <= 0
+
+    if dte is not None and dte <= 7:
+        risk.probability_risk_state = "FORCE_EXIT"
+        risk.recommended_action = "CANCEL_PASSIVE_AND_CLOSE_OR_ROLL"
+        risk.reason = "Expiry week risk; close or roll instead of waiting for passive fill."
+    elif strike_touched:
+        risk.probability_risk_state = "PANIC"
+        risk.recommended_action = "CANCEL_PASSIVE_AND_CLOSE_OR_ROLL"
+        risk.reason = "Underlying has touched or crossed the short strike."
+    elif premium_multiple is not None and premium_multiple >= 2:
+        risk.probability_risk_state = "PANIC"
+        risk.recommended_action = "CANCEL_PASSIVE_AND_CLOSE_OR_ROLL"
+        risk.reason = "Option premium doubled from entry; loss acceleration risk is high."
+    elif delta_abs is not None and delta_abs >= 0.25:
+        risk.probability_risk_state = "PANIC"
+        risk.recommended_action = "CANCEL_PASSIVE_AND_CLOSE_OR_ROLL"
+        risk.reason = "Delta is 0.25 or higher; touch probability has moved into danger zone."
+    elif touch is not None and touch >= 50:
+        risk.probability_risk_state = "THREATENED"
+        risk.recommended_action = "CANCEL_PASSIVE_AND_CLOSE_OR_ROLL"
+        risk.reason = "Estimated touch probability is 50% or higher."
+    elif (
+        (touch is not None and touch >= 35)
+        or (delta_abs is not None and delta_abs >= 0.18)
+        or (em_multiple is not None and em_multiple < 1.2)
+        or (distance_pct is not None and distance_pct < 2)
+    ):
+        risk.probability_risk_state = "REVIEW"
+        risk.recommended_action = "DO_NOT_PLACE_PASSIVE_CLOSE"
+        risk.reason = "Probability risk is elevated; review trend and roll/exit plan before passive order."
+    elif (
+        (touch is not None and touch >= 25)
+        or (em_multiple is not None and 1.2 <= em_multiple < 1.5)
+    ):
+        risk.probability_risk_state = "WATCH"
+        risk.recommended_action = "PASSIVE_CLOSE_ALLOWED_WITH_MONITORING"
+        risk.reason = "Risk is rising but still below review threshold."
+    else:
+        risk.probability_risk_state = "SAFE"
+        risk.recommended_action = "PASSIVE_CLOSE_ALLOWED"
+        risk.reason = "Strike is comfortably outside expected move and touch probability is low."
+
+    risk.warnings = warnings
+    return risk
+
+
+def build_option_probability_risk(
+    position: dict[str, Any],
+    analytics: dict[str, Any] | None = None,
+    quote: dict[str, Any] | None = None,
+) -> OptionProbabilityRisk:
+    analytics = analytics or {}
+    symbol = str(position.get("tradingsymbol") or position.get("symbol") or "").upper()
+    parts = option_symbol_parts(symbol)
+    underlying = str(parts.get("underlying") if parts else underlying_for_symbol(symbol) or "")
+    option_type = str(parts.get("option_type") if parts else analytics.get("option_type") or "").upper()
+    strike = _optional_float(parts.get("strike") if parts else analytics.get("strike"))
+    expiry = expiry_date_for_parts(parts) if parts else analytics.get("expiry")
+    if isinstance(expiry, str):
+        try:
+            expiry = datetime.strptime(expiry[:10], "%Y-%m-%d").date()
+        except ValueError:
+            expiry = None
+    dte = trading_days_remaining(expiry, app_now().date()) if isinstance(expiry, date) else None
+    spot = _optional_float(
+        position.get("stock_cmp")
+        or analytics.get("spot")
+        or position.get("underlying_spot")
+    )
+    avg_price = _optional_float(position.get("average_price"))
+    ltp = _optional_float(position.get("ltp") or position.get("last_price") or analytics.get("option_price"))
+    bid, ask = _quote_best_bid_ask(quote)
+    delta = _optional_float(analytics.get("delta") or position.get("delta"))
+    iv = _optional_float(analytics.get("iv") or analytics.get("iv_percent") or position.get("iv"))
+    if iv is not None and iv > 1:
+        iv = iv / 100
+    distance_points, distance_pct = calculate_distance_to_strike(spot, strike, option_type)
+    expected_move_points = _optional_float(analytics.get("expected_move_points") or analytics.get("expected_move"))
+    if expected_move_points is None and spot and iv and dte and dte > 0:
+        expected_move_points = spot * iv * math.sqrt(dte / 365)
+    expected_move_pct = (expected_move_points / spot * 100) if expected_move_points and spot else None
+    expected_move_multiple = calculate_expected_move_multiple(distance_points, expected_move_points)
+    probability_itm = calculate_probability_expiry_itm(option_type, delta, spot, strike, dte, iv)
+    probability_touch = calculate_probability_touch(probability_itm, delta)
+    premium_multiple = (ltp / avg_price) if ltp is not None and avg_price and avg_price > 0 else None
+    quantity = int(float(position.get("quantity") or 0))
+    warnings: list[str] = []
+    if probability_itm is None:
+        warnings.append("Probability unavailable: missing delta or IV inputs.")
+    if expected_move_multiple is None:
+        warnings.append("Expected-move buffer unavailable.")
+    if distance_points is None:
+        warnings.append("Strike distance unavailable.")
+    if bid is None and quote:
+        warnings.append("Bid unavailable from quote depth.")
+    if ask is None and quote:
+        warnings.append("Ask unavailable from quote depth.")
+    risk = OptionProbabilityRisk(
+        symbol=symbol,
+        underlying=underlying,
+        option_type=option_type,
+        position_side="SHORT" if quantity < 0 else "LONG",
+        strike=strike,
+        expiry=expiry if isinstance(expiry, date) else None,
+        dte=dte,
+        spot=spot,
+        avg_price=avg_price,
+        ltp=ltp,
+        bid=bid,
+        ask=ask,
+        delta=delta,
+        iv=iv,
+        distance_to_strike_points=distance_points,
+        distance_to_strike_pct=distance_pct,
+        expected_move_points=expected_move_points,
+        expected_move_pct=expected_move_pct,
+        expected_move_multiple=expected_move_multiple,
+        probability_expiry_itm_pct=probability_itm,
+        probability_touch_pct=probability_touch,
+        premium_multiple=premium_multiple,
+        dte_bucket=classify_dte_bucket(dte),
+        probability_risk_state="SAFE",
+        recommended_action="PASSIVE_CLOSE_ALLOWED",
+        reason="",
+        warnings=warnings,
+    )
+    return classify_probability_risk(risk)
+
+
+def passive_buy_close_allowed(probability_risk: OptionProbabilityRisk) -> bool:
+    if probability_risk.position_side != "SHORT":
+        return False
+    if probability_risk.probability_risk_state in {"REVIEW", "THREATENED", "PANIC", "FORCE_EXIT"}:
+        return False
+    if probability_risk.dte is not None and probability_risk.dte <= 7:
+        return False
+    if probability_risk.distance_to_strike_pct is not None and probability_risk.distance_to_strike_pct <= 0:
+        return False
+    if probability_risk.probability_touch_pct is not None and probability_risk.probability_touch_pct >= 35:
+        return False
+    if probability_risk.premium_multiple is not None and probability_risk.premium_multiple >= 1.25:
+        return False
+    if (
+        probability_risk.ltp is not None
+        and probability_risk.avg_price is not None
+        and probability_risk.ltp > probability_risk.avg_price
+    ):
+        return False
+    return True
+
+
+def aggressive_buy_close_price(probability_risk: OptionProbabilityRisk, tick_size: float = 0.05) -> float:
+    if probability_risk.ask and probability_risk.ask > 0:
+        return ceil_to_tick(probability_risk.ask * 1.02, tick_size)
+    if probability_risk.ltp and probability_risk.ltp > 0:
+        return ceil_to_tick(probability_risk.ltp * 1.05, tick_size)
+    return 0.0
 
 
 def implied_volatility(
@@ -7322,6 +7655,89 @@ def active_pe_position_underlyings(force_refresh: bool = False) -> set[str]:
     return result
 
 
+def active_short_option_sell_info_from_positions(
+    underlying: str,
+    positions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    clean_underlying = str(underlying or "").strip().upper()
+    result: dict[str, Any] = {
+        "underlying": clean_underlying,
+        "has_short_pe": False,
+        "has_short_ce": False,
+        "short_pe_count": 0,
+        "short_ce_count": 0,
+        "short_pe_symbols": [],
+        "short_ce_symbols": [],
+        "summary": "No active PE/CE SELL position found for this stock.",
+    }
+    if not clean_underlying:
+        return result
+    for position in positions:
+        try:
+            quantity = int(float(position.get("quantity") or 0))
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity >= 0:
+            continue
+        symbol = str(position.get("tradingsymbol") or "").strip().upper()
+        parts = option_symbol_parts(symbol)
+        if not parts or str(parts.get("underlying") or "").upper() != clean_underlying:
+            continue
+        try:
+            average_price = float(position.get("average_price") or 0)
+        except (TypeError, ValueError):
+            average_price = 0.0
+        detail = (
+            f"{symbol} qty {abs(quantity)}"
+            + (f" avg {average_price:.2f}" if average_price > 0 else "")
+        )
+        if parts["option_type"] == "PE":
+            result["has_short_pe"] = True
+            result["short_pe_count"] += 1
+            result["short_pe_symbols"].append(detail)
+        elif parts["option_type"] == "CE":
+            result["has_short_ce"] = True
+            result["short_ce_count"] += 1
+            result["short_ce_symbols"].append(detail)
+    notes: list[str] = []
+    if result["has_short_pe"]:
+        notes.append("Active PE SELL: " + "; ".join(result["short_pe_symbols"]))
+    if result["has_short_ce"]:
+        notes.append("Active CE SELL: " + "; ".join(result["short_ce_symbols"]))
+    result["summary"] = " | ".join(notes) if notes else result["summary"]
+    return result
+
+
+def active_short_option_sell_info_for_underlying(
+    underlying: str,
+    force_refresh: bool = True,
+) -> dict[str, Any]:
+    clean_underlying = str(underlying or "").strip().upper()
+    empty_result: dict[str, Any] = {
+        "underlying": clean_underlying,
+        "has_short_pe": False,
+        "has_short_ce": False,
+        "short_pe_count": 0,
+        "short_ce_count": 0,
+        "short_pe_symbols": [],
+        "short_ce_symbols": [],
+        "summary": "No active PE/CE SELL position found for this stock.",
+    }
+    if not clean_underlying or kite_orders is None:
+        return empty_result
+    try:
+        if force_refresh:
+            kite = kite_orders.kite_client()
+            positions = kite.positions().get("net", [])
+        else:
+            positions = open_option_positions(use_cache=True)
+    except Exception as exc:
+        empty_result["summary"] = f"Could not verify active PE/CE SELL positions: {friendly_external_error(exc, 'Kite positions')}"
+        empty_result["error"] = empty_result["summary"]
+        return empty_result
+    return active_short_option_sell_info_from_positions(clean_underlying, positions)
+
+
 EVENT_RISK_TERMS = {
     "board",
     "bonus",
@@ -7573,6 +7989,17 @@ def validate_trade_orders(orders: list[dict[str, Any]] | None) -> list[dict[str,
             validation["score"] = 0
             validation["error"] = "Risk engine blocked: " + ", ".join(str(code) for code in reason_codes)
             validation["impact"] = str(human_reason)
+        elif order.get("risk_soft_override_applied"):
+            reason_codes = risk_decision.get("reason_codes") or order.get("risk_reason_codes") or []
+            human_reason = (
+                risk_decision.get("human_reason")
+                or order.get("risk_human_reason")
+                or "Soft risk block was manually overridden."
+            )
+            validation["impact"] = (
+                f"{validation.get('impact') or ''} Override: {human_reason}"
+            ).strip()
+            validation["error"] = "Soft risk override: " + ", ".join(str(code) for code in reason_codes)
         elif risk_status == "REDUCE_SIZE":
             human_reason = (
                 risk_decision.get("human_reason")
@@ -7728,7 +8155,7 @@ def next_monthly_pe_candidate(
     today: date | None = None,
 ) -> dict[str, Any]:
     today = today or app_now().date()
-    spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
+    spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"], ttl_seconds=5).get(f"NSE:{underlying}", {})
     spot = quote_ltp(spot_quote)
     if spot <= 0:
         raise ValueError(f"Could not read spot for {underlying}.")
@@ -7772,9 +8199,11 @@ def income_pe_order_snapshot(underlying: str, target_strike: Any = None) -> dict
     clean_underlying = str(underlying or "").strip().upper()
     if not clean_underlying:
         raise ValueError("Select a PE candidate first.")
+    active_sell_info = active_short_option_sell_info_for_underlying(clean_underlying, True)
     if clean_underlying in active_pe_position_underlyings(True):
         raise PermissionError(
-            f"{clean_underlying} already has an active PE position. New PE SELL is blocked."
+            f"{clean_underlying} already has an active PE SELL position. New PE SELL is blocked. "
+            f"{active_sell_info.get('summary')}"
         )
     kite = kite_orders.kite_client()
     candidate = next_monthly_pe_candidate(kite, clean_underlying)
@@ -7822,6 +8251,10 @@ def income_pe_order_snapshot(underlying: str, target_strike: Any = None) -> dict
         "premium_yield_percent": (
             max_profit / assignment_value * 100 if assignment_value > 0 else 0
         ),
+        "active_sell_info": active_sell_info,
+        "active_sell_summary": active_sell_info.get("summary"),
+        "has_active_pe_sell": bool(active_sell_info.get("has_short_pe")),
+        "has_active_ce_sell": bool(active_sell_info.get("has_short_ce")),
     }
 
 
@@ -7831,7 +8264,7 @@ def next_monthly_ce_candidate(
     today: date | None = None,
 ) -> dict[str, Any]:
     today = today or app_now().date()
-    spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"]).get(f"NSE:{underlying}", {})
+    spot_quote = cached_kite_quote(kite, [f"NSE:{underlying}"], ttl_seconds=5).get(f"NSE:{underlying}", {})
     spot = quote_ltp(spot_quote)
     if spot <= 0:
         raise ValueError(f"Could not read spot for {underlying}.")
@@ -8764,6 +9197,8 @@ def build_missing_option_close_orders(
             "ltp": ltp,
             "existing_close_order": bool(existing_order),
         }
+        probability_risk = build_option_probability_risk(position)
+        evaluation.update(_option_probability_fields(probability_risk))
         if existing_order:
             evaluation.update(
                 {
@@ -8779,12 +9214,71 @@ def build_missing_option_close_orders(
             evaluations.append(evaluation)
             continue
         if close_side == "BUY":
-            price_basis = min(average_price, ltp)
-            limit_price = floor_to_tick(
-                price_basis * (1 - discount / 100),
-                0.05,
-            )
-            rule = f"{discount:g}% below min(LTP, average entry price)"
+            if probability_risk.probability_risk_state in {"PANIC", "FORCE_EXIT"}:
+                parts = option_symbol_parts(symbol)
+                if parts:
+                    expiry = expiry_date_for_parts(parts)
+                    hard_stop_dte_allowed, dte = intraday_hard_stop_trading_days_allowed(
+                        expiry,
+                        app_now().date(),
+                    )
+                    calendar_dte = max((expiry - app_now().date()).days, 0)
+                else:
+                    hard_stop_dte_allowed, dte, calendar_dte = False, None, None
+                if not hard_stop_dte_allowed:
+                    evaluation.update(
+                        {
+                            "action": "SKIP_PROBABILITY_RISK_DTE_NOT_READY",
+                            "dte": dte,
+                            "calendar_dte": calendar_dte,
+                            "skip_reason": (
+                                f"Probability-risk close skipped because trading DTE is "
+                                f"{dte if dte is not None else 'unknown'}"
+                                + (
+                                    f" (calendar DTE {calendar_dte})"
+                                    if calendar_dte is not None
+                                    else ""
+                                )
+                                + (
+                                    f"; aggressive close orders start only when trading DTE "
+                                    f"is {INTRADAY_HARD_STOP_START_DTE} or fewer."
+                                )
+                            ),
+                        }
+                    )
+                    evaluations.append(evaluation)
+                    continue
+                price_basis = ltp
+                limit_price = aggressive_buy_close_price(probability_risk)
+                rule = (
+                    "aggressive probability-risk close using ask +2% or LTP +5%; "
+                    f"state {probability_risk.probability_risk_state}"
+                )
+            elif probability_risk.probability_risk_state in {"REVIEW", "THREATENED"}:
+                evaluation.update(
+                    {
+                        "action": "SKIP_PROBABILITY_RISK_REVIEW",
+                        "skip_reason": probability_risk.reason,
+                    }
+                )
+                evaluations.append(evaluation)
+                continue
+            elif not passive_buy_close_allowed(probability_risk):
+                evaluation.update(
+                    {
+                        "action": "SKIP_PASSIVE_CLOSE_NOT_SAFE",
+                        "skip_reason": probability_risk.reason,
+                    }
+                )
+                evaluations.append(evaluation)
+                continue
+            else:
+                price_basis = min(average_price, ltp)
+                limit_price = floor_to_tick(
+                    price_basis * (1 - discount / 100),
+                    0.05,
+                )
+                rule = f"{discount:g}% below min(LTP, average entry price)"
         else:
             price_basis = max(average_price, ltp)
             limit_price = ceil_to_tick(
@@ -8802,6 +9296,9 @@ def build_missing_option_close_orders(
                 "price": limit_price,
                 "price_basis": price_basis,
                 "pricing_rule": rule,
+                "probability_risk_state": probability_risk.probability_risk_state,
+                "probability_action": probability_risk.recommended_action,
+                "probability_reason": probability_risk.reason,
             }
         )
         evaluations.append(evaluation)
@@ -8829,8 +9326,13 @@ def build_missing_option_close_orders(
                 "risk_note": (
                     f"AUTO CLOSE COVER: {close_side} {abs(quantity)} {symbol} at "
                     f"{limit_price:.2f}; {rule}. Average {average_price:.2f}, "
-                    f"fresh LTP {ltp:.2f}."
+                    f"fresh LTP {ltp:.2f}. Probability state "
+                    f"{probability_risk.probability_risk_state}: {probability_risk.reason}"
                 ),
+                "probability_risk_state": probability_risk.probability_risk_state,
+                "probability_touch_pct": probability_risk.probability_touch_pct,
+                "expected_move_multiple": probability_risk.expected_move_multiple,
+                "premium_multiple": probability_risk.premium_multiple,
                 "skip_if_close_order_exists": True,
             }
         )
@@ -8965,6 +9467,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                 },
                 available_cash,
             )
+            probability_risk = build_option_probability_risk(position, data)
             deployed = margin_required_for_position(kite, position)
             total_deployed += deployed
             rows.append(
@@ -9000,6 +9503,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "pcr": data.get("pcr"),
                     "support": data.get("support"),
                     "resistance": data.get("resistance"),
+                    **_option_probability_fields(probability_risk),
                     "existing_close_order": existing_close_order,
                     "existing_buy_order": (
                         existing_close_order if close_side == "BUY" else None
@@ -9013,6 +9517,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
             except Exception:
                 deployed = 0.0
             total_deployed += deployed
+            probability_risk = build_option_probability_risk(position)
             rows.append(
                 {
                     "symbol": symbol,
@@ -9026,6 +9531,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "error": str(exc),
                     "strategy_strength": "ERROR",
                     "strategy_color": "lightcoral",
+                    **_option_probability_fields(probability_risk),
                     "existing_close_order": existing_close_order,
                     "existing_buy_order": (
                         existing_close_order if close_side == "BUY" else None
@@ -9497,6 +10003,29 @@ def cached_kite_quote(kite: Any, keys: list[str] | tuple[str, ...], ttl_seconds:
         raise RuntimeError(friendly_external_error(exc, "Kite quote")) from exc
 
 
+def fresh_equity_cmp_map(
+    kite: Any,
+    symbols: Iterable[Any],
+    ttl_seconds: int = 5,
+) -> dict[str, float]:
+    """Return fresh NSE LTPs for underlying equities used in candidate scoring."""
+    clean_symbols = sorted(
+        {
+            str(symbol or "").strip().upper().removeprefix("NSE:")
+            for symbol in symbols
+            if str(symbol or "").strip()
+        }
+    )
+    if not clean_symbols:
+        return {}
+    quote_keys = [f"NSE:{symbol}" for symbol in clean_symbols]
+    quotes = cached_kite_quote(kite, quote_keys, ttl_seconds=ttl_seconds)
+    return {
+        symbol: quote_ltp(quotes.get(f"NSE:{symbol}", {}) or {})
+        for symbol in clean_symbols
+    }
+
+
 def apply_nfo_option_price_protection(
     kite: Any,
     orders: list[dict[str, Any]],
@@ -9552,15 +10081,22 @@ def apply_nfo_option_price_protection(
     return orders
 
 
-def cached_kite_positions(kite: Any) -> list[dict[str, Any]]:
+def cached_kite_positions(kite: Any, ttl_seconds: int = KITE_READ_CACHE_SECONDS) -> list[dict[str, Any]]:
     try:
         return cached_value(
             "kite:positions",
             lambda: kite.positions().get("net", []),
-            KITE_READ_CACHE_SECONDS,
+            ttl_seconds,
         )
     except Exception as exc:
         raise RuntimeError(friendly_external_error(exc, "Kite positions")) from exc
+
+
+def cached_kite_holdings(kite: Any, ttl_seconds: int = KITE_READ_CACHE_SECONDS) -> list[dict[str, Any]]:
+    try:
+        return cached_value("kite:holdings", kite.holdings, ttl_seconds)
+    except Exception as exc:
+        raise RuntimeError(friendly_external_error(exc, "Kite holdings")) from exc
 
 
 def cached_kite_orders(kite: Any) -> list[dict[str, Any]]:
@@ -10410,16 +10946,30 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if expiry_day >= today:
             option_rows_by_name.setdefault(name, []).append({**item, "_expiry_day": expiry_day})
 
+    live_cmp_by_symbol = fresh_equity_cmp_map(
+        kite,
+        [str(row.get("symbol") or "").upper() for row in investing_rows],
+        ttl_seconds=5,
+    )
     quote_keys: list[str] = []
     selected_by_symbol: dict[str, dict[str, Any]] = {}
+    target_call_strike_by_symbol: dict[str, float] = {}
     for row in investing_rows:
         symbol = str(row.get("symbol") or "").upper()
         sheet = income_growth_by_symbol.get(symbol)
-        cmp_value = float((sheet or {}).get("cmp") or row.get("cmp") or 0)
+        stored_cmp_value = float((sheet or {}).get("cmp") or row.get("cmp") or 0)
+        live_cmp_value = float(live_cmp_by_symbol.get(symbol) or 0)
+        cmp_value = live_cmp_value if live_cmp_value > 0 else stored_cmp_value
         quantity = int(float((sheet or {}).get("holding") or row.get("quantity") or 0))
         if cmp_value <= 0 or quantity <= 0:
             continue
-        target_strike = float((sheet or {}).get("call_strike") or (cmp_value * 1.10))
+        gap_pct = float((sheet or {}).get("gap_pct") or 10)
+        target_strike = (
+            cmp_value * (1 + gap_pct / 100)
+            if live_cmp_value > 0
+            else float((sheet or {}).get("call_strike") or (cmp_value * 1.10))
+        )
+        target_call_strike_by_symbol[symbol] = target_strike
         options = [
             item
             for item in option_rows_by_name.get(symbol, [])
@@ -10441,9 +10991,12 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     for row in investing_rows:
         symbol = str(row.get("symbol") or "").upper()
         sheet = income_growth_by_symbol.get(symbol)
-        cmp_value = float((sheet or {}).get("cmp") or row.get("cmp") or 0)
+        stored_cmp_value = float((sheet or {}).get("cmp") or row.get("cmp") or 0)
+        live_cmp_value = float(live_cmp_by_symbol.get(symbol) or 0)
+        cmp_value = live_cmp_value if live_cmp_value > 0 else stored_cmp_value
+        cmp_source = "Kite live quote" if live_cmp_value > 0 else "Income Growth snapshot"
         quantity = int(float((sheet or {}).get("holding") or row.get("quantity") or 0))
-        market_value = float((sheet or {}).get("value") or (quantity * cmp_value if cmp_value else 0))
+        market_value = quantity * cmp_value if cmp_value else float((sheet or {}).get("value") or 0)
         candidate = selected_by_symbol.get(symbol)
         core = str(row.get("core") or "").upper()
         quality_score = 1.0 if core == "Y" else 0.75 if quantity > 0 else 0.4
@@ -10471,7 +11024,7 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             trend_score = 0.6
         input_lot_size = int(float((sheet or {}).get("lot_size") or 0))
         input_lots_can_sell = int(float((sheet or {}).get("lots_can_sell") or 0))
-        input_call_strike = (sheet or {}).get("call_strike")
+        input_call_strike = target_call_strike_by_symbol.get(symbol) or (sheet or {}).get("call_strike")
         input_put_strike = (sheet or {}).get("pe")
         input_to_sell = (sheet or {}).get("to_sell")
         input_gap_pct = (sheet or {}).get("gap_pct")
@@ -10485,6 +11038,8 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             **row,
             "quantity": quantity,
             "cmp": cmp_value if cmp_value > 0 else row.get("cmp"),
+            "cmp_source": cmp_source,
+            "stale_cmp_snapshot": stored_cmp_value,
             "market_value": market_value,
             "sheet_source": bool(sheet),
             "times_lot": input_times_lot,
@@ -11428,9 +11983,17 @@ def build_live_pe_sell_rankings(
         float(row.get("value") or row.get("market_value") or 0)
         for row in growth_rows
     )
+    live_cmp_by_symbol = fresh_equity_cmp_map(
+        kite,
+        [str(row.get("symbol") or "").upper() for row in growth_rows],
+        ttl_seconds=5,
+    )
     for row in growth_rows:
         symbol = str(row.get("symbol") or "").upper()
-        cmp_value = float(row.get("cmp") or 0)
+        stored_cmp_value = float(row.get("cmp") or 0)
+        live_cmp_value = float(live_cmp_by_symbol.get(symbol) or 0)
+        cmp_value = live_cmp_value if live_cmp_value > 0 else stored_cmp_value
+        cmp_source = "Kite live quote" if live_cmp_value > 0 else str(row.get("cmp_source") or "Income Growth snapshot")
         if not symbol or cmp_value <= 0:
             continue
         try:
@@ -11467,6 +12030,8 @@ def build_live_pe_sell_rankings(
                     "symbol": symbol,
                     "option_symbol": contract["symbol"],
                     "cmp": cmp_value,
+                    "cmp_source": cmp_source,
+                    "stale_cmp_snapshot": stored_cmp_value,
                     "target_strike": contract["target_strike"],
                     "target_pe_strike_zone": contract["target_strike"],
                     "strike": contract["strike"],
@@ -11529,6 +12094,8 @@ def build_live_pe_sell_rankings(
                     "stock": symbol,
                     "symbol": symbol,
                     "cmp": cmp_value,
+                    "cmp_source": cmp_source,
+                    "stale_cmp_snapshot": stored_cmp_value,
                     "contract_valid": False,
                     "event_risk": "AMBER",
                     "reject_reasons": [friendly_external_error(exc, f"{symbol} PE candidate")],
@@ -12144,6 +12711,19 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
     settings = load_ce_sell_settings()
     active_underlyings = active_position_underlyings()
     instruments = cached_kite_instruments(kite, "NFO")
+    underlying_symbols = sorted(
+        {
+            str(row.get("symbol") or "").strip().upper()
+            for row in growth_rows
+            if str(row.get("symbol") or "").strip()
+        }
+    )
+    underlying_quote_keys = [f"NSE:{symbol}" for symbol in underlying_symbols]
+    underlying_quotes = (
+        cached_kite_quote(kite, underlying_quote_keys, ttl_seconds=5)
+        if underlying_quote_keys
+        else {}
+    )
     news_cache: dict[str, list[dict[str, str]]] = {}
     macro_tape = ce_macro_tape_snapshot()
     redeployment_universe = []
@@ -12167,7 +12747,11 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
     for row in growth_rows:
         symbol = str(row.get("symbol") or "").upper()
         holding = int(float(row.get("quantity") or 0))
-        cmp_value = float(row.get("cmp") or 0)
+        sheet_cmp_value = float(row.get("cmp") or 0)
+        live_quote = underlying_quotes.get(f"NSE:{symbol}", {}) or {}
+        live_cmp_value = quote_ltp(live_quote)
+        cmp_value = live_cmp_value if live_cmp_value > 0 else sheet_cmp_value
+        cmp_source = "Kite live quote" if live_cmp_value > 0 else "Income Growth snapshot"
         requested_lots = MAX_TOP3_CE_SELL_LOTS
         symbol_instruments = [
             item
@@ -12184,6 +12768,7 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
                     "holding_qty": holding,
                     "requested_lots": requested_lots,
                     "cmp": cmp_value,
+                    "cmp_source": cmp_source,
                     "contract_valid": False,
                     "reject_reasons": ["No current or future monthly CE contract is available."],
                 }
@@ -12218,6 +12803,7 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
                     "holding_qty": holding,
                     "requested_lots": requested_lots,
                     "cmp": cmp_value,
+                    "cmp_source": cmp_source,
                     "contract_valid": False,
                     "reject_reasons": [str(exc)],
                 }
@@ -12260,6 +12846,8 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
                 {
                     "stock": symbol, "holding_qty": holding, "active_lot_size": lot_size,
                     "requested_lots": requested_lots, "cmp": cmp_value,
+                    "cmp_source": cmp_source,
+                    "stale_cmp_snapshot": sheet_cmp_value,
                     "target_ce_strike_zone": target, "selected_ce_strike": float(selected.get("strike") or 0),
                     "expiry": str(expiry), "option_symbol": option_symbol, "premium": premium,
                     "rolled_from_expiry": rolled_from_expiry,
@@ -12293,7 +12881,17 @@ def build_live_ce_sell_rankings() -> tuple[list[dict[str, Any]], list[dict[str, 
                 }
             )
         except Exception as exc:
-            candidates.append({"stock": symbol, "holding_qty": holding, "active_lot_size": lot_size, "requested_lots": requested_lots, "cmp": cmp_value, "contract_valid": False, "reject_reasons": [str(exc)]})
+            candidates.append({
+                "stock": symbol,
+                "holding_qty": holding,
+                "active_lot_size": lot_size,
+                "requested_lots": requested_lots,
+                "cmp": cmp_value,
+                "cmp_source": cmp_source,
+                "stale_cmp_snapshot": sheet_cmp_value,
+                "contract_valid": False,
+                "reject_reasons": [str(exc)],
+            })
     return rank_ce_sell_candidates(candidates, settings)
 
 
@@ -12308,7 +12906,7 @@ def covered_ce_holding_source(kite: Any, underlying: str) -> dict[str, Any]:
     clean_underlying = str(underlying or "").strip().upper()
     kite_qty = 0
     kite_average_price = 0.0
-    for holding in kite.holdings():
+    for holding in cached_kite_holdings(kite):
         if str(holding.get("tradingsymbol") or "").upper() == clean_underlying:
             kite_qty = int(float(holding.get("quantity") or 0))
             kite_average_price = float(holding.get("average_price") or 0)
@@ -12338,8 +12936,9 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
     clean_underlying = str(underlying or "").strip().upper()
     if not clean_underlying:
         raise ValueError("Select an approved covered CE candidate first.")
+    kite = kite_orders.kite_client()
 
-    top, _, _ = ce_sell_dashboard(True)
+    top, _, _ = ce_sell_dashboard(False)
     candidate = next(
         (item for item in top if str(item.get("stock") or "").upper() == clean_underlying),
         None,
@@ -12349,8 +12948,8 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
             f"{clean_underlying} is no longer an approved Top 3 covered CE candidate. Recalculate and review."
         )
 
-    kite = kite_orders.kite_client()
-    positions = kite.positions().get("net", [])
+    positions = cached_kite_positions(kite, ttl_seconds=CE_SELL_POPUP_POSITION_CACHE_SECONDS)
+    active_sell_info = active_short_option_sell_info_from_positions(clean_underlying, positions)
     active_underlyings = {
         underlying_for_symbol(str(item.get("tradingsymbol") or "").upper())
         for item in positions
@@ -12358,7 +12957,8 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
     }
     if clean_underlying in active_underlyings:
         raise PermissionError(
-            f"{clean_underlying} already has an active option position. New covered CE SELL is blocked."
+            f"{clean_underlying} already has an active option position. New covered CE SELL is blocked. "
+            f"{active_sell_info.get('summary')}"
         )
 
     holding = covered_ce_holding_source(kite, clean_underlying)
@@ -12382,22 +12982,33 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
         )
 
     quote_key = f"NFO:{symbol}"
+    stock_quote_key = f"NSE:{clean_underlying}"
     try:
-        quote = kite.quote([quote_key]).get(quote_key, {})
+        quotes = cached_kite_quote(
+            kite,
+            [quote_key, stock_quote_key],
+            ttl_seconds=CE_SELL_POPUP_QUOTE_CACHE_SECONDS,
+        )
     except Exception as exc:
         raise RuntimeError(friendly_external_error(exc, f"{symbol} CE quote")) from exc
+    quote = quotes.get(quote_key, {})
     ltp = quote_ltp(quote)
     if ltp <= 0:
         raise ValueError(f"Could not read fresh CE premium for {symbol}.")
+    stock_quote = quotes.get(stock_quote_key, {})
+    fresh_cmp_value = quote_ltp(stock_quote)
+    if fresh_cmp_value <= 0:
+        raise ValueError(f"Could not read fresh stock CMP for {clean_underlying}.")
     settings = load_ce_sell_settings()
     limit_price = ceil_to_tick(
         ltp * (1 + float(settings["price_markup_percent"]) / 100),
         0.05,
     )
-    cmp_value = float(candidate.get("cmp") or 0)
+    cmp_value = fresh_cmp_value
     strike = float(candidate.get("selected_ce_strike") or 0)
     max_profit = limit_price * quantity
     covered_value = cmp_value * quantity
+    otm_percent = (strike - cmp_value) / cmp_value * 100 if cmp_value > 0 else 0
     return {
         "underlying": clean_underlying,
         "symbol": symbol,
@@ -12411,6 +13022,7 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
         "lots_to_sell": lots_to_sell,
         "quantity": quantity,
         "cmp": cmp_value,
+        "cmp_source": "Kite fresh quote",
         "strike": strike,
         "expiry": str(candidate.get("expiry") or ""),
         "ltp": ltp,
@@ -12419,10 +13031,14 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
         "max_profit": max_profit,
         "covered_value": covered_value,
         "premium_yield_percent": max_profit / covered_value * 100 if covered_value > 0 else 0,
-        "otm_percent": float(candidate.get("otm_percent") or 0),
+        "otm_percent": otm_percent,
         "score": float(candidate.get("final_ce_score") or 0),
         "event_risk": str(candidate.get("event_risk") or "N/A"),
         "breakout_risk": str(candidate.get("breakout_risk") or "N/A"),
+        "active_sell_info": active_sell_info,
+        "active_sell_summary": active_sell_info.get("summary"),
+        "has_active_pe_sell": bool(active_sell_info.get("has_short_pe")),
+        "has_active_ce_sell": bool(active_sell_info.get("has_short_ce")),
     }
 
 
@@ -12484,10 +13100,21 @@ def place_approved_ce_sell_order(underlying: str) -> dict[str, Any]:
 
 def income_growth_pe_sell_candidates(rows: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
+    live_cmp_by_symbol: dict[str, float] = {}
+    try:
+        if kite_orders is not None:
+            kite = kite_orders.kite_client()
+            live_cmp_by_symbol = fresh_equity_cmp_map(
+                kite,
+                [str(row.get("symbol") or "").upper() for row in rows],
+                ttl_seconds=5,
+            )
+    except Exception:
+        live_cmp_by_symbol = {}
     for row in rows:
         try:
             symbol = str(row.get("symbol") or "").upper()
-            cmp_value = float(row.get("cmp") or 0)
+            cmp_value = float(live_cmp_by_symbol.get(symbol) or row.get("cmp") or 0)
             put_strike = float(row.get("input_put_strike") or 0)
             lot_size = int(float(row.get("lot_size") or row.get("input_lot_size") or 0))
             pe_value = row.get("input_pe")
@@ -13569,8 +14196,46 @@ def cap_trading_option_rows_by_otm(
     return adjusted_rows, adjustments
 
 
+TRADING_SOFT_RISK_OVERRIDE_CODES = {
+    "LOW_PREMIUM_YIELD",
+    "MISSING_TECHNICAL_DATA",
+    "MISSING_MARKET_DATA",
+}
+
+
+def risk_decision_soft_override_allowed(decision: dict[str, Any] | None) -> bool:
+    if not decision or str(decision.get("decision") or "").upper() != "BLOCKED":
+        return False
+    reason_codes = {
+        str(code).upper()
+        for code in (decision.get("reason_codes") or [])
+        if str(code or "").strip()
+    }
+    return bool(reason_codes) and reason_codes.issubset(TRADING_SOFT_RISK_OVERRIDE_CODES)
+
+
+def apply_soft_risk_override_to_decision(
+    order: dict[str, Any],
+    decision: dict[str, Any],
+) -> dict[str, Any]:
+    overridden = dict(decision)
+    original_reason = str(overridden.get("human_reason") or "")
+    reason_codes = [str(code).upper() for code in overridden.get("reason_codes") or []]
+    overridden["original_decision"] = overridden.get("decision")
+    overridden["decision"] = "APPROVED"
+    overridden["risk_score"] = max(int(float(overridden.get("risk_score") or 0)), 65)
+    overridden["recommended_quantity"] = int(float(order.get("quantity") or overridden.get("recommended_quantity") or 0))
+    overridden["soft_override_applied"] = True
+    overridden["human_reason"] = (
+        "User override approved soft risk block: "
+        + ", ".join(reason_codes)
+        + (f". Original: {original_reason}" if original_reason else "")
+    )
+    return overridden
+
+
 def build_orders(
-    rows: list[dict[str, str]], no_ltp_price: bool, keep_existing_orders: bool
+    rows: list[dict[str, str]], no_ltp_price: bool, keep_existing_orders: bool, override_soft_risk_blocks: bool = False
 ) -> list[dict[str, Any]]:
     has_option_rows = any(
         str(row.get("exchange") or "NFO").strip().upper() == "NFO"
@@ -13635,7 +14300,7 @@ def build_orders(
                     "Could not load fresh option LTP for zero-price order(s): "
                     f"{', '.join(missing_price_symbols)}. {exc}"
                 ) from exc
-    apply_risk_engine_to_orders(orders)
+    apply_risk_engine_to_orders(orders, override_soft_risk_blocks)
     return orders
 
 
@@ -13777,7 +14442,10 @@ def append_trade_journal(
             )
 
 
-def apply_risk_engine_to_orders(orders: list[dict[str, Any]]) -> dict[str, Any]:
+def apply_risk_engine_to_orders(
+    orders: list[dict[str, Any]],
+    override_soft_risk_blocks: bool = False,
+) -> dict[str, Any]:
     if not orders:
         _, decisions, artifacts = evaluate_and_write_orders([], RISK_OUTPUT_DIR, RiskVetoEngine())
         return {"decisions": decisions, "artifacts": artifacts}
@@ -13788,6 +14456,13 @@ def apply_risk_engine_to_orders(orders: list[dict[str, Any]]) -> dict[str, Any]:
         trade.setdefault("portfolio_data", {})["open_positions"] = position_context
     engine = RiskVetoEngine()
     decisions = [engine.evaluate(trade) for trade in risk_trades]
+    if override_soft_risk_blocks:
+        decisions = [
+            apply_soft_risk_override_to_decision(order, decision)
+            if risk_decision_soft_override_allowed(decision)
+            else decision
+            for order, decision in zip(orders, decisions)
+        ]
     artifacts = write_risk_outputs(orders, decisions, RISK_OUTPUT_DIR)
     run_id = app_now().strftime("risk-%Y%m%d-%H%M%S")
     append_trade_journal(orders, risk_trades, decisions, run_id)
@@ -13798,6 +14473,8 @@ def apply_risk_engine_to_orders(orders: list[dict[str, Any]]) -> dict[str, Any]:
         order["risk_score"] = decision.get("risk_score")
         order["risk_reason_codes"] = decision.get("reason_codes") or []
         order["risk_human_reason"] = decision.get("human_reason")
+        order["risk_soft_override_applied"] = bool(decision.get("soft_override_applied"))
+        order["risk_original_decision"] = decision.get("original_decision")
         order["entry_premium"] = decision.get("entry_premium")
         order["target_exit_premium"] = decision.get("target_exit_premium")
         order["warning_premium"] = decision.get("warning_premium")
@@ -13826,6 +14503,7 @@ def risk_engine_preview_message(orders: list[dict[str, Any]] | None) -> str:
         if str((order.get("risk_decision") or {}).get("decision") or order.get("risk_status") or "").upper()
         == "REDUCE_SIZE"
     ]
+    overridden = [order for order in orders if order.get("risk_soft_override_applied")]
     if len(blocked) == len(orders):
         return (
             "No approved trades today. Risk engine blocked all trades. "
@@ -13834,9 +14512,13 @@ def risk_engine_preview_message(orders: list[dict[str, Any]] | None) -> str:
     if blocked or reduced:
         return (
             f"Risk engine reviewed orders: {len(orders) - len(blocked)} approved, "
-            f"{len(reduced)} reduced, {len(blocked)} blocked. "
+            f"{len(reduced)} reduced, {len(blocked)} blocked"
+            + (f", {len(overridden)} soft override approved" if overridden else "")
+            + ". "
             f"Reports saved in {RISK_OUTPUT_DIR}."
         )
+    if overridden:
+        return f"Risk engine approved all previewed orders, including {len(overridden)} soft override approval(s)."
     return "Risk engine approved all previewed orders."
 
 
@@ -13853,6 +14535,7 @@ def load_default_trade_preview(state: PageState) -> PageState:
         state.rows,
         state.no_ltp_price,
         state.keep_existing_orders,
+        state.override_soft_risk_blocks,
     )
     state.trade_validations = validate_trade_orders(state.orders)
     state.selected_indexes = default_selected_order_indexes(
@@ -14052,12 +14735,13 @@ def execute_orders(
     dry_run: bool,
     no_ltp_price: bool,
     keep_existing_orders: bool,
+    override_soft_risk_blocks: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     selected_rows = [row for index, row in enumerate(rows) if index in selected_indexes]
     if not selected_rows:
         raise ValueError("Select at least one order.")
 
-    orders = build_orders(selected_rows, no_ltp_price, keep_existing_orders)
+    orders = build_orders(selected_rows, no_ltp_price, keep_existing_orders, override_soft_risk_blocks)
     blocked_orders = [
         order
         for order in orders
@@ -14744,38 +15428,109 @@ def build_intraday_loss_limit_close_orders(
             else risk_config.PE_HARD_EXIT_MULTIPLIER
         )
         hard_stop_price = average_price * float(hard_multiplier)
-        hard_stop_triggered = hard_stop_price > 0 and ltp >= hard_stop_price
-        triggered = adverse_loss_pct >= float(loss_trigger_percent)
+        expiry = expiry_date_for_parts(parts)
+        hard_stop_dte_allowed, dte = intraday_hard_stop_trading_days_allowed(expiry, app_now().date())
+        calendar_dte = max((expiry - app_now().date()).days, 0)
+        raw_hard_stop_triggered = hard_stop_price > 0 and ltp >= hard_stop_price
+        raw_loss_triggered = adverse_loss_pct >= float(loss_trigger_percent)
+        probability_risk = build_option_probability_risk(position)
+        raw_probability_exit_triggered = probability_risk.probability_risk_state in {"PANIC", "FORCE_EXIT"}
+        triggered = raw_loss_triggered and hard_stop_dte_allowed
+        hard_stop_triggered = raw_hard_stop_triggered and hard_stop_dte_allowed
+        probability_exit_triggered = raw_probability_exit_triggered and hard_stop_dte_allowed
+        effective_triggered = triggered or hard_stop_triggered or probability_exit_triggered
         evaluation = {
             "tradingsymbol": symbol,
             "option_type": parts_option_type,
             "average_price": average_price,
             "ltp": ltp,
+            "expiry": expiry.isoformat(),
+            "dte": dte,
+            "calendar_dte": calendar_dte,
             "adverse_loss_pct": adverse_loss_pct,
             "trigger_percent": float(loss_trigger_percent),
             "hard_stop_price": hard_stop_price,
+            "raw_loss_triggered": raw_loss_triggered,
+            "raw_hard_stop_triggered": raw_hard_stop_triggered,
+            "hard_stop_dte_allowed": hard_stop_dte_allowed,
             "hard_stop_triggered": hard_stop_triggered,
-            "triggered": triggered or hard_stop_triggered,
-            "action": "MODIFY_OR_PLACE_BUY_CLOSE" if (triggered or hard_stop_triggered) else "NO_ACTION",
+            "raw_probability_exit_triggered": raw_probability_exit_triggered,
+            "probability_exit_triggered": probability_exit_triggered,
+            **_option_probability_fields(probability_risk),
+            "triggered": effective_triggered,
+            "action": (
+                "MODIFY_OR_PLACE_BUY_CLOSE"
+                if effective_triggered
+                else "NO_ACTION"
+            ),
         }
+        if (
+            (raw_loss_triggered or raw_hard_stop_triggered or raw_probability_exit_triggered)
+            and not hard_stop_dte_allowed
+            and not effective_triggered
+        ):
+            skipped_reasons = []
+            if raw_loss_triggered:
+                skipped_reasons.append(f"loss {adverse_loss_pct:.2f}% crossed {float(loss_trigger_percent):.0f}%")
+            if raw_hard_stop_triggered:
+                skipped_reasons.append(f"hard stop {hard_stop_price:.2f} crossed")
+            if raw_probability_exit_triggered:
+                skipped_reasons.append(f"probability risk {probability_risk.probability_risk_state}")
+            evaluation.update(
+                {
+                    "action": "SKIP_INTRADAY_OVERRIDE_DTE_NOT_READY",
+                    "skip_reason": (
+                        f"Aggressive close override skipped: {', '.join(skipped_reasons)}. "
+                        f"Trading DTE is {dte} (calendar DTE {calendar_dte}); override execution starts "
+                        f"only when trading DTE is {INTRADAY_HARD_STOP_START_DTE} or fewer."
+                    ),
+                }
+            )
         evaluations.append(evaluation)
-        if not triggered and not hard_stop_triggered:
+        if not effective_triggered:
             continue
-        price_source = hard_stop_price if hard_stop_triggered else ltp
-        price_basis = "hard_stop_price" if hard_stop_triggered else "fresh_LTP_loss_limit"
-        limit_price = floor_to_tick(
-            price_source * (1 - float(ltp_discount_percent) / 100),
-            0.05,
-        )
+        if probability_exit_triggered and not hard_stop_triggered:
+            price_source = ltp
+            price_basis = f"probability_{probability_risk.probability_risk_state.lower()}_aggressive"
+            limit_price = aggressive_buy_close_price(probability_risk)
+        else:
+            price_source = hard_stop_price if hard_stop_triggered else ltp
+            price_basis = "hard_stop_price" if hard_stop_triggered else "fresh_LTP_loss_limit"
+            limit_price = floor_to_tick(
+                price_source * (1 - float(ltp_discount_percent) / 100),
+                0.05,
+            )
         if limit_price <= 0:
             evaluation["triggered"] = False
             evaluation["action"] = "INVALID_LIMIT_PRICE"
             continue
+        if triggered and not hard_stop_triggered and not probability_exit_triggered and limit_price > average_price:
+            evaluation.update(
+                {
+                    "triggered": False,
+                    "action": "SKIP_SPIKE_ABOVE_ENTRY",
+                    "skipped_limit_price": limit_price,
+                    "skip_reason": (
+                        f"Loss-limit spike guard skipped BUY close at {limit_price:.2f} "
+                        f"because it is above entry premium {average_price:.2f}. "
+                        "Default missing-close guard may place a passive close order below entry instead."
+                    ),
+                }
+            )
+            continue
         note = (
+            (
+                f"PROBABILITY RISK EXIT: short {parts_option_type} state "
+                f"{probability_risk.probability_risk_state}. {probability_risk.reason} "
+                f"BUY close order set at aggressive limit {limit_price:.2f}."
+            )
+            if probability_exit_triggered and not hard_stop_triggered
+            else
             (
                 f"HARD STOP CONTROL: short {parts_option_type} premium {ltp:.2f} crossed "
                 f"hard stop {hard_stop_price:.2f}. BUY close order set at "
-                f"{float(ltp_discount_percent):.0f}% below hard stop to control loss."
+                f"{float(ltp_discount_percent):.0f}% below hard stop to control loss "
+                f"because trading DTE is {dte} (calendar DTE {calendar_dte})."
             )
             if hard_stop_triggered
             else (
@@ -14806,6 +15561,14 @@ def build_intraday_loss_limit_close_orders(
                 "adverse_loss_pct": adverse_loss_pct,
                 "hard_stop_premium": hard_stop_price,
                 "hard_stop_triggered": hard_stop_triggered,
+                "hard_stop_raw_triggered": raw_hard_stop_triggered,
+                "hard_stop_dte_allowed": hard_stop_dte_allowed,
+                "dte": dte,
+                "calendar_dte": calendar_dte,
+                "probability_risk_state": probability_risk.probability_risk_state,
+                "probability_touch_pct": probability_risk.probability_touch_pct,
+                "expected_move_multiple": probability_risk.expected_move_multiple,
+                "premium_multiple": probability_risk.premium_multiple,
                 "risk_note": note,
             }
         )
@@ -15101,7 +15864,7 @@ def scheduled_job_definitions() -> dict[str, dict[str, Any]]:
         },
         "intraday_position_close": {
             "name": "Intraday Close-Order Guard",
-            "purpose": "Maintain close BUY orders and tighten them to 10% below fresh LTP when short-option loss reaches 100%.",
+            "purpose": "Maintain option close orders; hard-stop control starts only inside 9 trading days to expiry.",
             "schedule": "Every 15 min, weekdays 09:30-15:15 IST",
             "load": intraday_position_close_schedule_state,
             "save": save_intraday_position_close_schedule_state,
@@ -15515,6 +16278,29 @@ def run_intraday_position_close_job(
                 if str(order.get("tradingsymbol") or "").upper()
                 not in (risk_symbols | loss_limit_symbols)
             ]
+            dte_guard_skips = [
+                evaluation
+                for evaluation in [*loss_limit_evaluations, *close_order_evaluations]
+                if str(evaluation.get("action") or "")
+                in {
+                    "SKIP_INTRADAY_OVERRIDE_DTE_NOT_READY",
+                    "SKIP_PROBABILITY_RISK_DTE_NOT_READY",
+                }
+            ]
+            dte_guard_message = ""
+            if dte_guard_skips:
+                skipped_symbols = ", ".join(
+                    f"{evaluation.get('tradingsymbol')} "
+                    f"(trading DTE {evaluation.get('dte') if evaluation.get('dte') is not None else 'unknown'})"
+                    for evaluation in dte_guard_skips[:5]
+                )
+                extra_count = len(dte_guard_skips) - 5
+                dte_guard_message = (
+                    f" DTE-gated risk exits skipped until trading DTE <= "
+                    f"{INTRADAY_HARD_STOP_START_DTE}: {skipped_symbols}"
+                    + (f", +{extra_count} more" if extra_count > 0 else "")
+                    + "."
+                )
             submitted_orders: list[dict[str, Any]] = []
             results: list[dict[str, Any]] = []
             if loss_limit_orders:
@@ -15556,6 +16342,7 @@ def run_intraday_position_close_job(
                             else ""
                         )
                         + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
+                        + dte_guard_message
                     ),
                     order_count=0,
                     results=results,
@@ -15584,6 +16371,7 @@ def run_intraday_position_close_job(
                     f"existing close orders skipped: {risk_existing_order_skips}; "
                     f"errors: {error_count}. {pricing_details}"
                     + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
+                    + dte_guard_message
                 ),
                 order_count=len(submitted_orders),
                 results=results,
@@ -15998,12 +16786,12 @@ def render_orders_table(
                 rendered = html.escape(str(value) if value else "-")
             elif field == "risk_status":
                 reason = order.get("risk_human_reason") or ""
-                status = str(value or "CHECK").upper()
+                status = "OVERRIDE" if order.get("risk_soft_override_applied") else str(value or "CHECK").upper()
                 badge_class = (
                     "good"
                     if status == "APPROVED"
                     else "ok"
-                    if status == "REDUCE_SIZE"
+                    if status in {"REDUCE_SIZE", "OVERRIDE"}
                     else "avoid"
                     if status == "BLOCKED"
                     else "check"
@@ -17652,14 +18440,28 @@ def render_position_close_schedule_panel() -> str:
         "fresh LTP or average entry price. "
         f"Long CE/PE positions, including NIFTY covers: SELL at {discount_percent:g}% above "
         "the higher of fresh LTP or average entry price. Existing matching close-side orders are preserved. "
-        "Risk override: when a short CE/PE premium loss reaches 100% or crosses the hard stop, "
+        "Risk override: when a short CE/PE premium loss reaches 100%, the loss-limit path can act immediately. "
+        f"Hard-stop price execution starts only when trading DTE is {INTRADAY_HARD_STOP_START_DTE} or fewer; "
         f"the guard modifies or places the BUY close order at {discount_percent:g}% below the "
-        "hard-stop price when breached, otherwise below fresh LTP, and records a LOSS LIMIT note.</p>"
+        "hard-stop price only inside that DTE window. Before hard stop, spike closes above entry are skipped, "
+        "and the passive missing-close guard can place a lower close order instead.</p>"
         f"{intraday_details}</section>"
     )
 
 
 def render_position_risk_monitor(state: PageState) -> str:
+    def lifecycle_trading_dte(expiry_value: Any) -> str:
+        if not expiry_value:
+            return "N/A"
+        if isinstance(expiry_value, date):
+            expiry_day = expiry_value
+        else:
+            try:
+                expiry_day = datetime.strptime(str(expiry_value)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                return str(days_to_expiry(expiry_value))
+        return str(trading_days_remaining(expiry_day, app_now().date()))
+
     rows = state.position_risk_rows or []
     summary = state.position_risk_summary or {}
     source_note = "Lifecycle monitor for existing SELL option positions. It recommends action only; it does not place orders automatically."
@@ -17720,7 +18522,7 @@ def render_position_risk_monitor(state: PageState) -> str:
             f"<td>{html.escape(fmt_number(row.get('target_exit_premium')))}</td>"
             f"<td>{html.escape(fmt_number(row.get('warning_premium')))}</td>"
             f"<td>{html.escape(fmt_number(row.get('hard_stop_premium')))}</td>"
-            f"<td>{html.escape(str(days_to_expiry(row.get('expiry')) if row.get('expiry') else 'N/A'))}</td>"
+            f"<td>{html.escape(lifecycle_trading_dte(row.get('expiry')))}</td>"
             f'<td class="{strength_class(status_color.get(status, ""))}"><strong>{html.escape(status)}</strong></td>'
             f"<td><strong>{html.escape(str(action))}</strong></td>"
             f"<td>{html.escape(str(row.get('reason') or ''))}</td>"
@@ -17730,7 +18532,7 @@ def render_position_risk_monitor(state: PageState) -> str:
         '<div class="table-wrap lifecycle-table-wrap"><table class="positions-table lifecycle-table">'
         "<thead><tr><th>Select</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Expiry</th><th>Qty</th>"
         "<th>Entry</th><th>Current</th><th>P&L</th><th>Premium %</th><th>Target</th><th>Warning</th>"
-        "<th>Hard stop</th><th>DTE</th><th>Status</th><th>Action</th><th>Reason</th></tr></thead>"
+        "<th>Hard stop</th><th>Trading DTE</th><th>Status</th><th>Action</th><th>Reason</th></tr></thead>"
         f"<tbody>{row_html}</tbody></table></div>"
         if rows
         else '<p class="status">Load the monitor to see lifecycle status for current SELL option positions.</p>'
@@ -17921,6 +18723,35 @@ def render_positions_panel(
             ("Return on margin", f"{fmt_number(summary.get('return_pct'))}%"),
         ]
     )
+    probability_counts: dict[str, int] = {}
+    for row in rows:
+        state_name = str(row.get("probability_risk_state") or "UNKNOWN").upper()
+        probability_counts[state_name] = probability_counts.get(state_name, 0) + 1
+    highest_touch = max(
+        [float(row.get("probability_touch_pct") or 0) for row in rows],
+        default=0.0,
+    )
+    probability_summary = "".join(
+        f'<div class="position-summary-chip"><span>{html.escape(label)}</span>'
+        f'<strong>{html.escape(value)}</strong></div>'
+        for label, value in [
+            ("Panic / force", str(sum(probability_counts.get(name, 0) for name in ("PANIC", "FORCE_EXIT", "THREATENED")))),
+            ("Review", str(probability_counts.get("REVIEW", 0))),
+            ("Watch", str(probability_counts.get("WATCH", 0))),
+            ("Highest touch", f"{fmt_number(highest_touch)}%"),
+        ]
+    )
+
+    def probability_state_class(value: Any) -> str:
+        state_name = str(value or "").upper()
+        if state_name in {"PANIC", "FORCE_EXIT", "THREATENED"}:
+            return "red"
+        if state_name == "REVIEW":
+            return "yellow"
+        if state_name == "WATCH":
+            return "orange"
+        return "green"
+
     table_rows = "".join(
         (
         "<tr>"
@@ -17941,6 +18772,12 @@ def render_positions_panel(
         )
         + "</span></td>"
         f'<td class="{strength_class("red" if float(row.get("pe_exit_score") or 100) < 50 else "yellow" if float(row.get("pe_exit_score") or 100) < 80 else "green")}"><strong>{html.escape(fmt_number(row.get("pe_exit_score")))}</strong><span>PE risk score</span></td>'
+        f"<td><strong>{html.escape(str(row.get('dte') if row.get('dte') is not None else 'N/A'))}</strong><span>{html.escape(str(row.get('dte_bucket') or 'DTE'))}</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('distance_to_strike_points')))}</strong><span>{html.escape(fmt_number(row.get('distance_to_strike_pct')))}%</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('probability_touch_pct')))}%</strong><span>Touch</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('expected_move_multiple')))}x</strong><span>EM buffer</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('premium_multiple')))}x</strong><span>Premium</span></td>"
+        f'<td class="{strength_class(probability_state_class(row.get("probability_risk_state")))}"><strong>{html.escape(str(row.get("probability_risk_state") or "N/A"))}</strong><span>{html.escape(str(row.get("probability_recommended_action") or ""))}</span></td>'
         f'<td class="{strength_class(row.get("buy_color"))}"><strong>{html.escape(compact_signal(row.get("buy_signal")))}</strong><span>{html.escape(str(row.get("buy_signal", "")))}</span></td>'
         f'<td><strong>{html.escape(fmt_number(row.get("sell_pop")))}%</strong><span>SELL POP</span></td>'
         f'<td><strong>{html.escape(fmt_number(row.get("otm_distance")))}%</strong><span>OTM</span></td>'
@@ -17958,6 +18795,7 @@ def render_positions_panel(
     table = (
         '<section class="panel positions-analytics-panel"><div class="panel-title">Active Position Analytics</div>'
         '<div class="research-table-hint">Premium capture: book sold options at 50-70% decay; roll near expiry if capture is not enough.</div>'
+        f'<div class="position-summary-strip probability-risk-summary">{probability_summary}</div>'
         f'<div class="status">Market data as of: <strong>{html.escape(str(summary.get("as_of") or "Not loaded"))}</strong>. Use Load Active Positions for a fresh Kite pull.'
         + (
             f' <span class="pnl-negative">Open BUY order check unavailable: {html.escape(str(summary.get("order_lookup_error")))}</span>'
@@ -17966,8 +18804,8 @@ def render_positions_panel(
         )
         + "</div>"
         '<div class="table-wrap positions-table-wrap"><table class="positions-table"><thead><tr>'
-        '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>PE Score</th><th>Buy</th>'
-        '<th>POP</th><th>OTM</th><th>Sell</th><th>Strength</th><th>Delta</th>'
+        '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th>P&L</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th><th>Margin</th><th>PE Score</th>'
+        '<th>Trading DTE</th><th>Dist</th><th>Touch</th><th>EM</th><th>Prem x</th><th>Prob Risk</th><th>Buy</th><th>POP</th><th>OTM</th><th>Sell</th><th>Strength</th><th>Delta</th>'
         '<th>IV</th><th>PCR</th><th>S / R</th><th>Error</th></tr></thead>'
         f"<tbody>{table_rows}</tbody></table></div></section>"
         if rows
@@ -18414,6 +19252,7 @@ def render_income_panel(state: PageState) -> str:
             <div><span>Maximum profit</span><strong id="income-pe-max-profit">--</strong></div>
             <div><span>Premium yield</span><strong id="income-pe-yield">--</strong></div>
           </div>
+          <div class="option-position-info" id="income-pe-active-position-info">Checking active PE/CE SELL positions...</div>
           <div class="income-equity-order-summary" id="income-pe-summary">Loading fresh PE contract and premium...</div>
           <input type="hidden" name="income_underlying" id="income-pe-underlying">
           <input type="hidden" name="income_target_strike" id="income-pe-target-strike">
@@ -19481,6 +20320,7 @@ def render_page(state: PageState) -> bytes:
         f'{render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}'
         f'{render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}'
         f'{render_checkbox("keep_existing_orders", "Always place new order", state.keep_existing_orders, "Turn off to modify a similar open order when found; if no modifiable order exists, the app places a new order.")}'
+        f'{render_checkbox("override_soft_risk_blocks", "Override soft risk blocks", state.override_soft_risk_blocks, "Allows only LOW_PREMIUM_YIELD, MISSING_TECHNICAL_DATA, and MISSING_MARKET_DATA blocks. Event, expiry, stop-loss, duplicate, position, and price-protection blocks still stay blocked.")}'
         "</div>"
     )
     execute_after_orders = (
@@ -21284,6 +22124,21 @@ def render_page(state: PageState) -> bytes:
       color: #0f766e;
       background: #ecfdf5;
       font-weight: 850;
+    }}
+    .option-position-info {{
+      margin: 10px 0;
+      padding: 10px 12px;
+      border: 1px solid #bae6fd;
+      border-radius: 9px;
+      background: #f0f9ff;
+      color: #075985;
+      font-weight: 800;
+      line-height: 1.35;
+    }}
+    .option-position-info.has-risk {{
+      border-color: #facc15;
+      background: #fef9c3;
+      color: #854d0e;
     }}
     .income-equity-breath {{ display: none; }}
     .income-equity-breath.active {{ display: block; }}
@@ -23811,6 +24666,7 @@ def render_page(state: PageState) -> bytes:
               <div><span>OTM / yield</span><strong id="ce-sell-yield">--</strong></div>
               <div><span>Score / risk</span><strong id="ce-sell-risk">--</strong></div>
             </div>
+            <div class="option-position-info" id="ce-sell-active-position-info">Checking active PE/CE SELL positions...</div>
             <div class="income-equity-order-summary" id="ce-sell-summary">Loading fresh covered CE order...</div>
             <div class="trade-news-panel"><strong>Recent stock news</strong><div id="ce-sell-news">Loading news...</div></div>
             <input type="hidden" name="ce_sell_underlying" id="ce-sell-underlying">
@@ -24341,6 +25197,7 @@ def render_page(state: PageState) -> bytes:
     const incomePeAssignment = document.getElementById('income-pe-assignment');
     const incomePeMaxProfit = document.getElementById('income-pe-max-profit');
     const incomePeYield = document.getElementById('income-pe-yield');
+    const incomePeActiveInfo = document.getElementById('income-pe-active-position-info');
     const incomePeSummary = document.getElementById('income-pe-summary');
     const incomePeUnderlying = document.getElementById('income-pe-underlying');
     const incomePeTargetStrike = document.getElementById('income-pe-target-strike');
@@ -24407,6 +25264,7 @@ def render_page(state: PageState) -> bytes:
     const ceSellMaxProfit = document.getElementById('ce-sell-max-profit');
     const ceSellYield = document.getElementById('ce-sell-yield');
     const ceSellRisk = document.getElementById('ce-sell-risk');
+    const ceSellActiveInfo = document.getElementById('ce-sell-active-position-info');
     const ceSellSummary = document.getElementById('ce-sell-summary');
     const ceSellNews = document.getElementById('ce-sell-news');
     const ceSellUnderlying = document.getElementById('ce-sell-underlying');
@@ -24496,6 +25354,10 @@ def render_page(state: PageState) -> bytes:
       if (incomePeUnderlying) incomePeUnderlying.value = underlying;
       if (incomePeTargetStrike) incomePeTargetStrike.value = strike;
       if (incomePeSummary) incomePeSummary.textContent = 'Loading fresh monthly PE contract and premium from Kite...';
+      if (incomePeActiveInfo) {{
+        incomePeActiveInfo.textContent = 'Checking active PE/CE SELL positions...';
+        incomePeActiveInfo.classList.remove('has-risk');
+      }}
       setQuoteLoading(incomePeModal, incomePeLoading, true, 'Recalculating PE SELL candidate...');
       try {{
         const response = await fetch(`/income/pe-quote?underlying=${{encodeURIComponent(underlying)}}&strike=${{encodeURIComponent(strike)}}`, {{ cache: 'no-store' }});
@@ -24509,9 +25371,17 @@ def render_page(state: PageState) -> bytes:
         if (incomePeAssignment) incomePeAssignment.textContent = Number(data.assignment_value || 0).toFixed(0);
         if (incomePeMaxProfit) incomePeMaxProfit.textContent = Number(data.max_profit || 0).toFixed(0);
         if (incomePeYield) incomePeYield.textContent = `${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
+        if (incomePeActiveInfo) {{
+          incomePeActiveInfo.textContent = data.active_sell_summary || 'No active PE/CE SELL position found for this stock.';
+          incomePeActiveInfo.classList.toggle('has-risk', Boolean(data.has_active_pe_sell || data.has_active_ce_sell));
+        }}
         if (incomePeSummary) incomePeSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | ${{Number(data.markup_percent || 0).toFixed(2)}}% above fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Assignment value ${{Number(data.assignment_value || 0).toFixed(0)}} | Maximum profit ${{Number(data.max_profit || 0).toFixed(0)}}`;
         if (incomePeReview) incomePeReview.disabled = false;
       }} catch (error) {{
+        if (incomePeActiveInfo) {{
+          incomePeActiveInfo.textContent = 'Active PE/CE SELL check unavailable in this quote load.';
+          incomePeActiveInfo.classList.remove('has-risk');
+        }}
         if (incomePeSummary) incomePeSummary.textContent = compactClientError(error.message, 'Could not load PE quote');
       }} finally {{
         setQuoteLoading(incomePeModal, incomePeLoading, false);
@@ -24806,6 +25676,10 @@ def render_page(state: PageState) -> bytes:
       if (ceSellTitle) ceSellTitle.textContent = `${{underlying}} Covered CE SELL Review`;
       if (ceSellUnderlying) ceSellUnderlying.value = underlying;
       if (ceSellSummary) ceSellSummary.textContent = 'Revalidating Top 3 status, coverage, positions, and fresh CE premium...';
+      if (ceSellActiveInfo) {{
+        ceSellActiveInfo.textContent = 'Checking active PE/CE SELL positions...';
+        ceSellActiveInfo.classList.remove('has-risk');
+      }}
       setQuoteLoading(ceSellModal, ceSellLoading, true, 'Revalidating covered CE SELL candidate...');
       const newsPromise = loadCeSellNews(underlying);
       try {{
@@ -24821,10 +25695,18 @@ def render_page(state: PageState) -> bytes:
         if (ceSellMaxProfit) ceSellMaxProfit.textContent = Number(data.max_profit || 0).toFixed(0);
         if (ceSellYield) ceSellYield.textContent = `${{Number(data.otm_percent || 0).toFixed(2)}}% / ${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
         if (ceSellRisk) ceSellRisk.textContent = `${{Number(data.score || 0).toFixed(0)}} / ${{data.event_risk || 'N/A'}} event / ${{data.breakout_risk || 'N/A'}} breakout`;
+        if (ceSellActiveInfo) {{
+          ceSellActiveInfo.textContent = data.active_sell_summary || 'No active PE/CE SELL position found for this stock.';
+          ceSellActiveInfo.classList.toggle('has-risk', Boolean(data.has_active_pe_sell || data.has_active_ce_sell));
+        }}
         if (ceSellSummary) ceSellSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | ${{Number(data.markup_percent || 0).toFixed(2)}}% above fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Effective holding ${{data.holding_qty}} from ${{data.holding_source || 'holding record'}}`;
-        await newsPromise;
+        newsPromise.catch(() => {{}});
         if (ceSellReview) ceSellReview.disabled = false;
       }} catch (error) {{
+        if (ceSellActiveInfo) {{
+          ceSellActiveInfo.textContent = 'Active PE/CE SELL check unavailable in this quote load.';
+          ceSellActiveInfo.classList.remove('has-risk');
+        }}
         if (ceSellSummary) ceSellSummary.textContent = compactClientError(error.message, 'Could not load covered CE order');
       }} finally {{
         setQuoteLoading(ceSellModal, ceSellLoading, false);
@@ -26052,7 +26934,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             symbols_text = first(query, "stocks") or first(query, "symbols")
             symbols = [item for item in symbols_text.split(",") if item.strip()]
             try:
-                self.send_json({"ok": True, "news": fetch_stock_news(symbols)})
+                clean_symbols = sorted({underlying_for_symbol(item.strip().upper()) for item in symbols if item.strip()})
+                cache_key = "trade-news:" + "|".join(clean_symbols)
+                news = cached_value(
+                    cache_key,
+                    lambda: fetch_stock_news(clean_symbols),
+                    TRADE_NEWS_CACHE_SECONDS,
+                )
+                self.send_json({"ok": True, "news": news})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc), "news": []})
             return
@@ -26195,6 +27084,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             csv_text=first(form, "csv_text"),
             no_ltp_price=checked(form, "no_ltp_price"),
             keep_existing_orders=checked(form, "keep_existing_orders"),
+            override_soft_risk_blocks=checked(form, "override_soft_risk_blocks"),
             dry_run=checked(form, "dry_run"),
             api_key=first(form, "api_key"),
             api_secret=first(form, "api_secret"),
@@ -26321,6 +27211,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.rows,
                     state.no_ltp_price,
                     state.keep_existing_orders,
+                    state.override_soft_risk_blocks,
                 )
                 state.trade_validations = validate_trade_orders(state.orders)
                 state.selected_indexes = default_selected_order_indexes(
@@ -26384,6 +27275,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.dry_run,
                     state.no_ltp_price,
                     state.keep_existing_orders,
+                    state.override_soft_risk_blocks,
                 )
                 state.trade_validations = validate_trade_orders(state.orders)
                 state.selected_indexes = selected
@@ -26591,6 +27483,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         state.rows,
                         True,
                         state.keep_existing_orders,
+                        state.override_soft_risk_blocks,
                     )
                     state.trade_validations = validate_trade_orders(state.orders)
                     state.selected_indexes = default_selected_order_indexes(
