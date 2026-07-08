@@ -9056,6 +9056,16 @@ def build_intraday_pe_risk_exit_orders(
     for position in pe_positions:
         symbol = str(position.get("tradingsymbol") or "").upper()
         parts = option_symbol_parts(symbol) or {}
+        if parts:
+            expiry = expiry_date_for_parts(parts)
+            hard_stop_dte_allowed, dte = intraday_hard_stop_trading_days_allowed(
+                expiry,
+                app_now().date(),
+            )
+            calendar_dte = max((expiry - app_now().date()).days, 0)
+        else:
+            expiry = None
+            hard_stop_dte_allowed, dte, calendar_dte = False, None, None
         option_key = f"{position.get('exchange') or 'NFO'}:{symbol}"
         underlying_key = f"NSE:{parts.get('underlying') or underlying_for_symbol(symbol)}"
         option_quote = quotes.get(option_key, {}) or {}
@@ -9071,6 +9081,12 @@ def build_intraday_pe_risk_exit_orders(
             available_cash,
         )
         evaluation["tradingsymbol"] = symbol
+        evaluation["expiry"] = expiry.isoformat() if expiry else ""
+        evaluation["dte"] = dte
+        evaluation["calendar_dte"] = calendar_dte
+        evaluation["hard_stop_dte_allowed"] = hard_stop_dte_allowed
+        raw_should_exit = bool(evaluation.get("should_exit"))
+        evaluation["raw_should_exit"] = raw_should_exit
         existing_close_order = open_buy_orders.get(symbol)
         if existing_close_order:
             evaluation["scheduler_action"] = "SKIP_EXISTING_CLOSE_ORDER"
@@ -9085,6 +9101,22 @@ def build_intraday_pe_risk_exit_orders(
                     existing_close_order.get("pending_quantity")
                     or existing_close_order.get("quantity")
                     or 0
+                )
+            )
+        elif raw_should_exit and not hard_stop_dte_allowed:
+            evaluation["should_exit"] = False
+            evaluation["scheduler_action"] = "SKIP_STRICT_PE_DTE_NOT_READY"
+            evaluation["skip_reason"] = (
+                f"Strict SELL PE risk exit skipped because trading DTE is "
+                f"{dte if dte is not None else 'unknown'}"
+                + (
+                    f" (calendar DTE {calendar_dte})"
+                    if calendar_dte is not None
+                    else ""
+                )
+                + (
+                    f"; strict risk exits start only when trading DTE is "
+                    f"{INTRADAY_HARD_STOP_START_DTE} or fewer."
                 )
             )
         evaluations.append(evaluation)
@@ -16278,14 +16310,22 @@ def run_intraday_position_close_job(
                 if str(order.get("tradingsymbol") or "").upper()
                 not in (risk_symbols | loss_limit_symbols)
             ]
+            dte_guard_skip_actions = {
+                "SKIP_INTRADAY_OVERRIDE_DTE_NOT_READY",
+                "SKIP_PROBABILITY_RISK_DTE_NOT_READY",
+                "SKIP_STRICT_PE_DTE_NOT_READY",
+            }
             dte_guard_skips = [
                 evaluation
-                for evaluation in [*loss_limit_evaluations, *close_order_evaluations]
-                if str(evaluation.get("action") or "")
-                in {
-                    "SKIP_INTRADAY_OVERRIDE_DTE_NOT_READY",
-                    "SKIP_PROBABILITY_RISK_DTE_NOT_READY",
-                }
+                for evaluation in [
+                    *loss_limit_evaluations,
+                    *risk_evaluations,
+                    *close_order_evaluations,
+                ]
+                if (
+                    str(evaluation.get("action") or "") in dte_guard_skip_actions
+                    or str(evaluation.get("scheduler_action") or "") in dte_guard_skip_actions
+                )
             ]
             dte_guard_message = ""
             if dte_guard_skips:
