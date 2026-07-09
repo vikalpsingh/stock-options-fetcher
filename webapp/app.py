@@ -182,7 +182,7 @@ DEFAULT_OPENAI_SYSTEM_PROMPT = """You are Monthly Income by Trading GPT.
 Generate only Kite-compatible CSV output.
 
 CSV columns must be:
-exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity
+symbol,exchange,transaction_type,lots,price_markup_percent,product,order_type,price,validity,tag
 
 Rules:
 - No explanation.
@@ -195,6 +195,8 @@ Rules:
 - product should usually be NRML for options.
 - order_type should usually be LIMIT.
 - validity should usually be DAY.
+- lots must be a positive whole number.
+- Do not include lot_size; the app resolves the current contract lot size from Kite.
 - Strategy is conservative monthly income using covered call or cash-secured put.
 - SELL CALL only when actual share holding covers the full option quantity.
 - SELL PUT only when cash is available to buy all lots if assigned.
@@ -3132,8 +3134,11 @@ def nifty_option_liquidity_metrics(quote: dict[str, Any]) -> dict[str, int]:
 def is_nifty_preview_option_illiquid(quote: dict[str, Any]) -> bool:
     metrics = nifty_option_liquidity_metrics(quote)
     return (
-        metrics["oi"] < NIFTY_INCOME_MIN_OI_FOR_PREVIEW
-        and metrics["volume"] < NIFTY_INCOME_MIN_VOLUME_FOR_PREVIEW
+        quote_ltp(quote) <= 0
+        or (
+            metrics["oi"] < NIFTY_INCOME_MIN_OI_FOR_PREVIEW
+            and metrics["volume"] < NIFTY_INCOME_MIN_VOLUME_FOR_PREVIEW
+        )
     )
 
 
@@ -3152,6 +3157,7 @@ def adjust_nifty_preview_sell_order_for_liquidity(
     original_strike = numeric_int(adjusted.get("strike"))
     if original_strike <= 0:
         return adjusted
+    original_symbol = str(adjusted.get("tradingsymbol") or "").upper()
     strike = original_strike
     total_shift = 0
     checks: list[str] = []
@@ -3161,7 +3167,10 @@ def adjust_nifty_preview_sell_order_for_liquidity(
         symbol = str(adjusted.get("tradingsymbol") or "").upper()
         quote = quote_lookup(symbol)
         metrics = nifty_option_liquidity_metrics(quote)
-        checks.append(f"{symbol}: OI {metrics['oi']}, volume {metrics['volume']}")
+        checks.append(
+            f"{symbol}: LTP {fmt_number(quote_ltp(quote), 2)}, "
+            f"OI {metrics['oi']}, volume {metrics['volume']}"
+        )
         if not is_nifty_preview_option_illiquid(quote):
             break
         if total_shift >= NIFTY_INCOME_MAX_LIQUIDITY_SHIFT_POINTS:
@@ -3176,10 +3185,12 @@ def adjust_nifty_preview_sell_order_for_liquidity(
 
     if total_shift:
         adjusted["original_strike"] = original_strike
+        adjusted["original_tradingsymbol"] = original_symbol
         adjusted["liquidity_shift_points"] = total_shift
         adjusted["liquidity_adjustment_note"] = (
-            f"Reduced OTM by {total_shift} points because earlier NIFTY {option_type} strike liquidity "
-            f"had OI < {NIFTY_INCOME_MIN_OI_FOR_PREVIEW} and volume < {NIFTY_INCOME_MIN_VOLUME_FOR_PREVIEW}. "
+            f"Moved NIFTY {option_type} strike {total_shift} points closer to spot because an earlier "
+            f"contract had no positive LTP or had OI < {NIFTY_INCOME_MIN_OI_FOR_PREVIEW} and "
+            f"volume < {NIFTY_INCOME_MIN_VOLUME_FOR_PREVIEW}. "
             f"Max adjustment allowed is {NIFTY_INCOME_MAX_LIQUIDITY_SHIFT_POINTS} points."
         )
         adjusted["liquidity_checks"] = checks
@@ -3302,6 +3313,7 @@ def nifty_candidate_previews(
                 "expected_move_multiple": expected_multiple,
                 "risk_status": risk_status,
                 "original_strike": sell_order.get("original_strike") or strike,
+                "original_tradingsymbol": sell_order.get("original_tradingsymbol") or symbol,
                 "liquidity_shift_points": sell_order.get("liquidity_shift_points") or 0,
                 "liquidity_adjustment_note": sell_order.get("liquidity_adjustment_note") or "",
                 "selection_reason": (
@@ -3478,6 +3490,7 @@ def nifty_income_pair_orders_from_otm(
             "dynamic_hedge_warning": hedge_decision.get("warning"),
             "dynamic_hedge_skip_reason": hedge_decision.get("skip_reason"),
             "original_strike": adjusted_seed.get("original_strike") or strike,
+            "original_tradingsymbol": adjusted_seed.get("original_tradingsymbol") or symbol,
             "liquidity_shift_points": adjusted_seed.get("liquidity_shift_points") or 0,
             "liquidity_adjustment_note": adjusted_seed.get("liquidity_adjustment_note") or "",
             "liquidity_checks": adjusted_seed.get("liquidity_checks") or [],
@@ -3558,6 +3571,48 @@ def calculate_nifty_manual_pair_risk(
     }
 
 
+NIFTY_INDIVIDUAL_UNCOVERED_NON_OVERRIDABLE_BLOCKS = {
+    "LOW_VIX",
+    "HIGH_VIX",
+    "EVENT_RISK",
+    "DELTA_TOO_HIGH",
+    "EXPECTED_MOVE_TOO_CLOSE",
+    "TREND_AGAINST_STRATEGY",
+    "MONTHLY_LOSS_LIMIT",
+    "TWO_CONSECUTIVE_STOP_LOSSES",
+    "MARGIN_HEAT_LIMIT",
+}
+
+
+def evaluate_nifty_individual_uncovered_override(
+    selected_sides: set[str],
+    include_cover: bool,
+    risk_acknowledged: bool,
+    confidence: dict[str, Any] | None,
+) -> dict[str, Any]:
+    confidence = confidence if isinstance(confidence, dict) else {}
+    hard_blocks = {
+        str(item).strip().upper()
+        for item in (confidence.get("hard_blocks") or [])
+        if str(item).strip()
+    }
+    non_overridable = sorted(
+        hard_blocks & NIFTY_INDIVIDUAL_UNCOVERED_NON_OVERRIDABLE_BLOCKS
+    )
+    requested = (
+        len(selected_sides) == 1
+        and not include_cover
+        and bool(risk_acknowledged)
+    )
+    return {
+        "requested": requested,
+        "allowed": requested and not non_overridable,
+        "selected_side": next(iter(selected_sides), "") if len(selected_sides) == 1 else "",
+        "non_overridable_blocks": non_overridable,
+        "hard_blocks": sorted(hard_blocks),
+    }
+
+
 def nifty_pair_liquidity_probe_quote_keys(
     orders: list[dict[str, Any]],
     instruments: list[dict[str, Any]],
@@ -3596,6 +3651,7 @@ def nifty_income_manual_pair_snapshot(
     include_pe: bool = True,
     include_ce: bool = True,
     include_cover: bool = True,
+    allow_uncovered_override: bool = False,
 ) -> dict[str, Any]:
     config = nifty_income_config()
     kite = kite_orders.kite_client() if kite_orders else None
@@ -3795,6 +3851,13 @@ def nifty_income_manual_pair_snapshot(
         for side, selected in (("PE", effective_include_pe), ("CE", effective_include_ce))
         if selected
     }
+    confidence_dict = nifty_confidence_to_dict(confidence)
+    individual_uncovered_override = evaluate_nifty_individual_uncovered_override(
+        selected_sides,
+        bool(include_cover),
+        bool(allow_uncovered_override),
+        confidence_dict,
+    )
     covered_sides = generated_hedge_sides | existing_hedge_sides
     uncovered_sides = sorted(selected_sides - covered_sides)
     coverage_status = _nifty_hedge_coverage_status("PE" in existing_hedge_sides, "CE" in existing_hedge_sides)
@@ -3809,6 +3872,19 @@ def nifty_income_manual_pair_snapshot(
     else:
         hedge_coverage_message = "No existing long NIFTY hedge found. Protective BUY legs will be generated when covers are enabled."
     missing_ltp = [row["tradingsymbol"] for row in orders if row.get("price", 0) <= 0]
+    risk_reward_status = (
+        "MANUAL_SINGLE_LEG_RISK_ACCEPTED"
+        if individual_uncovered_override["allowed"]
+        else "REJECT_CONFIDENCE_NO_TRADE"
+        if confidence.action == "NO_TRADE"
+        else "PREVIEW_ONLY"
+        if confidence.action == "PREVIEW_ONLY"
+        else "REJECT_PREMIUM_YIELD"
+        if risk["margin_required"] and (risk["net_credit"] / risk["margin_required"] * 100) < float(config.get("min_premium_yield_on_margin_pct") or 0.8)
+        else "REJECT_MAX_LOSS_TO_CREDIT"
+        if max_loss_to_credit_ratio is not None and max_loss_to_credit_ratio > float(config.get("max_loss_to_credit_ratio") or 4.0)
+        else "OK"
+    )
     return {
         "spot": spot,
         "india_vix": india_vix,
@@ -3828,18 +3904,7 @@ def nifty_income_manual_pair_snapshot(
         "hedge_cost": risk["cover_cost"],
         "net_credit": risk["net_credit"],
         "max_loss_to_credit_ratio": max_loss_to_credit_ratio,
-        "risk_reward_status": (
-            "REJECT_CONFIDENCE_NO_TRADE"
-            if confidence.action == "NO_TRADE"
-            else "PREVIEW_ONLY"
-            if confidence.action == "PREVIEW_ONLY"
-            else
-            "REJECT_PREMIUM_YIELD"
-            if risk["margin_required"] and (risk["net_credit"] / risk["margin_required"] * 100) < float(config.get("min_premium_yield_on_margin_pct") or 0.8)
-            else "REJECT_MAX_LOSS_TO_CREDIT"
-            if max_loss_to_credit_ratio is not None and max_loss_to_credit_ratio > float(config.get("max_loss_to_credit_ratio") or 4.0)
-            else "OK"
-        ),
+        "risk_reward_status": risk_reward_status,
         "defined_risk": risk["defined_risk"],
         "uncovered_sides": uncovered_sides,
         "missing_ltp": missing_ltp,
@@ -3869,6 +3934,7 @@ def nifty_income_manual_pair_snapshot(
         "coverage_all_selected_sides_covered": not uncovered_sides,
         "hedge_coverage_warnings": existing_hedge_coverage.get("warnings") or [],
         "naked_live_allowed": bool(config.get("allow_live_naked_nifty_sell", False)),
+        "individual_uncovered_override": individual_uncovered_override,
         "requested_include_pe": bool(include_pe),
         "requested_include_ce": bool(include_ce),
         "existing_short_sides": sorted(existing_short_sides),
@@ -3877,7 +3943,7 @@ def nifty_income_manual_pair_snapshot(
             for side, requested in (("PE", include_pe), ("CE", include_ce))
             if requested and side in existing_short_sides
         ),
-        "confidence_score": nifty_confidence_to_dict(confidence),
+        "confidence_score": confidence_dict,
     }
 
 
@@ -3902,6 +3968,7 @@ def place_nifty_income_manual_pair(
         include_pe,
         include_ce,
         include_cover,
+        allow_uncovered_override,
     )
     missing_ltp = snapshot.get("missing_ltp") or []
     if missing_ltp:
@@ -3921,7 +3988,19 @@ def place_nifty_income_manual_pair(
             + ", ".join(uncovered_sides)
             + ". Enable protective covers, use existing hedge positions, or acknowledge uncovered NIFTY risk explicitly."
         )
-    if str(snapshot.get("risk_reward_status") or "OK") != "OK":
+    individual_override = (
+        snapshot.get("individual_uncovered_override")
+        if isinstance(snapshot.get("individual_uncovered_override"), dict)
+        else {}
+    )
+    if (
+        str(snapshot.get("risk_reward_status") or "OK")
+        not in {"OK", "MANUAL_SINGLE_LEG_RISK_ACCEPTED"}
+        or (
+            str(snapshot.get("risk_reward_status") or "") == "MANUAL_SINGLE_LEG_RISK_ACCEPTED"
+            and not individual_override.get("allowed")
+        )
+    ):
         confidence = snapshot.get("confidence_score") if isinstance(snapshot.get("confidence_score"), dict) else {}
         if str(confidence.get("action") or "") in {"NO_TRADE", "PREVIEW_ONLY"}:
             raise PermissionError(
@@ -6803,7 +6882,21 @@ def calculateSafeLimitPrice(order: dict[str, Any], quote: dict[str, Any]) -> dic
     lower, upper = estimateOptionLppRange(ltp, tick_size)
     side = str(order.get("transaction_type") or "").strip().upper()
     current_price = float(order.get("price") or 0)
-    source_price = float(order.get("_csv_price") if order.get("_csv_price") is not None else current_price or 0)
+    strategy_price = current_price
+    markup_percent: float | None = None
+    if side == "SELL" and not order.get("_ignore_markup_price"):
+        raw_markup = order.get("price_markup_percent")
+        if raw_markup not in {None, ""}:
+            try:
+                markup_percent = float(raw_markup)
+            except (TypeError, ValueError):
+                markup_percent = None
+        if markup_percent is not None and markup_percent >= 0 and ltp > 0:
+            strategy_price = roundToTick(
+                ltp * (1 + markup_percent / 100),
+                tick_size,
+            )
+    source_price = strategy_price
     result = {
         "ok": False,
         "price": None,
@@ -6836,9 +6929,9 @@ def calculateSafeLimitPrice(order: dict[str, Any], quote: dict[str, Any]) -> dic
                 f"Bid/ask spread {spread_pct:.1f}% is too wide; order skipped."
             )
             return result
-    if source_price > 0 and lower <= current_price <= upper:
-        safe_price = roundToTick(current_price, tick_size)
-        adjusted = safe_price != current_price
+    if source_price > 0 and lower <= strategy_price <= upper:
+        safe_price = roundToTick(strategy_price, tick_size)
+        adjusted = safe_price != strategy_price
     elif side == "SELL":
         safe_price = max(lower, min(upper, float(bid or 0) - tick_size))
         safe_price = roundToTick(safe_price, tick_size)
@@ -6860,9 +6953,15 @@ def calculateSafeLimitPrice(order: dict[str, Any], quote: dict[str, Any]) -> dic
         {
             "ok": True,
             "price": safe_price,
-            "auto_adjusted": adjusted or source_price <= 0 or not (lower <= current_price <= upper),
+            "auto_adjusted": adjusted or source_price <= 0 or not (lower <= strategy_price <= upper),
             "message": (
                 f"LPP safe price {safe_price:.2f}; LTP {ltp:.2f}, "
+                + (
+                    f"SELL markup {markup_percent:.2f}%, "
+                    if markup_percent is not None
+                    else ""
+                )
+                +
                 f"bid {fmt_number(bid, 2) if bid else 'N/A'}, "
                 f"ask {fmt_number(ask, 2) if ask else 'N/A'}, "
                 f"range {lower:.2f}-{upper:.2f}."
@@ -9883,17 +9982,39 @@ def validate_kite_order_rows(rows: list[dict[str, str]]) -> None:
         symbol = (row.get("tradingsymbol") or row.get("symbol") or "").strip().upper()
         transaction_type = (row.get("transaction_type") or "").strip().upper()
         quantity_text = (row.get("quantity") or "").strip()
+        lots_text = (row.get("lots") or "").strip()
         if not symbol:
             errors.append(f"Row {index}: missing tradingsymbol.")
         if transaction_type not in {"BUY", "SELL"}:
             errors.append(f"Row {index}: transaction_type must be BUY or SELL.")
+        if quantity_text and lots_text:
+            errors.append(f"Row {index}: use either lots or quantity for {symbol or 'this order'}, not both.")
+            continue
+        if lots_text:
+            try:
+                lots_value = float(lots_text)
+                lots = int(lots_value)
+            except ValueError:
+                errors.append(f"Row {index}: lots must be numeric.")
+                continue
+            if lots <= 0 or lots_value != lots:
+                errors.append(
+                    f"Row {index}: lots must be a positive whole number for {symbol or 'this order'}."
+                )
+            continue
+        if not quantity_text:
+            errors.append(f"Row {index}: missing lots or quantity for {symbol or 'this order'}.")
+            continue
         try:
-            quantity = int(float(quantity_text or "0"))
+            quantity_value = float(quantity_text)
+            quantity = int(quantity_value)
         except ValueError:
             errors.append(f"Row {index}: quantity must be numeric.")
             continue
-        if quantity <= 0:
-            errors.append(f"Row {index}: quantity must be greater than 0 for {symbol or 'this order'}.")
+        if quantity <= 0 or quantity_value != quantity:
+            errors.append(
+                f"Row {index}: quantity must be a positive whole number for {symbol or 'this order'}."
+            )
     if errors:
         preview = "\n".join(errors[:8])
         more = f"\n...and {len(errors) - 8} more issue(s)." if len(errors) > 8 else ""
@@ -9924,11 +10045,115 @@ def persist_default_csv_text(csv_text: str) -> str:
     return f"{archive_message}Updated {DEFAULT_CSV_PATH.name} from the input box."
 
 
-def save_today_csv_text(csv_text: str) -> tuple[str, str]:
+def option_quote_has_trade_activity(quote: dict[str, Any]) -> bool:
+    """Return whether a quote represents a contract with usable trading activity."""
+    if quote_ltp(quote) <= 0:
+        return False
+    activity_fields_present = any(
+        key in quote for key in ("volume", "last_trade_time", "depth")
+    )
+    if not activity_fields_present:
+        # Some mocked/limited quote responses expose only last_price.
+        return True
+    try:
+        if float(quote.get("volume") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if quote.get("last_trade_time"):
+        return True
+    bid, ask = getBestBidAsk(quote)
+    return bool(bid or ask)
+
+
+def enrich_csv_option_prices_from_kite(
+    csv_text: str,
+    kite: Any | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Populate option LIMIT prices from fresh Kite LTP and drop untraded contracts."""
+    normalized = normalize_kite_csv_input(csv_text).strip()
+    rows = parse_csv_text(normalized)
+    validate_kite_order_rows(rows)
+    option_rows = [
+        row
+        for row in rows
+        if str(row.get("exchange") or "").strip().upper() == "NFO"
+        and option_symbol_parts(
+            str(row.get("tradingsymbol") or row.get("symbol") or "").strip().upper()
+        )
+    ]
+    if not option_rows:
+        return normalized.rstrip() + "\n", {
+            "priced_count": 0,
+            "removed_count": 0,
+            "removed_symbols": [],
+        }
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+    kite = kite or kite_orders.kite_client()
+    quote_keys = [
+        f"NFO:{str(row.get('tradingsymbol') or row.get('symbol') or '').strip().upper()}"
+        for row in option_rows
+    ]
+    # Saving is an explicit action: bypass the quote cache every time.
+    quotes = cached_kite_quote(kite, quote_keys, ttl_seconds=0)
+    removed_symbols: list[str] = []
+    enriched_rows: list[dict[str, str]] = []
+    priced_count = 0
+    for row in rows:
+        updated = dict(row)
+        exchange = str(updated.get("exchange") or "").strip().upper()
+        symbol = str(updated.get("tradingsymbol") or updated.get("symbol") or "").strip().upper()
+        if exchange != "NFO" or not option_symbol_parts(symbol):
+            enriched_rows.append(updated)
+            continue
+        quote = quotes.get(f"NFO:{symbol}", {}) or {}
+        if not option_quote_has_trade_activity(quote):
+            removed_symbols.append(symbol)
+            continue
+        ltp = quote_ltp(quote)
+        try:
+            markup = float(
+                updated.get("price_markup_percent")
+                or option_sell_markup_percent_setting()
+            )
+        except (TypeError, ValueError):
+            markup = option_sell_markup_percent_setting()
+        markup = max(markup, 0.0)
+        side = str(updated.get("transaction_type") or "").strip().upper()
+        raw_price = (
+            ltp * (1 + markup / 100)
+            if side == "SELL"
+            else max(0.05, ltp * (1 - markup / 100))
+        )
+        updated["price"] = f"{roundToTick(raw_price, 0.05):.2f}"
+        enriched_rows.append(updated)
+        priced_count += 1
+
+    reader = csv.DictReader(io.StringIO(normalized))
+    fieldnames = list(reader.fieldnames or [])
+    if "price" not in fieldnames:
+        insert_at = fieldnames.index("validity") if "validity" in fieldnames else len(fieldnames)
+        fieldnames.insert(insert_at, "price")
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(
+        {field: row.get(field, "") for field in fieldnames}
+        for row in enriched_rows
+    )
+    return output.getvalue(), {
+        "priced_count": priced_count,
+        "removed_count": len(removed_symbols),
+        "removed_symbols": removed_symbols,
+    }
+
+
+def save_today_csv_text(csv_text: str, kite: Any | None = None) -> tuple[str, str]:
     text = normalize_kite_csv_input(csv_text).strip()
     if not text:
         raise ValueError("CSV text is empty. Paste or upload CSV before saving.")
-    parse_csv_text(text)
+    text, pricing = enrich_csv_option_prices_from_kite(text, kite)
     today_path = dated_income_csv_path()
     normalized_new = text.rstrip() + "\n"
     archive_message = ""
@@ -9951,7 +10176,17 @@ def save_today_csv_text(csv_text: str) -> tuple[str, str]:
         if archive_path and archive_path.exists() and not today_path.exists():
             archive_path.replace(today_path)
         raise
-    return str(today_path), f"{archive_message}Saved CSV text to {today_path.name}."
+    removed_message = ""
+    if pricing["removed_count"]:
+        removed_message = (
+            f" Removed {pricing['removed_count']} untraded/invalid option contract(s): "
+            f"{', '.join(pricing['removed_symbols'])}."
+        )
+    return (
+        str(today_path),
+        f"{archive_message}Saved CSV text to {today_path.name} with fresh Kite prices for "
+        f"{pricing['priced_count']} option contract(s).{removed_message}",
+    )
 
 
 def restore_csv_text_after_save_error(csv_path: str) -> tuple[str, str]:
@@ -11252,7 +11487,8 @@ def income_growth_gpt_user_prompt(rows: list[dict[str, Any]], summary: dict[str,
         )
     return (
         "Provide best shares to take position today and generate CSV file in the exact format "
-        "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity.\n"
+        "symbol,exchange,transaction_type,lots,price_markup_percent,product,order_type,price,validity,tag.\n"
+        "Use positive whole-number lots and do not include lot_size; the app resolves it from Kite.\n"
         "Use the Monthly Income by Trading GPT rules from the system prompt. Prefer conservative covered CALLs "
         "from this Income Growth table. Skip any row that is not fully covered, has no valid option symbol, "
         "or violates conservative monthly income rules. If live premium is unavailable, use price as 0.\n\n"
@@ -13938,6 +14174,18 @@ KITE_CSV_REQUIRED_FIELDS = [
     "price",
     "validity",
 ]
+KITE_CSV_LOTS_FIELDS = [
+    "symbol",
+    "exchange",
+    "transaction_type",
+    "lots",
+    "price_markup_percent",
+    "product",
+    "order_type",
+    "price",
+    "validity",
+    "tag",
+]
 KITE_CSV_HEADER_ALIASES = {
     "symbol": "tradingsymbol",
     "trading_symbol": "tradingsymbol",
@@ -13983,26 +14231,59 @@ def canonicalize_kite_csv(candidate: str) -> str:
     reader = csv.DictReader(io.StringIO(candidate.lstrip("\ufeff")))
     if not reader.fieldnames:
         raise ValueError("CSV is missing a header row.")
-    row_count = 0
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=KITE_CSV_REQUIRED_FIELDS, lineterminator="\n")
-    writer.writeheader()
-    for raw_row in reader:
-        normalized = {
+    normalized_rows = [
+        {
             canonical_field_name(key or ""): (value or "").strip()
             for key, value in raw_row.items()
         }
-        if not any(normalized.values()):
-            continue
-        row = {field: normalized.get(field, "") for field in KITE_CSV_REQUIRED_FIELDS}
-        if not row["quantity"]:
-            lots_text = normalized.get("lots", "")
-            lot_size_text = normalized.get("lot_size", "")
-            if lots_text and lot_size_text:
-                try:
-                    row["quantity"] = str(int(float(lots_text) * float(lot_size_text)))
-                except ValueError:
-                    raise ValueError("CSV lots and lot_size must be numeric.") from None
+        for raw_row in reader
+        if any((value or "").strip() for value in raw_row.values())
+    ]
+    if not normalized_rows:
+        raise ValueError("CSV has no order rows.")
+
+    row_modes: set[str] = set()
+    for normalized in normalized_rows:
+        has_lots = bool(normalized.get("lots"))
+        has_quantity = bool(normalized.get("quantity"))
+        if has_lots and has_quantity:
+            raise ValueError("Use either lots or quantity in a CSV row, not both.")
+        if has_lots:
+            row_modes.add("lots")
+        elif has_quantity:
+            row_modes.add("quantity")
+        else:
+            raise ValueError("CSV is missing lots or quantity.")
+    if len(row_modes) != 1:
+        raise ValueError("Do not mix lots-based and quantity-based rows in the same CSV.")
+
+    lots_mode = "lots" in row_modes
+    output_fields = KITE_CSV_LOTS_FIELDS if lots_mode else KITE_CSV_REQUIRED_FIELDS
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=output_fields, lineterminator="\n")
+    writer.writeheader()
+    for normalized in normalized_rows:
+        if lots_mode:
+            try:
+                lots = int(float(normalized.get("lots") or 0))
+            except ValueError:
+                raise ValueError("CSV lots must be a whole number.") from None
+            if lots <= 0 or float(normalized.get("lots") or 0) != lots:
+                raise ValueError("CSV lots must be a positive whole number.")
+            row = {
+                "symbol": normalized.get("tradingsymbol", ""),
+                "exchange": normalized.get("exchange", ""),
+                "transaction_type": normalized.get("transaction_type", ""),
+                "lots": str(lots),
+                "price_markup_percent": normalized.get("price_markup_percent", ""),
+                "product": normalized.get("product", ""),
+                "order_type": normalized.get("order_type", ""),
+                "price": normalized.get("price", ""),
+                "validity": normalized.get("validity", ""),
+                "tag": normalized.get("tag", ""),
+            }
+        else:
+            row = {field: normalized.get(field, "") for field in KITE_CSV_REQUIRED_FIELDS}
         if not row["exchange"]:
             row["exchange"] = "NFO"
         if not row["product"]:
@@ -14013,14 +14294,13 @@ def canonicalize_kite_csv(candidate: str) -> str:
             row["validity"] = "DAY"
         if not row["price"]:
             row["price"] = "0"
-        if not {"tradingsymbol", "quantity", "transaction_type"}.issubset(
+        symbol_field = "symbol" if lots_mode else "tradingsymbol"
+        size_field = "lots" if lots_mode else "quantity"
+        if not {symbol_field, size_field, "transaction_type"}.issubset(
             {field for field, value in row.items() if value}
         ):
-            raise ValueError("CSV is missing tradingsymbol, quantity, or transaction_type.")
+            raise ValueError(f"CSV is missing {symbol_field}, {size_field}, or transaction_type.")
         writer.writerow(row)
-        row_count += 1
-    if row_count == 0:
-        raise ValueError("CSV has no order rows.")
     return output.getvalue()
 
 
@@ -14037,7 +14317,7 @@ def extract_csv_from_text(text: str) -> str:
         if "," not in line:
             continue
         header = {canonical_field_name(item) for item in line.split(",")}
-        has_quantity = "quantity" in header or {"lots", "lot_size"}.issubset(header)
+        has_quantity = "quantity" in header or "lots" in header
         if not required_headers.issubset(header) or not has_quantity:
             continue
         csv_lines = [line]
@@ -14142,7 +14422,8 @@ def generate_csv_with_openai(prompt: str, model: str, system_prompt: str) -> tup
         repair_prompt = (
             "Convert the previous response into valid Kite CSV only. "
             "Use exactly this header: "
-            "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\n"
+            "symbol,exchange,transaction_type,lots,price_markup_percent,product,order_type,price,validity,tag\n"
+            "Use positive whole-number lots and do not include lot_size. "
             "No explanation, no markdown, no notes. If price is unknown, use 0.\n\n"
             f"Previous response:\n{output}"
         )
@@ -14328,6 +14609,61 @@ def apply_soft_risk_override_to_decision(
     return overridden
 
 
+def resolve_order_arg_lot_sizes(
+    row_args: list[argparse.Namespace],
+    kite: Any,
+) -> dict[tuple[str, str], int]:
+    """Resolve user-entered lots to the live contract lot size.
+
+    Kite's order API accepts unit quantity, not a number-of-lots field. The web
+    app keeps lots as the user input and resolves the current instrument lot
+    size here, immediately before building the Kite order.
+    """
+    relevant_items = [
+        item
+        for item in row_args
+        if getattr(item, "lots", None) is not None
+        or str(getattr(item, "exchange", "") or "").strip().upper() == "NFO"
+    ]
+    if not relevant_items:
+        return {}
+
+    instruments_by_exchange: dict[str, dict[str, dict[str, Any]]] = {}
+    resolved: dict[tuple[str, str], int] = {}
+    for item in relevant_items:
+        exchange = str(getattr(item, "exchange", "") or "NFO").strip().upper()
+        symbol = str(getattr(item, "symbol", "") or "").strip().upper()
+        if not symbol:
+            if getattr(item, "lots", None) is not None:
+                raise ValueError("Lots-based order is missing a trading symbol.")
+            continue
+        if exchange not in instruments_by_exchange:
+            instruments_by_exchange[exchange] = {
+                str(instrument.get("tradingsymbol") or "").strip().upper(): instrument
+                for instrument in cached_kite_instruments(kite, exchange)
+                if instrument.get("tradingsymbol")
+            }
+        instrument = instruments_by_exchange[exchange].get(symbol)
+        if not instrument:
+            if getattr(item, "lots", None) is not None:
+                raise ValueError(
+                    f"Could not resolve the current lot size for {exchange}:{symbol}. "
+                    "Verify that the contract is active in Kite."
+                )
+            continue
+        try:
+            lot_size = int(float(instrument.get("lot_size") or 0))
+        except (TypeError, ValueError):
+            lot_size = 0
+        if lot_size <= 0 and getattr(item, "lots", None) is not None:
+            raise ValueError(f"Kite returned an invalid lot size for {exchange}:{symbol}.")
+        if lot_size > 0:
+            if getattr(item, "lots", None) is not None:
+                item.lot_size = lot_size
+            resolved[(exchange, symbol)] = lot_size
+    return resolved
+
+
 def build_orders(
     rows: list[dict[str, str]], no_ltp_price: bool, keep_existing_orders: bool, override_soft_risk_blocks: bool = False
 ) -> list[dict[str, Any]]:
@@ -14336,7 +14672,8 @@ def build_orders(
         and option_symbol_parts(str(row.get("tradingsymbol") or row.get("symbol") or "").strip().upper())
         for row in rows
     )
-    kite = kite_orders.kite_client() if has_option_rows else None
+    has_lots_rows = any(str(row.get("lots") or "").strip() for row in rows)
+    kite = kite_orders.kite_client() if has_option_rows or has_lots_rows else None
     working_rows, strike_adjustments = (
         cap_trading_option_rows_by_otm(rows, kite) if kite is not None else ([dict(row) for row in rows], {})
     )
@@ -14344,6 +14681,11 @@ def build_orders(
     row_args = [kite_orders.args_for_csv_row(base_args, row) for row in working_rows]
     needs_kite = any(not item.no_ltp_price for item in row_args)
     kite = kite or (kite_orders.kite_client() if needs_kite else None)
+    resolved_lot_sizes = (
+        resolve_order_arg_lot_sizes(row_args, kite)
+        if kite is not None and (has_option_rows or has_lots_rows)
+        else {}
+    )
     orders: list[dict[str, Any]] = []
     errors: list[str] = []
     for index, item in enumerate(row_args, start=1):
@@ -14351,6 +14693,27 @@ def build_orders(
         exchange = str(getattr(item, "exchange", "") or working_rows[index - 1].get("exchange", "NFO")).upper()
         try:
             order = kite_orders.build_order(item, kite)
+            if (
+                exchange == "NFO"
+                and str(order.get("transaction_type") or "").upper() == "SELL"
+                and option_symbol_parts(symbol)
+            ):
+                order["price_markup_percent"] = float(
+                    kite_orders.effective_price_markup_percent(item)
+                )
+            requested_lots = getattr(item, "lots", None)
+            if requested_lots is not None:
+                order["lots"] = int(requested_lots)
+                order["lot_size"] = int(
+                    resolved_lot_sizes.get((exchange, symbol))
+                    or getattr(item, "lot_size", 0)
+                    or 0
+                )
+            elif exchange == "NFO":
+                instrument_lot_size = resolved_lot_sizes.get((exchange, symbol), 0)
+                if instrument_lot_size > 0 and int(order.get("quantity") or 0) % instrument_lot_size == 0:
+                    order["lots"] = int(order["quantity"]) // instrument_lot_size
+                    order["lot_size"] = instrument_lot_size
             try:
                 order["_csv_price"] = float(working_rows[index - 1].get("price") or 0)
             except (TypeError, ValueError):
@@ -14760,6 +15123,7 @@ def send_order_with_lpp_retry(
         old_price = float(order.get("price") or 0)
         order["_csv_price"] = 0.0
         order["price"] = 0.0
+        order["_ignore_markup_price"] = True
         apply_nfo_option_price_protection(kite, [order], ttl_seconds=0, raise_on_block=True)
         new_price = float(order.get("price") or 0)
         print(
@@ -14779,6 +15143,7 @@ def safe_retry_payload_for_order(kite: Any, order: dict[str, Any]) -> dict[str, 
     retry_order = dict(order)
     retry_order["_csv_price"] = 0.0
     retry_order["price"] = 0.0
+    retry_order["_ignore_markup_price"] = True
     try:
         apply_nfo_option_price_protection(kite, [retry_order], ttl_seconds=0, raise_on_block=True)
     except Exception:
@@ -16832,7 +17197,7 @@ def render_orders_table(
         "exchange",
         "tradingsymbol",
         "transaction_type",
-        "quantity",
+        "lots",
         "product",
         "order_type",
         "price",
@@ -16858,6 +17223,7 @@ def render_orders_table(
         "target_exit_premium": "target",
         "warning_premium": "warning",
         "hard_stop_premium": "hard stop",
+        "lots": "lots",
     }
     header = "".join(
         f"<th>{html.escape(header_labels.get(field, field))}</th>"
@@ -16926,6 +17292,18 @@ def render_orders_table(
                     )
             elif field == "ltp":
                 rendered = html.escape(fmt_number(value, 2) if value != "" else "N/A")
+            elif field == "lots":
+                quantity = int(float(order.get("quantity") or 0))
+                rendered = html.escape(
+                    fmt_number(value, 0)
+                    if value not in {"", None}
+                    else "N/A"
+                )
+                if value not in {"", None} and quantity > 0:
+                    rendered += (
+                        f'<small class="order-unit-quantity" title="Kite API quantity">'
+                        f'{html.escape(str(quantity))} units</small>'
+                    )
             elif field == "otm_percent":
                 rendered = html.escape(f"{fmt_number(value, 2)}%" if value != "" else "N/A")
             elif field == "price_markup_percent":
@@ -16961,6 +17339,7 @@ def render_orders_table(
         )
     return (
         '<section class="panel"><div class="panel-title">Orders</div>'
+        '<div class="status">Enter option size in lots. The current contract lot size is resolved from Kite; Zerodha receives the corresponding unit quantity.</div>'
         '<div class="status order-position-note">Rows in light red already have an active Kite position for the same underlying and option side, or an open/pending Kite order for the exact symbol and transaction side. Duplicate rows cannot be selected.</div>'
         '<div class="table-wrap"><table><thead><tr><th>Select</th><th>Score</th>'
         f"{header}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
@@ -19926,6 +20305,32 @@ def render_nifty_income_panel(state: PageState) -> str:
         </section>
         """
 
+    def best_nifty_positions_panel_html() -> str:
+        return f"""
+        <section class="panel nifty-best-positions-panel">
+          <div class="nifty-dashboard-head">
+            <div>
+              <div class="panel-title">Best NIFTY PE + CE SELL Positions</div>
+              <p class="status">The regime engine selects the strongest PE and CE income legs. Review fresh option liquidity, OTM distance, premium, POP, margin, and defined-risk protection before placing the pair.</p>
+            </div>
+            <span class="score-badge {strategy_badge}">{html.escape(strategy_status)}</span>
+          </div>
+          <div class="nifty-best-position-action">
+            <div>
+              <strong>Fresh-price execution</strong>
+              <small>SELL limits default to {html.escape(fmt_number(config.get("manual_pair_sell_markup_percent") or 20, 2))}% above fresh Kite LTP. The order window revalidates both legs before the 10-second pause.</small>
+            </div>
+            <button type="button" id="nifty-pair-open" data-pe-otm="{html.escape(default_pe_otm, quote=True)}" data-ce-otm="{html.escape(default_ce_otm, quote=True)}">Place nifty positions</button>
+          </div>
+          <div class="table-wrap nifty-preview-wrap">
+            <table class="nifty-preview-table">
+              <thead><tr><th>Side</th><th>Expiry</th><th>Option / Hedge</th><th>Strike</th><th>NIFTY</th><th>OTM</th><th>MMI OTM</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>IV</th><th>OI</th><th>Chg OI</th><th>Volume</th><th>Premium / lot</th><th>Max gain</th><th>Margin / max loss</th><th>Credit % / width</th><th>Credit quality</th><th>Yield</th><th>Risk</th></tr></thead>
+              <tbody>{candidate_rows()}</tbody>
+            </table>
+          </div>
+        </section>
+        """
+
     def recommendation_workbench_html() -> str:
         rec = strategy_recommendation if isinstance(strategy_recommendation, dict) else {}
         dq = data_quality if isinstance(data_quality, dict) else {}
@@ -20103,6 +20508,7 @@ def render_nifty_income_panel(state: PageState) -> str:
         </div>
       </section>
       {decision_gate_panel_html()}
+      {best_nifty_positions_panel_html()}
       {recommendation_workbench_html()}
       {hedge_integrity_panel_html()}
       {capital_router_panel_html()}
@@ -20153,18 +20559,14 @@ def render_nifty_income_panel(state: PageState) -> str:
         </div>
         {f'<ul class="nifty-warning-list">{warnings_html}</ul>' if warnings_html else f'<p class="status">{html.escape(str(dynamic_warning or "No hard warnings in the latest NIFTY snapshot."))}</p>'}
       </section>
-      <section class="panel">
-        <div class="panel-title">Spread Candidates</div>
-        <div class="status">Candidate PE/CE spreads chosen by regime and risk filters. Review the table, then build the tactical order only if the gate and recommendation agree.</div>
-        <div class="actions">
-          <button type="button" id="nifty-pair-open" data-pe-otm="{html.escape(default_pe_otm, quote=True)}" data-ce-otm="{html.escape(default_ce_otm, quote=True)}">Build Tactical Spread Order</button>
-        </div>
-        <div class="table-wrap nifty-preview-wrap"><table class="nifty-preview-table"><thead><tr><th>Side</th><th>Expiry</th><th>Option / Hedge</th><th>Strike</th><th>NIFTY</th><th>OTM</th><th>MMI OTM</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>IV</th><th>OI</th><th>Chg OI</th><th>Volume</th><th>Premium / lot</th><th>Max gain</th><th>Margin / max loss</th><th>Credit % / width</th><th>Credit quality</th><th>Yield</th><th>Risk</th></tr></thead><tbody>{candidate_rows()}</tbody></table></div>
-      </section>
       <div class="live-modal-backdrop" id="nifty-pair-order-modal">
         <div class="live-modal income-pe-order-modal-card nifty-pair-order-modal-card">
-          <h2>NIFTY Tactical Spread Order Review</h2>
-          <p class="status">The engine selects PE/CE strikes from the current regime. Protective covers are recommended; uncovered NIFTY SELL legs can carry very large loss, especially on the CE side.</p>
+          <h2>NIFTY PE + CE SELL Position Review</h2>
+          <p class="status">Fresh Kite quotes and critical option analytics are revalidated here. SELL limits default to {html.escape(fmt_number(config.get("manual_pair_sell_markup_percent") or 20, 2))}% above LTP; protective covers are recommended because uncovered NIFTY SELL risk can be very large.</p>
+          <div class="nifty-individual-order-guide">
+            <strong>Individual PE or CE SELL</strong>
+            <span>Select only the side you want, switch Protective covers off, and accept uncovered risk. Review &amp; Start 10s will unlock after fresh validation unless a hard market-risk gate blocks entry.</span>
+          </div>
           <input type="hidden" name="nifty_pair_confirmed" id="nifty-pair-confirmed" value="0">
           <input type="hidden" name="nifty_pair_pe_otm" id="nifty-pair-pe-otm" value="{html.escape(default_pe_otm, quote=True)}">
           <input type="hidden" name="nifty_pair_ce_otm" id="nifty-pair-ce-otm" value="{html.escape(default_ce_otm, quote=True)}">
@@ -20206,6 +20608,7 @@ def render_nifty_income_panel(state: PageState) -> str:
               <div class="leg-kicker">PE VERTICAL SPREAD</div>
               <strong id="nifty-pair-pe-symbol">--</strong>
               <small id="nifty-pair-pe-detail">--</small>
+              <div class="nifty-liquidity-adjustment" id="nifty-pair-pe-adjustment"></div>
               <div class="nifty-hedge-leg"><span>Protective BUY</span><strong id="nifty-pair-pe-hedge">--</strong><small id="nifty-pair-pe-hedge-detail">Dynamic width below SELL strike</small></div>
               <div class="leg-pop">POP <span id="nifty-pair-pe-pop">--</span></div>
             </section>
@@ -20213,6 +20616,7 @@ def render_nifty_income_panel(state: PageState) -> str:
               <div class="leg-kicker">CE VERTICAL SPREAD</div>
               <strong id="nifty-pair-ce-symbol">--</strong>
               <small id="nifty-pair-ce-detail">--</small>
+              <div class="nifty-liquidity-adjustment" id="nifty-pair-ce-adjustment"></div>
               <div class="nifty-hedge-leg"><span>Protective BUY</span><strong id="nifty-pair-ce-hedge">--</strong><small id="nifty-pair-ce-hedge-detail">Dynamic width above SELL strike</small></div>
               <div class="leg-pop">POP <span id="nifty-pair-ce-pop">--</span></div>
             </section>
@@ -20466,7 +20870,7 @@ def render_page(state: PageState) -> bytes:
     execution_checks = (
         '<div class="execution-checks">'
         f'{render_checkbox("dry_run", "Dry run", state.dry_run, "Build orders and show what would happen without sending anything to Kite.")}'
-        f'{render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on when the CSV already has prices or lot_size. Turn off to fetch LTP/lot size from Kite.")}'
+        f'{render_checkbox("no_ltp_price", "Use CSV/manual price only", state.no_ltp_price, "Leave this on only when the CSV has a valid price. Contract lot size is always resolved from Kite for lots-based orders.")}'
         f'{render_checkbox("keep_existing_orders", "Always place new order", state.keep_existing_orders, "Turn off to modify a similar open order when found; if no modifiable order exists, the app places a new order.")}'
         f'{render_checkbox("override_soft_risk_blocks", "Override soft risk blocks", state.override_soft_risk_blocks, "Allows only LOW_PREMIUM_YIELD, MISSING_TECHNICAL_DATA, and MISSING_MARKET_DATA blocks. Event, expiry, stop-loss, duplicate, position, and price-protection blocks still stay blocked.")}'
         "</div>"
@@ -22153,6 +22557,45 @@ def render_page(state: PageState) -> bytes:
       line-height: 1.1;
       overflow-wrap: anywhere;
     }}
+    .nifty-best-positions-panel {{
+      border-color: #5eead4;
+      background:
+        linear-gradient(135deg, rgba(236, 254, 255, 0.96) 0%, rgba(240, 253, 250, 0.98) 52%, #ffffff 100%);
+      box-shadow: 0 16px 34px rgba(15, 118, 110, 0.10);
+    }}
+    .nifty-best-position-action {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin: 0 0 12px;
+      padding: 11px 12px;
+      border: 1px solid #99f6e4;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.9);
+    }}
+    .nifty-best-position-action strong,
+    .nifty-best-position-action small {{
+      display: block;
+    }}
+    .nifty-best-position-action strong {{
+      color: #0f766e;
+      font-size: 13px;
+      font-weight: 950;
+    }}
+    .nifty-best-position-action small {{
+      margin-top: 3px;
+      color: #52647a;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.35;
+    }}
+    .nifty-best-position-action button {{
+      flex: 0 0 auto;
+      min-width: 180px;
+      background: linear-gradient(135deg, #0369a1 0%, #0f766e 100%);
+      box-shadow: 0 10px 22px rgba(15, 118, 110, 0.18);
+    }}
     .nifty-preview-wrap {{
       border: 1px solid #99f6e4;
       border-radius: 10px;
@@ -22324,6 +22767,30 @@ def render_page(state: PageState) -> bytes:
       gap: 10px;
       margin: 12px 0;
     }}
+    .nifty-individual-order-guide {{
+      margin: 10px 0 12px;
+      padding: 10px 12px;
+      border: 1px solid #bae6fd;
+      border-radius: 9px;
+      background: linear-gradient(135deg, #eff6ff, #ecfeff);
+      color: #0c4a6e;
+      text-align: left;
+    }}
+    .nifty-individual-order-guide strong,
+    .nifty-individual-order-guide span {{
+      display: block;
+    }}
+    .nifty-individual-order-guide strong {{
+      margin-bottom: 3px;
+      color: #075985;
+      font-size: 13px;
+      font-weight: 950;
+    }}
+    .nifty-individual-order-guide span {{
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.4;
+    }}
     .nifty-side-selector label {{
       display: grid;
       grid-template-columns: auto 1fr;
@@ -22420,6 +22887,21 @@ def render_page(state: PageState) -> bytes:
     .nifty-pair-leg-section small {{
       color: #334155;
       line-height: 1.35;
+    }}
+    .nifty-liquidity-adjustment {{
+      display: none;
+      margin-top: 8px;
+      padding: 7px 8px;
+      border: 1px solid #fbbf24;
+      border-radius: 7px;
+      background: #fffbeb;
+      color: #92400e;
+      font-size: 11px;
+      font-weight: 850;
+      line-height: 1.35;
+    }}
+    .nifty-liquidity-adjustment.active {{
+      display: block;
     }}
     .leg-kicker {{
       color: #0f766e;
@@ -24707,6 +25189,8 @@ def render_page(state: PageState) -> bytes:
       .nifty-summary-cards {{ grid-template-columns: 1fr; }}
       .nifty-regime-grid {{ grid-template-columns: 1fr; }}
       .nifty-dashboard-head {{ align-items: flex-start; flex-direction: column; }}
+      .nifty-best-position-action {{ align-items: stretch; flex-direction: column; }}
+      .nifty-best-position-action button {{ width: 100%; min-width: 0; }}
       .nifty-config-panel summary {{ align-items: flex-start; flex-direction: column; }}
       .home-hero h2 {{ font-size: 20px; }}
       .home-pnl-strip {{ grid-template-columns: 1fr; }}
@@ -25379,8 +25863,10 @@ def render_page(state: PageState) -> bytes:
     const niftyPairMaxLoss = document.getElementById('nifty-pair-max-loss');
     const niftyPairPeSymbol = document.getElementById('nifty-pair-pe-symbol');
     const niftyPairPeDetail = document.getElementById('nifty-pair-pe-detail');
+    const niftyPairPeAdjustment = document.getElementById('nifty-pair-pe-adjustment');
     const niftyPairCeSymbol = document.getElementById('nifty-pair-ce-symbol');
     const niftyPairCeDetail = document.getElementById('nifty-pair-ce-detail');
+    const niftyPairCeAdjustment = document.getElementById('nifty-pair-ce-adjustment');
     const niftyPairPePop = document.getElementById('nifty-pair-pe-pop');
     const niftyPairCePop = document.getElementById('nifty-pair-ce-pop');
     const niftyPairPeHedge = document.getElementById('nifty-pair-pe-hedge');
@@ -25658,6 +26144,16 @@ def render_page(state: PageState) -> bytes:
       if (niftyPairPeDetail) niftyPairPeDetail.textContent = pe.tradingsymbol ? `Strike ${{pe.strike}} | LTP ${{Number(pe.option_ltp || 0).toFixed(2)}} | Limit ${{Number(pe.price || 0).toFixed(2)}} | OTM ${{Number(pe.otm_pct || 0).toFixed(2)}}%` : '--';
       if (niftyPairCeSymbol) niftyPairCeSymbol.textContent = ce.tradingsymbol || '--';
       if (niftyPairCeDetail) niftyPairCeDetail.textContent = ce.tradingsymbol ? `Strike ${{ce.strike}} | LTP ${{Number(ce.option_ltp || 0).toFixed(2)}} | Limit ${{Number(ce.price || 0).toFixed(2)}} | OTM ${{Number(ce.otm_pct || 0).toFixed(2)}}%` : '--';
+      const renderLiquidityAdjustment = (element, row) => {{
+        if (!element) return;
+        const shift = Number(row && row.liquidity_shift_points || 0);
+        element.classList.toggle('active', shift > 0);
+        element.textContent = shift > 0
+          ? `Tradable strike adjusted from ${{row.original_tradingsymbol || row.original_strike || '--'}} / ${{row.original_strike || '--'}} by ${{shift}} points after LTP and liquidity checks. Maximum adjustment: ${{Number({NIFTY_INCOME_MAX_LIQUIDITY_SHIFT_POINTS}).toFixed(0)}} points.`
+          : '';
+      }};
+      renderLiquidityAdjustment(niftyPairPeAdjustment, pe);
+      renderLiquidityAdjustment(niftyPairCeAdjustment, ce);
       if (niftyPairPePop) niftyPairPePop.textContent = pe.pop_estimate ? `${{Number(pe.pop_estimate).toFixed(1)}}% approx` : '--';
       if (niftyPairCePop) niftyPairCePop.textContent = ce.pop_estimate ? `${{Number(ce.pop_estimate).toFixed(1)}}% approx` : '--';
       if (niftyPairPeHedge) niftyPairPeHedge.textContent = peHedge.tradingsymbol || '--';
@@ -25679,10 +26175,14 @@ def render_page(state: PageState) -> bytes:
       const missing = (data.missing_ltp || []);
       const skipped = (data.skipped_existing_sides || []);
       const dynamicBlocked = data.dynamic_hedge_allowed === false;
-      const riskRejected = data.risk_reward_status && data.risk_reward_status !== 'OK';
+      const individualOverride = data.individual_uncovered_override || {{}};
+      const individualRiskAccepted = Boolean(individualOverride.allowed);
+      const riskRejected = data.risk_reward_status
+        && !['OK', 'MANUAL_SINGLE_LEG_RISK_ACCEPTED'].includes(String(data.risk_reward_status));
       const confidence = data.confidence_score || {{}};
       const confidenceAction = String(confidence.action || '');
-      const confidenceBlocked = confidenceAction === 'NO_TRADE' || confidenceAction === 'PREVIEW_ONLY';
+      const confidenceBlocked = !individualRiskAccepted
+        && (confidenceAction === 'NO_TRADE' || confidenceAction === 'PREVIEW_ONLY');
       if (niftyPairSummary) {{
         const markup = Number(data.sell_markup_percent || 0).toFixed(2);
         const selectedSides = [includePe ? 'PE spread' : '', includeCe ? 'CE spread' : ''].filter(Boolean).join(' + ');
@@ -25706,13 +26206,30 @@ def render_page(state: PageState) -> bytes:
         const ackNote = uncoveredSides.length > 0 && !includeCover && uncoveredAcknowledged
           ? ' | Uncovered NIFTY risk acknowledged for this order'
           : '';
+        const individualNote = individualRiskAccepted
+          ? ` | INDIVIDUAL ${{individualOverride.selected_side || ''}} SELL: manual uncovered-risk acceptance active`
+          : '';
+        const overrideBlockNote = individualOverride.requested && !individualRiskAccepted
+          ? ` | Individual risk override blocked by ${{(individualOverride.non_overridable_blocks || []).join(', ') || 'hard safety gate'}}`
+          : '';
+        const adjustedLegs = [pe, ce]
+          .filter((row) => Number(row && row.liquidity_shift_points || 0) > 0)
+          .map((row) => `${{row.option_type}} ${{row.original_strike}}→${{row.strike}} (${{row.liquidity_shift_points}} pts)`);
+        const liquidityNote = adjustedLegs.length
+          ? ` | Tradable strike adjustment: ${{adjustedLegs.join(', ')}}`
+          : '';
         niftyPairSummary.textContent = missing.length
           ? `Fresh LTP missing for ${{missing.join(', ')}}. Refresh again before GO.`
-          : `${{selectedSides}} | ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} per leg | ${{coverNote}} | SELL limit ${{markup}}% above LTP | Net credit ${{Number(data.max_gain || 0).toFixed(0)}} | Est. margin ${{data.max_loss_unlimited ? 'UNLIMITED' : Number(data.margin_required || data.max_loss || 0).toFixed(0)}} | Return ${{data.max_loss_unlimited ? 'N/A' : Number(data.return_on_margin_pct || 0).toFixed(2) + '%'}}${{confidenceNote}}${{confidenceReason}}${{dynamicNote}}${{riskNote}}${{skippedNote}}${{ackNote}}${{nakedBlocked ? ' | Acknowledge uncovered risk or enable protective covers' : ''}}`;
+          : `${{selectedSides}} | ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} per leg | ${{coverNote}} | SELL limit ${{markup}}% above LTP | Net credit ${{Number(data.max_gain || 0).toFixed(0)}} | Est. margin ${{data.max_loss_unlimited ? 'UNLIMITED' : Number(data.margin_required || data.max_loss || 0).toFixed(0)}} | Return ${{data.max_loss_unlimited ? 'N/A' : Number(data.return_on_margin_pct || 0).toFixed(2) + '%'}}${{liquidityNote}}${{confidenceNote}}${{confidenceReason}}${{dynamicNote}}${{riskNote}}${{skippedNote}}${{ackNote}}${{individualNote}}${{overrideBlockNote}}${{nakedBlocked ? ' | Acknowledge uncovered risk or enable protective covers' : ''}}`;
         niftyPairSummary.classList.toggle('signal-red', missing.length > 0 || nakedBlocked || dynamicBlocked || riskRejected || confidenceBlocked || Boolean(data.max_loss_unlimited));
       }}
       const uncoveredAcknowledged = Boolean(niftyPairUncoveredAck && niftyPairUncoveredAck.checked);
-      if (niftyPairReview) niftyPairReview.disabled = missing.length > 0 || dynamicBlocked || riskRejected || confidenceBlocked || ((data.uncovered_sides || []).length > 0 && !data.naked_live_allowed && !uncoveredAcknowledged);
+      if (niftyPairReview) niftyPairReview.disabled = missing.length > 0
+        || dynamicBlocked
+        || riskRejected
+        || confidenceBlocked
+        || (individualOverride.requested && !individualRiskAccepted)
+        || ((data.uncovered_sides || []).length > 0 && !data.naked_live_allowed && !uncoveredAcknowledged);
     }}
     async function refreshNiftyPairDetails() {{
       if (!niftyPairModal) return;
@@ -25722,6 +26239,7 @@ def render_page(state: PageState) -> bytes:
       const includePe = Boolean(niftyPairIncludePe && niftyPairIncludePe.checked);
       const includeCe = Boolean(niftyPairIncludeCe && niftyPairIncludeCe.checked);
       const includeCover = Boolean(niftyPairIncludeCover && niftyPairIncludeCover.checked);
+      const uncoveredAck = Boolean(niftyPairUncoveredAck && niftyPairUncoveredAck.checked);
       if (!includePe && !includeCe) {{
         if (niftyPairSummary) {{
           niftyPairSummary.textContent = 'Select at least one side: PE spread or CE spread.';
@@ -25734,7 +26252,7 @@ def render_page(state: PageState) -> bytes:
       if (niftyPairSummary) niftyPairSummary.textContent = 'Loading fresh NIFTY option premium, POP approximation, and max gain...';
       setQuoteLoading(niftyPairModal, niftyPairLoading, true, 'Revalidating NIFTY PE+CE pair...');
       try {{
-        const response = await fetch(`/nifty-income/pair-quote?pe_otm=${{encodeURIComponent(peOtm)}}&ce_otm=${{encodeURIComponent(ceOtm)}}&lots=${{encodeURIComponent(lots)}}&include_pe=${{includePe ? '1' : '0'}}&include_ce=${{includeCe ? '1' : '0'}}&include_cover=${{includeCover ? '1' : '0'}}`, {{ cache: 'no-store' }});
+        const response = await fetch(`/nifty-income/pair-quote?pe_otm=${{encodeURIComponent(peOtm)}}&ce_otm=${{encodeURIComponent(ceOtm)}}&lots=${{encodeURIComponent(lots)}}&include_pe=${{includePe ? '1' : '0'}}&include_ce=${{includeCe ? '1' : '0'}}&include_cover=${{includeCover ? '1' : '0'}}&uncovered_ack=${{uncoveredAck ? '1' : '0'}}`, {{ cache: 'no-store' }});
         const data = await response.json();
         if (!data.ok) throw new Error(data.error || 'Could not load NIFTY pair');
         renderNiftyPairLegs(data);
@@ -26997,6 +27515,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     first(query, "include_pe", "1") != "0",
                     first(query, "include_ce", "1") != "0",
                     first(query, "include_cover", "1") != "0",
+                    first(query, "uncovered_ack", "0") == "1",
                 )
                 self.send_json({"ok": True, **snapshot})
             except Exception as exc:

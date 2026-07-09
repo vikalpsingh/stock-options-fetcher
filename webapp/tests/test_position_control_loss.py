@@ -14,6 +14,8 @@ def test_intraday_guard_uses_hard_stop_price_when_crossed():
     }
     with patch.object(app, "open_option_positions", return_value=[position]), patch.object(
         app, "refresh_option_positions_with_live_ltp", return_value=[position]
+    ), patch.object(
+        app, "intraday_hard_stop_trading_days_allowed", return_value=(True, 5)
     ):
         orders, evaluations = app.build_intraday_loss_limit_close_orders(
             kite=None,
@@ -40,6 +42,8 @@ def test_intraday_guard_does_not_chase_spike_above_entry_before_hard_stop():
     }
     with patch.object(app, "open_option_positions", return_value=[position]), patch.object(
         app, "refresh_option_positions_with_live_ltp", return_value=[position]
+    ), patch.object(
+        app, "intraday_hard_stop_trading_days_allowed", return_value=(True, 5)
     ):
         orders, evaluations = app.build_intraday_loss_limit_close_orders(
             kite=None,

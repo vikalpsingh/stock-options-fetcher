@@ -10,7 +10,7 @@ Generate only Kite-compatible CSV output.
 
 CSV columns must be:
 
-exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity
+symbol,exchange,transaction_type,lots,price_markup_percent,product,order_type,price,validity,tag
 
 ## Output Rules
 
@@ -26,6 +26,8 @@ exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validi
 - product should usually be NRML for options.
 - order_type should usually be LIMIT.
 - validity should usually be DAY.
+- lots must be a positive whole number.
+- Do not include lot_size; the app resolves the current contract lot size from Kite.
 - price must be a valid numeric limit price.
 - If live premium is unavailable, use price as 0 and still return CSV only.
 - User must verify live premium, lot size, margin, liquidity, event risk, and order price before placement.
@@ -271,8 +273,8 @@ When generating SELL option CSV:
 - Use NRML product.
 - Use LIMIT order.
 - Use DAY validity.
-- Use total quantity, not lots.
-- Quantity = lot size x number of lots.
+- Use number of lots, not unit quantity.
+- Do not calculate or return lot_size.
 - Use valid tradingsymbol format as per NSE option contract.
 - Prefer next monthly expiry if current expiry is too close.
 - For covered CALL, generate SELL CE only.
@@ -294,6 +296,6 @@ If market is already down and user expects further downfall:
 
 Return only this CSV structure:
 
-exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity
+symbol,exchange,transaction_type,lots,price_markup_percent,product,order_type,price,validity,tag
 
 No notes. No explanation. No markdown. No warnings.
