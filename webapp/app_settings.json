@@ -20,8 +20,8 @@
   "income_growth_gpt_scheduler": {
     "csv_path": "C:\\Coding\\NSE\\stock-options-fetcher\\29Jun2026.csv",
     "enabled": true,
-    "last_attempt_date": "2026-06-30",
-    "last_run_at": "30 Jun 2026 09:30:10 IST",
+    "last_attempt_date": "2026-07-09",
+    "last_run_at": "09 Jul 2026 09:35:42 IST",
     "message": "Scheduled Income Growth GPT validation authentication failed: open Kite Setup, confirm the active profile, and regenerate today's access token.",
     "order_count": 3,
     "output_preview": "exchange,tradingsymbol,quantity,transaction_type,product,order_type,price,validity\nNFO,PGEL26JUL530CE,950,SELL,NRML,LIMIT,0,DAY\nNFO,UNITDSPR26JUL1380CE,400,SELL,NRML,LIMIT,0,DAY\nNFO,BAJFINANCE26JUL990CE,750,SELL,NRML,LIMIT,0,DAY",
@@ -99,9 +99,9 @@
     "enabled": true,
     "end_time": "15:15",
     "interval_minutes": 15,
-    "last_run_at": "08 Jul 2026 14:36:49 IST",
-    "last_slot": "14:30",
-    "last_slot_key": "2026-07-08:14:30",
+    "last_run_at": "09 Jul 2026 09:35:44 IST",
+    "last_slot": "09:30",
+    "last_slot_key": "2026-07-09:09:30",
     "loss_limit_evaluations": [
       {
         "action": "NO_ACTION",
@@ -173,7 +173,7 @@
         "triggered": false
       }
     ],
-    "message": "NSE market timestamp verified at 14:36:50 IST. Missing BUY/SELL close orders placed: 1; loss/hard-stop overrides: 0; strict PE exits: 0; existing close orders skipped: 1; errors: 0. NAUKRI26JUL1060PE: LIMIT 4.40 (BUY at 20% below min_ltp_average_price) [AUTO CLOSE COVER: BUY 550 NAUKRI26JUL1060PE at 4.40; 20% below min(LTP, average entry price); risk exits gated until trading DTE 9 or fewer. Average 5.50, fresh LTP 6.70. Probability state SAFE: Strike is comfortably outside expected move and touch probability is low.] DTE-gated risk exits skipped until trading DTE <= 9: PFC26JUL420PE (trading DTE 14), NAUKRI26JUL1060PE (trading DTE 14). Aggressive risk exits downgraded to default passive close orders until trading DTE <= 9: NAUKRI26JUL1060PE (trading DTE 14). Passive close candidates: BUY 1, SELL 0.",
+    "message": "Intraday option close-order check authentication failed: open Kite Setup, confirm the active profile, and regenerate today's access token.",
     "order_count": 1,
     "paused_until": "",
     "pe_risk_evaluations": [
@@ -225,18 +225,11 @@
       }
     ],
     "profile": "Shanti",
-    "results": [
-      {
-        "detail": "placed. AUTO CLOSE COVER: BUY 550 NAUKRI26JUL1060PE at 4.40; 20% below min(LTP, average entry price); risk exits gated until trading DTE 9 or fewer. Average 5.50, fresh LTP 6.70. Probability state SAFE: Strike is comfortably outside expected move and touch probability is low.",
-        "order_id": "260708151451103",
-        "status": "LIVE_SENT",
-        "tradingsymbol": "NAUKRI26JUL1060PE"
-      }
-    ],
-    "run_count_today": 22,
-    "run_date": "2026-07-08",
+    "results": [],
+    "run_count_today": 1,
+    "run_date": "2026-07-09",
     "start_time": "09:30",
-    "status": "PLACED"
+    "status": "ERROR"
   },
   "kite_profiles": {
     "Aanya": {
@@ -254,7 +247,7 @@
       "NIFTY_INCOME_ENABLED": true
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "KD9hyByNKCH4fu66bU0QV5WJYiTEU2jf",
+      "KITE_ACCESS_TOKEN": "0UQDmQQmQoTdAc3wxkgjVjI3MwT8Ehll",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES",

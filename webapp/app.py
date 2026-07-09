@@ -112,9 +112,9 @@ OPENAI_CSV_PROMPT_PATH = APP_ROOT / "openai_csv_prompt.md"
 DEFAULT_ETF_BUY_AMOUNT = 10000.0
 DEFAULT_OPTION_SELL_MARKUP_PERCENT = 20.0
 DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT = 20.0
+DEFAULT_INTRADAY_HARD_STOP_START_DTE = 9
 INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT = 100.0
 INTRADAY_LOSS_LIMIT_LTP_DISCOUNT_PERCENT = 10.0
-INTRADAY_HARD_STOP_START_DTE = 9
 CONTROL_LOSS_HARD_STOP_DISCOUNT_PERCENT = 10.0
 POSITION_CLOSE_SCHEDULE_TIME = "09:20"
 POSITION_CLOSE_SCHEDULE_WINDOW_MINUTES = 10
@@ -1302,6 +1302,18 @@ def position_close_discount_percent_setting() -> float:
     except (TypeError, ValueError):
         return DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT
     return discount if 0 <= discount < 100 else DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT
+
+
+def intraday_hard_stop_start_dte_setting() -> int:
+    value = load_app_settings().get(
+        "intraday_hard_stop_start_dte",
+        DEFAULT_INTRADAY_HARD_STOP_START_DTE,
+    )
+    try:
+        dte = int(float(value))
+    except (TypeError, ValueError):
+        return DEFAULT_INTRADAY_HARD_STOP_START_DTE
+    return max(0, min(dte, 60))
 
 
 def normalize_home_tickers(value: Any) -> list[str]:
@@ -5529,6 +5541,7 @@ class PageState:
     kite_ip_data: list[dict[str, str]] | None = None
     etf_buy_amount: float = field(default_factory=etf_buy_amount_setting)
     option_sell_markup_percent: float = field(default_factory=option_sell_markup_percent_setting)
+    intraday_hard_stop_start_dte: int = field(default_factory=intraday_hard_stop_start_dte_setting)
     home_tickers: str = field(default_factory=home_tickers_text)
 
 
@@ -6291,7 +6304,7 @@ def trading_days_remaining(expiry: date, today: date | None = None) -> int:
 def intraday_hard_stop_trading_days_allowed(expiry: date, today: date | None = None) -> tuple[bool, int]:
     """Return whether hard-stop price execution is inside the trading-day expiry window."""
     trading_dte = trading_days_remaining(expiry, today or app_now().date())
-    return trading_dte <= INTRADAY_HARD_STOP_START_DTE, trading_dte
+    return trading_dte <= intraday_hard_stop_start_dte_setting(), trading_dte
 
 
 def next_month_start(day: date) -> date:
@@ -9116,7 +9129,7 @@ def build_intraday_pe_risk_exit_orders(
                 )
                 + (
                     f"; strict risk exits start only when trading DTE is "
-                    f"{INTRADAY_HARD_STOP_START_DTE} or fewer."
+                    f"{intraday_hard_stop_start_dte_setting()} or fewer."
                 )
             )
         evaluations.append(evaluation)
@@ -9287,7 +9300,7 @@ def build_missing_option_close_orders(
                 )
                 rule = (
                     f"{discount:g}% below min(LTP, average entry price); "
-                    f"risk exits gated until trading DTE {INTRADAY_HARD_STOP_START_DTE} or fewer"
+                    f"risk exits gated until trading DTE {intraday_hard_stop_start_dte_setting()} or fewer"
                 )
             elif probability_risk.probability_risk_state in {"PANIC", "FORCE_EXIT"}:
                 parts = option_symbol_parts(symbol)
@@ -9316,7 +9329,7 @@ def build_missing_option_close_orders(
                                 )
                                 + (
                                     f"; aggressive close orders start only when trading DTE "
-                                    f"is {INTRADAY_HARD_STOP_START_DTE} or fewer."
+                                    f"is {intraday_hard_stop_start_dte_setting()} or fewer."
                                 )
                             ),
                         }
@@ -15563,7 +15576,7 @@ def build_intraday_loss_limit_close_orders(
                     "skip_reason": (
                         f"Aggressive close override skipped: {', '.join(skipped_reasons)}. "
                         f"Trading DTE is {dte} (calendar DTE {calendar_dte}); override execution starts "
-                        f"only when trading DTE is {INTRADAY_HARD_STOP_START_DTE} or fewer."
+                        f"only when trading DTE is {intraday_hard_stop_start_dte_setting()} or fewer."
                     ),
                 }
             )
@@ -16386,7 +16399,7 @@ def run_intraday_position_close_job(
                 extra_count = len(dte_guard_skips) - 5
                 dte_guard_message = (
                     f" DTE-gated risk exits skipped until trading DTE <= "
-                    f"{INTRADAY_HARD_STOP_START_DTE}: {skipped_symbols}"
+                    f"{intraday_hard_stop_start_dte_setting()}: {skipped_symbols}"
                     + (f", +{extra_count} more" if extra_count > 0 else "")
                     + "."
                 )
@@ -16405,7 +16418,7 @@ def run_intraday_position_close_job(
                 extra_count = len(dte_passive_downgrades) - 5
                 dte_passive_message = (
                     " Aggressive risk exits downgraded to default passive close "
-                    f"orders until trading DTE <= {INTRADAY_HARD_STOP_START_DTE}: "
+                    f"orders until trading DTE <= {intraday_hard_stop_start_dte_setting()}: "
                     f"{downgraded_symbols}"
                     + (f", +{extra_count} more" if extra_count > 0 else "")
                     + "."
@@ -18576,7 +18589,7 @@ def render_position_close_schedule_panel() -> str:
         f"Long CE/PE positions, including NIFTY covers: SELL at {discount_percent:g}% above "
         "the higher of fresh LTP or average entry price. Existing matching close-side orders are preserved. "
         "Risk override: when a short CE/PE premium loss reaches 100%, the loss-limit path can act immediately. "
-        f"Hard-stop price execution starts only when trading DTE is {INTRADAY_HARD_STOP_START_DTE} or fewer; "
+        f"Hard-stop price execution starts only when trading DTE is {intraday_hard_stop_start_dte_setting()} or fewer; "
         f"the guard modifies or places the BUY close order at {discount_percent:g}% below the "
         "hard-stop price only inside that DTE window. Before hard stop, spike closes above entry are skipped, "
         "and the passive missing-close guard can place a lower close order instead.</p>"
@@ -20606,6 +20619,8 @@ def render_page(state: PageState) -> bytes:
             {render_number_input("etf_buy_amount", "ETF buy amount", etf_buy_amount, "100")}
             {render_number_input("option_sell_markup_percent", "Option SELL limit markup %", state.option_sell_markup_percent, "0.05")}
             <p class="status">Used by Trading Top 3 CE SELL and INCOME PE SELL cards. Default is 20% above fresh option LTP.</p>
+            {render_number_input("intraday_hard_stop_start_dte", "Intraday hard-stop start trading DTE", state.intraday_hard_stop_start_dte, "1")}
+            <p class="status">Intraday Missing Close-Order Guard uses this trading-DTE threshold for hard-stop and aggressive risk exits. Basic missing close orders still use the saved Position BUY discount.</p>
             <div class="kite-action-preview">{html.escape(etf_buy_action)}</div>
             <p class="status">Saved in <code>{html.escape(str(SETTINGS_PATH.name))}</code>.</p>
           </section>
@@ -27279,7 +27294,21 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 or option_sell_markup_percent_setting()
             ),
+            intraday_hard_stop_start_dte=int(
+                float(
+                    first(
+                        form,
+                        "intraday_hard_stop_start_dte",
+                        str(intraday_hard_stop_start_dte_setting()),
+                    )
+                    or intraday_hard_stop_start_dte_setting()
+                )
+            ),
             home_tickers=first(form, "home_tickers", home_tickers_text()),
+        )
+        state.intraday_hard_stop_start_dte = max(
+            0,
+            min(int(state.intraday_hard_stop_start_dte), 60),
         )
         if request_path.startswith("/positions") and "position_discount_percent" in form:
             if 0 <= state.position_discount_percent < 100:
@@ -27649,6 +27678,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     {
                         "etf_buy_amount": state.etf_buy_amount,
                         "option_sell_markup_percent": state.option_sell_markup_percent,
+                        "intraday_hard_stop_start_dte": state.intraday_hard_stop_start_dte,
                         "home_tickers": normalized_home_tickers,
                         "selected_kite_profile": profile_name,
                     }
@@ -27658,6 +27688,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = (
                     f"Kite setup saved for {profile_name}. ETF buy amount {format_buy_amount(state.etf_buy_amount)}. "
                     f"Option SELL markup {state.option_sell_markup_percent:.2f}%. "
+                    f"Intraday hard-stop start DTE {state.intraday_hard_stop_start_dte}. "
                     f"Home watchlist has {len(normalized_home_tickers)} ticker(s)."
                 )
             elif request_path == "/kite-token/generate":
