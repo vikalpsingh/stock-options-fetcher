@@ -69,6 +69,11 @@ from nifty_options_engine.workflow import (
     validate_active_nifty_hedges,
     validate_nifty_data_quality,
 )
+from nifty_grow import (
+    NIFTY_GROW_DEFAULT_CONFIG,
+    nifty_grow_audit_csv,
+    nifty_grow_from_income_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3652,6 +3657,9 @@ def nifty_income_manual_pair_snapshot(
     include_ce: bool = True,
     include_cover: bool = True,
     allow_uncovered_override: bool = False,
+    target_expiry: date | str | None = None,
+    target_pe_strike: float | int | str | None = None,
+    target_ce_strike: float | int | str | None = None,
 ) -> dict[str, Any]:
     config = nifty_income_config()
     kite = kite_orders.kite_client() if kite_orders else None
@@ -3661,6 +3669,21 @@ def nifty_income_manual_pair_snapshot(
     spot = quote_ltp(quotes.get("NSE:NIFTY 50", {}))
     if spot <= 0:
         raise RuntimeError("Could not load fresh NIFTY spot from Kite.")
+
+    def optional_float(value: Any) -> float:
+        try:
+            if value in (None, ""):
+                return 0.0
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    requested_pe_strike = optional_float(target_pe_strike)
+    requested_ce_strike = optional_float(target_ce_strike)
+    if requested_pe_strike > 0 and spot > requested_pe_strike:
+        pe_otm_pct = max(0.01, (spot - requested_pe_strike) / spot * 100)
+    if requested_ce_strike > 0 and requested_ce_strike > spot:
+        ce_otm_pct = max(0.01, (requested_ce_strike - spot) / spot * 100)
     india_vix = quote_ltp(quotes.get("NSE:INDIA VIX", {}))
     if india_vix <= 0:
         india_vix = None
@@ -3674,6 +3697,15 @@ def nifty_income_manual_pair_snapshot(
         and str(item.get("segment") or "").upper() == "NFO-OPT"
     ]
     expiry = nifty_nearest_expiry(nifty_instruments, today, config)
+    requested_expiry = _coerce_date(target_expiry)
+    if requested_expiry:
+        available_expiries = {
+            expiry_day
+            for expiry_day in (_coerce_date(item.get("expiry")) for item in nifty_instruments)
+            if expiry_day is not None
+        }
+        if requested_expiry in available_expiries:
+            expiry = requested_expiry
     use_existing_hedges = bool(config.get("use_existing_hedge_positions", True))
     existing_short_sides: set[str] = set()
     try:
@@ -3891,6 +3923,8 @@ def nifty_income_manual_pair_snapshot(
         "expiry": expiry.isoformat(),
         "pe_otm_pct": float(pe_otm_pct),
         "ce_otm_pct": float(ce_otm_pct),
+        "target_pe_strike": requested_pe_strike or None,
+        "target_ce_strike": requested_ce_strike or None,
         "orders": orders,
         "sell_legs": sell_previews,
         "hedge_legs": hedge_previews,
@@ -3955,6 +3989,9 @@ def place_nifty_income_manual_pair(
     include_ce: bool = True,
     include_cover: bool = True,
     allow_uncovered_override: bool = False,
+    target_expiry: date | str | None = None,
+    target_pe_strike: float | int | str | None = None,
+    target_ce_strike: float | int | str | None = None,
 ) -> list[dict[str, Any]]:
     if not kite_profile_nifty_income_enabled():
         raise PermissionError(
@@ -3969,6 +4006,9 @@ def place_nifty_income_manual_pair(
         include_ce,
         include_cover,
         allow_uncovered_override,
+        target_expiry,
+        target_pe_strike,
+        target_ce_strike,
     )
     missing_ltp = snapshot.get("missing_ltp") or []
     if missing_ltp:
@@ -5259,6 +5299,19 @@ def execute_nifty_orders(
     return results
 
 
+def nifty_grow_snapshot(force: bool = False) -> dict[str, Any]:
+    cache_key = "nifty-grow:snapshot"
+    if not force:
+        cached = APP_CACHE.get(cache_key)
+        if cached and time.time() - cached[0] < 120:
+            return copy.deepcopy(cached[1])
+    income_snapshot = nifty_income_snapshot(force)
+    model = nifty_grow_from_income_snapshot(income_snapshot, NIFTY_GROW_DEFAULT_CONFIG)
+    model["base_income_snapshot_loaded_at"] = datetime.now(INDIA_TIME_ZONE).isoformat()
+    APP_CACHE[cache_key] = (time.time(), copy.deepcopy(model))
+    return model
+
+
 def run_nifty_income_entry_job(now: datetime | None = None, force: bool = False) -> dict[str, Any] | None:
     if not kite_profile_nifty_income_enabled():
         return None
@@ -5616,6 +5669,8 @@ class PageState:
     nifty_income_snapshot: dict[str, Any] | None = None
     nifty_income_results: list[dict[str, Any]] | None = None
     nifty_income_error: str = ""
+    nifty_grow_snapshot: dict[str, Any] | None = None
+    nifty_grow_error: str = ""
     kite_request_token: str = ""
     kite_ip_data: list[dict[str, str]] | None = None
     etf_buy_amount: float = field(default_factory=etf_buy_amount_setting)
@@ -19804,6 +19859,290 @@ def render_income_panel(state: PageState) -> str:
     </form>"""
 
 
+def render_nifty_grow_panel(state: PageState) -> str:
+    panel_style = "" if state.active_tab == "nifty-grow" else ' style="display:none"'
+    snapshot = state.nifty_grow_snapshot or {}
+    if not snapshot and state.active_tab == "nifty-grow" and not state.nifty_grow_error:
+        try:
+            snapshot = nifty_grow_snapshot(False)
+        except Exception as exc:
+            state.nifty_grow_error = f"{friendly_external_error(exc, 'NIFTYGrow')}\n\n{traceback.format_exc()}"
+            snapshot = {}
+    optimizer = snapshot.get("optimizer") or {}
+    strategy = snapshot.get("strategy") or {}
+    candidates = snapshot.get("candidates") or []
+    risk_contract = snapshot.get("risk_contract") or {}
+    warnings = snapshot.get("warnings") or []
+    best_allowed = next((row for row in candidates if row.get("allowed")), None)
+    best_candidate = best_allowed or snapshot.get("best_candidate") or (candidates[0] if candidates else {})
+
+    def n(value: Any, default: float = 0.0) -> float:
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def status_badge(allowed: Any, text: str | None = None) -> str:
+        is_allowed = bool(allowed)
+        label = text or ("SELECTED" if is_allowed else "REJECTED")
+        css = "good" if is_allowed else "avoid"
+        return f'<span class="score-badge {css}">{html.escape(label)}</span>'
+
+    def expiry_rows() -> str:
+        rows = optimizer.get("all_expiry_candidates") or []
+        if not rows:
+            return '<tr><td colspan="8">Refresh NIFTYGrow to scan expiry buckets.</td></tr>'
+        selected_expiry = str(optimizer.get("selected_expiry") or "")
+        html_rows = []
+        for row in rows:
+            selected = str(row.get("expiry") or "") == selected_expiry and bool(selected_expiry)
+            html_rows.append(
+                "<tr>"
+                f"<td>{status_badge(selected, 'BEST' if selected else str(row.get('status') or 'SCAN'))}</td>"
+                f"<td><strong>{html.escape(str(row.get('expiry') or 'N/A'))}</strong></td>"
+                f"<td>{html.escape(str(row.get('dte') or 'N/A'))}</td>"
+                f"<td>{html.escape(str(row.get('bucket') or 'N/A'))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('liquidity_score'), 0))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('expected_move_points'), 2))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('credit_quality_score'), 0))}</td>"
+                f"<td>{html.escape(str(row.get('reason') or row.get('rejection_reason') or optimizer.get('reason') or ''))}</td>"
+                "</tr>"
+            )
+        return "".join(html_rows)
+
+    def candidate_rows() -> str:
+        if not candidates:
+            return '<tr><td colspan="16">No tactical spread candidates available yet.</td></tr>'
+        html_rows = []
+        for row in candidates:
+            allowed = bool(row.get("allowed"))
+            reason = row.get("rejection_reason") or ("Allowed by NIFTYGrow filters" if allowed else "Rejected")
+            prob = row.get("probability_metrics") or {}
+            html_rows.append(
+                f'<tr class="{"signal-green" if allowed else "signal-red"}">'
+                f"<td>{status_badge(allowed, 'ALLOW' if allowed else 'BLOCK')}</td>"
+                f"<td><strong>{html.escape(str(row.get('strategy') or 'N/A'))}</strong><small>{html.escape(str(row.get('side') or ''))}</small></td>"
+                f"<td>{html.escape(str(row.get('expiry_date') or row.get('expiry') or 'N/A'))}</td>"
+                f"<td>{html.escape(str(row.get('dte') or 'N/A'))}</td>"
+                f"<td class=\"nifty-key-cell strike-cell\"><strong>{html.escape(fmt_number(row.get('short_strike'), 0))}</strong></td>"
+                f"<td>{html.escape(fmt_number(row.get('hedge_strike'), 0))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('spread_width'), 0))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('net_credit'), 2))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('credit_pct_of_width'), 2))}%</td>"
+                f"<td>{html.escape(fmt_number(row.get('liquidity_score'), 0))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('probability_touch') or prob.get('probability_touch_pct'), 2))}%</td>"
+                f"<td>{html.escape(fmt_number(row.get('expected_move_multiple') or prob.get('expected_move_multiple'), 2))}x</td>"
+                f"<td>{html.escape(fmt_number(row.get('confidence_score'), 0))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('max_gain'), 2))}</td>"
+                f"<td>{html.escape(fmt_number(row.get('max_loss'), 2))}</td>"
+                f"<td>{html.escape(str(reason))}</td>"
+                "</tr>"
+            )
+        return "".join(html_rows)
+
+    def side_otm(side: str, fallback: float = 5.5) -> float:
+        row = next(
+            (
+                item
+                for item in candidates
+                if item.get("allowed") and str(item.get("side") or "").upper() == side
+            ),
+            None,
+        ) or (
+            best_candidate if str(best_candidate.get("side") or "").upper() == side else {}
+        )
+        metrics = row.get("probability_metrics") if isinstance(row.get("probability_metrics"), dict) else {}
+        return max(1.0, n(metrics.get("distance_to_strike_pct") or row.get("otm_pct"), fallback))
+
+    include_pe = any(row.get("allowed") and str(row.get("side") or "").upper() == "PE" for row in candidates)
+    include_ce = any(row.get("allowed") and str(row.get("side") or "").upper() == "CE" for row in candidates)
+    if str(strategy.get("selected_strategy") or "") == "BULL_PUT_SPREAD":
+        include_ce = False
+    elif str(strategy.get("selected_strategy") or "") == "BEAR_CALL_SPREAD":
+        include_pe = False
+    elif str(strategy.get("selected_strategy") or "") == "IRON_CONDOR":
+        include_pe = include_pe or bool(candidates)
+        include_ce = include_ce or bool(candidates)
+    selected_expiry = str(optimizer.get("selected_expiry") or "")
+    can_build = bool(best_allowed) and (include_pe or include_ce)
+    pe_otm = fmt_number(side_otm("PE"), 2)
+    ce_otm = fmt_number(side_otm("CE"), 2)
+
+    def selected_side_candidate(side: str) -> dict[str, Any]:
+        side = side.upper()
+        return next(
+            (
+                row
+                for row in candidates
+                if row.get("allowed") and str(row.get("side") or "").upper() == side
+            ),
+            {},
+        )
+
+    def any_side_candidate(side: str) -> dict[str, Any]:
+        side = side.upper()
+        return selected_side_candidate(side) or next(
+            (row for row in candidates if str(row.get("side") or "").upper() == side),
+            {},
+        )
+
+    pe_candidate = selected_side_candidate("PE") if include_pe else {}
+    ce_candidate = selected_side_candidate("CE") if include_ce else {}
+
+    def strike_attr(row: dict[str, Any]) -> str:
+        strike = n(row.get("short_strike"), 0.0) if row else 0.0
+        return str(int(round(strike))) if strike > 0 else ""
+
+    pe_strike_attr = strike_attr(pe_candidate)
+    ce_strike_attr = strike_attr(ce_candidate)
+    build_button = (
+        f'<button type="button" id="nifty-grow-open" data-expiry="{html.escape(selected_expiry, quote=True)}" '
+        f'data-pe-otm="{html.escape(pe_otm, quote=True)}" data-ce-otm="{html.escape(ce_otm, quote=True)}" '
+        f'data-pe-strike="{html.escape(pe_strike_attr, quote=True)}" data-ce-strike="{html.escape(ce_strike_attr, quote=True)}" '
+        f'data-include-pe="{1 if include_pe else 0}" data-include-ce="{1 if include_ce else 0}" data-lots="1">'
+        "Place nifty positions</button>"
+        if can_build
+        else '<button type="button" disabled>Place nifty positions</button>'
+    )
+
+    def best_position_rows() -> str:
+        selected = [("PE SELL", pe_candidate), ("CE SELL", ce_candidate)]
+        rows = []
+        for label, row in selected:
+            side = "PE" if label.startswith("PE") else "CE"
+            display_row = row or any_side_candidate(side)
+            if not display_row:
+                rows.append(
+                    "<tr class=\"signal-red\">"
+                    f"<td><strong>{html.escape(label)}</strong></td>"
+                    "<td colspan=\"10\">No candidate found for this side.</td>"
+                    "</tr>"
+                )
+                continue
+            allowed = bool(row)
+            prob = display_row.get("probability_metrics") if isinstance(display_row.get("probability_metrics"), dict) else {}
+            adjustment = display_row.get("strike_adjustment_reason") or (
+                "Selected exact strike" if allowed else display_row.get("rejection_reason") or "Not selected"
+            )
+            hedge_symbol = display_row.get("hedge_symbol") or display_row.get("hedge_tradingsymbol") or ""
+            option_text = str(display_row.get("short_symbol") or display_row.get("tradingsymbol") or "N/A")
+            if hedge_symbol:
+                option_text += f" | Hedge {hedge_symbol}"
+            rows.append(
+                f'<tr class="{"signal-green" if allowed else "signal-red"}">'
+                f"<td><strong>{html.escape(label)}</strong><small>{html.escape(str(display_row.get('strategy') or ''))}</small></td>"
+                f"<td>{html.escape(str(display_row.get('expiry_date') or display_row.get('expiry') or selected_expiry or 'N/A'))}</td>"
+                f"<td><strong>{html.escape(option_text)}</strong></td>"
+                f"<td class=\"nifty-key-cell strike-cell\"><strong>{html.escape(fmt_number(display_row.get('short_strike'), 0))}</strong></td>"
+                f"<td>{html.escape(fmt_number(prob.get('distance_to_strike_pct') or display_row.get('otm_pct'), 2))}%</td>"
+                f"<td>{html.escape(fmt_number(display_row.get('net_credit'), 2))}</td>"
+                f"<td>{html.escape(fmt_number(display_row.get('probability_touch') or prob.get('probability_touch_pct'), 2))}%</td>"
+                f"<td>{html.escape(fmt_number(display_row.get('max_gain'), 2))}</td>"
+                f"<td>{html.escape(fmt_number(display_row.get('liquidity_score'), 0))}</td>"
+                f"<td>{html.escape(fmt_number(display_row.get('confidence_score'), 0))}</td>"
+                f"<td>{html.escape(str(adjustment))}</td>"
+                "</tr>"
+            )
+        return "".join(rows)
+    warning_html = "".join(f"<li>{html.escape(str(item))}</li>" for item in warnings if str(item).strip())
+    audit_csv = nifty_grow_audit_csv(snapshot) if snapshot else ""
+    error_html = (
+        f'<section class="alert error"><strong>NIFTYGrow error</strong><pre>{html.escape(state.nifty_grow_error)}</pre></section>'
+        if state.nifty_grow_error
+        else ""
+    )
+    no_trade_message = ""
+    if not can_build:
+        fallback = "Wheel / Covered Call / Keep Cash"
+        no_trade_message = (
+            '<div class="nifty-section-card signal-yellow">'
+            '<div class="nifty-section-title">No Trade / Capital Router</div>'
+            f'<strong>{html.escape(str(strategy.get("selected_strategy") or "NO_TRADE"))}</strong>'
+            f'<p>{html.escape(str(strategy.get("reason") or optimizer.get("reason") or "No approved NIFTYGrow candidate."))}</p>'
+            f'<small>Fallback: {html.escape(fallback)}</small>'
+            '</div>'
+        )
+    return f"""
+    <form id="nifty-grow-panel" method="post" action="/nifty-grow/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      {error_html}
+      <section class="panel nifty-hero-panel">
+        <div>
+          <div class="panel-title">NIFTYGrow - 3W Tactical Expiry Optimizer</div>
+          <p class="status">Liquidity-first NIFTY spreads. Scans 2W, preferred 3W, and 4W buckets, then routes only the best risk-adjusted structure into the existing 10-second NIFTY execution review.</p>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/nifty-grow/load">Refresh NIFTYGrow Model</button>
+        </div>
+      </section>
+      <section class="panel nifty-dashboard-panel">
+        <div class="nifty-dashboard-layout">
+          <div class="nifty-section-card">
+            <div class="nifty-section-title">Selected Expiry</div>
+            <div class="income-equity-metrics">
+              <div><span>Expiry</span><strong>{html.escape(str(optimizer.get("selected_expiry") or "N/A"))}</strong></div>
+              <div><span>DTE</span><strong>{html.escape(str(optimizer.get("selected_dte") or "N/A"))}</strong></div>
+              <div><span>Bucket</span><strong>{html.escape(str(optimizer.get("selected_bucket") or "N/A"))}</strong></div>
+              <div><span>Expiry score</span><strong>{html.escape(fmt_number(optimizer.get("expiry_score"), 0))}</strong></div>
+            </div>
+            <p class="status">{html.escape(str(optimizer.get("reason") or ""))}</p>
+          </div>
+          <div class="nifty-section-card">
+            <div class="nifty-section-title">Market Regime</div>
+            <div class="income-equity-metrics">
+              <div><span>Strategy</span><strong>{html.escape(str(strategy.get("selected_strategy") or "N/A"))}</strong></div>
+              <div><span>PE side</span><strong>{'Allowed' if strategy.get('allow_pe_spread') else 'Blocked'}</strong></div>
+              <div><span>CE side</span><strong>{'Allowed' if strategy.get('allow_ce_spread') else 'Blocked'}</strong></div>
+              <div><span>Reason</span><strong>{html.escape(str(strategy.get("reason") or "N/A"))}</strong></div>
+            </div>
+          </div>
+        </div>
+        {no_trade_message}
+      </section>
+      <section class="panel">
+        <div class="panel-title">Best NIFTY PE + CE SELL Positions</div>
+        <p class="status">The regime engine selects the strongest PE and CE income legs. Review fresh option liquidity, OTM distance, premium, POP, margin, and defined-risk protection before placing the pair.</p>
+        <div class="nifty-order-strip">
+          <div>
+            <strong>Fresh-price execution</strong>
+            <small>SELL limits default to 20.00% above fresh Kite LTP. The order window revalidates both legs before the 10-second pause.</small>
+          </div>
+          {build_button}
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>Side</th><th>Expiry</th><th>Option / Hedge</th><th>Strike</th><th>OTM</th><th>Credit</th><th>Touch risk</th><th>Max gain</th><th>Liquidity</th><th>Confidence</th><th>Adjustment / status</th></tr></thead><tbody>{best_position_rows()}</tbody></table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">NIFTY Expiry Optimizer</div>
+        <div class="table-wrap"><table><thead><tr><th>Status</th><th>Expiry</th><th>DTE</th><th>Bucket</th><th>Liquidity</th><th>Expected move</th><th>Credit quality</th><th>Reason</th></tr></thead><tbody>{expiry_rows()}</tbody></table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">Tactical Spread Candidates</div>
+        <p class="status">Best candidate ranks first. Rejected rows stay visible for audit and learning.</p>
+        <div class="table-wrap"><table><thead><tr><th>Status</th><th>Strategy</th><th>Expiry</th><th>DTE</th><th>Short strike</th><th>Hedge strike</th><th>Width</th><th>Credit</th><th>Credit %</th><th>Liquidity</th><th>Touch</th><th>EM multiple</th><th>Confidence</th><th>Max gain</th><th>Max loss</th><th>Reason</th></tr></thead><tbody>{candidate_rows()}</tbody></table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">Risk Contract</div>
+        <div class="income-equity-metrics">
+          <div><span>Max gain</span><strong>{html.escape(fmt_number(risk_contract.get("max_gain"), 2))}</strong></div>
+          <div><span>Max loss</span><strong>{html.escape(fmt_number(risk_contract.get("max_loss"), 2))}</strong></div>
+          <div><span>Yield on margin</span><strong>{html.escape(fmt_number(risk_contract.get("premium_yield_on_margin_pct"), 2))}%</strong></div>
+          <div><span>Loss / credit</span><strong>{html.escape(fmt_number(risk_contract.get("max_loss_to_credit_ratio"), 2))}</strong></div>
+          <div><span>Stop value</span><strong>{html.escape(fmt_number(risk_contract.get("stop_loss_value"), 2))}</strong></div>
+          <div><span>Profit target</span><strong>{html.escape(str(risk_contract.get("profit_target_decay_pct") or "N/A"))}% decay</strong></div>
+          <div><span>Force exit DTE</span><strong>{html.escape(str(risk_contract.get("force_exit_dte") or "N/A"))}</strong></div>
+        </div>
+        {f'<ul class="status-list">{warning_html}</ul>' if warning_html else ''}
+      </section>
+      <details class="panel">
+        <summary>Show NIFTYGrow audit CSV</summary>
+        <textarea class="console-output" readonly rows="8">{html.escape(audit_csv)}</textarea>
+      </details>
+    </form>
+    """
+
+
 def render_nifty_income_panel(state: PageState) -> str:
     panel_style = "" if state.active_tab == "nifty-income" else ' style="display:none"'
     snapshot = state.nifty_income_snapshot
@@ -20570,6 +20909,9 @@ def render_nifty_income_panel(state: PageState) -> str:
           <input type="hidden" name="nifty_pair_confirmed" id="nifty-pair-confirmed" value="0">
           <input type="hidden" name="nifty_pair_pe_otm" id="nifty-pair-pe-otm" value="{html.escape(default_pe_otm, quote=True)}">
           <input type="hidden" name="nifty_pair_ce_otm" id="nifty-pair-ce-otm" value="{html.escape(default_ce_otm, quote=True)}">
+          <input type="hidden" name="nifty_pair_target_expiry" id="nifty-pair-target-expiry" value="">
+          <input type="hidden" name="nifty_pair_pe_strike" id="nifty-pair-pe-strike" value="">
+          <input type="hidden" name="nifty_pair_ce_strike" id="nifty-pair-ce-strike" value="">
           <div class="nifty-side-selector">
             <label><input type="checkbox" name="nifty_pair_include_pe" id="nifty-pair-include-pe" checked> <span>PE side</span><small>SELL PE; hedge optional</small></label>
             <label><input type="checkbox" name="nifty_pair_include_ce" id="nifty-pair-include-ce" checked> <span>CE side</span><small>SELL CE; hedge optional</small></label>
@@ -20899,6 +21241,7 @@ def render_page(state: PageState) -> bytes:
     income_growth_tab_class = "active" if state.active_tab == "income-growth" else ""
     equity_tab_class = "active" if state.active_tab == "equity" else ""
     nifty_income_tab_class = "active" if state.active_tab == "nifty-income" else ""
+    nifty_grow_tab_class = "active" if state.active_tab == "nifty-grow" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
     kite_setup_panel_style = "" if state.active_tab == "kite-setup" else ' style="display:none"'
@@ -22593,6 +22936,40 @@ def render_page(state: PageState) -> bytes:
     .nifty-best-position-action button {{
       flex: 0 0 auto;
       min-width: 180px;
+      background: linear-gradient(135deg, #0369a1 0%, #0f766e 100%);
+      box-shadow: 0 10px 22px rgba(15, 118, 110, 0.18);
+    }}
+    .nifty-order-strip {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin: 10px 0 12px;
+      padding: 12px 14px;
+      border: 1px solid #99f6e4;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #ecfeff 0%, #f0fdfa 100%);
+      box-shadow: 0 12px 24px rgba(15, 118, 110, 0.10);
+    }}
+    .nifty-order-strip strong,
+    .nifty-order-strip small {{
+      display: block;
+    }}
+    .nifty-order-strip strong {{
+      color: #0f766e;
+      font-size: 14px;
+      font-weight: 950;
+    }}
+    .nifty-order-strip small {{
+      margin-top: 4px;
+      color: #52647a;
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1.35;
+    }}
+    .nifty-order-strip button {{
+      flex: 0 0 auto;
+      min-width: 190px;
       background: linear-gradient(135deg, #0369a1 0%, #0f766e 100%);
       box-shadow: 0 10px 22px rgba(15, 118, 110, 0.18);
     }}
@@ -25263,6 +25640,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       {f'<button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>' if nifty_income_enabled else ''}
+      {f'<button class="tab-button utility-action {nifty_grow_tab_class}" type="button" data-tab="nifty-grow">NIFTYGrow</button>' if nifty_income_enabled else ''}
       <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
       <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
       <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT</button>
@@ -25393,6 +25771,7 @@ def render_page(state: PageState) -> bytes:
     {render_research_panel(state)}
     {render_income_panel(state)}
     {render_nifty_income_panel(state)}
+    {render_nifty_grow_panel(state)}
     {render_investing_panel(state)}
     {render_equity_panel(state)}
     {render_income_growth_panel(state)}
@@ -25645,6 +26024,8 @@ def render_page(state: PageState) -> bytes:
       document.getElementById('research-panel').style.display = active === 'research' ? '' : 'none';
       document.getElementById('income-panel').style.display = active === 'income' ? '' : 'none';
       document.getElementById('nifty-income-panel').style.display = active === 'nifty-income' ? '' : 'none';
+      const niftyGrowPanel = document.getElementById('nifty-grow-panel');
+      if (niftyGrowPanel) niftyGrowPanel.style.display = active === 'nifty-grow' ? '' : 'none';
       document.getElementById('investing-panel').style.display = active === 'investing' ? '' : 'none';
       document.getElementById('equity-panel').style.display = active === 'equity' ? '' : 'none';
       document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
@@ -25670,6 +26051,7 @@ def render_page(state: PageState) -> bytes:
           research: '/research',
           income: '/income',
           'nifty-income': '/nifty-income',
+          'nifty-grow': '/nifty-grow',
           investing: '/investing',
           equity: '/equity',
           'income-growth': '/income-growth',
@@ -25764,6 +26146,7 @@ def render_page(state: PageState) -> bytes:
       '/orders/refresh': 'Loading current Kite orders...',
       '/analytics/load': 'Calculating option analytics...',
       '/income/load': 'Calculating income candidates...',
+      '/nifty-grow/load': 'Optimizing NIFTY expiries and tactical spreads...',
       '/income-growth/load': 'Refreshing income-growth analysis...',
       '/investing/load': 'Refreshing investing portfolio...',
       '/equity/load': 'Loading equity holdings...',
@@ -25844,9 +26227,13 @@ def render_page(state: PageState) -> bytes:
     const incomePeBreath = document.getElementById('income-pe-breath');
     const incomePeLoading = document.getElementById('income-pe-loading');
     const niftyPairOpen = document.getElementById('nifty-pair-open');
+    const niftyGrowOpen = document.getElementById('nifty-grow-open');
     const niftyPairModal = document.getElementById('nifty-pair-order-modal');
     const niftyPairPeOtm = document.getElementById('nifty-pair-pe-otm');
     const niftyPairCeOtm = document.getElementById('nifty-pair-ce-otm');
+    const niftyPairTargetExpiry = document.getElementById('nifty-pair-target-expiry');
+    const niftyPairPeStrike = document.getElementById('nifty-pair-pe-strike');
+    const niftyPairCeStrike = document.getElementById('nifty-pair-ce-strike');
     const niftyPairLots = document.getElementById('nifty-pair-lots');
     const niftyPairIncludePe = document.getElementById('nifty-pair-include-pe');
     const niftyPairIncludeCe = document.getElementById('nifty-pair-include-ce');
@@ -26252,7 +26639,16 @@ def render_page(state: PageState) -> bytes:
       if (niftyPairSummary) niftyPairSummary.textContent = 'Loading fresh NIFTY option premium, POP approximation, and max gain...';
       setQuoteLoading(niftyPairModal, niftyPairLoading, true, 'Revalidating NIFTY PE+CE pair...');
       try {{
-        const response = await fetch(`/nifty-income/pair-quote?pe_otm=${{encodeURIComponent(peOtm)}}&ce_otm=${{encodeURIComponent(ceOtm)}}&lots=${{encodeURIComponent(lots)}}&include_pe=${{includePe ? '1' : '0'}}&include_ce=${{includeCe ? '1' : '0'}}&include_cover=${{includeCover ? '1' : '0'}}&uncovered_ack=${{uncoveredAck ? '1' : '0'}}`, {{ cache: 'no-store' }});
+        const targetExpiry = niftyPairModal ? (niftyPairModal.dataset.targetExpiry || '') : '';
+        const expiryParam = targetExpiry ? `&expiry=${{encodeURIComponent(targetExpiry)}}` : '';
+        const targetPeStrike = niftyPairModal ? (niftyPairModal.dataset.peStrike || '') : '';
+        const targetCeStrike = niftyPairModal ? (niftyPairModal.dataset.ceStrike || '') : '';
+        const peStrikeParam = targetPeStrike ? `&pe_strike=${{encodeURIComponent(targetPeStrike)}}` : '';
+        const ceStrikeParam = targetCeStrike ? `&ce_strike=${{encodeURIComponent(targetCeStrike)}}` : '';
+        if (niftyPairTargetExpiry) niftyPairTargetExpiry.value = targetExpiry;
+        if (niftyPairPeStrike) niftyPairPeStrike.value = targetPeStrike;
+        if (niftyPairCeStrike) niftyPairCeStrike.value = targetCeStrike;
+        const response = await fetch(`/nifty-income/pair-quote?pe_otm=${{encodeURIComponent(peOtm)}}&ce_otm=${{encodeURIComponent(ceOtm)}}&lots=${{encodeURIComponent(lots)}}&include_pe=${{includePe ? '1' : '0'}}&include_ce=${{includeCe ? '1' : '0'}}&include_cover=${{includeCover ? '1' : '0'}}&uncovered_ack=${{uncoveredAck ? '1' : '0'}}${{expiryParam}}${{peStrikeParam}}${{ceStrikeParam}}`, {{ cache: 'no-store' }});
         const data = await response.json();
         if (!data.ok) throw new Error(data.error || 'Could not load NIFTY pair');
         renderNiftyPairLegs(data);
@@ -26267,9 +26663,35 @@ def render_page(state: PageState) -> bytes:
     }}
     niftyPairOpen && niftyPairOpen.addEventListener('click', () => {{
       resetNiftyPairConfirmation();
+      if (niftyPairModal) {{
+        niftyPairModal.dataset.targetExpiry = niftyPairOpen.dataset.expiry || '';
+        niftyPairModal.dataset.peStrike = '';
+        niftyPairModal.dataset.ceStrike = '';
+      }}
+      if (niftyPairTargetExpiry) niftyPairTargetExpiry.value = niftyPairOpen.dataset.expiry || '';
+      if (niftyPairPeStrike) niftyPairPeStrike.value = '';
+      if (niftyPairCeStrike) niftyPairCeStrike.value = '';
       if (niftyPairPeOtm) niftyPairPeOtm.value = niftyPairOpen.dataset.peOtm || niftyPairPeOtm.value || '5.5';
       if (niftyPairCeOtm) niftyPairCeOtm.value = niftyPairOpen.dataset.ceOtm || niftyPairCeOtm.value || '5.5';
       if (niftyPairLots && !niftyPairLots.value) niftyPairLots.value = '1';
+      if (niftyPairModal) niftyPairModal.style.display = 'flex';
+      refreshNiftyPairDetails();
+    }});
+    niftyGrowOpen && niftyGrowOpen.addEventListener('click', () => {{
+      resetNiftyPairConfirmation();
+      if (niftyPairModal) {{
+        niftyPairModal.dataset.targetExpiry = niftyGrowOpen.dataset.expiry || '';
+        niftyPairModal.dataset.peStrike = niftyGrowOpen.dataset.peStrike || '';
+        niftyPairModal.dataset.ceStrike = niftyGrowOpen.dataset.ceStrike || '';
+      }}
+      if (niftyPairTargetExpiry) niftyPairTargetExpiry.value = niftyGrowOpen.dataset.expiry || '';
+      if (niftyPairPeStrike) niftyPairPeStrike.value = niftyGrowOpen.dataset.peStrike || '';
+      if (niftyPairCeStrike) niftyPairCeStrike.value = niftyGrowOpen.dataset.ceStrike || '';
+      if (niftyPairPeOtm) niftyPairPeOtm.value = niftyGrowOpen.dataset.peOtm || '5.5';
+      if (niftyPairCeOtm) niftyPairCeOtm.value = niftyGrowOpen.dataset.ceOtm || '5.5';
+      if (niftyPairLots) niftyPairLots.value = niftyGrowOpen.dataset.lots || '1';
+      if (niftyPairIncludePe) niftyPairIncludePe.checked = niftyGrowOpen.dataset.includePe !== '0';
+      if (niftyPairIncludeCe) niftyPairIncludeCe.checked = niftyGrowOpen.dataset.includeCe !== '0';
       if (niftyPairModal) niftyPairModal.style.display = 'flex';
       refreshNiftyPairDetails();
     }});
@@ -27465,6 +27887,29 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.nifty_income_error = f"{friendly_external_error(exc, 'NIFTY Income')}\n\n{traceback.format_exc()}"
             self.send_page(state)
             return
+        if parsed_url.path == "/nifty-grow":
+            if not kite_profile_nifty_income_enabled():
+                self.send_page(
+                    PageState(
+                        active_tab="kite-setup",
+                        error=(
+                            f"NIFTYGrow is disabled for Kite profile {selected_kite_profile_name()}. "
+                            "Enable Nifty Income in Kite Setup to open this strategy."
+                        ),
+                    )
+                )
+                return
+            state = PageState(active_tab="nifty-grow")
+            try:
+                state.nifty_grow_snapshot, state.console_log = call_with_console(
+                    nifty_grow_snapshot,
+                    False,
+                )
+                state.message = "Loaded cached NIFTYGrow tactical model."
+            except Exception as exc:
+                state.nifty_grow_error = f"{friendly_external_error(exc, 'NIFTYGrow')}\n\n{traceback.format_exc()}"
+            self.send_page(state)
+            return
         if parsed_url.path == "/income/pe-quote":
             query = parse_qs(parsed_url.query, keep_blank_values=True)
             try:
@@ -27516,6 +27961,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     first(query, "include_ce", "1") != "0",
                     first(query, "include_cover", "1") != "0",
                     first(query, "uncovered_ack", "0") == "1",
+                    first(query, "expiry"),
+                    first(query, "pe_strike"),
+                    first(query, "ce_strike"),
                 )
                 self.send_json({"ok": True, **snapshot})
             except Exception as exc:
@@ -27731,6 +28179,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/income")
                 else "nifty-income"
                 if request_path.startswith("/nifty-income")
+                else "nifty-grow"
+                if request_path.startswith("/nifty-grow")
                 else "investing"
                 if request_path.startswith("/investing")
                 else "equity"
@@ -27837,12 +28287,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             else:
                 state.position_discount_percent = position_close_discount_percent_setting()
 
-        if request_path.startswith("/nifty-income") and not kite_profile_nifty_income_enabled(
-            state.kite_profile
-        ):
+        if (
+            request_path.startswith("/nifty-income")
+            or request_path.startswith("/nifty-grow")
+        ) and not kite_profile_nifty_income_enabled(state.kite_profile):
             state.active_tab = "kite-setup"
             state.error = (
-                f"Nifty Income is disabled for Kite profile {state.kite_profile}. "
+                f"NIFTY strategies are disabled for Kite profile {state.kite_profile}. "
                 "Enable it in Kite Setup before using this strategy."
             )
             self.send_page(state)
@@ -28353,6 +28804,20 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     f"Active positions {summary.get('active_positions') or 0}; "
                     f"P&L {fmt_number(summary.get('pnl'))}."
                 )
+            elif request_path == "/nifty-grow/load":
+                state.nifty_grow_snapshot, state.console_log = call_with_console(
+                    nifty_grow_snapshot,
+                    True,
+                )
+                optimizer = state.nifty_grow_snapshot.get("optimizer") or {}
+                candidates = state.nifty_grow_snapshot.get("candidates") or []
+                approved_count = sum(1 for row in candidates if row.get("allowed"))
+                state.message = (
+                    "NIFTYGrow model refreshed. "
+                    f"Selected {optimizer.get('selected_bucket') or 'NONE'} expiry "
+                    f"{optimizer.get('selected_expiry') or 'N/A'}; "
+                    f"{approved_count} approved tactical candidate(s)."
+                )
             elif request_path == "/nifty-income/save-config":
                 save_nifty_income_config(
                     {
@@ -28438,6 +28903,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     checked(form, "nifty_pair_include_ce"),
                     checked(form, "nifty_pair_include_cover"),
                     checked(form, "nifty_pair_uncovered_ack"),
+                    first(form, "nifty_pair_target_expiry"),
+                    first(form, "nifty_pair_pe_strike"),
+                    first(form, "nifty_pair_ce_strike"),
                 )
                 state.nifty_income_results = results
                 state.nifty_income_snapshot = nifty_income_snapshot(True)
