@@ -10,12 +10,12 @@ import "@fontsource-variable/noto-sans-devanagari";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://indiankumbh.com"),
-  title: { default: "IndianKumbh — Guides for All Kumbh Melas in India", template: "%s | IndianKumbh" },
-  description: "One trusted guide for Ujjain, Nashik-Trimbakeshwar, Prayagraj and Haridwar Kumbh Melas.",
-  keywords: ["Indian Kumbh", "Ujjain Simhastha 2028", "Nashik Kumbh 2027", "Prayagraj Kumbh", "Haridwar Kumbh"],
+  title: { default: "IndianKumbh — India’s Practical Pilgrimage Travel Guide", template: "%s | IndianKumbh" },
+  description: "India’s practical pilgrimage travel guide for Kumbh Mela, Char Dham, 12 Jyotirlinga, temple circuits and sacred city travel.",
+  keywords: ["Indian pilgrimage travel", "Kumbh Mela", "Char Dham Yatra", "12 Jyotirlinga", "temple circuits", "sacred cities"],
   openGraph: {
-    title: "IndianKumbh — One Trusted Guide for All Kumbh Melas",
-    description: "Currently focused on Ujjain Simhastha 2028, with national guides being built.",
+    title: "IndianKumbh — India’s Practical Pilgrimage Travel Guide",
+    description: "Kumbh Mela, Char Dham, 12 Jyotirlinga, temple circuits and sacred city travel for families and senior citizens.",
     images: ["/images/ujjain-shipra-hero.png"],
     type: "website",
   },
@@ -26,8 +26,8 @@ const travelSchema = {
   "@context": "https://schema.org",
   "@type": "TravelGuide",
   name: "IndianKumbh",
-  description: "Practical multilingual planning for India's four sacred Kumbh cities.",
-  about: ["Ujjain", "Nashik-Trimbakeshwar", "Prayagraj", "Haridwar"].map((name) => ({ "@type": "TouristDestination", name })),
+  description: "India’s practical pilgrimage travel guide for Kumbh Mela, Char Dham, 12 Jyotirlinga, temple circuits and sacred city travel.",
+  about: ["Kumbh Mela", "Char Dham Yatra", "12 Jyotirlinga", "Temple Circuits", "Sacred Cities"].map((name) => ({ "@type": "TouristDestination", name })),
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

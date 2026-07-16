@@ -6821,6 +6821,17 @@ def aggressive_buy_close_price(probability_risk: OptionProbabilityRisk, tick_siz
     return 0.0
 
 
+def passive_buy_close_price_below_ltp(
+    ltp: float,
+    discount_percent: float,
+    tick_size: float = 0.05,
+) -> float:
+    """For short-option close orders, never chase a spike before hard-stop is crossed."""
+    if ltp <= 0:
+        return 0.0
+    return floor_to_tick(ltp * (1 - float(discount_percent) / 100), tick_size)
+
+
 def implied_volatility(
     option_price: float,
     spot: float,
@@ -9490,12 +9501,29 @@ def build_missing_option_close_orders(
                     )
                     evaluations.append(evaluation)
                     continue
-                price_basis = ltp
-                limit_price = aggressive_buy_close_price(probability_risk)
-                rule = (
-                    "aggressive probability-risk close using ask +2% or LTP +5%; "
-                    f"state {probability_risk.probability_risk_state}"
+                hard_multiplier = (
+                    risk_config.CE_HARD_EXIT_MULTIPLIER
+                    if str((option_symbol_parts(symbol) or {}).get("option_type") or "").upper() == "CE"
+                    else risk_config.PE_HARD_EXIT_MULTIPLIER
                 )
+                hard_stop_price = average_price * float(hard_multiplier)
+                if hard_stop_price > 0 and ltp >= hard_stop_price:
+                    price_basis = hard_stop_price
+                    limit_price = floor_to_tick(
+                        hard_stop_price * (1 - discount / 100),
+                        0.05,
+                    )
+                    rule = (
+                        f"hard stop crossed; {discount:g}% below hard-stop premium "
+                        f"{hard_stop_price:.2f}"
+                    )
+                else:
+                    price_basis = ltp
+                    limit_price = passive_buy_close_price_below_ltp(ltp, discount, 0.05)
+                    rule = (
+                        "probability-risk close kept passive because hard stop has not crossed; "
+                        f"{discount:g}% below fresh LTP"
+                    )
             elif probability_risk.probability_risk_state in {"REVIEW", "THREATENED"}:
                 evaluation.update(
                     {
@@ -16005,8 +16033,12 @@ def build_intraday_loss_limit_close_orders(
             continue
         if probability_exit_triggered and not hard_stop_triggered:
             price_source = ltp
-            price_basis = f"probability_{probability_risk.probability_risk_state.lower()}_aggressive"
-            limit_price = aggressive_buy_close_price(probability_risk)
+            price_basis = f"probability_{probability_risk.probability_risk_state.lower()}_passive_ltp"
+            limit_price = passive_buy_close_price_below_ltp(
+                ltp,
+                float(ltp_discount_percent),
+                0.05,
+            )
         else:
             price_source = hard_stop_price if hard_stop_triggered else ltp
             price_basis = "hard_stop_price" if hard_stop_triggered else "fresh_LTP_loss_limit"
@@ -16034,9 +16066,11 @@ def build_intraday_loss_limit_close_orders(
             continue
         note = (
             (
-                f"PROBABILITY RISK EXIT: short {parts_option_type} state "
+                f"PROBABILITY RISK PASSIVE CLOSE: short {parts_option_type} state "
                 f"{probability_risk.probability_risk_state}. {probability_risk.reason} "
-                f"BUY close order set at aggressive limit {limit_price:.2f}."
+                f"Hard stop {hard_stop_price:.2f} has not crossed, so BUY close order "
+                f"is kept {float(ltp_discount_percent):.0f}% below fresh LTP {ltp:.2f} "
+                f"at passive limit {limit_price:.2f}."
             )
             if probability_exit_triggered and not hard_stop_triggered
             else
@@ -19872,6 +19906,7 @@ def render_nifty_grow_panel(state: PageState) -> str:
     strategy = snapshot.get("strategy") or {}
     candidates = snapshot.get("candidates") or []
     risk_contract = snapshot.get("risk_contract") or {}
+    execution_reality = snapshot.get("execution_reality") or {}
     warnings = snapshot.get("warnings") or []
     best_allowed = next((row for row in candidates if row.get("allowed")), None)
     best_candidate = best_allowed or snapshot.get("best_candidate") or (candidates[0] if candidates else {})
@@ -19888,6 +19923,13 @@ def render_nifty_grow_panel(state: PageState) -> str:
         is_allowed = bool(allowed)
         label = text or ("SELECTED" if is_allowed else "REJECTED")
         css = "good" if is_allowed else "avoid"
+        return f'<span class="score-badge {css}">{html.escape(label)}</span>'
+
+    def live_gate_badge(row: dict[str, Any]) -> str:
+        gate = row.get("live_order_gate") if isinstance(row.get("live_order_gate"), dict) else {}
+        allowed = bool(row.get("live_order_allowed"))
+        label = "LIVE" if allowed else str(gate.get("action") or gate.get("status") or "BLOCK")
+        css = "good" if allowed else "risky" if "PREVIEW" in label else "avoid"
         return f'<span class="score-badge {css}">{html.escape(label)}</span>'
 
     def expiry_rows() -> str:
@@ -19914,12 +19956,13 @@ def render_nifty_grow_panel(state: PageState) -> str:
 
     def candidate_rows() -> str:
         if not candidates:
-            return '<tr><td colspan="16">No tactical spread candidates available yet.</td></tr>'
+            return '<tr><td colspan="19">No tactical spread candidates available yet.</td></tr>'
         html_rows = []
         for row in candidates:
             allowed = bool(row.get("allowed"))
             reason = row.get("rejection_reason") or ("Allowed by NIFTYGrow filters" if allowed else "Rejected")
             prob = row.get("probability_metrics") or {}
+            eq = row.get("execution_quality") if isinstance(row.get("execution_quality"), dict) else {}
             html_rows.append(
                 f'<tr class="{"signal-green" if allowed else "signal-red"}">'
                 f"<td>{status_badge(allowed, 'ALLOW' if allowed else 'BLOCK')}</td>"
@@ -19935,6 +19978,9 @@ def render_nifty_grow_panel(state: PageState) -> str:
                 f"<td>{html.escape(fmt_number(row.get('probability_touch') or prob.get('probability_touch_pct'), 2))}%</td>"
                 f"<td>{html.escape(fmt_number(row.get('expected_move_multiple') or prob.get('expected_move_multiple'), 2))}x</td>"
                 f"<td>{html.escape(fmt_number(row.get('confidence_score'), 0))}</td>"
+                f"<td>{live_gate_badge(row)}</td>"
+                f"<td>{html.escape(fmt_number(eq.get('realistic_credit_points') or row.get('realistic_credit_points'), 2))}</td>"
+                f"<td>{html.escape(str(eq.get('data_quality') or row.get('execution_data_quality') or 'N/A'))}</td>"
                 f"<td>{html.escape(fmt_number(row.get('max_gain'), 2))}</td>"
                 f"<td>{html.escape(fmt_number(row.get('max_loss'), 2))}</td>"
                 f"<td>{html.escape(str(reason))}</td>"
@@ -19966,7 +20012,7 @@ def render_nifty_grow_panel(state: PageState) -> str:
         include_pe = include_pe or bool(candidates)
         include_ce = include_ce or bool(candidates)
     selected_expiry = str(optimizer.get("selected_expiry") or "")
-    can_build = bool(best_allowed) and (include_pe or include_ce)
+    can_build = False
     pe_otm = fmt_number(side_otm("PE"), 2)
     ce_otm = fmt_number(side_otm("CE"), 2)
 
@@ -19990,6 +20036,13 @@ def render_nifty_grow_panel(state: PageState) -> str:
 
     pe_candidate = selected_side_candidate("PE") if include_pe else {}
     ce_candidate = selected_side_candidate("CE") if include_ce else {}
+    include_pe = bool(pe_candidate)
+    include_ce = bool(ce_candidate)
+    can_build = bool(
+        pe_candidate
+        and ce_candidate
+        and str(execution_reality.get("status") or "") == "TRADE_ALLOWED"
+    )
 
     def strike_attr(row: dict[str, Any]) -> str:
         strike = n(row.get("short_strike"), 0.0) if row else 0.0
@@ -20046,6 +20099,25 @@ def render_nifty_grow_panel(state: PageState) -> str:
                 "</tr>"
             )
         return "".join(rows)
+    exec_status = str(execution_reality.get("status") or "NO_TRADE")
+    exec_css = "signal-green" if exec_status == "TRADE_ALLOWED" else "signal-red"
+    exec_reasons = execution_reality.get("reason_codes") or []
+    exec_reason_html = ", ".join(str(item) for item in exec_reasons) or str(execution_reality.get("human_reason") or "")
+    execution_reality_html = f"""
+      <section class="panel {exec_css}">
+        <div class="panel-title">Execution Reality Check</div>
+        <p class="status">NIFTYGrow now needs a balanced PE and CE pair with real bid/ask credit before live execution is enabled.</p>
+        <div class="income-equity-metrics">
+          <div><span>Command</span><strong>{html.escape(exec_status)}</strong></div>
+          <div><span>Data quality</span><strong>{html.escape(str(execution_reality.get("data_quality") or "N/A"))}</strong></div>
+          <div><span>Realistic credit</span><strong>{html.escape(fmt_number(execution_reality.get("realistic_credit_value"), 2))}</strong></div>
+          <div><span>LTP credit</span><strong>{html.escape(fmt_number(execution_reality.get("ltp_credit_value"), 2))}</strong></div>
+          <div><span>Paper gap</span><strong>{html.escape(fmt_number(execution_reality.get("optimistic_vs_realistic_gap_pct"), 2))}%</strong></div>
+          <div><span>Missing side</span><strong>{html.escape(str(execution_reality.get("missing_sides") or "None"))}</strong></div>
+        </div>
+        <p class="status">{html.escape(exec_reason_html)}</p>
+      </section>
+    """
     warning_html = "".join(f"<li>{html.escape(str(item))}</li>" for item in warnings if str(item).strip())
     audit_csv = nifty_grow_audit_csv(snapshot) if snapshot else ""
     error_html = (
@@ -20101,6 +20173,7 @@ def render_nifty_grow_panel(state: PageState) -> str:
         </div>
         {no_trade_message}
       </section>
+      {execution_reality_html}
       <section class="panel">
         <div class="panel-title">Best NIFTY PE + CE SELL Positions</div>
         <p class="status">The regime engine selects the strongest PE and CE income legs. Review fresh option liquidity, OTM distance, premium, POP, margin, and defined-risk protection before placing the pair.</p>
@@ -20120,7 +20193,7 @@ def render_nifty_grow_panel(state: PageState) -> str:
       <section class="panel">
         <div class="panel-title">Tactical Spread Candidates</div>
         <p class="status">Best candidate ranks first. Rejected rows stay visible for audit and learning.</p>
-        <div class="table-wrap"><table><thead><tr><th>Status</th><th>Strategy</th><th>Expiry</th><th>DTE</th><th>Short strike</th><th>Hedge strike</th><th>Width</th><th>Credit</th><th>Credit %</th><th>Liquidity</th><th>Touch</th><th>EM multiple</th><th>Confidence</th><th>Max gain</th><th>Max loss</th><th>Reason</th></tr></thead><tbody>{candidate_rows()}</tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Status</th><th>Strategy</th><th>Expiry</th><th>DTE</th><th>Short strike</th><th>Hedge strike</th><th>Width</th><th>Credit</th><th>Credit %</th><th>Liquidity</th><th>Touch</th><th>EM multiple</th><th>Confidence</th><th>Live gate</th><th>Real credit</th><th>Data</th><th>Max gain</th><th>Max loss</th><th>Reason</th></tr></thead><tbody>{candidate_rows()}</tbody></table></div>
       </section>
       <section class="panel">
         <div class="panel-title">Risk Contract</div>

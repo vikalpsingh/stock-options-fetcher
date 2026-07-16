@@ -7,6 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { PackageLeadForm } from "@/src/components/packages/PackageLeadForm";
 import { getPackagesForDestination } from "@/src/data/packageCategories";
+import { HotelBookingCTA } from "@/src/components/travel/HotelBookingCTA";
+import { HotelSearchBox } from "@/src/components/travel/HotelSearchBox";
+import { TravelSearchWidget } from "@/src/components/travel/TravelSearchWidget";
 
 export const metadata: Metadata = {
   title: "Ujjain Kumbh 2028 Packages | Family, Senior Citizen and Group Yatra",
@@ -80,10 +83,9 @@ export default function UjjainPackagesPage() {
 
       <section className="bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24">
         <div className="mx-auto max-w-7xl">
-          <SectionHeading eyebrow="Book accommodation separately" title="Compare hotel options by base city" text="Hotel availability, payment and cancellation are handled on the partner website." />
-          <div className="mt-8 flex flex-wrap gap-3">
-            {[["Check Ujjain Hotels", "/go/booking-ujjain-hotels"], ["Check Indore Hotels", "/go/booking-indore-hotels"], ["Check Bhopal Hotels", "/go/booking-bhopal-hotels"]].map(([label, href]) => <Button key={href} asChild variant="outline"><Link href={href} rel="sponsored nofollow">{label}<ArrowRight className="h-4 w-4" /></Link></Button>)}
-          </div>
+          <SectionHeading eyebrow="Prefer self-booking your hotel?" title="Compare hotel options by base city" text="Hotel availability, payment and cancellation are handled on Booking.com or by the hotel." />
+          <div className="mt-10 grid gap-8 xl:grid-cols-[.95fr_1.05fr]"><HotelSearchBox title="Prefer self-booking your hotel?" sourcePage="ujjain-packages" /><HotelBookingCTA title="Book hotels separately" sourcePage="ujjain-packages" /></div>
+          <div className="mt-10"><TravelSearchWidget title="Self-book bus, flight or train separately" sourcePage="ujjain-packages-secondary-travel" /></div>
         </div>
       </section>
 

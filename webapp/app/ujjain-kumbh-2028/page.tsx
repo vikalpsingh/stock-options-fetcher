@@ -20,6 +20,10 @@ import { FAQAccordion } from "@/components/faq-accordion";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { getKumbhSite } from "@/src/data/kumbhSites";
+import { HotelBookingCTA } from "@/src/components/travel/HotelBookingCTA";
+import { HotelSearchBox } from "@/src/components/travel/HotelSearchBox";
+import { TravelSearchWidget } from "@/src/components/travel/TravelSearchWidget";
+import { RecommendedRouteCards } from "@/src/components/travel/RecommendedRouteCards";
 
 const ujjain = getKumbhSite("ujjain-kumbh-2028")!;
 
@@ -97,6 +101,18 @@ export default function UjjainKumbhPage() {
           <div className="mt-10 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
             {planningCards.map(({ icon: Icon, ...card }) => <Link key={card.href} href={card.href} className="group"><Card className="premium-card h-full border-gold/30 transition group-hover:-translate-y-1 group-hover:border-saffron/50"><CardContent><span className="grid h-12 w-12 place-items-center rounded-2xl bg-orange-50 text-saffron"><Icon className="h-6 w-6" /></span><h2 className="mt-5 font-serif text-2xl">{card.title}</h2><p className="mt-3 text-sm leading-7 text-stone-600">{card.text}</p><span className="mt-6 inline-flex items-center gap-2 text-sm font-bold text-maroon">Open guide<ArrowRight className="h-4 w-4" /></span></CardContent></Card></Link>)}
           </div>
+          <div className="mt-12 grid gap-8 xl:grid-cols-[.95fr_1.05fr]">
+            <HotelSearchBox title="Where to Stay for Ujjain Kumbh" sourcePage="ujjain-kumbh-2028" />
+            <HotelBookingCTA title="Where to Stay for Ujjain Kumbh" sourcePage="ujjain-kumbh-2028" />
+          </div>
+          <div className="mt-12"><TravelSearchWidget title="Search bus, hotel, flight and train options" sourcePage="ujjain-kumbh-2028" /></div>
+        </div>
+      </section>
+
+      <section className="bg-white px-4 py-16 sm:px-6 lg:px-8 lg:py-24">
+        <div className="mx-auto max-w-7xl">
+          <SectionHeading eyebrow="Route recommendations" title="Best ways to reach Ujjain Kumbh from your city" text="Use these as a starting point, then verify availability, cancellation terms and official Kumbh traffic plans before booking." />
+          <div className="mt-10"><RecommendedRouteCards destinationSlug="ujjain-kumbh-2028" sourcePage="ujjain-route-cards" /></div>
         </div>
       </section>
 

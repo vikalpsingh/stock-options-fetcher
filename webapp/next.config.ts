@@ -10,6 +10,11 @@ const nextConfig: NextConfig = {
       { source: "/mahakal-guide", destination: "/mahakal-temple-guide", permanent: true },
       { source: "/stay", destination: "/stay-guide", permanent: true },
       { source: "/nearby-destinations", destination: "/nearby-places", permanent: true },
+      { source: "/nashik-kumbh-2027", destination: "/kumbh-mela/nashik-kumbh-2027", permanent: true },
+      { source: "/ujjain-kumbh-2028", destination: "/kumbh-mela/ujjain-kumbh-2028", permanent: true },
+      { source: "/prayagraj-kumbh", destination: "/kumbh-mela/prayagraj-kumbh", permanent: true },
+      { source: "/haridwar-kumbh", destination: "/kumbh-mela/haridwar-kumbh", permanent: true },
+      { source: "/kumbh-calendar", destination: "/kumbh-mela/kumbh-calendar", permanent: true },
     ];
   },
   async headers() {

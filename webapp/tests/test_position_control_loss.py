@@ -57,6 +57,36 @@ def test_intraday_guard_does_not_chase_spike_above_entry_before_hard_stop():
     assert "above entry premium" in evaluations[0]["skip_reason"]
 
 
+def test_intraday_probability_risk_close_stays_below_ltp_before_hard_stop():
+    position = {
+        "exchange": "NFO",
+        "tradingsymbol": "ETERNAL26JUL315CE",
+        "quantity": -2425,
+        "product": "NRML",
+        "average_price": 1.10,
+        "ltp": 3.20,
+    }
+    with patch.object(app, "open_option_positions", return_value=[position]), patch.object(
+        app, "refresh_option_positions_with_live_ltp", return_value=[position]
+    ), patch.object(
+        app, "intraday_hard_stop_trading_days_allowed", return_value=(True, 9)
+    ):
+        orders, evaluations = app.build_intraday_loss_limit_close_orders(
+            kite=None,
+            loss_trigger_percent=100,
+            ltp_discount_percent=20,
+        )
+
+    assert evaluations[0]["probability_risk_state"] == "PANIC"
+    assert evaluations[0]["hard_stop_triggered"] is False
+    assert orders[0]["tradingsymbol"] == "ETERNAL26JUL315CE"
+    assert orders[0]["transaction_type"] == "BUY"
+    assert orders[0]["price"] == 2.55
+    assert orders[0]["price"] < position["ltp"]
+    assert orders[0]["price_basis"] == "probability_panic_passive_ltp"
+    assert "PROBABILITY RISK PASSIVE CLOSE" in orders[0]["risk_note"]
+
+
 def test_control_loss_builds_buy_order_at_ten_percent_below_hard_stop():
     rows = [
         {

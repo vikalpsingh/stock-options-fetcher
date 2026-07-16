@@ -238,7 +238,7 @@
       "NIFTY_INCOME_ENABLED": false
     },
     "Monika": {
-      "KITE_ACCESS_TOKEN": "cAStKnl2CPq7duJRxOU5jn6VUSrcnTeN",
+      "KITE_ACCESS_TOKEN": "tPZP1wX4InXN4lxqvyoeXEeorEITlMq7",
       "KITE_API_KEY": "tnaa26kee3iza58w",
       "KITE_API_SECRET": "pk55c56ih0ak3pd6cfmk24z14yt22946",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
@@ -400,5 +400,5 @@
     "schedule_time": "09:20",
     "status": "ERROR"
   },
-  "selected_kite_profile": "Shanti"
+  "selected_kite_profile": "Monika"
 }

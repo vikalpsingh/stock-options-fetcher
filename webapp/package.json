@@ -6,6 +6,7 @@
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",
+    "test:integration": "node --test tests/affiliate-links.integration.mjs tests/booking-url.integration.mjs tests/travel-url.integration.mjs",
     "lint": "next lint"
   },
   "dependencies": {

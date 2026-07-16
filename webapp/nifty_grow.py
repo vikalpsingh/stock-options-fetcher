@@ -4,7 +4,7 @@ import csv
 import io
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from typing import Any
 
@@ -98,6 +98,35 @@ NIFTY_GROW_DEFAULT_CONFIG: dict[str, Any] = {
         "emergency_short_delta": 0.25,
         "emergency_probability_touch_pct": 50.0,
     },
+    "nifty_execution_quality_guard": {
+        "enabled": True,
+        "min_confidence_for_live_order": 70,
+        "min_realistic_credit_pct_of_width": 8.0,
+        "preferred_realistic_credit_pct_of_width": 10.0,
+        "excellent_realistic_credit_pct_of_width": 12.0,
+        "min_realistic_premium_yield_on_margin_pct": 0.8,
+        "paper_trap_max_optimistic_vs_realistic_gap_pct": 25.0,
+        "paper_trap_max_ltp_vs_bidask_gap_pct": 20.0,
+        "preview_allowed_with_ltp_only": True,
+        "reject_live_if_ltp_only": True,
+        "reject_missing_bid_ask": True,
+        "reject_zero_bid": True,
+        "min_oi_for_live": 10000,
+        "min_volume_for_live": 10,
+        "max_bid_ask_spread_pct": 8.0,
+        "max_live_sell_markup_pct": 5.0,
+        "max_live_buy_discount_pct": 3.0,
+        "require_delta_for_live": True,
+        "max_short_delta_for_income": 0.18,
+        "reject_short_delta_above": 0.22,
+        "max_probability_touch_pct": 35.0,
+        "max_loss_mismatch_pct": 5.0,
+        # Kept false because Kite margin verification is profile/session-dependent.
+        # When enabled, Nifty Grow becomes preview-only unless broker margin is attached.
+        "require_broker_verified_margin": False,
+        "hedge_first_required": True,
+        "no_naked_nifty_sell": True,
+    },
 }
 
 
@@ -109,6 +138,66 @@ class NiftyGrowDecision:
     expiry_score: float
     reason: str
     all_expiry_candidates: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ExecutionQualityResult:
+    data_quality: str
+    optimistic_credit_points: float
+    ltp_credit_points: float
+    realistic_credit_points: float
+    optimistic_credit_value: float
+    ltp_credit_value: float
+    realistic_credit_value: float
+    optimistic_vs_realistic_gap_pct: float
+    ltp_vs_bidask_gap_pct: float
+    credit_pct_of_width: float
+    premium_yield_on_margin_pct: float
+    min_bid: float
+    max_ask: float
+    quote_warnings: list[str]
+    reason_codes: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PaperTrapDecision:
+    allowed: bool
+    decision: str
+    reason_codes: list[str]
+    warnings: list[str]
+    human_reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MaxLossValidation:
+    accepted: bool
+    expected_max_loss: float
+    app_reported_max_loss: float
+    mismatch_pct: float
+    reason_codes: list[str]
+    human_reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class NiftyLiveOrderGate:
+    allowed: bool
+    action: str
+    status: str
+    reason_codes: list[str]
+    warnings: list[str]
+    human_reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def _merge_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -543,6 +632,396 @@ def validate_credit_quality(spread_candidate: dict[str, Any], config: dict[str, 
     }
 
 
+def _candidate_strategy_legs(candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    lots = max(1, _int(candidate.get("lots"), 1))
+    lot_size = max(1, _int(candidate.get("lot_size"), 65))
+    short_symbol = str(candidate.get("short_symbol") or candidate.get("tradingsymbol") or "")
+    hedge_symbol = str(candidate.get("hedge_symbol") or candidate.get("hedge_tradingsymbol") or "")
+    side = str(candidate.get("side") or candidate.get("option_type") or "").upper()
+    legs = [
+        {
+            "tradingsymbol": short_symbol,
+            "transaction_type": "SELL",
+            "option_type": side,
+            "strike": candidate.get("short_strike") or candidate.get("strike"),
+            "ltp": candidate.get("short_ltp") if candidate.get("short_ltp") is not None else candidate.get("ltp"),
+            "bid": candidate.get("short_bid") if candidate.get("short_bid") is not None else candidate.get("bid"),
+            "ask": candidate.get("short_ask") if candidate.get("short_ask") is not None else candidate.get("ask"),
+            "delta": candidate.get("short_delta") if candidate.get("short_delta") is not None else candidate.get("delta"),
+            "oi": candidate.get("short_oi") if candidate.get("short_oi") is not None else candidate.get("oi"),
+            "volume": candidate.get("short_volume") if candidate.get("short_volume") is not None else candidate.get("volume"),
+            "price": candidate.get("short_limit_price") or candidate.get("price"),
+            "lots": lots,
+            "lot_size": lot_size,
+        }
+    ]
+    if hedge_symbol:
+        legs.append(
+            {
+                "tradingsymbol": hedge_symbol,
+                "transaction_type": "BUY",
+                "option_type": side,
+                "strike": candidate.get("hedge_strike"),
+                "ltp": candidate.get("hedge_ltp"),
+                "bid": candidate.get("hedge_bid"),
+                "ask": candidate.get("hedge_ask"),
+                "delta": candidate.get("hedge_delta"),
+                "oi": candidate.get("hedge_oi"),
+                "volume": candidate.get("hedge_volume"),
+                "price": candidate.get("hedge_limit_price"),
+                "lots": lots,
+                "lot_size": lot_size,
+            }
+        )
+    return legs
+
+
+def _normalise_strategy_legs(strategy_legs: Any, quote_data: dict[str, Any] | None = None, lot_size: int = 65) -> list[dict[str, Any]]:
+    if isinstance(strategy_legs, dict) and ("short_symbol" in strategy_legs or "short_strike" in strategy_legs):
+        legs = _candidate_strategy_legs(strategy_legs)
+    elif isinstance(strategy_legs, dict) and "legs" in strategy_legs:
+        legs = list(strategy_legs.get("legs") or [])
+    else:
+        legs = list(strategy_legs or [])
+    normalised: list[dict[str, Any]] = []
+    quote_data = quote_data or {}
+    for leg in legs:
+        row = dict(leg)
+        symbol = str(row.get("tradingsymbol") or row.get("symbol") or "")
+        quote = quote_data.get(symbol) or quote_data.get(f"NFO:{symbol}") or {}
+        if quote:
+            row["ltp"] = quote.get("ltp") or quote.get("last_price") or row.get("ltp")
+            row["bid"] = quote.get("bid") or quote.get("best_bid") or row.get("bid")
+            row["ask"] = quote.get("ask") or quote.get("best_ask") or row.get("ask")
+            row["oi"] = quote.get("oi") or quote.get("open_interest") or row.get("oi")
+            row["volume"] = quote.get("volume") or quote.get("day_volume") or row.get("volume")
+            row["delta"] = quote.get("delta") if quote.get("delta") is not None else row.get("delta")
+        row["lot_size"] = max(1, _int(row.get("lot_size"), lot_size))
+        row["lots"] = max(1, _int(row.get("lots"), 1))
+        normalised.append(row)
+    return normalised
+
+
+def calculate_realistic_executable_credit(
+    strategy_legs: Any,
+    quote_data: dict[str, Any] | None = None,
+    lot_size: int = 65,
+    config: dict[str, Any] | None = None,
+) -> ExecutionQualityResult:
+    cfg = _merge_config(config)
+    guard = cfg["nifty_execution_quality_guard"]
+    legs = _normalise_strategy_legs(strategy_legs, quote_data, lot_size)
+    optimistic_credit = 0.0
+    ltp_credit = 0.0
+    realistic_credit = 0.0
+    reason_codes: list[str] = []
+    warnings: list[str] = []
+    min_bid = math.inf
+    max_ask = 0.0
+    full_quote = True
+    ltp_seen = False
+    total_qty = 0
+    width = _float(strategy_legs.get("spread_width") if isinstance(strategy_legs, dict) else 0)
+    margin = 0.0
+    if isinstance(strategy_legs, dict):
+        margin = _float(strategy_legs.get("margin_required") or strategy_legs.get("max_loss"))
+
+    for leg in legs:
+        side = str(leg.get("transaction_type") or "").upper()
+        ltp = _float(leg.get("ltp") or leg.get("last_price") or leg.get("option_ltp"))
+        bid = _float(leg.get("bid") or leg.get("best_bid"))
+        ask = _float(leg.get("ask") or leg.get("best_ask"))
+        price = _float(leg.get("price") or leg.get("limit_price"))
+        qty = max(1, _int(leg.get("quantity"), _int(leg.get("lots"), 1) * _int(leg.get("lot_size"), lot_size)))
+        total_qty = max(total_qty, qty)
+        if ltp > 0:
+            ltp_seen = True
+        else:
+            full_quote = False
+            reason_codes.append("REJECT_LTP_MISSING")
+        if side == "SELL":
+            min_bid = min(min_bid, bid) if bid > 0 else min_bid
+            if bid <= 0:
+                full_quote = False
+                reason_codes.append("REJECT_ZERO_BID" if guard.get("reject_zero_bid", True) else "WARN_ZERO_BID")
+            if ask <= 0:
+                full_quote = False
+                reason_codes.append("REJECT_BID_ASK_MISSING")
+            optimistic_leg = price if price > 0 else ltp * (1 + _float(guard.get("max_live_sell_markup_pct"), 5.0) / 100)
+            optimistic_credit += optimistic_leg
+            ltp_credit += ltp
+            realistic_credit += bid if bid > 0 else 0.0
+        elif side == "BUY":
+            max_ask = max(max_ask, ask)
+            if ask <= 0:
+                full_quote = False
+                reason_codes.append("REJECT_BID_ASK_MISSING")
+            if bid <= 0:
+                warnings.append("BUY_LEG_BID_MISSING")
+            optimistic_leg = price if price > 0 else ltp * (1 - _float(guard.get("max_live_buy_discount_pct"), 3.0) / 100)
+            optimistic_credit -= optimistic_leg
+            ltp_credit -= ltp
+            realistic_credit -= ask if ask > 0 else 0.0
+
+        if bid > 0 and ask > 0 and _spread_pct(bid, ask, ltp) > _float(guard.get("max_bid_ask_spread_pct"), 8.0):
+            reason_codes.append("REJECT_WIDE_BID_ASK")
+        if _int(leg.get("oi")) < _int(guard.get("min_oi_for_live"), 10000):
+            reason_codes.append("REJECT_LOW_OI")
+        if _int(leg.get("volume")) < _int(guard.get("min_volume_for_live"), 10):
+            reason_codes.append("REJECT_LOW_VOLUME")
+
+    if not legs:
+        reason_codes.append("REJECT_NO_LEGS")
+    data_quality = "FULL_QUOTE" if full_quote and legs else "LTP_ONLY" if ltp_seen else "MISSING_QUOTE"
+    optimistic_credit = _round_tick(optimistic_credit)
+    ltp_credit = _round_tick(ltp_credit)
+    realistic_credit = _round_tick(realistic_credit)
+    denominator = max(0.05, abs(realistic_credit))
+    optimistic_gap = max(0.0, (optimistic_credit - realistic_credit) / denominator * 100)
+    ltp_gap = max(0.0, abs(ltp_credit - realistic_credit) / denominator * 100)
+    value_qty = total_qty if total_qty > 0 else max(1, lot_size)
+    credit_pct = realistic_credit / width * 100 if width > 0 else 0.0
+    premium_yield = realistic_credit * value_qty / margin * 100 if margin > 0 else 0.0
+    return ExecutionQualityResult(
+        data_quality=data_quality,
+        optimistic_credit_points=round(optimistic_credit, 2),
+        ltp_credit_points=round(ltp_credit, 2),
+        realistic_credit_points=round(realistic_credit, 2),
+        optimistic_credit_value=round(optimistic_credit * value_qty, 2),
+        ltp_credit_value=round(ltp_credit * value_qty, 2),
+        realistic_credit_value=round(realistic_credit * value_qty, 2),
+        optimistic_vs_realistic_gap_pct=round(optimistic_gap, 2),
+        ltp_vs_bidask_gap_pct=round(ltp_gap, 2),
+        credit_pct_of_width=round(credit_pct, 2),
+        premium_yield_on_margin_pct=round(premium_yield, 2),
+        min_bid=0.0 if math.isinf(min_bid) else round(min_bid, 2),
+        max_ask=round(max_ask, 2),
+        quote_warnings=sorted(set(warnings)),
+        reason_codes=sorted(set(reason_codes)),
+    )
+
+
+def validate_paper_trap_guard(
+    candidate: dict[str, Any],
+    execution_quality: ExecutionQualityResult | dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> PaperTrapDecision:
+    cfg = _merge_config(config)
+    guard = cfg["nifty_execution_quality_guard"]
+    eq = execution_quality.to_dict() if isinstance(execution_quality, ExecutionQualityResult) else dict(execution_quality)
+    reasons: list[str] = []
+    warnings: list[str] = list(eq.get("quote_warnings") or [])
+    if eq.get("data_quality") != "FULL_QUOTE" and guard.get("reject_live_if_ltp_only", True):
+        reasons.append("REJECT_LTP_ONLY_PRICE")
+    if _float(eq.get("realistic_credit_points")) <= 0:
+        reasons.append("REJECT_NO_REALISTIC_CREDIT")
+    if _float(eq.get("credit_pct_of_width")) < _float(guard.get("min_realistic_credit_pct_of_width"), 8.0):
+        reasons.append("REJECT_REALISTIC_CREDIT_BELOW_MIN")
+    if _float(eq.get("premium_yield_on_margin_pct")) < _float(guard.get("min_realistic_premium_yield_on_margin_pct"), 0.8):
+        reasons.append("REJECT_REALISTIC_YIELD_BELOW_MIN")
+    if _float(eq.get("optimistic_vs_realistic_gap_pct")) > _float(guard.get("paper_trap_max_optimistic_vs_realistic_gap_pct"), 25.0):
+        reasons.append("REJECT_PAPER_TRAP_OPTIMISTIC_GAP")
+    if _float(eq.get("ltp_vs_bidask_gap_pct")) > _float(guard.get("paper_trap_max_ltp_vs_bidask_gap_pct"), 20.0):
+        reasons.append("REJECT_PAPER_TRAP_LTP_GAP")
+    reasons.extend(str(item) for item in eq.get("reason_codes") or [] if str(item).startswith("REJECT"))
+    confidence = _float(candidate.get("confidence_score"), 0)
+    if confidence < _float(guard.get("min_confidence_for_live_order"), 70):
+        reasons.append("REJECT_CONFIDENCE_BELOW_MIN")
+    allowed = not reasons
+    decision = "TRADE_ALLOWED" if allowed else "PREVIEW_ONLY" if guard.get("preview_allowed_with_ltp_only", True) else "NO_TRADE"
+    human = (
+        "Bid/ask credit is realistic enough for live review."
+        if allowed
+        else "Live order blocked by execution-quality guard: " + ", ".join(sorted(set(reasons)))
+    )
+    return PaperTrapDecision(allowed=allowed, decision=decision, reason_codes=sorted(set(reasons)), warnings=sorted(set(warnings)), human_reason=human)
+
+
+def validate_defined_risk_payoff(
+    candidate: dict[str, Any],
+    app_reported_max_loss: float | None = None,
+    config: dict[str, Any] | None = None,
+) -> MaxLossValidation:
+    cfg = _merge_config(config)
+    guard = cfg["nifty_execution_quality_guard"]
+    reasons: list[str] = []
+    width = _float(candidate.get("spread_width") or candidate.get("spread_width_points"))
+    lot_size = max(1, _int(candidate.get("lot_size"), 65))
+    lots = max(1, _int(candidate.get("lots"), 1))
+    credit_points = _float(candidate.get("realistic_credit_points") or candidate.get("net_credit"))
+    if width <= 0 or not candidate.get("hedge_symbol"):
+        reasons.append("REJECT_UNDEFINED_RISK")
+    expected = max(0.0, width - credit_points) * lot_size * lots if width > 0 else math.inf
+    reported = _float(app_reported_max_loss if app_reported_max_loss is not None else candidate.get("max_loss"))
+    mismatch = abs(reported - expected) / expected * 100 if expected > 0 and not math.isinf(expected) else 0.0
+    if reported > 0 and expected > 0 and mismatch > _float(guard.get("max_loss_mismatch_pct"), 5.0):
+        reasons.append("REJECT_MAX_LOSS_MISMATCH")
+    accepted = not reasons
+    return MaxLossValidation(
+        accepted=accepted,
+        expected_max_loss=0.0 if math.isinf(expected) else round(expected, 2),
+        app_reported_max_loss=round(reported, 2),
+        mismatch_pct=round(mismatch, 2),
+        reason_codes=sorted(set(reasons)),
+        human_reason=(
+            "Defined-risk payoff math is consistent."
+            if accepted
+            else "Max-loss validation failed: " + ", ".join(sorted(set(reasons)))
+        ),
+    )
+
+
+def validate_short_leg_probability(candidate: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = _merge_config(config)
+    guard = cfg["nifty_execution_quality_guard"]
+    reasons: list[str] = []
+    warnings: list[str] = []
+    delta = abs(_float(candidate.get("short_delta"), -1.0))
+    if delta <= 0:
+        if guard.get("require_delta_for_live", True):
+            reasons.append("REJECT_DELTA_MISSING")
+        else:
+            warnings.append("DELTA_MISSING")
+    elif delta > _float(guard.get("reject_short_delta_above"), 0.22):
+        reasons.append("REJECT_DELTA_EXTREME")
+    elif delta > _float(guard.get("max_short_delta_for_income"), 0.18):
+        reasons.append("REJECT_DELTA_TOO_HIGH")
+    touch = _float(candidate.get("probability_touch"))
+    if touch <= 0 and delta > 0:
+        touch = min(100.0, delta * 200)
+    if touch > _float(guard.get("max_probability_touch_pct"), 35.0):
+        reasons.append("REJECT_TOUCH_PROBABILITY_HIGH")
+    return {
+        "allowed": not reasons,
+        "delta_abs": round(delta, 4) if delta > 0 else None,
+        "probability_touch_pct": round(touch, 2),
+        "reason_codes": sorted(set(reasons)),
+        "warnings": sorted(set(warnings)),
+        "human_reason": "Short-leg probability is inside entry limits." if not reasons else "Probability gate failed: " + ", ".join(sorted(set(reasons))),
+    }
+
+
+def validate_iron_condor_premium_balance(candidate: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    pe_credit = _float(candidate.get("pe_credit") or candidate.get("pe_realistic_credit"))
+    ce_credit = _float(candidate.get("ce_credit") or candidate.get("ce_realistic_credit"))
+    if pe_credit <= 0 or ce_credit <= 0:
+        return {"status": "UNKNOWN", "allowed": True, "ratio": None, "warnings": ["PAIR_CREDIT_MISSING"], "reason_codes": []}
+    ratio = max(pe_credit, ce_credit) / max(0.05, min(pe_credit, ce_credit))
+    reasons: list[str] = []
+    warnings: list[str] = []
+    if ratio > 4:
+        reasons.append("REJECT_PREMIUM_SKEW_TOO_HIGH")
+    elif ratio > 3:
+        warnings.append("PREMIUM_SKEW_HIGH")
+    return {
+        "status": "BALANCED" if ratio <= 3 else "SKEWED",
+        "allowed": not reasons,
+        "ratio": round(ratio, 2),
+        "warnings": warnings,
+        "reason_codes": reasons,
+    }
+
+
+def validate_hedge_first_execution(candidate: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = _merge_config(config)
+    guard = cfg["nifty_execution_quality_guard"]
+    has_short = bool(candidate.get("short_symbol"))
+    has_hedge = bool(candidate.get("hedge_symbol"))
+    reasons: list[str] = []
+    if guard.get("no_naked_nifty_sell", True) and has_short and not has_hedge:
+        reasons.append("REJECT_UNCOVERED_NIFTY_SELL")
+    if guard.get("hedge_first_required", True) and has_short and has_hedge:
+        return {"allowed": True, "execution_sequence": "BUY_HEDGE_FIRST_THEN_SELL_SHORT", "reason_codes": []}
+    return {"allowed": not reasons, "execution_sequence": "SELL_ONLY", "reason_codes": reasons}
+
+
+def evaluate_nifty_live_order_gate(
+    candidate: dict[str, Any],
+    validations: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> NiftyLiveOrderGate:
+    cfg = _merge_config(config)
+    guard = cfg["nifty_execution_quality_guard"]
+    reasons: list[str] = []
+    warnings: list[str] = []
+    if not candidate.get("tactical_allowed", candidate.get("allowed", False)):
+        reasons.append("REJECT_TACTICAL_FILTER")
+    for key in ("paper_trap", "max_loss_validation", "probability_gate", "hedge_execution"):
+        item = validations.get(key) or {}
+        if item.get("warnings"):
+            warnings.extend(str(value) for value in item.get("warnings") or [])
+        if item.get("reason_codes"):
+            reasons.extend(str(value) for value in item.get("reason_codes") or [])
+        if item.get("allowed") is False or item.get("accepted") is False:
+            if key == "paper_trap":
+                reasons.append("REJECT_EXECUTION_QUALITY")
+            elif key == "max_loss_validation":
+                reasons.append("REJECT_PAYOFF_VALIDATION")
+            elif key == "probability_gate":
+                reasons.append("REJECT_PROBABILITY_GATE")
+            elif key == "hedge_execution":
+                reasons.append("REJECT_HEDGE_EXECUTION")
+    if _float(candidate.get("confidence_score"), 0) < _float(guard.get("min_confidence_for_live_order"), 70):
+        reasons.append("REJECT_CONFIDENCE_BELOW_MIN")
+    if guard.get("require_broker_verified_margin", False) and not candidate.get("broker_margin_verified"):
+        reasons.append("REJECT_MARGIN_NOT_BROKER_VERIFIED")
+    allowed = not reasons
+    action = "TRADE_ALLOWED" if allowed else "PREVIEW_ONLY"
+    status = "TRADE_ALLOWED" if allowed else "BLOCKED_BY_GUARD"
+    return NiftyLiveOrderGate(
+        allowed=allowed,
+        action=action,
+        status=status,
+        reason_codes=sorted(set(reasons)),
+        warnings=sorted(set(warnings)),
+        human_reason=(
+            "NIFTYGrow candidate passed execution-quality, payoff, probability, and hedge checks."
+            if allowed
+            else "NIFTYGrow live order blocked: " + ", ".join(sorted(set(reasons)))
+        ),
+    )
+
+
+def enrich_nifty_execution_quality(candidate: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = _merge_config(config)
+    if not cfg["nifty_execution_quality_guard"].get("enabled", True):
+        return candidate
+    candidate = dict(candidate)
+    candidate["tactical_allowed"] = bool(candidate.get("allowed"))
+    eq = calculate_realistic_executable_credit(candidate, config=cfg)
+    candidate["realistic_credit_points"] = eq.realistic_credit_points
+    candidate["realistic_credit_value"] = eq.realistic_credit_value
+    candidate["execution_data_quality"] = eq.data_quality
+    paper = validate_paper_trap_guard(candidate, eq, cfg)
+    candidate_for_loss = {**candidate, "realistic_credit_points": eq.realistic_credit_points}
+    max_loss = validate_defined_risk_payoff(candidate_for_loss, candidate.get("max_loss"), cfg)
+    probability = validate_short_leg_probability(candidate, cfg)
+    hedge_execution = validate_hedge_first_execution(candidate, cfg)
+    gate = evaluate_nifty_live_order_gate(
+        candidate,
+        {
+            "paper_trap": paper.to_dict(),
+            "max_loss_validation": max_loss.to_dict(),
+            "probability_gate": probability,
+            "hedge_execution": hedge_execution,
+        },
+        cfg,
+    )
+    candidate["execution_quality"] = eq.to_dict()
+    candidate["paper_trap_guard"] = paper.to_dict()
+    candidate["max_loss_validation"] = max_loss.to_dict()
+    candidate["probability_gate"] = probability
+    candidate["hedge_execution"] = hedge_execution
+    candidate["live_order_gate"] = gate.to_dict()
+    candidate["live_order_allowed"] = gate.allowed
+    if candidate["tactical_allowed"] and not gate.allowed:
+        existing_reason = str(candidate.get("rejection_reason") or "")
+        joined = ", ".join(gate.reason_codes)
+        candidate["rejection_reason"] = ", ".join(part for part in [existing_reason, joined] if part)
+    candidate["allowed"] = bool(candidate["tactical_allowed"] and gate.allowed)
+    return candidate
+
+
 def _option_rows(option_chain: list[dict[str, Any]], expiry: date, option_type: str) -> list[dict[str, Any]]:
     return [
         row
@@ -652,7 +1131,14 @@ def _candidate_from_pair(
     short_strike = _float(short.get("strike"))
     hedge_strike = _float(hedge.get("strike"))
     width = abs(short_strike - hedge_strike)
-    net_credit = _float(short.get("bid") or short.get("ltp")) - _float(hedge.get("ask") or hedge.get("ltp"))
+    short_ltp = _float(short.get("ltp") or short.get("last_price"))
+    short_bid = _float(short.get("bid") or short.get("best_bid"))
+    short_ask = _float(short.get("ask") or short.get("best_ask"))
+    hedge_ltp = _float(hedge.get("ltp") or hedge.get("last_price"))
+    hedge_bid = _float(hedge.get("bid") or hedge.get("best_bid"))
+    hedge_ask = _float(hedge.get("ask") or hedge.get("best_ask"))
+    lot_size = _int(short.get("lot_size"), 65)
+    net_credit = (short_bid if short_bid > 0 else short_ltp) - (hedge_ask if hedge_ask > 0 else hedge_ltp)
     short_liq = calculate_option_liquidity_score(short, config)
     hedge_liq = calculate_option_liquidity_score(hedge, config)
     liquidity_score = round((short_liq["score"] * 0.7) + (hedge_liq["score"] * 0.3), 2)
@@ -696,7 +1182,7 @@ def _candidate_from_pair(
         + max(0.0, 100.0 - prob["probability_touch_pct"]) * 0.2
         + min(100.0, prob["expected_move_multiple"] * 40) * 0.2,
     )
-    return {
+    candidate = {
         "strategy": strategy,
         "side": side,
         "expiry": _date(short.get("expiry") or short.get("expiry_date")),
@@ -708,12 +1194,25 @@ def _candidate_from_pair(
         "hedge_strike": hedge_strike,
         "short_delta": _float(short.get("delta")),
         "hedge_delta": _float(hedge.get("delta")),
+        "short_ltp": short_ltp,
+        "short_bid": short_bid,
+        "short_ask": short_ask,
+        "short_oi": _int(short.get("oi") or short.get("open_interest")),
+        "short_volume": _int(short.get("volume") or short.get("day_volume")),
+        "hedge_ltp": hedge_ltp,
+        "hedge_bid": hedge_bid,
+        "hedge_ask": hedge_ask,
+        "hedge_oi": _int(hedge.get("oi") or hedge.get("open_interest")),
+        "hedge_volume": _int(hedge.get("volume") or hedge.get("day_volume")),
+        "lot_size": lot_size,
+        "lots": 1,
         "spread_width": width,
         "net_credit": _round_tick(net_credit),
         "credit_pct_of_width": credit["credit_pct_of_width"],
         "required_credit": credit["required_credit_points"],
-        "max_gain": round(max(0.0, net_credit * _int(short.get("lot_size"), 65)), 2),
-        "max_loss": round(max(0.0, width - net_credit) * _int(short.get("lot_size"), 65), 2),
+        "max_gain": round(max(0.0, net_credit * lot_size), 2),
+        "max_loss": round(max(0.0, width - net_credit) * lot_size, 2),
+        "margin_required": round(max(0.0, width - net_credit) * lot_size, 2),
         "pop": round(max(0.0, 100.0 - prob["probability_expiry_itm_pct"]), 2),
         "probability_touch": prob["probability_touch_pct"],
         "expected_move_multiple": prob["expected_move_multiple"],
@@ -732,6 +1231,7 @@ def _candidate_from_pair(
         "strike_adjustment_reason": (strike_adjustment or {}).get("reason") or "",
         "strike_adjustment_checks": (strike_adjustment or {}).get("checks") or [],
     }
+    return enrich_nifty_execution_quality(candidate, config)
 
 
 def build_3w_tactical_spread_candidates(
@@ -855,6 +1355,56 @@ def build_nifty_grow_model(option_chain_by_expiry: dict[Any, list[dict[str, Any]
     )
     valid = [row for row in candidates if row.get("allowed")]
     best = valid[0] if valid else (candidates[0] if candidates else {})
+
+    def _first_side(side: str, live_only: bool = True) -> dict[str, Any]:
+        side = side.upper()
+        for row in candidates:
+            if str(row.get("side") or "").upper() != side:
+                continue
+            if live_only and not row.get("allowed"):
+                continue
+            return row
+        return {}
+
+    pe_live = _first_side("PE", True)
+    ce_live = _first_side("CE", True)
+    pe_preview = pe_live or _first_side("PE", False)
+    ce_preview = ce_live or _first_side("CE", False)
+    selected_pair = [row for row in (pe_live, ce_live) if row]
+    preview_pair = [row for row in (pe_preview, ce_preview) if row]
+    missing_sides = [side for side, row in (("PE", pe_live), ("CE", ce_live)) if not row]
+    pair_reason_codes: list[str] = []
+    for row in preview_pair:
+        gate = row.get("live_order_gate") if isinstance(row.get("live_order_gate"), dict) else {}
+        pair_reason_codes.extend(str(item) for item in gate.get("reason_codes") or [])
+    if missing_sides:
+        pair_reason_codes.extend(f"MISSING_LIVE_READY_{side}" for side in missing_sides)
+    pair_realistic = sum(_float((row.get("execution_quality") or {}).get("realistic_credit_value")) for row in selected_pair)
+    pair_ltp = sum(_float((row.get("execution_quality") or {}).get("ltp_credit_value")) for row in preview_pair)
+    pair_optimistic = sum(_float((row.get("execution_quality") or {}).get("optimistic_credit_value")) for row in preview_pair)
+    pair_gap = max((_float((row.get("execution_quality") or {}).get("optimistic_vs_realistic_gap_pct")) for row in preview_pair), default=0.0)
+    pair_ltp_gap = max((_float((row.get("execution_quality") or {}).get("ltp_vs_bidask_gap_pct")) for row in preview_pair), default=0.0)
+    pair_data_quality = "FULL_QUOTE" if selected_pair and len(selected_pair) == 2 else (
+        "PREVIEW_ONLY" if preview_pair else "MISSING_QUOTE"
+    )
+    execution_reality = {
+        "status": "TRADE_ALLOWED" if pe_live and ce_live else "NO_TRADE",
+        "action": "PLACE_BALANCED_PE_CE" if pe_live and ce_live else "PREVIEW_ONLY",
+        "data_quality": pair_data_quality,
+        "selected_sides": ",".join(str(row.get("side")) for row in selected_pair) or "NONE",
+        "missing_sides": ",".join(missing_sides),
+        "realistic_credit_value": round(pair_realistic, 2),
+        "ltp_credit_value": round(pair_ltp, 2),
+        "optimistic_credit_value": round(pair_optimistic, 2),
+        "optimistic_vs_realistic_gap_pct": round(pair_gap, 2),
+        "ltp_vs_bidask_gap_pct": round(pair_ltp_gap, 2),
+        "reason_codes": sorted(set(pair_reason_codes)),
+        "human_reason": (
+            "Balanced PE and CE NIFTYGrow pair passed live execution guard."
+            if pe_live and ce_live
+            else "Balanced PE+CE pair is not live-ready: " + ", ".join(sorted(set(pair_reason_codes or ["NO_LIVE_READY_PAIR"])))
+        ),
+    }
     risk_contract = {
         "max_gain": best.get("max_gain"),
         "max_loss": best.get("max_loss"),
@@ -885,6 +1435,14 @@ def build_nifty_grow_model(option_chain_by_expiry: dict[Any, list[dict[str, Any]
             "max_loss": row.get("max_loss"),
             "premium_yield_on_margin": row.get("premium_yield_on_margin_pct"),
             "confidence_score": row.get("confidence_score"),
+            "execution_data_quality": row.get("execution_data_quality"),
+            "realistic_credit": row.get("realistic_credit_points"),
+            "realistic_credit_value": row.get("realistic_credit_value"),
+            "execution_credit_pct": (row.get("execution_quality") or {}).get("credit_pct_of_width") if isinstance(row.get("execution_quality"), dict) else None,
+            "execution_yield_on_margin": (row.get("execution_quality") or {}).get("premium_yield_on_margin_pct") if isinstance(row.get("execution_quality"), dict) else None,
+            "paper_trap_decision": (row.get("paper_trap_guard") or {}).get("decision") if isinstance(row.get("paper_trap_guard"), dict) else None,
+            "live_order_gate": (row.get("live_order_gate") or {}).get("status") if isinstance(row.get("live_order_gate"), dict) else None,
+            "live_order_reasons": "; ".join((row.get("live_order_gate") or {}).get("reason_codes") or []) if isinstance(row.get("live_order_gate"), dict) else None,
             "allowed": row.get("allowed"),
             "rejection_reason": row.get("rejection_reason"),
             "exit_policy": cfg["nifty_3w_exit_policy"],
@@ -897,6 +1455,7 @@ def build_nifty_grow_model(option_chain_by_expiry: dict[Any, list[dict[str, Any]
         "market_state": market_state,
         "strategy": strategy,
         "candidates": candidates,
+        "execution_reality": execution_reality,
         "risk_contract": risk_contract,
         "audit_rows": audit_rows,
         "best_candidate": best,
@@ -920,8 +1479,8 @@ def nifty_grow_from_income_snapshot(income_snapshot: dict[str, Any], config: dic
             continue
         lot_size = _int((income_snapshot.get("config") or {}).get("lot_size"), 65)
         ltp = _float(row.get("option_ltp"))
-        bid = _float(row.get("bid"), max(0.05, ltp * 0.98))
-        ask = _float(row.get("ask"), ltp * 1.02 if ltp > 0 else 0.0)
+        bid = _float(row.get("bid") or row.get("best_bid"))
+        ask = _float(row.get("ask") or row.get("best_ask"))
         pop = _float(row.get("pop") or row.get("sell_pop"))
         delta = _float(row.get("delta"))
         if delta == 0 and pop:
@@ -939,8 +1498,8 @@ def nifty_grow_from_income_snapshot(income_snapshot: dict[str, Any], config: dic
             "bid": bid,
             "ask": ask,
             "iv": row.get("iv"),
-            "oi": 25000 if row.get("oi") in (None, "", "N/A", "--") else row.get("oi"),
-            "volume": 1500 if row.get("volume") in (None, "", "N/A", "--") else row.get("volume"),
+            "oi": _int(row.get("oi") or row.get("open_interest")),
+            "volume": _int(row.get("volume") or row.get("day_volume")),
             "tradingsymbol": row.get("tradingsymbol") or "",
             "quote_timestamp": now_iso,
             "lot_size": lot_size,
@@ -950,7 +1509,7 @@ def nifty_grow_from_income_snapshot(income_snapshot: dict[str, Any], config: dic
         hedge_symbol = row.get("hedge_symbol")
         hedge_strike = row.get("hedge_strike")
         if hedge_symbol and hedge_strike:
-            hedge_ltp = _float(row.get("hedge_ltp"), max(5.0, ltp * 0.25 if ltp > 0 else 5.0))
+            hedge_ltp = _float(row.get("hedge_ltp"))
             option_chain_by_expiry.setdefault(expiry, []).append(
                 {
                     "expiry": expiry,
@@ -958,11 +1517,11 @@ def nifty_grow_from_income_snapshot(income_snapshot: dict[str, Any], config: dic
                     "strike": hedge_strike,
                     "delta": -0.05 if side == "PE" else 0.05,
                     "ltp": hedge_ltp,
-                    "bid": max(0.05, hedge_ltp * 0.95),
-                    "ask": max(0.05, hedge_ltp * 1.03),
+                    "bid": _float(row.get("hedge_bid")),
+                    "ask": _float(row.get("hedge_ask")),
                     "iv": row.get("iv"),
-                    "oi": max(10000, _int(row.get("hedge_oi") or row.get("oi") or 15000)),
-                    "volume": max(500, _int(row.get("hedge_volume") or row.get("volume") or 700)),
+                    "oi": _int(row.get("hedge_oi")),
+                    "volume": _int(row.get("hedge_volume")),
                     "tradingsymbol": hedge_symbol,
                     "quote_timestamp": now_iso,
                     "lot_size": lot_size,
@@ -1028,6 +1587,14 @@ def nifty_grow_audit_csv(model: dict[str, Any]) -> str:
         "max_loss",
         "premium_yield_on_margin",
         "confidence_score",
+        "execution_data_quality",
+        "realistic_credit",
+        "realistic_credit_value",
+        "execution_credit_pct",
+        "execution_yield_on_margin",
+        "paper_trap_decision",
+        "live_order_gate",
+        "live_order_reasons",
         "allowed",
         "rejection_reason",
         "exit_policy",

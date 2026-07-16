@@ -34,20 +34,28 @@ export function Header() {
   const labels = portal.nav;
   const terms = navigationTerms[locale];
 
-  const navItems = [
+  const navItems = locale === "en" ? [
+    { label: "Kumbh Mela", path: "/kumbh-mela", focus: true },
+    { label: "Char Dham", path: "/char-dham-yatra" },
+    { label: "Jyotirlinga", path: "/12-jyotirlinga" },
+    { label: "Temple Circuits", path: "/temple-circuits" },
+    { label: "Sacred Cities", path: "/sacred-cities" },
+    { label: "Packages", path: "/packages" },
+    { label: "Travel Tools", path: "/travel-tools" },
+  ] : [
     { label: labels[1], path: "/ujjain-kumbh-2028", focus: true },
-    { label: labels[5], path: locale === "en" ? "/plan-and-book" : "/plan-my-trip" },
+    { label: labels[5], path: "/plan-my-trip" },
     { label: labels[3], path: "/mahakal-temple-guide" },
     { label: labels[4], path: "/stay-guide" },
   ];
   const kumbhPaths = [
-    { path: "/ujjain-kumbh-2028", label: locale === "en" ? "Ujjain Simhastha 2028" : labels[1], focus: true },
-    { path: "/nashik-kumbh-2027", label: `${portal.fourCities[1].city} 2027`, focus: false },
-    { path: "/prayagraj-kumbh", label: portal.fourCities[2].city, focus: false },
-    { path: "/haridwar-kumbh", label: portal.fourCities[3].city, focus: false },
-    { path: "/kumbh-calendar", label: labels[2], focus: false },
+    { path: "/kumbh-mela/nashik-kumbh-2027", label: "Nashik-Trimbakeshwar 2027", focus: true },
+    { path: "/kumbh-mela/ujjain-kumbh-2028", label: "Ujjain Simhastha 2028", focus: false },
+    { path: "/kumbh-mela/prayagraj-kumbh", label: "Prayagraj Kumbh", focus: false },
+    { path: "/kumbh-mela/haridwar-kumbh", label: "Haridwar Kumbh", focus: false },
+    { path: "/kumbh-mela/kumbh-calendar", label: "Kumbh Calendar", focus: false },
   ] as const;
-  const allKumbhsLabel = terms.allKumbhs;
+  const allKumbhsLabel = locale === "en" ? "Kumbh Mela" : terms.allKumbhs;
   const blogLabel = locale === "en" ? "Blog" : portal.latestTitle;
   const planHref = localizedHref(locale === "en" ? "/plan-and-book" : "/plan-my-trip", locale);
 
