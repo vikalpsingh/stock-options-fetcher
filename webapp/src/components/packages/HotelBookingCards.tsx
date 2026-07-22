@@ -17,7 +17,7 @@ export function HotelBookingCards({ compact = false }: { compact?: boolean }) {
             <span className="grid h-11 w-11 place-items-center rounded-2xl bg-orange-50 text-saffron"><Icon className="h-5 w-5" /></span>
             <h3 className="mt-5 font-serif text-2xl">Stay in {option.city}</h3>
             <p className="mt-3 text-sm leading-6 text-stone-600"><strong>Best for:</strong> {option.bestFor}</p>
-            <Link href={option.link} className="mt-6 inline-flex items-center gap-2 text-sm font-bold text-maroon">
+            <Link href={option.link} target="_blank" rel="noopener noreferrer" className="mt-6 inline-flex items-center gap-2 text-sm font-bold text-maroon">
               Check {option.city} Hotels<ArrowRight className="h-4 w-4" />
             </Link>
           </CardContent>

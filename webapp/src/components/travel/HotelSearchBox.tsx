@@ -63,7 +63,9 @@ export function HotelSearchBox({
       campaign,
       sourcePage,
     });
-    window.location.href = `/go/booking?${query.toString()}`;
+    const bookingUrl = `/go/booking?${query.toString()}`;
+    const opened = window.open(bookingUrl, "_blank", "noopener,noreferrer");
+    if (!opened) setError("Your browser blocked the new booking window. Please allow pop-ups for IndianKumbh.com and try again.");
   }
 
   return (

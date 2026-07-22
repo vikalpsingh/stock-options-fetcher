@@ -1,1 +1,19 @@
-[]
+[
+  {
+    "id": "6fcebf54-1ad0-42c8-8170-d3a082b0648f",
+    "provider": "booking",
+    "city": "ujjain",
+    "checkin": "2026-07-23",
+    "checkout": "2026-07-30",
+    "adults": 2,
+    "rooms": 1,
+    "children": 0,
+    "budget": "standard",
+    "campaign": "plan-and-book",
+    "sourcePage": "plan-and-book",
+    "createdAt": "2026-07-18T09:22:31.430Z",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    "referrer": "",
+    "targetHost": "booking.com"
+  }
+]

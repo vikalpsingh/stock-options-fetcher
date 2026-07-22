@@ -74,6 +74,33 @@ from nifty_grow import (
     nifty_grow_audit_csv,
     nifty_grow_from_income_snapshot,
 )
+from ipo_data_service import (
+    IPO_BUY_ZONE_FIELDS,
+    IPO_EXPORT_FIELDS,
+    IPO_MARKET_TYPE_OPTIONS,
+    IPO_NO_VERIFIED_DATA_MESSAGE,
+    IPO_QUARTERLY_FIELDS,
+    IPO_RANKING_VIEW_OPTIONS,
+    IPO_RISK_ALERT_FIELDS,
+    IPO_SNAPSHOT_FIELDS,
+    IPO_THEME_FILTER_OPTIONS,
+    IPO_TOP10_FIELDS,
+    IPO_WATCHLIST_FIELDS,
+    QUARTER_OPTIONS,
+    build_ipo_dashboard,
+    export_ipo_records_csv,
+    ipo_export_filename,
+    ipo_year_options,
+    load_ipo_snapshots,
+    save_ipo_top10_snapshot,
+)
+from income.covered_call import (
+    CoveredCallInput,
+    build_covered_call_recommendation,
+    classify_income_symbol_category,
+    select_atr_guarded_call_strike,
+    select_monthly_expiry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +290,7 @@ INCOME_DASHBOARD_CACHE_SECONDS = 15 * 60
 CE_SELL_DASHBOARD_CACHE_SECONDS = 30
 CE_SELL_POPUP_POSITION_CACHE_SECONDS = 10
 CE_SELL_POPUP_QUOTE_CACHE_SECONDS = 10
+CE_SELL_CLIENT_SNAPSHOT_MAX_AGE_SECONDS = 180
 TRADE_NEWS_CACHE_SECONDS = 5 * 60
 NIFTY_INCOME_ENTRY_SCHEDULE_TIME = "15:16"
 NIFTY_INCOME_CLOSE_SCHEDULE_TIME = "14:59"
@@ -774,6 +802,13 @@ MONTH_CODES = {
     "NOV": 11,
     "DEC": 12,
 }
+INDEX_WEEKLY_MONTH_CODES = {
+    **{str(month): month for month in range(1, 10)},
+    "O": 10,
+    "N": 11,
+    "D": 12,
+}
+INDEX_WEEKLY_SYMBOL_UNDERLYINGS = ("MIDCPNIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "NIFTY")
 
 
 def load_local_env_files() -> None:
@@ -5677,6 +5712,15 @@ class PageState:
     option_sell_markup_percent: float = field(default_factory=option_sell_markup_percent_setting)
     intraday_hard_stop_start_dte: int = field(default_factory=intraday_hard_stop_start_dte_setting)
     home_tickers: str = field(default_factory=home_tickers_text)
+    ipo_year: int = field(default_factory=lambda: datetime.now(INDIA_TIME_ZONE).year)
+    ipo_quarter: str = "Latest Available"
+    ipo_market_type: str = "All"
+    ipo_theme: str = "All"
+    ipo_ranking_view: str = "Best IPOs by long-term score"
+    ipo_only_multibagger: bool = True
+    ipo_dashboard: dict[str, Any] | None = None
+    ipo_export_csv: str = ""
+    ipo_export_filename: str = ""
 
 
 def mask_secret(value: str | None) -> str:
@@ -5902,6 +5946,7 @@ def is_app_page_request(path: str) -> bool:
         "/income",
         "/investing",
         "/equity",
+        "/ipo",
         "/income-growth",
         "/commodity",
         "/analytics",
@@ -6381,9 +6426,36 @@ def csv_trading_symbols(csv_text: str) -> list[str]:
 
 
 def option_symbol_parts(symbol: str) -> dict[str, Any] | None:
+    clean_symbol = symbol.upper()
+    index_prefixes = "|".join(INDEX_WEEKLY_SYMBOL_UNDERLYINGS)
+    weekly_match = re.match(
+        rf"^(?P<underlying>{index_prefixes})(?P<yy>\d{{2}})(?P<mon>[1-9OND])(?P<day>\d{{2}})(?P<strike>\d+(?:\.\d+)?)(?P<type>CE|PE)$",
+        clean_symbol,
+    )
+    if weekly_match:
+        data = weekly_match.groupdict()
+        year = 2000 + int(data["yy"])
+        month = INDEX_WEEKLY_MONTH_CODES[data["mon"]]
+        day = int(data["day"])
+        try:
+            expiry = date(year, month, day)
+        except ValueError:
+            return None
+        return {
+            "underlying": data["underlying"],
+            "year": year,
+            "month": month,
+            "month_code": data["mon"],
+            "day": day,
+            "expiry": expiry,
+            "expiry_kind": "WEEKLY",
+            "strike": data["strike"],
+            "option_type": data["type"],
+        }
+
     match = re.match(
         r"^(?P<underlying>[A-Z0-9-]+?)(?P<yy>\d{2})(?P<mon>JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(?P<strike>\d+(?:\.\d+)?)(?P<type>CE|PE)$",
-        symbol.upper(),
+        clean_symbol,
     )
     if not match:
         return None
@@ -6395,6 +6467,7 @@ def option_symbol_parts(symbol: str) -> dict[str, Any] | None:
         "year": year,
         "month": month,
         "month_code": data["mon"],
+        "expiry_kind": "MONTHLY",
         "strike": data["strike"],
         "option_type": data["type"],
     }
@@ -6416,6 +6489,16 @@ def last_weekday_of_month(year: int, month: int, weekday: int) -> date:
 
 
 def expiry_date_for_parts(parts: dict[str, Any]) -> date:
+    explicit_expiry = parts.get("expiry")
+    if isinstance(explicit_expiry, datetime):
+        return explicit_expiry.date()
+    if isinstance(explicit_expiry, date):
+        return explicit_expiry
+    if isinstance(explicit_expiry, str) and explicit_expiry:
+        try:
+            return datetime.strptime(explicit_expiry[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
     switch_date = date(2025, 9, 1)
     contract_month = date(parts["year"], parts["month"], 1)
     weekday = 1 if contract_month >= switch_date else 3
@@ -11363,9 +11446,22 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         [str(row.get("symbol") or "").upper() for row in investing_rows],
         ttl_seconds=5,
     )
+    existing_short_ce_qty_by_symbol: dict[str, int] = {}
+    try:
+        for position in open_option_positions(use_cache=True):
+            symbol_text = str(position.get("tradingsymbol") or "").upper()
+            quantity = int(float(position.get("quantity") or 0))
+            if quantity < 0 and symbol_text.endswith("CE"):
+                underlying = underlying_for_symbol(symbol_text).upper()
+                existing_short_ce_qty_by_symbol[underlying] = existing_short_ce_qty_by_symbol.get(underlying, 0) + abs(quantity)
+    except Exception as exc:
+        logger.warning("Could not load open CE positions for covered-call capacity: %s", exc)
     quote_keys: list[str] = []
     selected_by_symbol: dict[str, dict[str, Any]] = {}
     target_call_strike_by_symbol: dict[str, float] = {}
+    selected_expiry_by_symbol: dict[str, Any] = {}
+    strike_meta_by_symbol: dict[str, dict[str, Any]] = {}
+    symbol_category_by_symbol: dict[str, str] = {}
     for row in investing_rows:
         symbol = str(row.get("symbol") or "").upper()
         sheet = income_growth_by_symbol.get(symbol)
@@ -11376,22 +11472,43 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if cmp_value <= 0 or quantity <= 0:
             continue
         gap_pct = float((sheet or {}).get("gap_pct") or 10)
-        target_strike = (
+        category = classify_income_symbol_category(
+            symbol,
+            core=row.get("core"),
+            sector=row.get("sector"),
+        )
+        symbol_category_by_symbol[symbol] = category
+        symbol_options = option_rows_by_name.get(symbol, [])
+        expiry_choice = select_monthly_expiry(symbol_options, as_of=today)
+        selected_expiry_by_symbol[symbol] = expiry_choice
+        expiry_options = (
+            [item for item in symbol_options if item.get("_expiry_day") == expiry_choice.expiry]
+            if expiry_choice.expiry
+            else symbol_options
+        )
+        guarded_strike, strike_meta = select_atr_guarded_call_strike(
+            spot_price=cmp_value,
+            available_strikes=[float(item.get("strike") or 0) for item in expiry_options],
+            category=category,
+            today_change_pct=(sheet or {}).get("today"),
+            week_change_pct=(sheet or {}).get("week_1"),
+        )
+        fallback_target = (
             cmp_value * (1 + gap_pct / 100)
             if live_cmp_value > 0
             else float((sheet or {}).get("call_strike") or (cmp_value * 1.10))
         )
+        target_strike = guarded_strike or fallback_target
+        strike_meta_by_symbol[symbol] = {**strike_meta, "sheet_gap_target": fallback_target}
         target_call_strike_by_symbol[symbol] = target_strike
         options = [
             item
-            for item in option_rows_by_name.get(symbol, [])
+            for item in expiry_options
             if float(item.get("strike") or 0) >= target_strike
         ]
         if not options:
             continue
-        nearest_expiry = min(item["_expiry_day"] for item in options)
-        same_expiry = [item for item in options if item["_expiry_day"] == nearest_expiry]
-        candidate = min(same_expiry, key=lambda item: float(item.get("strike") or 0))
+        candidate = min(options, key=lambda item: float(item.get("strike") or 0))
         quote_key = f"NFO:{candidate.get('tradingsymbol')}"
         selected_by_symbol[symbol] = {**candidate, "_quote_key": quote_key}
         quote_keys.append(quote_key)
@@ -11474,35 +11591,93 @@ def income_growth_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             continue
         lot_size = input_lot_size or int(candidate.get("lot_size") or 0)
         premium = quote_ltp(option_quotes.get(str(candidate.get("_quote_key")), {}))
-        covered_lots = input_lots_can_sell if sheet else (quantity // lot_size if lot_size > 0 else 0)
+        category = symbol_category_by_symbol.get(symbol) or classify_income_symbol_category(
+            symbol,
+            core=row.get("core"),
+            sector=row.get("sector"),
+        )
+        expiry_choice = selected_expiry_by_symbol.get(symbol)
+        candidate_expiry = candidate.get("_expiry_day")
+        candidate_strike = float(candidate.get("strike") or 0)
+        cc_recommendation = build_covered_call_recommendation(
+            CoveredCallInput(
+                symbol=symbol,
+                holding_qty=quantity,
+                lot_size=lot_size,
+                spot_price=cmp_value,
+                strike=candidate_strike,
+                expiry=candidate_expiry,
+                premium=premium if premium > 0 else None,
+                user_max_lots=MAX_TOP3_CE_SELL_LOTS,
+                category=category,
+                today_change_pct=today_change,
+                week_change_pct=week_change,
+                month_change_pct=month_change,
+                existing_short_ce_qty=existing_short_ce_qty_by_symbol.get(symbol, 0),
+            ),
+            as_of=today,
+        )
+        capacity = cc_recommendation.capacity
+        covered_lots = capacity.capacity_lots
+        recommended_lots = cc_recommendation.recommended_lots
         remainder = quantity % lot_size if lot_size > 0 else 0
         extra_shares = (lot_size - remainder) if lot_size > 0 and remainder else 0
         capital_for_next_lot = extra_shares * cmp_value if extra_shares else 0.0
-        monthly_income = covered_lots * lot_size * premium
-        premium_yield_pct = (premium / cmp_value * 100) if cmp_value > 0 and premium > 0 else 0.0
+        capacity_monthly_income = covered_lots * lot_size * premium
+        monthly_income = cc_recommendation.max_profit
+        premium_yield_pct = cc_recommendation.premium_yield_pct
         liquidity_score = 1.0 if premium > 0 and monthly_income >= 5000 else 0.7 if premium > 0 else 0.25
         gap_score = 1.0 if isinstance(input_gap_pct, (int, float)) and input_gap_pct >= 8 else 0.7
-        cc_capacity_score = covered_lots * premium_yield_pct * liquidity_score * quality_score * valuation_score * trend_score * gap_score
+        cc_capacity_score = cc_recommendation.score
         additional_income = lot_size * premium
         additional_capacity_per_lakh = additional_income / (capital_for_next_lot / 100000) if capital_for_next_lot and premium > 0 else 0.0
-        coverage_ok = quantity >= lot_size and (not isinstance(input_times_lot, (int, float)) or input_times_lot >= 1)
-        if quantity <= 0:
-            decision, color = "NO_HOLDING_NO_CC", "red"
-        elif not coverage_ok:
-            decision, color = "NEED_MORE_SHARES_FOR_LOT", "red"
-        elif capital_for_next_lot and capital_for_next_lot <= 100000 and additional_capacity_per_lakh > 1500:
-            decision, color = "BUY_TO_COMPLETE_NEXT_LOT", "green"
-        elif covered_lots > 0 and premium > 0:
-            decision, color = "SELL_COVERED_CALL_CANDIDATE", "green"
-        elif premium <= 0:
-            decision, color = "CHECK_LIVE_PREMIUM", "yellow"
-        elif valuation_score < 0.6:
-            decision, color = "WAIT_VALUATION_RISK", "yellow"
+        decision = cc_recommendation.decision
+        if decision == "SELL_NOW":
+            color = "green"
+        elif decision in {"NEED_MORE_SHARES", "NO_TRADE_LOW_PREMIUM", "NO_TRADE_EXPIRY_TOO_CLOSE", "NO_TRADE_EXCESSIVE_COVERAGE"}:
+            color = "red"
         else:
-            decision, color = "ACCUMULATE_SLOWLY", "yellow"
+            color = "yellow"
         total_existing_income += monthly_income
         best_additional = max(best_additional, additional_capacity_per_lakh)
-        rows.append({**base_row, "candidate_ce": str(candidate.get("tradingsymbol") or f"{symbol} CALL {fmt_number(input_call_strike)}"), "lot_size": lot_size, "covered_lots": covered_lots, "extra_shares": extra_shares, "capital_for_next_lot": capital_for_next_lot, "premium": premium if premium > 0 else None, "monthly_income": monthly_income, "premium_yield_pct": premium_yield_pct, "liquidity_score": liquidity_score, "quality_score": quality_score, "valuation_score": valuation_score, "trend_score": trend_score, "cc_capacity_score": cc_capacity_score, "additional_capacity_per_lakh": additional_capacity_per_lakh, "decision": decision, "decision_color": color})
+        rows.append(
+            {
+                **base_row,
+                "candidate_ce": str(candidate.get("tradingsymbol") or f"{symbol} CALL {fmt_number(input_call_strike)}"),
+                "selected_call_strike": candidate_strike,
+                "selected_expiry": candidate_expiry,
+                "selected_expiry_dte": cc_recommendation.dte,
+                "selected_expiry_reason": getattr(expiry_choice, "reason", ""),
+                "strike_method": strike_meta_by_symbol.get(symbol, {}).get("method"),
+                "strike_metadata": strike_meta_by_symbol.get(symbol, {}),
+                "lot_size": lot_size,
+                "capacity_lots": covered_lots,
+                "covered_lots": covered_lots,
+                "existing_short_ce_lots": capacity.existing_short_ce_lots,
+                "unencumbered_shares": capacity.unencumbered_shares,
+                "recommended_lots": recommended_lots,
+                "recommended_quantity": cc_recommendation.recommended_quantity,
+                "max_total_covered_pct": capacity.max_total_covered_pct,
+                "recommended_covered_pct": capacity.recommended_covered_pct,
+                "extra_shares": extra_shares,
+                "capital_for_next_lot": capital_for_next_lot,
+                "premium": premium if premium > 0 else None,
+                "capacity_monthly_income": capacity_monthly_income,
+                "monthly_income": monthly_income,
+                "premium_yield_pct": premium_yield_pct,
+                "liquidity_score": liquidity_score,
+                "quality_score": quality_score,
+                "valuation_score": valuation_score,
+                "trend_score": trend_score,
+                "cc_capacity_score": cc_capacity_score,
+                "additional_capacity_per_lakh": additional_capacity_per_lakh,
+                "decision": decision,
+                "decision_color": color,
+                "reason_codes": cc_recommendation.reason_codes,
+                "decision_explanation": cc_recommendation.explanation,
+                "category": cc_recommendation.category,
+            }
+        )
     rows.sort(key=lambda row: (float(row.get("additional_capacity_per_lakh") or 0), float(row.get("cc_capacity_score") or 0)), reverse=True)
     return rows, {
         "existing_monthly_income": total_existing_income,
@@ -11522,9 +11697,13 @@ def income_growth_gpt_user_prompt(rows: list[dict[str, Any]], summary: dict[str,
             "Stock",
             "Holding shares",
             "Times of lot size",
-            "Lots can be sold",
+            "Capacity lots",
+            "Recommended lots",
+            "Recommended quantity",
             "CMP",
             "CALL STRIKE",
+            "Selected expiry",
+            "DTE",
             "Value",
             "TO SELL",
             "Lot Size",
@@ -11539,7 +11718,10 @@ def income_growth_gpt_user_prompt(rows: list[dict[str, Any]], summary: dict[str,
             "Today",
             "Kite CE",
             "Live Premium",
+            "Premium yield %",
             "App Decision",
+            "Reason codes",
+            "Decision explanation",
         ]
     )
     for row in rows:
@@ -11548,9 +11730,13 @@ def income_growth_gpt_user_prompt(rows: list[dict[str, Any]], summary: dict[str,
                 row.get("symbol"),
                 row.get("quantity"),
                 row.get("times_lot"),
-                row.get("covered_lots"),
+                row.get("capacity_lots", row.get("covered_lots")),
+                row.get("recommended_lots"),
+                row.get("recommended_quantity"),
                 row.get("cmp"),
-                row.get("input_call_strike"),
+                row.get("selected_call_strike") or row.get("input_call_strike"),
+                row.get("selected_expiry"),
+                row.get("selected_expiry_dte"),
                 row.get("market_value"),
                 row.get("input_to_sell"),
                 row.get("lot_size") or row.get("input_lot_size"),
@@ -11565,7 +11751,10 @@ def income_growth_gpt_user_prompt(rows: list[dict[str, Any]], summary: dict[str,
                 row.get("input_today"),
                 row.get("candidate_ce"),
                 row.get("premium"),
+                row.get("premium_yield_pct"),
                 row.get("decision"),
+                "|".join(str(item) for item in row.get("reason_codes") or []),
+                row.get("decision_explanation"),
             ]
         )
     return (
@@ -13343,7 +13532,266 @@ def covered_ce_holding_source(kite: Any, underlying: str) -> dict[str, Any]:
     }
 
 
-def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
+def ce_sell_event_context(candidate: dict[str, Any]) -> dict[str, str]:
+    risk = str(
+        candidate.get("corporate_action_risk")
+        or candidate.get("event_risk")
+        or "CHECK"
+    ).upper()
+    event_date = str(
+        candidate.get("next_result_date")
+        or candidate.get("result_date")
+        or candidate.get("event_date")
+        or candidate.get("corporate_action_ex_date")
+        or candidate.get("corporate_action_record_date")
+        or ""
+    ).strip()
+    detail = str(
+        candidate.get("event_risk_reason")
+        or candidate.get("corporate_action_detail")
+        or candidate.get("corporate_action_reason")
+        or ""
+    ).strip()
+    if event_date:
+        label = event_date
+        if detail:
+            label = f"{label} | {detail[:120]}"
+    elif detail:
+        label = detail[:140]
+    else:
+        label = "Result date not available - verify NSE/BSE result calendar before GO"
+        if risk in {"N/A", "NONE"}:
+            risk = "CHECK"
+    return {
+        "next_result_date": label,
+        "result_event_risk": risk,
+        "result_event_detail": detail or label,
+    }
+
+
+def ce_sell_number(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def ce_sell_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def income_growth_ce_candidate_for_order(underlying: str) -> dict[str, Any] | None:
+    clean_underlying = str(underlying or "").strip().upper()
+    if not clean_underlying:
+        return None
+    rows, _summary = income_growth_candidates()
+    for row in rows:
+        if str(row.get("symbol") or "").strip().upper() != clean_underlying:
+            continue
+        decision = str(row.get("decision") or "").upper()
+        color = str(row.get("decision_color") or "").lower()
+        candidate_ce = str(row.get("candidate_ce") or "").strip().upper()
+        recommended_lots = ce_sell_int(row.get("recommended_lots"))
+        is_ready = (
+            recommended_lots > 0
+            and bool(candidate_ce)
+            and (
+                color in {"green", "lightgreen"}
+                or "GREEN" in decision
+                or "GOOD" in decision
+                or "READY" in decision
+                or decision == "SELL_NOW"
+            )
+        )
+        if not is_ready:
+            return None
+        return {
+            "stock": clean_underlying,
+            "option_symbol": candidate_ce,
+            "holding_qty": ce_sell_int(row.get("quantity")),
+            "active_lot_size": ce_sell_int(row.get("lot_size") or row.get("input_lot_size")),
+            "lots_to_sell": min(
+                MAX_TOP3_CE_SELL_LOTS,
+                max(0, recommended_lots),
+            ),
+            "cmp": ce_sell_number(row.get("cmp")),
+            "selected_ce_strike": ce_sell_number(
+                row.get("selected_call_strike") or row.get("input_call_strike")
+            ),
+            "expiry": str(row.get("selected_expiry") or ""),
+            "final_ce_score": ce_sell_number(row.get("cc_capacity_score")),
+            "event_risk": str(
+                row.get("corporate_action_risk")
+                or row.get("event_risk")
+                or row.get("result_event_risk")
+                or "CHECK"
+            ).upper(),
+            "breakout_risk": str(row.get("breakout_risk") or "N/A").upper(),
+            "next_result_date": row.get("next_result_date") or row.get("result_date"),
+            "event_risk_reason": (
+                row.get("event_risk_reason")
+                or row.get("corporate_action_detail")
+                or row.get("decision_explanation")
+                or "Income Growth ready candidate. Verify result calendar before GO."
+            ),
+            "source": "Income Growth ready candidate",
+        }
+    return None
+
+
+def ce_sell_card_snapshot_payload(item: dict[str, Any]) -> dict[str, Any]:
+    settings = load_ce_sell_settings()
+    stock = str(item.get("stock") or "").strip().upper()
+    symbol = str(item.get("option_symbol") or "").strip().upper()
+    lot_size = ce_sell_int(item.get("active_lot_size") or item.get("lot_size"))
+    lots_to_sell = min(MAX_TOP3_CE_SELL_LOTS, max(0, ce_sell_int(item.get("lots_to_sell"))))
+    quantity = lots_to_sell * lot_size
+    holding_qty = ce_sell_int(item.get("holding_qty"))
+    cmp_value = ce_sell_number(item.get("cmp"))
+    strike = ce_sell_number(item.get("selected_ce_strike"))
+    ltp = ce_sell_number(item.get("premium") or item.get("ltp") or item.get("option_ltp"))
+    markup = float(settings["price_markup_percent"])
+    limit_price = ce_sell_number(item.get("sell_limit_price"))
+    if limit_price <= 0 and ltp > 0:
+        limit_price = ceil_to_tick(ltp * (1 + markup / 100), 0.05)
+    max_profit = ce_sell_number(item.get("max_profit"))
+    if max_profit <= 0 and limit_price > 0 and quantity > 0:
+        max_profit = limit_price * quantity
+    covered_value = cmp_value * quantity
+    premium_yield = ce_sell_number(item.get("premium_yield_percent"))
+    if premium_yield <= 0 and covered_value > 0 and max_profit > 0:
+        premium_yield = max_profit / covered_value * 100
+    otm = ce_sell_number(item.get("otm_percent"))
+    if otm == 0 and cmp_value > 0 and strike > 0:
+        otm = (strike - cmp_value) / cmp_value * 100
+    event_context = ce_sell_event_context(item)
+    has_active = bool(item.get("has_active_position"))
+    return {
+        "underlying": stock,
+        "symbol": symbol,
+        "holding_qty": holding_qty,
+        "holding_source": str(item.get("holding_source") or "Top 3 CE scan holding snapshot"),
+        "kite_holding_qty": ce_sell_int(item.get("kite_holding_qty")),
+        "income_growth_holding_qty": ce_sell_int(item.get("income_growth_holding_qty") or holding_qty),
+        "average_price": ce_sell_number(item.get("average_buy_price") or item.get("average_price")),
+        "lot_size": lot_size,
+        "covered_lots": ce_sell_int(item.get("covered_lots_available") or item.get("covered_lots")),
+        "lots_to_sell": lots_to_sell,
+        "quantity": quantity,
+        "cmp": cmp_value,
+        "cmp_source": str(item.get("cmp_source") or "Latest Top 3 CE scan"),
+        "strike": strike,
+        "expiry": str(item.get("expiry") or ""),
+        "ltp": ltp,
+        "limit_price": limit_price,
+        "markup_percent": markup,
+        "max_profit": max_profit,
+        "covered_value": covered_value,
+        "premium_yield_percent": premium_yield,
+        "otm_percent": otm,
+        "score": ce_sell_number(item.get("final_ce_score")),
+        "event_risk": str(item.get("event_risk") or item.get("corporate_action_risk") or "N/A"),
+        "breakout_risk": str(item.get("breakout_risk") or "N/A"),
+        "candidate_source": str(item.get("source") or "Top 3 CE SELL card snapshot"),
+        "active_sell_info": {
+            "summary": (
+                "Existing active option position for this stock."
+                if has_active
+                else "No active PE/CE SELL position found for this stock."
+            ),
+            "has_short_pe": False,
+            "has_short_ce": has_active,
+        },
+        "active_sell_summary": (
+            "Existing active option position for this stock."
+            if has_active
+            else "No active PE/CE SELL position found for this stock."
+        ),
+        "has_active_pe_sell": False,
+        "has_active_ce_sell": has_active,
+        "snapshot_created_at": time.time(),
+        "snapshot_source": "Trading tab latest Top 3 CE data",
+        "client_snapshot": True,
+        **event_context,
+    }
+
+
+def parse_ce_sell_client_snapshot(raw_snapshot: str | None) -> dict[str, Any] | None:
+    if not raw_snapshot:
+        return None
+    try:
+        parsed = json.loads(raw_snapshot)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def normalize_ce_sell_client_snapshot(
+    underlying: str,
+    raw_snapshot: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not raw_snapshot:
+        return None
+    clean_underlying = str(underlying or raw_snapshot.get("underlying") or "").strip().upper()
+    snapshot_underlying = str(raw_snapshot.get("underlying") or "").strip().upper()
+    if not clean_underlying or snapshot_underlying != clean_underlying:
+        return None
+    created_at = ce_sell_number(raw_snapshot.get("snapshot_created_at"))
+    if created_at <= 0 or time.time() - created_at > CE_SELL_CLIENT_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+    normalized = dict(raw_snapshot)
+    normalized["underlying"] = clean_underlying
+    normalized["symbol"] = str(raw_snapshot.get("symbol") or "").strip().upper()
+    normalized["holding_qty"] = ce_sell_int(raw_snapshot.get("holding_qty"))
+    normalized["kite_holding_qty"] = ce_sell_int(raw_snapshot.get("kite_holding_qty"))
+    normalized["income_growth_holding_qty"] = ce_sell_int(raw_snapshot.get("income_growth_holding_qty"))
+    normalized["average_price"] = ce_sell_number(raw_snapshot.get("average_price"))
+    normalized["lot_size"] = ce_sell_int(raw_snapshot.get("lot_size"))
+    normalized["lots_to_sell"] = min(MAX_TOP3_CE_SELL_LOTS, max(0, ce_sell_int(raw_snapshot.get("lots_to_sell"))))
+    normalized["quantity"] = ce_sell_int(raw_snapshot.get("quantity"))
+    normalized["cmp"] = ce_sell_number(raw_snapshot.get("cmp"))
+    normalized["strike"] = ce_sell_number(raw_snapshot.get("strike"))
+    normalized["ltp"] = ce_sell_number(raw_snapshot.get("ltp"))
+    normalized["limit_price"] = ce_sell_number(raw_snapshot.get("limit_price"))
+    normalized["markup_percent"] = ce_sell_number(raw_snapshot.get("markup_percent"))
+    normalized["max_profit"] = ce_sell_number(raw_snapshot.get("max_profit"))
+    normalized["covered_value"] = ce_sell_number(raw_snapshot.get("covered_value"))
+    normalized["premium_yield_percent"] = ce_sell_number(raw_snapshot.get("premium_yield_percent"))
+    normalized["otm_percent"] = ce_sell_number(raw_snapshot.get("otm_percent"))
+    normalized["score"] = ce_sell_number(raw_snapshot.get("score"))
+    if (
+        not normalized["symbol"]
+        or normalized["lot_size"] <= 0
+        or normalized["lots_to_sell"] <= 0
+        or normalized["quantity"] <= 0
+        or normalized["ltp"] <= 0
+        or normalized["limit_price"] <= 0
+        or normalized["quantity"] > normalized["holding_qty"]
+    ):
+        return None
+    expected_quantity = normalized["lots_to_sell"] * normalized["lot_size"]
+    if expected_quantity > 0:
+        normalized["quantity"] = min(normalized["quantity"], expected_quantity)
+    normalized.setdefault("holding_source", "Top 3 CE scan holding snapshot")
+    normalized.setdefault("candidate_source", "Top 3 CE SELL card snapshot")
+    normalized.setdefault("active_sell_summary", "No active PE/CE SELL position found for this stock.")
+    normalized.setdefault("active_sell_info", {"summary": normalized["active_sell_summary"]})
+    normalized["client_snapshot_used"] = True
+    return normalized
+
+
+def ce_sell_order_snapshot(
+    underlying: str,
+    snapshot_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    client_snapshot = normalize_ce_sell_client_snapshot(underlying, snapshot_override)
+    if client_snapshot:
+        return client_snapshot
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     clean_underlying = str(underlying or "").strip().upper()
@@ -13357,8 +13805,11 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
         None,
     )
     if not candidate:
+        candidate = income_growth_ce_candidate_for_order(clean_underlying)
+    if not candidate:
         raise PermissionError(
-            f"{clean_underlying} is no longer an approved Top 3 covered CE candidate. Recalculate and review."
+            f"{clean_underlying} is not an approved covered CE candidate right now. "
+            "Use a green Ready to review card or recalculate Top 3 CE SELL."
         )
 
     positions = cached_kite_positions(kite, ttl_seconds=CE_SELL_POPUP_POSITION_CACHE_SECONDS)
@@ -13422,6 +13873,7 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
     max_profit = limit_price * quantity
     covered_value = cmp_value * quantity
     otm_percent = (strike - cmp_value) / cmp_value * 100 if cmp_value > 0 else 0
+    event_context = ce_sell_event_context(candidate)
     return {
         "underlying": clean_underlying,
         "symbol": symbol,
@@ -13448,6 +13900,8 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
         "score": float(candidate.get("final_ce_score") or 0),
         "event_risk": str(candidate.get("event_risk") or "N/A"),
         "breakout_risk": str(candidate.get("breakout_risk") or "N/A"),
+        "candidate_source": str(candidate.get("source") or "Top 3 CE SELL"),
+        **event_context,
         "active_sell_info": active_sell_info,
         "active_sell_summary": active_sell_info.get("summary"),
         "has_active_pe_sell": bool(active_sell_info.get("has_short_pe")),
@@ -13455,14 +13909,17 @@ def ce_sell_order_snapshot(underlying: str) -> dict[str, Any]:
     }
 
 
-def place_approved_ce_sell_order(underlying: str) -> dict[str, Any]:
+def place_approved_ce_sell_order(
+    underlying: str,
+    snapshot_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
     if os.getenv("KITE_CONFIRM_LIVE_ORDER") != "YES":
         raise PermissionError(
             'Covered CE order refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
         )
-    snapshot = ce_sell_order_snapshot(underlying)
+    snapshot = ce_sell_order_snapshot(underlying, snapshot_override)
     kite = kite_orders.kite_client()
     order = {
         "variety": "regular",
@@ -13497,13 +13954,18 @@ def place_approved_ce_sell_order(underlying: str) -> dict[str, Any]:
         return result
     invalidate_kite_trade_cache()
     clear_app_cache((f"ce-sell-dashboard:{selected_kite_profile_name()}",))
+    quote_source = (
+        "latest page LTP"
+        if snapshot.get("client_snapshot_used")
+        else "fresh LTP"
+    )
     return {
         "tradingsymbol": snapshot["symbol"],
         "status": "LIVE_SENT",
         "order_id": order_id,
         "detail": (
             f"SELL covered CE {snapshot['quantity']} qty at LIMIT {snapshot['limit_price']:.2f}. "
-            f"{float(snapshot.get('markup_percent') or option_sell_markup_percent_setting()):.2f}% above fresh LTP {snapshot['ltp']:.2f}; "
+            f"{float(snapshot.get('markup_percent') or option_sell_markup_percent_setting()):.2f}% above {quote_source} {snapshot['ltp']:.2f}; "
             f"effective holding {snapshot['holding_qty']} shares "
             f"from {snapshot['holding_source']}. Kite action: {action}."
         ),
@@ -17210,9 +17672,14 @@ def render_ce_sell_dashboard(state: PageState) -> str:
             f'<p>{html.escape(str(item.get("reject_reason") or item.get("explanation") or ""))}</p>'
         )
         if actionable:
+            snapshot_payload = html.escape(
+                json.dumps(ce_sell_card_snapshot_payload(item), separators=(",", ":"), default=str),
+                quote=True,
+            )
             return (
                 f'<button type="button" class="pe-rank-card ce-sell-order-button {css_class}" '
-                f'data-underlying="{html.escape(str(item.get("stock") or ""), quote=True)}">'
+                f'data-underlying="{html.escape(str(item.get("stock") or ""), quote=True)}" '
+                f'data-ce-snapshot="{snapshot_payload}">'
                 f'{content}<em>Review fresh quote, news, and covered SELL order</em></button>'
             )
         return f'<article class="pe-rank-card {css_class}">{content}</article>'
@@ -17957,6 +18424,497 @@ def floor_to_tick(value: float, tick_size: float = 0.05) -> float:
     return round(math.floor(value / tick_size) * tick_size, 2)
 
 
+def render_ipo_panel(state: PageState) -> str:
+    if state.active_tab != "ipo" and state.ipo_dashboard is None:
+        return f"""
+    <form id="ipo-panel" method="post" action="/ipo/load" style="display:none">
+      {env_hidden_fields_for_render()}
+    </form>"""
+    dashboard = state.ipo_dashboard
+    if dashboard is None:
+        try:
+            dashboard = build_ipo_dashboard(
+                state.ipo_year,
+                state.ipo_quarter,
+                APP_DB_PATH,
+                state.ipo_only_multibagger,
+                market_type=state.ipo_market_type,
+                theme=state.ipo_theme,
+                ranking_view=state.ipo_ranking_view,
+            )
+        except Exception as exc:
+            dashboard = {
+                "year": state.ipo_year,
+                "quarter": state.ipo_quarter,
+                "upcoming": [],
+                "listed": [],
+                "top10": [],
+                "screener": {},
+                "quarterly_monitor": [],
+                "alerts": [],
+                "rankings": {},
+                "detail": {},
+                "summary": {},
+                "snapshots": [],
+                "validation_report": {},
+                "data_issues": [],
+                "messages": [friendly_external_error(exc, "IPO dashboard")],
+                "generated_at": "",
+                "data_source": "unavailable",
+            }
+            state.error = f"{friendly_external_error(exc, 'IPO dashboard')}\n\n{traceback.format_exc()}"
+    upcoming = list(dashboard.get("upcoming") or [])
+    listed = list(dashboard.get("listed") or [])
+    quarterly = list(dashboard.get("quarterly_monitor") or [])
+    alerts = list(dashboard.get("alerts") or [])
+    rankings = dashboard.get("rankings") or {}
+    selected_ranking = list(rankings.get(state.ipo_ranking_view) or listed)
+    detail = dashboard.get("detail") or (selected_ranking[0] if selected_ranking else {})
+    summary = dashboard.get("summary") or {}
+    screener = dashboard.get("screener") or {}
+    exports = screener.get("exports") or {}
+    top10 = list(dashboard.get("top10") or [])
+    snapshots = list(dashboard.get("snapshots") or [])
+    validation_report = dashboard.get("validation_report") or {}
+    data_issues = list(dashboard.get("data_issues") or [])
+    cache_info = dashboard.get("_cache") or {}
+    panel_style = "" if state.active_tab == "ipo" else ' style="display:none"'
+
+    def text_value(value: Any, default: str = "N/A") -> str:
+        if value in {None, ""}:
+            return default
+        return str(value)
+
+    def num_text(value: Any, decimals: int = 2) -> str:
+        if value in {None, ""}:
+            return "N/A"
+        try:
+            return f"{float(value):.{decimals}f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def pct_text(value: Any) -> str:
+        return f"{num_text(value)}%" if value not in {None, ""} else "N/A"
+
+    def crore_text(value: Any) -> str:
+        if value in {None, ""}:
+            return "N/A"
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return f"{amount / 10_000:.2f} Cr"
+
+    def compact_mcap(value: Any) -> str:
+        if value in {None, ""}:
+            return "N/A"
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if amount >= 10_000:
+            return f"{amount / 10_000:.2f} Cr"
+        return f"{amount:.2f}"
+
+    def sort_header(label: str, col: int) -> str:
+        return f'<button type="button" class="sort-header" data-sort-col="{col}">{html.escape(label)}</button>'
+
+    def ipo_screener_url(symbol: Any) -> str:
+        clean_symbol = re.sub(r"[^A-Z0-9-]", "", str(symbol or "").upper())
+        return screener_link_for_code(f"NSE:{clean_symbol}") if clean_symbol else "https://www.screener.in/"
+
+    def ipo_symbol_cell(row: dict[str, Any], tag: str = "td") -> str:
+        company = text_value(row.get("company_name"))
+        symbol = text_value(row.get("symbol"), "")
+        screener_url = ipo_screener_url(symbol)
+        return (
+            f'<{tag} class="position-symbol-cell">'
+            f'<a href="{html.escape(screener_url, quote=True)}" target="_blank" rel="noopener">{html.escape(company)}</a>'
+            f'<span>{html.escape(symbol)}</span>'
+            f'<span><a class="mini-link" href="{html.escape(screener_url, quote=True)}" target="_blank" rel="noopener">Screener</a></span>'
+            f'</{tag}>'
+        )
+
+    def badge_class(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"green", "strong", "buy zone reached"}:
+            return "good"
+        if text in {"blue", "result confirmed"}:
+            return "blue"
+        if text in {"red", "avoid", "remove from watchlist"}:
+            return "bad"
+        if text in {"yellow", "watchlist", "buy on correction"}:
+            return "warn"
+        return "neutral"
+
+    def badge(value: Any, fallback: str = "N/A") -> str:
+        label = text_value(value, fallback)
+        return f'<span class="ipo-badge {badge_class(label)}">{html.escape(label)}</span>'
+
+    def score_badge(value: Any) -> str:
+        if value in {None, ""}:
+            return '<span class="ipo-score-pill bad">N/A</span>'
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return '<span class="ipo-score-pill bad">N/A</span>'
+        kind = "bad"
+        if score >= 75:
+            kind = "good"
+        elif score >= 60:
+            kind = "warn"
+        elif score >= 45:
+            kind = "neutral"
+        return f'<span class="ipo-score-pill {kind}">{html.escape(num_text(score, 0))}</span>'
+
+    def risk_list(row: dict[str, Any], limit: int = 4) -> str:
+        risks = row.get("risk_flags") or []
+        if isinstance(risks, str):
+            risks = [item.strip() for item in risks.split(",") if item.strip()]
+        if not risks:
+            return '<span class="muted-cell">No major red flag in stored data</span>'
+        return "".join(
+            f'<span class="ipo-badge bad">{html.escape(str(item))}</span>'
+            for item in list(risks)[:limit]
+        )
+
+    def action_card(row: dict[str, Any]) -> str:
+        if not row:
+            return '<article class="ipo-rank-card"><strong>No detail row yet</strong><span>Load IPO data to show the strongest candidate.</span></article>'
+        return f"""
+        <article class="ipo-rank-card">
+          <div class="ipo-card-top">{ipo_symbol_cell(row, "div")}<span>{score_badge(row.get("lt_score"))}</span></div>
+          <div class="ipo-card-grid compact">
+            <span>Action</span><strong>{badge(row.get("action"))}</strong>
+            <span>Flag</span><strong>{badge(row.get("flag"))}</strong>
+            <span>Theme</span><strong>{html.escape(text_value(row.get("theme")))}</strong>
+            <span>Drawdown</span><strong>{html.escape(pct_text(row.get("drawdown_from_52w_high_pct")))}</strong>
+          </div>
+          <p>{html.escape(text_value(row.get("final_recommendation"), "No recommendation available."))}</p>
+        </article>
+        """
+
+    year_options_html = "".join(
+        f'<option value="{year}"{" selected" if int(year) == int(state.ipo_year) else ""}>{year}</option>'
+        for year in ipo_year_options(datetime.now(INDIA_TIME_ZONE).date())
+    )
+    quarter_options_html = "".join(
+        f'<option value="{html.escape(quarter, quote=True)}"{" selected" if quarter == state.ipo_quarter else ""}>{html.escape(quarter)}</option>'
+        for quarter in QUARTER_OPTIONS
+    )
+    market_options_html = "".join(
+        f'<option value="{html.escape(option, quote=True)}"{" selected" if option == state.ipo_market_type else ""}>{html.escape(option)}</option>'
+        for option in IPO_MARKET_TYPE_OPTIONS
+    )
+    theme_options_html = "".join(
+        f'<option value="{html.escape(option, quote=True)}"{" selected" if option == state.ipo_theme else ""}>{html.escape(option)}</option>'
+        for option in IPO_THEME_FILTER_OPTIONS
+    )
+    ranking_options_html = "".join(
+        f'<option value="{html.escape(option, quote=True)}"{" selected" if option == state.ipo_ranking_view else ""}>{html.escape(option)}</option>'
+        for option in IPO_RANKING_VIEW_OPTIONS
+    )
+    messages_html = "".join(
+        f'<div class="ipo-message">{html.escape(str(message))}</div>'
+        for message in dashboard.get("messages", [])
+    )
+    cache_label = "Daily cache hit" if cache_info.get("hit") else "Fresh/generated"
+    generated_at = text_value(dashboard.get("generated_at") or cache_info.get("generated_at"), "Not generated")
+    data_source = text_value(dashboard.get("data_source"), "verified IPO source adapters")
+    best_score = summary.get("best_score")
+    research_decision = dashboard.get("research_decision") or {}
+    decision_best = research_decision.get("best") or {}
+    decision_symbol = text_value(decision_best.get("symbol"), "")
+    decision_company = text_value(decision_best.get("company_name"), "No candidate")
+    decision_screener_url = ipo_screener_url(decision_symbol)
+    decision_steps_html = "".join(
+        f"<li>{html.escape(str(step))}</li>"
+        for step in (research_decision.get("research_steps") or [])[:4]
+    )
+    source_notes_html = "".join(
+        f"<li>{html.escape(str(note))}</li>"
+        for note in (research_decision.get("source_notes") or dashboard.get("source_notes") or [])[:5]
+    )
+    if not source_notes_html:
+        source_notes_html = "<li>Source status will appear after loading or force-refreshing IPO data.</li>"
+    source_panel = f"""
+      <details class="ipo-detail-card">
+        <summary>Source quality and weekly refresh notes</summary>
+        <strong>{html.escape(text_value(research_decision.get("source_quality"), data_source))}</strong>
+        <ul>{source_notes_html}</ul>
+      </details>
+    """
+    validation_cards = [
+        ("Total rows loaded", validation_report.get("total_rows_loaded", dashboard.get("listed_all_count", 0)), "Raw listed IPO rows from verified adapters / explicit demo mode"),
+        ("Verified listed", validation_report.get("verified_listed_companies", dashboard.get("listed_verified_count", 0)), "Symbol, ISIN, listing date, exchange verified"),
+        ("Eligible scoring", validation_report.get("eligible_for_scoring", dashboard.get("listed_eligible_count", len(listed))), "Rows allowed into ranking and buy-zone engine"),
+        ("Excluded rows", validation_report.get("excluded_unverified_rows", len(data_issues)), "Unverified, demo, or incomplete rows"),
+        ("Missing price", validation_report.get("rows_missing_price", 0), "No current price available"),
+        ("Missing financials", validation_report.get("rows_missing_financials", 0), "Latest quarterly / valuation data missing"),
+        ("Missing holding data", validation_report.get("rows_missing_shareholding", 0), "Promoter / pledge / FII-DII data missing"),
+        ("Buy-zone", summary.get("buy_zone_count", len(exports.get("buy_zone") or [])), "Only eligible verified rows can reach buy zone"),
+    ]
+    validation_cards_html = "".join(
+        f'<div class="ipo-stat-card{" risk" if "Missing" in label or "Excluded" in label else ""}>'
+        f'<span>{html.escape(label)}</span><strong>{html.escape(str(value))}</strong><small>{html.escape(help_text)}</small></div>'
+        for label, value, help_text in validation_cards
+    )
+
+    upcoming_cards = "".join(
+        f"""
+        <article class="ipo-upcoming-card">
+          <div class="ipo-card-top"><a href="{html.escape(ipo_screener_url(item.get("symbol")), quote=True)}" target="_blank" rel="noopener">{html.escape(text_value(item.get("company_name")))}</a><span>{html.escape(text_value(item.get("ipo_date")))}</span></div>
+          <div class="ipo-card-sector">{html.escape(text_value(item.get("sector")))}</div>
+          <div class="ipo-card-grid">
+            <span>Issue</span><strong>{html.escape(text_value(item.get("issue_size")))}</strong>
+            <span>Price band</span><strong>{html.escape(text_value(item.get("price_band")))}</strong>
+            <span>GMP</span><strong>{html.escape(text_value(item.get("gmp")))}</strong>
+          </div>
+          <a class="mini-link" href="{html.escape(ipo_screener_url(item.get("symbol")), quote=True)}" target="_blank" rel="noopener">Open Screener</a>
+          <small>{html.escape(text_value(item.get("source")))} | {html.escape(text_value(item.get("last_updated_at")))}</small>
+        </article>
+        """
+        for item in upcoming
+    ) or '<div class="muted-cell">No upcoming IPO records available in the local cache.</div>'
+
+    listed_rows = "".join(
+        "<tr>"
+        f'{ipo_symbol_cell(row)}'
+        f'<td>{badge(row.get("action"))}</td>'
+        f'<td>{badge(row.get("flag"))}</td>'
+        f'<td>{score_badge(row.get("lt_score"))}</td>'
+        f'<td>{html.escape(text_value(row.get("market_type")))}</td>'
+        f'<td>{badge("Yes" if row.get("is_listed_verified") else "No")}</td>'
+        f'<td>{badge("Yes" if row.get("eligible_for_scoring") else "No")}</td>'
+        f'<td>{html.escape(text_value(row.get("sector")))}</td>'
+        f'<td>{html.escape(text_value(row.get("theme")))}</td>'
+        f'<td>{html.escape(text_value(row.get("listing_date")))}</td>'
+        f'<td>{html.escape(num_text(row.get("ipo_price") or row.get("issue_price")))}</td>'
+        f'<td>{html.escape(compact_mcap(row.get("ipo_market_cap")))}</td>'
+        f'<td>{html.escape(num_text(row.get("current_price")))}</td>'
+        f'<td>{html.escape(compact_mcap(row.get("current_market_cap") or row.get("market_cap")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("gain_from_ipo_pct") or row.get("return_from_issue_pct")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("drawdown_from_52w_high_pct")))}</td>'
+        "</tr>"
+        for row in listed
+    ) or f'<tr><td colspan="16" class="muted-cell">{html.escape(IPO_NO_VERIFIED_DATA_MESSAGE)}</td></tr>'
+
+    data_issue_rows = "".join(
+        "<tr>"
+        f'{ipo_symbol_cell(row)}'
+        f'<td>{html.escape(text_value(row.get("exchange")))}</td>'
+        f'<td>{badge("Yes" if row.get("is_listed_verified") else "No")}</td>'
+        f'<td>{badge("Yes" if row.get("eligible_for_scoring") else "No")}</td>'
+        f'<td>{badge(row.get("action"), "UNVERIFIED - EXCLUDED")}</td>'
+        f'<td>{html.escape(text_value(row.get("exclusion_reason"), "Missing verification data"))}</td>'
+        f'<td>{html.escape(text_value(row.get("missing_fields"), "N/A"))}</td>'
+        f'<td>{html.escape(text_value(row.get("data_source") or row.get("source")))}</td>'
+        "</tr>"
+        for row in data_issues
+    ) or '<tr><td colspan="8" class="muted-cell">No excluded IPO rows for this selection.</td></tr>'
+
+    quarterly_rows = "".join(
+        "<tr>"
+        f'{ipo_symbol_cell(row)}'
+        f'<td>{html.escape(text_value(row.get("quarter")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("latest_revenue_growth_yoy") or row.get("revenue_growth_yoy")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("ebitda_growth_yoy")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("latest_pat_growth_yoy") or row.get("pat_growth_yoy") or row.get("profit_growth_yoy")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("opm_trend_pct")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("roce")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("roe")))}</td>'
+        f'<td>{html.escape(num_text(row.get("debt_to_equity")))}</td>'
+        f'<td>{html.escape(num_text(row.get("debtor_days"), 0))}</td>'
+        f'<td>{html.escape(num_text(row.get("inventory_days"), 0))}</td>'
+        f'<td>{html.escape(num_text(row.get("cash_conversion_cycle"), 0))}</td>'
+        f'<td>{html.escape(num_text(row.get("cfo_pat")))}</td>'
+        f'<td>{html.escape(num_text(row.get("fcf")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("promoter_holding_change")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("pledge_change")))}</td>'
+        f'<td>{html.escape(pct_text(row.get("fii_dii_change")))}</td>'
+        f'<td>{badge(row.get("flag"))}</td>'
+        "</tr>"
+        for row in quarterly
+    ) or '<tr><td colspan="18" class="muted-cell">Quarterly monitor rows will appear after loading IPO data.</td></tr>'
+
+    ranking_cards = "".join(action_card(row) for row in selected_ranking[:6]) or action_card({})
+
+    alert_cards = "".join(
+        f"""
+        <article class="ipo-alert-card {badge_class(alert.get("severity"))}">
+          <span>{badge(alert.get("severity"))}</span>
+          <strong>{html.escape(text_value(alert.get("alert_type")))}</strong>
+          <a href="{html.escape(ipo_screener_url(alert.get("symbol")), quote=True)}" target="_blank" rel="noopener">{html.escape(text_value(alert.get("company_name") or alert.get("symbol")))}</a>
+          <p>{html.escape(text_value(alert.get("message")))}</p>
+        </article>
+        """
+        for alert in alerts[:12]
+    ) or '<div class="muted-cell">No active IPO alerts for this selection.</div>'
+
+    snapshot_rows = "".join(
+        "<tr>"
+        f'<td>{html.escape(text_value(row.get("created_at")))}</td>'
+        f'<td>{html.escape(text_value(row.get("quarter")))}</td>'
+        f'<td>{html.escape(str(row.get("rank") or ""))}</td>'
+        f'{ipo_symbol_cell(row)}'
+        f'<td>{html.escape(num_text(row.get("total_score"), 0))}</td>'
+        f'<td>{html.escape(num_text(row.get("quality_score"), 1))}</td>'
+        f'<td>{html.escape(num_text(row.get("risk_score"), 1))}</td>'
+        f'<td>{html.escape(text_value(row.get("ai_commentary")))}</td>'
+        "</tr>"
+        for row in snapshots
+    ) or '<tr><td colspan="8" class="muted-cell">No quarterly snapshots saved yet.</td></tr>'
+
+    export_panel = ""
+    if state.ipo_export_csv:
+        export_panel = f"""
+      <section class="panel ipo-export-panel">
+        <div class="panel-title">CSV Export</div>
+        <p class="status">Prepared file: <strong>{html.escape(state.ipo_export_filename or "ipo_export.csv")}</strong></p>
+        <textarea class="ipo-export-box" readonly>{html.escape(state.ipo_export_csv)}</textarea>
+      </section>"""
+
+    return f"""
+    <form id="ipo-panel" method="post" action="/ipo/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <input type="hidden" name="ipo_export_csv" value="{html.escape(state.ipo_export_csv, quote=True)}">
+      <input type="hidden" name="ipo_export_filename" value="{html.escape(state.ipo_export_filename, quote=True)}">
+      <input type="hidden" name="ipo_only_multibagger_present" value="1">
+      <section class="panel ipo-command-panel">
+        <div class="ipo-command-top">
+          <div>
+            <div class="panel-title">IPO Screener</div>
+            <p class="status">Long-term IPO opportunity screener: quarterly confirmation first, valuation comfort second, listing-day excitement last.</p>
+          </div>
+          <div class="actions">
+            <button type="submit" formaction="/ipo/load">Load Screener</button>
+            <button type="submit" formaction="/ipo/force-refresh" class="secondary">Refresh Prices / Valuation</button>
+          </div>
+        </div>
+        <div class="ipo-filter-grid">
+          <label><span>Year</span><select name="ipo_year">{year_options_html}</select></label>
+          <label><span>Quarter</span><select name="ipo_quarter">{quarter_options_html}</select></label>
+          <label><span>Market type</span><select name="ipo_market_type">{market_options_html}</select></label>
+          <label><span>Sector / theme</span><select name="ipo_theme">{theme_options_html}</select></label>
+          <label class="wide"><span>Ranking view</span><select name="ipo_ranking_view">{ranking_options_html}</select></label>
+          {render_checkbox("ipo_only_multibagger", "Only positive return IPOs", state.ipo_only_multibagger, "For 2026 research this keeps IPOs trading above issue price today. Long-term score still requires verified financial data.")}
+        </div>
+      </section>
+      <section class="panel ipo-table-panel ipo-results-panel">
+        <div class="ipo-section-head">
+          <div>
+            <div class="panel-title">IPO Results</div>
+            <p class="status">Results are shown immediately after Load Screener. The positive-return filter keeps current-year names that are above IPO price and still eligible for serious follow-up.</p>
+          </div>
+          <div class="ipo-results-tags">
+            {badge("Positive returns ON" if state.ipo_only_multibagger else "All verified IPOs")}
+            {badge(f"{len(listed)} shown", "0 shown")}
+          </div>
+        </div>
+        <div class="table-wrap"><table id="ipo-listed-table" class="ipo-table"><thead><tr>
+          <th>{sort_header("Company", 0)}</th><th>{sort_header("Action", 1)}</th><th>{sort_header("Flag", 2)}</th>
+          <th>{sort_header("LT Score", 3)}</th><th>{sort_header("Market", 4)}</th><th>{sort_header("Verified", 5)}</th>
+          <th>{sort_header("Scoring", 6)}</th><th>{sort_header("Sector", 7)}</th><th>{sort_header("Theme", 8)}</th>
+          <th>{sort_header("Listing date", 9)}</th><th>{sort_header("IPO price", 10)}</th>
+          <th>{sort_header("IPO mcap", 11)}</th><th>{sort_header("CMP", 12)}</th><th>{sort_header("Current mcap", 13)}</th>
+          <th>{sort_header("Gain IPO", 14)}</th><th>{sort_header("52W drawdown", 15)}</th>
+        </tr></thead><tbody>{listed_rows}</tbody></table></div>
+      </section>
+      <details class="panel ipo-health-panel">
+        <summary>Data health, cache and validation</summary>
+        <div class="summary-grid compact">{validation_cards_html}</div>
+        <div class="summary-grid compact">
+          <div class="ipo-stat-card"><span>Upcoming IPOs</span><strong>{html.escape(str(summary.get("upcoming_count", len(upcoming))))}</strong><small>Company, date, sector, GMP watch</small></div>
+          <div class="ipo-stat-card"><span>Risk alerts</span><strong>{html.escape(str(summary.get("risk_alert_count", 0)))}</strong><small>Eligible-row alerts only</small></div>
+          <div class="ipo-stat-card"><span>Best score</span><strong>{html.escape(num_text(best_score, 0))}</strong><small>{html.escape(text_value(summary.get("best_action"), "Action N/A"))}</small></div>
+          <div class="ipo-stat-card"><span>{html.escape(cache_label)}</span><strong>{html.escape(generated_at)}</strong><small>{html.escape(data_source)}</small></div>
+        </div>
+        {messages_html}
+      </details>
+      <section class="panel ipo-decision-panel">
+        <div class="ipo-decision-main">
+          <span class="mini-kicker">Best long-term IPO decision</span>
+          <h3>{html.escape(decision_company)}</h3>
+          <p>{html.escape(text_value(research_decision.get("outcome"), "Load IPO data to build a decision."))}</p>
+          <div class="ipo-decision-actions">
+            <a class="mini-link" href="{html.escape(decision_screener_url, quote=True)}" target="_blank" rel="noopener">Open Screener</a>
+            {badge(research_decision.get("rating"), "N/A")}
+          </div>
+        </div>
+        <div class="ipo-decision-score">
+          <span>Score</span>
+          <strong>{html.escape(num_text(decision_best.get("total_score") or best_score, 0))}</strong>
+          <small>{html.escape(text_value(decision_best.get("sector"), "Sector N/A"))}</small>
+        </div>
+        <div class="ipo-decision-list">
+          <span class="mini-kicker">Process discipline</span>
+          <ul>{decision_steps_html or "<li>Use score, quarterly proof, cash conversion, and correction before long-term allocation.</li>"}</ul>
+        </div>
+        {source_panel}
+      </section>
+      <section class="panel ipo-upcoming-panel">
+        <div class="panel-title">Upcoming IPOs</div>
+        <p class="status ipo-gmp-note">GMP is unofficial grey-market information. It is shown for awareness only and is not used directly in the long-term score.</p>
+        <div class="ipo-upcoming-grid">{upcoming_cards}</div>
+      </section>
+      <section class="panel ipo-table-panel">
+        <div class="panel-title">Data Issues</div>
+        <p class="status">Rows excluded from production ranking, quarterly monitoring, and buy-zone decisions until listing, price, market-cap, financial, and source verification is complete.</p>
+        <div class="table-wrap"><table id="ipo-data-issues-table" class="ipo-table"><thead><tr>
+          <th>{sort_header("Company", 0)}</th><th>{sort_header("Exchange", 1)}</th><th>{sort_header("Verified", 2)}</th>
+          <th>{sort_header("Scoring", 3)}</th><th>{sort_header("Action", 4)}</th><th>{sort_header("Reason", 5)}</th>
+          <th>{sort_header("Missing fields", 6)}</th><th>{sort_header("Source", 7)}</th>
+        </tr></thead><tbody>{data_issue_rows}</tbody></table></div>
+      </section>
+      <section class="panel ipo-table-panel">
+        <div class="panel-title">Quarterly Monitoring Table</div>
+        <p class="status">Quarterly result proof: growth, margin trend, ROCE/ROE, debt, working capital, cash conversion, promoter/FII-DII movement.</p>
+        <div class="table-wrap"><table id="ipo-quarterly-table" class="ipo-table"><thead><tr>
+          <th>{sort_header("Company", 0)}</th><th>{sort_header("Quarter", 1)}</th><th>{sort_header("Revenue YoY", 2)}</th>
+          <th>{sort_header("EBITDA YoY", 3)}</th><th>{sort_header("PAT YoY", 4)}</th><th>{sort_header("OPM trend", 5)}</th>
+          <th>{sort_header("ROCE", 6)}</th><th>{sort_header("ROE", 7)}</th><th>{sort_header("D/E", 8)}</th>
+          <th>{sort_header("Debtor days", 9)}</th><th>{sort_header("Inventory days", 10)}</th><th>{sort_header("CCC", 11)}</th>
+          <th>{sort_header("CFO/PAT", 12)}</th><th>{sort_header("FCF", 13)}</th><th>{sort_header("Promoter chg", 14)}</th>
+          <th>{sort_header("Pledge chg", 15)}</th><th>{sort_header("FII/DII chg", 16)}</th><th>{sort_header("Flag", 17)}</th>
+        </tr></thead><tbody>{quarterly_rows}</tbody></table></div>
+      </section>
+      <section class="panel ipo-table-panel">
+        <div class="panel-title">Ranking Views</div>
+        <p class="status">{html.escape(state.ipo_ranking_view)}. Use this to find corrected quality, strong-but-expensive names, weak cash conversion, or avoid lists.</p>
+        <div class="ipo-rank-grid">{ranking_cards}</div>
+      </section>
+      <section class="panel ipo-table-panel">
+        <div class="panel-title">Automatic Alerts</div>
+        <div class="ipo-alert-grid">{alert_cards}</div>
+      </section>
+      <section class="panel ipo-table-panel">
+        <div class="panel-title">Company Detail Page</div>
+        <div class="ipo-detail-grid">
+          <article class="ipo-detail-card"><span class="mini-kicker">Business snapshot</span><strong>{html.escape(text_value(detail.get("company_name"), "No company"))}</strong><p>{html.escape(text_value(detail.get("business_snapshot"), "Load IPO data to show the detail view."))}</p></article>
+          <article class="ipo-detail-card"><span class="mini-kicker">Sector thesis</span><strong>{html.escape(text_value(detail.get("theme")))}</strong><p>{html.escape(text_value(detail.get("sector_thesis"), "Sector thesis will appear after scoring."))}</p></article>
+          <article class="ipo-detail-card"><span class="mini-kicker">IPO valuation vs current</span><div class="ipo-card-grid compact"><span>IPO price</span><strong>{html.escape(num_text(detail.get("ipo_price") or detail.get("issue_price")))}</strong><span>CMP</span><strong>{html.escape(num_text(detail.get("current_price")))}</strong><span>PE / peer</span><strong>{html.escape(num_text(detail.get("pe_ratio")))} / {html.escape(num_text(detail.get("peer_median_pe") or detail.get("industry_pe")))}</strong><span>52W drawdown</span><strong>{html.escape(pct_text(detail.get("drawdown_from_52w_high_pct")))}</strong></div></article>
+          <article class="ipo-detail-card"><span class="mini-kicker">Quarterly history</span><div class="ipo-mini-trend">Revenue {html.escape(pct_text(detail.get("latest_revenue_growth_yoy") or detail.get("revenue_growth_yoy")))} | PAT {html.escape(pct_text(detail.get("latest_pat_growth_yoy") or detail.get("pat_growth_yoy") or detail.get("profit_growth_yoy")))} | OPM {html.escape(pct_text(detail.get("opm_trend_pct")))}</div></article>
+          <article class="ipo-detail-card"><span class="mini-kicker">Shareholding trend</span><div class="ipo-mini-trend">Promoter change {html.escape(pct_text(detail.get("promoter_holding_change")))} | Pledge change {html.escape(pct_text(detail.get("pledge_change")))} | FII/DII change {html.escape(pct_text(detail.get("fii_dii_change")))}</div></article>
+          <article class="ipo-detail-card"><span class="mini-kicker">Risk flags</span><div class="ipo-alert-grid">{risk_list(detail)}</div></article>
+          <article class="ipo-detail-card wide"><span class="mini-kicker">Final recommendation</span>{badge(detail.get("action"))}<p>{html.escape(text_value(detail.get("final_recommendation"), "No recommendation available."))}</p></article>
+        </div>
+      </section>
+      <section class="panel ipo-table-panel">
+        <div class="panel-title">Exports</div>
+        <p class="status">Export separate research files for weekly watchlist, buy-zone names, risk alerts, and quarterly result summary.</p>
+        <div class="actions">
+          <button type="submit" formaction="/ipo/export-watchlist" class="secondary">Export Watchlist CSV</button>
+          <button type="submit" formaction="/ipo/export-buy-zone" class="secondary">Export Buy-Zone CSV</button>
+          <button type="submit" formaction="/ipo/export-risk-alerts" class="secondary">Export Risk Alerts CSV</button>
+          <button type="submit" formaction="/ipo/export-quarterly" class="secondary">Export Quarterly CSV</button>
+          <button type="submit" formaction="/ipo/export-top10" class="secondary">Export Top 10 CSV</button>
+        </div>
+      </section>
+      {export_panel}
+      {render_graceful_error(state.error, "IPO Dashboard Error") if state.error and state.active_tab == "ipo" else ""}
+    </form>"""
+
+
 def render_investing_panel(state: PageState) -> str:
     if state.active_tab != "investing" and state.investing_rows is None:
         return f"""
@@ -18236,7 +19194,7 @@ def render_income_growth_panel(state: PageState) -> str:
     summary_cards = "".join(
         f'<div class="investing-summary-card"><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong><small>{html.escape(detail)}</small></div>'
         for label, value, detail in [
-            ("Est monthly CC income", fmt_number(summary.get("existing_monthly_income")), "from currently covered lots"),
+            ("Est monthly CC income", fmt_number(summary.get("existing_monthly_income")), "from recommended covered lots"),
             ("Best add per 1L", fmt_number(summary.get("best_additional_per_lakh")), "premium unlocked per extra capital"),
             ("Portfolio value", format_buy_amount(summary.get("portfolio_market")), "live market value"),
             ("Updated", str(summary.get("as_of") or "Not refreshed"), "manual refresh only"),
@@ -18272,9 +19230,13 @@ def render_income_growth_panel(state: PageState) -> str:
         f'<td class="position-symbol-cell">{equity_stock_button(row)}</td>'
         f"<td>{html.escape(str(row.get('quantity', '')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('times_lot'), 2))}</td>"
-        f"<td><strong>{html.escape(str(row.get('covered_lots', row.get('lots_can_sell_input', 0))))}</strong></td>"
+        f"<td><strong>{html.escape(str(row.get('capacity_lots', row.get('covered_lots', row.get('lots_can_sell_input', 0)))))}</strong></td>"
+        f"<td>{html.escape(str(row.get('existing_short_ce_lots', 0)))}</td>"
+        f"<td><strong>{html.escape(str(row.get('recommended_lots', 0)))}</strong></td>"
+        f"<td>{html.escape(str(row.get('recommended_quantity', 0)))}</td>"
         f"<td>{html.escape(fmt_number(row.get('cmp')))}</td>"
-        f"<td>{html.escape(fmt_number(row.get('input_call_strike')))}</td>"
+        f"<td>{html.escape(fmt_number(row.get('selected_call_strike') or row.get('input_call_strike')))}</td>"
+        f"<td>{html.escape(str(row.get('selected_expiry') or 'N/A'))}<br><small>{html.escape(str(row.get('selected_expiry_dte') or 'N/A'))} DTE</small></td>"
         f"<td>{html.escape(format_buy_amount(row.get('market_value')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('input_to_sell')))}</td>"
         f"<td>{html.escape(str(row.get('lot_size') or row.get('input_lot_size') or 'N/A'))}</td>"
@@ -18289,11 +19251,131 @@ def render_income_growth_panel(state: PageState) -> str:
         f"<td>{html.escape(pct_cell(row.get('input_today')))}</td>"
         f"<td>{render_symbol_value('tradingsymbol', row.get('candidate_ce', ''))}</td>"
         f"<td>{html.escape(fmt_number(row.get('premium')))}</td>"
+        f"<td>{html.escape(pct_cell(row.get('premium_yield_pct')))}</td>"
         f"<td>{html.escape(fmt_number(row.get('monthly_income')))}</td>"
         f"<td><strong>{html.escape(fmt_number(row.get('cc_capacity_score'), 2))}</strong></td>"
         f'<td class="{strength_class(row.get("decision_color"))}"><strong>{html.escape(str(row.get("decision", "")))}</strong></td>'
+        f"<td><small>{html.escape(', '.join(str(item) for item in row.get('reason_codes') or []))}</small><br><small>{html.escape(str(row.get('decision_explanation') or ''))}</small></td>"
         "</tr>"
         )
+
+    def income_growth_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def income_growth_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def income_growth_event_badge(row: dict[str, Any]) -> str:
+        risk = str(
+            row.get("corporate_action_risk")
+            or row.get("event_risk")
+            or "CHECK"
+        ).upper()
+        detail = str(
+            row.get("event_risk_reason")
+            or row.get("corporate_action_detail")
+            or row.get("decision_explanation")
+            or "Quarterly result date is not verified in this screen. Recheck before GO."
+        )
+        css = "signal-green" if risk == "GREEN" else "signal-red" if risk == "RED" else "signal-yellow"
+        return (
+            f'<span class="income-growth-result-warning {css}">'
+            f'Result/event: {html.escape(risk)}<small>{html.escape(detail[:115])}</small></span>'
+        )
+
+    def income_growth_card_bucket(row: dict[str, Any]) -> tuple[str, str, bool]:
+        decision = str(row.get("decision") or "").upper()
+        color = str(row.get("decision_color") or "").lower()
+        recommended_lots = income_growth_int(row.get("recommended_lots"))
+        candidate_ce = str(row.get("candidate_ce") or "").strip()
+        has_order_shape = recommended_lots > 0 and bool(candidate_ce)
+        if has_order_shape and (
+            color in {"green", "lightgreen"}
+            or "GREEN" in decision
+            or "GOOD" in decision
+            or "READY" in decision
+        ):
+            return "Ready to review", "validation-green", True
+        if has_order_shape:
+            return "Watch / review", "validation-yellow", True
+        return "Blocked / avoid", "validation-red", False
+
+    def render_income_growth_card(row: dict[str, Any]) -> tuple[str, str]:
+        bucket, css_class, actionable = income_growth_card_bucket(row)
+        symbol = str(row.get("symbol") or "").upper()
+        company = str(row.get("company") or "")
+        lots = income_growth_int(row.get("recommended_lots"))
+        qty = income_growth_int(row.get("recommended_quantity"))
+        lot_size = income_growth_int(row.get("lot_size") or row.get("input_lot_size"))
+        premium = income_growth_float(row.get("premium"))
+        monthly_income = income_growth_float(row.get("monthly_income"))
+        score = income_growth_float(row.get("cc_capacity_score"))
+        event_badge = income_growth_event_badge(row)
+        order_action = (
+            f'<button type="button" class="income-growth-card-order ce-sell-order-button" '
+            f'data-underlying="{html.escape(symbol, quote=True)}">Review SELL order</button>'
+            if actionable
+            else '<span class="income-growth-card-order muted-action">No order - fix coverage / risk first</span>'
+        )
+        card_html = (
+            f'<article class="income-growth-action-card {css_class}">'
+            f'<div class="income-growth-card-head"><div><strong>{html.escape(symbol)}</strong>'
+            f'<small>{html.escape(company)}</small></div><span>Score {html.escape(fmt_number(score, 0))}</span></div>'
+            f'<div class="income-growth-card-metrics">'
+            f'<span>Decision<strong>{html.escape(str(row.get("decision") or bucket))}</strong></span>'
+            f'<span>Candidate CE<strong>{html.escape(str(row.get("candidate_ce") or "N/A"))}</strong></span>'
+            f'<span>Expiry / DTE<strong>{html.escape(str(row.get("selected_expiry") or "N/A"))} / {html.escape(str(row.get("selected_expiry_dte") or "N/A"))}</strong></span>'
+            f'<span>Holding / lot<strong>{html.escape(str(row.get("quantity") or 0))} / {html.escape(str(lot_size or "N/A"))}</strong></span>'
+            f'<span>Recommended<strong>{html.escape(str(lots))} lot | {html.escape(str(qty))} qty</strong></span>'
+            f'<span>CMP / strike<strong>{html.escape(fmt_number(row.get("cmp")))} / {html.escape(fmt_number(row.get("selected_call_strike") or row.get("input_call_strike")))}</strong></span>'
+            f'<span>OTM gap<strong>{html.escape(pct_cell(row.get("input_gap_pct")))}</strong></span>'
+            f'<span>Premium / yield<strong>{html.escape(fmt_number(premium))} / {html.escape(pct_cell(row.get("premium_yield_pct")))}</strong></span>'
+            f'<span>Max income<strong>{html.escape(format_buy_amount(monthly_income))}</strong></span>'
+            f'<span>52W / 1Y<strong>{html.escape(pct_cell(row.get("input_52w")))} / {html.escape(pct_cell(row.get("input_1y")))}</strong></span>'
+            f'<span>Month / today<strong>{html.escape(pct_cell(row.get("input_month")))} / {html.escape(pct_cell(row.get("input_today")))}</strong></span>'
+            f'</div>'
+            f'<div class="income-growth-card-footer">{event_badge}{order_action}</div>'
+            f'<p>{html.escape(str(row.get("decision_explanation") or "Review live quote, news, coverage and result calendar before order placement.")[:180])}</p>'
+            '</article>'
+        )
+        return bucket, card_html
+
+    grouped_income_cards: dict[str, list[str]] = {
+        "Ready to review": [],
+        "Watch / review": [],
+        "Blocked / avoid": [],
+    }
+    for card_row in sorted(
+        rows,
+        key=lambda item: (
+            income_growth_float(item.get("cc_capacity_score")),
+            income_growth_float(item.get("monthly_income")),
+            income_growth_float(item.get("market_value")),
+        ),
+        reverse=True,
+    ):
+        bucket_name, rendered_card = render_income_growth_card(card_row)
+        grouped_income_cards.setdefault(bucket_name, []).append(rendered_card)
+    income_growth_group_sections = []
+    for group_name, cards in grouped_income_cards.items():
+        group_body = "".join(cards) or '<div class="status">No candidates in this group.</div>'
+        income_growth_group_sections.append(
+            '<section class="income-growth-decision-group">'
+            f'<div class="income-growth-decision-head"><strong>{html.escape(group_name)}</strong>'
+            f'<span>{len(cards)} candidate(s)</span></div>'
+            f'<div class="income-growth-decision-grid">{group_body}</div>'
+            '</section>'
+        )
+    income_growth_cards_html = "".join(income_growth_group_sections)
+    if not any(grouped_income_cards.values()):
+        income_growth_cards_html = '<div class="status">Click Refresh Income Growth to build the card decision view.</div>'
+
     table_rows = "".join(
         render_income_growth_row(row)
         for row in rows
@@ -18301,9 +19383,9 @@ def render_income_growth_panel(state: PageState) -> str:
     dividend_rows = list(summary.get("dividend_income_rows") or [])
     dividend_table_rows = "".join(render_income_growth_row(row) for row in dividend_rows)
     if not dividend_table_rows:
-        dividend_table_rows = '<tr><td colspan="23" class="muted-cell">Refresh Income Growth to load PGINVIT-IV and IRBINVIT market data.</td></tr>'
+        dividend_table_rows = '<tr><td colspan="29" class="muted-cell">Refresh Income Growth to load PGINVIT-IV and IRBINVIT market data.</td></tr>'
     if not table_rows:
-        table_rows = '<tr><td colspan="23" class="muted-cell">Click Refresh Income Growth to calculate covered-call capacity from your holdings sheet.</td></tr>'
+        table_rows = '<tr><td colspan="29" class="muted-cell">Click Refresh Income Growth to calculate covered-call capacity from your holdings sheet.</td></tr>'
     try:
         stored_holdings = load_income_growth_holding_map()
     except Exception:
@@ -18336,9 +19418,13 @@ def render_income_growth_panel(state: PageState) -> str:
         "Stock",
         "Holding",
         "Times lot",
-        "Lots sell",
+        "Capacity lots",
+        "Open CE lots",
+        "Recommended lots",
+        "Rec qty",
         "CMP",
         "CALL Strike",
+        "Expiry",
         "Value",
         "To sell",
         "Lot Size",
@@ -18353,9 +19439,11 @@ def render_income_growth_panel(state: PageState) -> str:
         "Today",
         "Kite CE",
         "Premium",
+        "Yield",
         "Monthly income",
         "Score",
         "Decision",
+        "Reason",
     ]
     header_html = "".join(
         f'<th><button type="button" class="sort-header" data-sort-col="{index}">{html.escape(label)}</button></th>'
@@ -18391,10 +19479,17 @@ def render_income_growth_panel(state: PageState) -> str:
       </section>
       {render_income_growth_gpt_schedule_panel()}
       {gpt_result}
-      <section class="panel income-growth-table-panel">
-        <div class="panel-title">Covered Call Capacity Score From Current Holding Sheet</div>
-        <div class="status">Click a stock name to BUY or SELL equity through the selected Kite profile. Uses your holding shares, lot multiple, lots can be sold, CMP, call strike, PE, 52W, 1Y, monthly, weekly, and today move.</div>
-        <div class="table-wrap"><table id="income-growth-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{table_rows}</tbody></table></div>
+      <section class="panel income-growth-card-panel">
+        <div class="panel-title">Covered CALL Decision Cards</div>
+        <div class="status">Cards are grouped by decision so you can act quickly. Every SELL button still revalidates fresh Kite quote, holding coverage, existing positions, news, and event risk before the 10-second pause.</div>
+        <div class="income-growth-decision-stack">{income_growth_cards_html}</div>
+      </section>
+      <section class="panel income-growth-table-panel income-growth-audit-panel">
+        <details class="income-growth-audit-details">
+          <summary><span>Full holding sheet audit</span><small>Open detailed table for sorting, 52W, PE, lot and score data</small></summary>
+          <div class="status">Click a stock name to BUY or SELL equity through the selected Kite profile. Uses your holding shares, lot multiple, lots can be sold, CMP, call strike, PE, 52W, 1Y, monthly, weekly, and today move.</div>
+          <div class="table-wrap"><table id="income-growth-table" class="income-growth-table"><thead><tr>{header_html}</tr></thead><tbody>{table_rows}</tbody></table></div>
+        </details>
       </section>
       {render_results(state.income_growth_equity_results)}
       {update_form_html}
@@ -21313,6 +22408,7 @@ def render_page(state: PageState) -> bytes:
     investing_tab_class = "active" if state.active_tab == "investing" else ""
     income_growth_tab_class = "active" if state.active_tab == "income-growth" else ""
     equity_tab_class = "active" if state.active_tab == "equity" else ""
+    ipo_tab_class = "active" if state.active_tab == "ipo" else ""
     nifty_income_tab_class = "active" if state.active_tab == "nifty-income" else ""
     nifty_grow_tab_class = "active" if state.active_tab == "nifty-grow" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
@@ -22596,6 +23692,179 @@ def render_page(state: PageState) -> bytes:
       border-color: #99f6e4;
       background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
     }}
+    .income-growth-card-panel {{
+      border-color: #86efac;
+      background:
+        radial-gradient(circle at 8% 0%, rgba(16, 185, 129, 0.16), transparent 28%),
+        linear-gradient(135deg, #ffffff 0%, #ecfdf5 100%);
+    }}
+    .income-growth-decision-stack {{
+      display: grid;
+      gap: 14px;
+      margin-top: 12px;
+    }}
+    .income-growth-decision-group {{
+      border: 1px solid #b8e5de;
+      border-radius: 12px;
+      padding: 11px;
+      background: rgba(255, 255, 255, 0.68);
+    }}
+    .income-growth-decision-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      color: #0f4c5c;
+    }}
+    .income-growth-decision-head strong {{
+      font-size: 14px;
+      font-weight: 950;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }}
+    .income-growth-decision-head span {{
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: #e0f2fe;
+      color: #075985;
+      font-size: 11px;
+      font-weight: 900;
+    }}
+    .income-growth-decision-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+      gap: 10px;
+    }}
+    .income-growth-action-card {{
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      padding: 12px;
+      box-shadow: 0 12px 28px rgba(15, 118, 110, 0.07);
+      background: #ffffff;
+    }}
+    .income-growth-action-card.validation-green {{
+      border-color: #86efac;
+      background: linear-gradient(135deg, #ecfdf5, #ffffff);
+    }}
+    .income-growth-action-card.validation-yellow {{
+      border-color: #fde68a;
+      background: linear-gradient(135deg, #fffbeb, #ffffff);
+    }}
+    .income-growth-action-card.validation-red {{
+      border-color: #fecaca;
+      background: linear-gradient(135deg, #fff1f2, #ffffff);
+    }}
+    .income-growth-card-head {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 9px;
+    }}
+    .income-growth-card-head strong {{
+      display: block;
+      color: #006b5f;
+      font-size: 18px;
+      font-weight: 950;
+    }}
+    .income-growth-card-head small {{
+      display: block;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1.25;
+    }}
+    .income-growth-card-head span {{
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: #dbeafe;
+      color: #1e3a8a;
+      font-size: 11px;
+      font-weight: 950;
+      white-space: nowrap;
+    }}
+    .income-growth-card-metrics {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 10px;
+    }}
+    .income-growth-card-metrics span {{
+      color: #64748b;
+      font-size: 10.5px;
+      font-weight: 850;
+      text-transform: uppercase;
+    }}
+    .income-growth-card-metrics strong {{
+      display: block;
+      margin-top: 2px;
+      color: #0f172a;
+      font-size: 13px;
+      font-weight: 950;
+      overflow-wrap: anywhere;
+      text-transform: none;
+    }}
+    .income-growth-card-footer {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+    }}
+    .income-growth-result-warning {{
+      display: block;
+      padding: 7px 8px;
+      border-radius: 8px;
+      line-height: 1.25;
+    }}
+    .income-growth-result-warning small {{
+      display: block;
+      margin-top: 2px;
+      font-size: 10px;
+      font-weight: 750;
+    }}
+    .income-growth-card-order {{
+      min-height: 38px;
+      white-space: nowrap;
+    }}
+    .income-growth-card-order.muted-action {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 8px 10px;
+      border-radius: 9px;
+      background: #f1f5f9;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 900;
+      text-align: center;
+    }}
+    .income-growth-action-card p {{
+      margin: 9px 0 0;
+      color: #475569;
+      font-size: 11px;
+      line-height: 1.35;
+    }}
+    .income-growth-audit-panel {{
+      padding: 0;
+    }}
+    .income-growth-audit-details {{
+      padding: 14px 16px;
+    }}
+    .income-growth-audit-details summary {{
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: #0f4c5c;
+      font-weight: 950;
+    }}
+    .income-growth-audit-details summary small {{
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 800;
+    }}
     .income-growth-gpt-result {{
       border-color: #7dd3fc;
       background:
@@ -23192,6 +24461,64 @@ def render_page(state: PageState) -> bytes:
       overscroll-behavior: contain;
       scrollbar-gutter: stable;
     }}
+    #ce-sell-order-modal .income-pe-order-modal-card {{
+      width: min(760px, calc(100vw - 28px));
+      text-align: left;
+    }}
+    #ce-sell-order-modal h2,
+    #ce-sell-order-modal .status,
+    #ce-sell-order-modal .breath-text,
+    #ce-sell-order-modal .countdown,
+    #ce-sell-order-modal .trade-news-panel {{
+      text-align: center;
+    }}
+    #ce-sell-order-modal .ce-sell-metrics {{
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 14px 0;
+    }}
+    #ce-sell-order-modal .ce-sell-metrics > div {{
+      min-width: 0;
+      min-height: 82px;
+      padding: 11px 12px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }}
+    #ce-sell-order-modal .ce-sell-metrics .ce-sell-wide {{
+      grid-column: span 2;
+    }}
+    #ce-sell-order-modal .ce-sell-metrics .ce-sell-full {{
+      grid-column: 1 / -1;
+      min-height: 62px;
+      background: linear-gradient(135deg, #fff7ed 0%, #fefce8 100%);
+      border-color: #fde68a;
+    }}
+    #ce-sell-order-modal .ce-sell-metrics strong {{
+      overflow-wrap: anywhere;
+      word-break: normal;
+      line-height: 1.18;
+    }}
+    #ce-sell-order-modal .ce-sell-metrics small {{
+      display: block;
+      margin-top: 6px;
+      color: #475569;
+      font-size: 12px;
+      line-height: 1.25;
+    }}
+    #ce-sell-order-modal #ce-sell-result-date {{
+      font-size: 15px;
+      text-align: left;
+    }}
+    #ce-sell-order-modal .option-position-info,
+    #ce-sell-order-modal .income-equity-order-summary {{
+      line-height: 1.35;
+      text-align: center;
+    }}
+    #ce-sell-order-modal .trade-news-panel {{
+      max-height: 155px;
+      overflow-y: auto;
+    }}
     .income-pe-order-modal-card .modal-actions {{
       position: sticky;
       z-index: 4;
@@ -23667,6 +24994,12 @@ def render_page(state: PageState) -> bytes:
       --tab-ink: #075985;
       --tab-shadow: rgba(14, 116, 144, 0.16);
     }}
+    .tab-button[data-tab="ipo"] {{
+      --tab-a: #d1fae5;
+      --tab-b: #fef3c7;
+      --tab-ink: #047857;
+      --tab-shadow: rgba(16, 185, 129, 0.16);
+    }}
     .tab-button[data-tab="investing"] {{
       --tab-a: #dbeafe;
       --tab-b: #ecfdf5;
@@ -23777,6 +25110,7 @@ def render_page(state: PageState) -> bytes:
     #analytics-panel,
     #research-panel,
     #income-panel,
+    #ipo-panel,
     #commodity-panel,
     #order-management-panel,
     #gpt-panel,
@@ -23793,6 +25127,7 @@ def render_page(state: PageState) -> bytes:
     #positions-panel {{ border-left: 5px solid #0f766e; }}
     #analytics-panel, #research-panel {{ border-left: 5px solid #2563eb; }}
     #income-panel {{ border-left: 5px solid #22c55e; }}
+    #ipo-panel {{ border-left: 5px solid #10b981; }}
     #commodity-panel {{ border-left: 5px solid #f59e0b; }}
     #order-management-panel {{ border-left: 5px solid #ef4444; }}
     #gpt-panel {{ border-left: 5px solid #14b8a6; }}
@@ -23812,6 +25147,9 @@ def render_page(state: PageState) -> bytes:
     #income-panel {{
       background: linear-gradient(135deg, rgba(240, 253, 244, 0.92), rgba(254, 252, 232, 0.86));
     }}
+    #ipo-panel {{
+      background: linear-gradient(135deg, rgba(240, 253, 250, 0.94), rgba(255, 251, 235, 0.80));
+    }}
     #commodity-panel {{
       background: linear-gradient(135deg, rgba(255, 247, 237, 0.94), rgba(254, 243, 199, 0.76));
     }}
@@ -23823,6 +25161,400 @@ def render_page(state: PageState) -> bytes:
     }}
     #kite-setup-panel {{
       background: linear-gradient(135deg, rgba(236, 254, 255, 0.94), rgba(240, 249, 255, 0.84));
+    }}
+    .ipo-hero-panel {{
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) minmax(360px, 1.4fr) auto;
+      gap: 14px;
+      align-items: start;
+    }}
+    .ipo-control-strip {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(150px, 1fr));
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid rgba(20, 184, 166, 0.22);
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(240, 253, 250, 0.86), rgba(255, 251, 235, 0.72));
+    }}
+    .ipo-control-strip label {{ margin: 0; }}
+    .ipo-control-strip select {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 9px 10px;
+      background: #fff;
+      color: var(--ink);
+    }}
+    .ipo-summary-panel {{
+      padding: 8px 10px;
+    }}
+    .ipo-summary-panel .summary-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
+      gap: 8px;
+      margin: 0;
+    }}
+    .ipo-summary-panel .investing-summary-card {{
+      min-height: 48px;
+      padding: 7px 10px;
+      border-radius: 10px;
+      box-shadow: 0 8px 18px rgba(22, 101, 52, 0.06);
+    }}
+    .ipo-summary-panel .investing-summary-card strong {{
+      margin: 3px 0 2px;
+      font-size: 16px;
+      line-height: 1;
+    }}
+    .ipo-summary-panel .investing-summary-card span,
+    .ipo-summary-panel .investing-summary-card small {{
+      font-size: 8.5px;
+      line-height: 1.15;
+    }}
+    .ipo-upcoming-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }}
+    .ipo-upcoming-card {{
+      border: 1px solid rgba(20, 184, 166, 0.25);
+      border-radius: 14px;
+      padding: 14px;
+      background: linear-gradient(135deg, #f0fdfa, #fff7ed);
+      box-shadow: 0 12px 26px rgba(15, 23, 42, 0.06);
+    }}
+    .ipo-card-top {{
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: flex-start;
+    }}
+    .ipo-card-top a {{
+      color: #0f766e;
+      font-size: 16px;
+      font-weight: 950;
+      text-decoration: none;
+    }}
+    .ipo-card-top a:hover {{ text-decoration: underline; }}
+    .ipo-card-top span {{ color: #92400e; font-weight: 800; white-space: nowrap; }}
+    .ipo-card-sector {{ color: #475569; font-weight: 800; margin: 8px 0; }}
+    .ipo-card-grid {{
+      display: grid;
+      grid-template-columns: 88px 1fr;
+      gap: 6px 10px;
+      margin: 10px 0;
+    }}
+    .ipo-card-grid span {{ color: #64748b; font-size: 12px; font-weight: 800; text-transform: uppercase; }}
+    .ipo-card-grid strong {{ color: #0f172a; }}
+    .ipo-gmp-note {{
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid #fde68a;
+      background: #fffbeb;
+      color: #92400e;
+      font-weight: 800;
+    }}
+    .ipo-message {{
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #ecfdf5;
+      border: 1px solid #86efac;
+      color: #047857;
+      font-weight: 800;
+    }}
+    .ipo-decision-panel {{
+      display: grid;
+      grid-template-columns: minmax(260px, 1.6fr) minmax(110px, 0.45fr) minmax(220px, 1fr) minmax(260px, 1.15fr);
+      gap: 12px;
+      align-items: stretch;
+      border-color: rgba(20, 184, 166, 0.38);
+      background:
+        radial-gradient(circle at top left, rgba(187, 247, 208, 0.55), transparent 34%),
+        linear-gradient(135deg, rgba(240, 253, 250, 0.95), rgba(255, 251, 235, 0.82));
+    }}
+    .ipo-decision-main,
+    .ipo-decision-score,
+    .ipo-decision-list {{
+      border: 1px solid rgba(20, 184, 166, 0.25);
+      border-radius: 14px;
+      padding: 13px 14px;
+      background: rgba(255, 255, 255, 0.72);
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+    }}
+    .ipo-decision-main h3 {{
+      margin: 5px 0 6px;
+      color: #075985;
+      font-size: 20px;
+      line-height: 1.1;
+    }}
+    .ipo-decision-main p {{
+      margin: 0;
+      color: #334155;
+      font-weight: 750;
+      line-height: 1.35;
+    }}
+    .ipo-decision-actions {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }}
+    .ipo-decision-actions span {{
+      border-radius: 999px;
+      padding: 5px 9px;
+      background: #dcfce7;
+      color: #166534;
+      font-weight: 900;
+      font-size: 11px;
+    }}
+    .ipo-decision-score {{
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      text-align: center;
+    }}
+    .ipo-decision-score span,
+    .mini-kicker {{
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 950;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }}
+    .ipo-decision-score strong {{
+      color: #047857;
+      font-size: 34px;
+      line-height: 1;
+      margin: 5px 0;
+    }}
+    .ipo-decision-score small {{
+      color: #334155;
+      font-weight: 800;
+    }}
+    .ipo-decision-list ul {{
+      margin: 8px 0 0;
+      padding-left: 18px;
+      color: #334155;
+    }}
+    .ipo-decision-list li {{
+      margin: 4px 0;
+      line-height: 1.3;
+    }}
+    .ipo-decision-list.source strong {{
+      display: block;
+      margin-top: 5px;
+      color: #0f766e;
+      font-size: 12px;
+      line-height: 1.25;
+    }}
+    .ipo-score-pill {{
+      display: inline-block;
+      min-width: 44px;
+      text-align: center;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: #dcfce7;
+      color: #166534;
+      font-weight: 900;
+    }}
+    .ipo-export-box {{ min-height: 180px; }}
+    .ipo-table th, .ipo-table td {{ white-space: nowrap; }}
+    .ipo-table td:last-child {{ white-space: normal; min-width: 220px; }}
+    .ipo-filter-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(180px, 1fr));
+      gap: 10px;
+      align-items: end;
+    }}
+    .ipo-filter-grid select {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 9px 10px;
+      background: rgba(255, 255, 255, 0.94);
+      color: var(--ink);
+    }}
+    .ipo-badge {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 22px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 950;
+      text-transform: uppercase;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }}
+    .ipo-badge.green,
+    .ipo-badge.good {{ background: #dcfce7; color: #166534; border: 1px solid #86efac; }}
+    .ipo-badge.yellow,
+    .ipo-badge.warn {{ background: #fef9c3; color: #854d0e; border: 1px solid #fde68a; }}
+    .ipo-badge.red,
+    .ipo-badge.bad {{ background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }}
+    .ipo-badge.blue {{ background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }}
+    .ipo-badge.neutral {{ background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; }}
+    .ipo-command-panel {{
+      border: 1px solid rgba(20, 184, 166, 0.28);
+      border-radius: 16px;
+      padding: 16px;
+      background:
+        radial-gradient(circle at top right, rgba(187, 247, 208, 0.46), transparent 30%),
+        linear-gradient(135deg, rgba(240, 253, 250, 0.95), rgba(255, 251, 235, 0.78));
+    }}
+    .ipo-command-top {{
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) auto;
+      gap: 12px;
+      align-items: start;
+    }}
+    .ipo-command-top .actions {{
+      margin-top: 0;
+      justify-content: flex-end;
+    }}
+    .ipo-command-main {{
+      border-radius: 14px;
+      padding: 14px;
+      color: #ecfeff;
+      background: linear-gradient(135deg, #0f172a, #0f766e);
+      box-shadow: 0 18px 34px rgba(15, 23, 42, 0.13);
+    }}
+    .ipo-command-main h3 {{ margin: 5px 0 6px; font-size: 22px; line-height: 1.1; }}
+    .ipo-command-main p {{ margin: 0; color: #cffafe; font-weight: 760; line-height: 1.35; }}
+    .ipo-stat-card {{
+      border: 1px solid rgba(34, 197, 94, 0.22);
+      border-radius: 14px;
+      padding: 13px;
+      background: rgba(255, 255, 255, 0.78);
+    }}
+    .ipo-stat-card span {{
+      display: block;
+      color: #64748b;
+      font-size: 10px;
+      font-weight: 950;
+      text-transform: uppercase;
+    }}
+    .ipo-stat-card strong {{
+      display: block;
+      margin-top: 6px;
+      color: #047857;
+      font-size: 24px;
+      line-height: 1;
+    }}
+    .ipo-results-panel {{
+      border-color: rgba(16, 185, 129, 0.42);
+      background:
+        radial-gradient(circle at top right, rgba(220, 252, 231, 0.58), transparent 34%),
+        linear-gradient(135deg, rgba(255, 255, 255, 0.94), rgba(240, 253, 250, 0.86));
+    }}
+    .ipo-section-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: flex-start;
+      margin-bottom: 10px;
+    }}
+    .ipo-section-head .status {{
+      margin-bottom: 0;
+    }}
+    .ipo-results-tags {{
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      min-width: 170px;
+    }}
+    .ipo-health-panel {{
+      padding: 10px 12px;
+      border-color: rgba(20, 184, 166, 0.26);
+      background: rgba(240, 253, 250, 0.64);
+    }}
+    .ipo-health-panel summary {{
+      cursor: pointer;
+      color: #0f766e;
+      font-weight: 950;
+    }}
+    .ipo-health-panel .summary-grid.compact {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
+      gap: 8px;
+      margin: 10px 0 0;
+    }}
+    .ipo-health-panel .ipo-stat-card {{
+      min-height: 54px;
+      padding: 9px 11px;
+    }}
+    .ipo-health-panel .ipo-stat-card strong {{
+      font-size: 18px;
+    }}
+    .ipo-rank-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+    }}
+    .ipo-rank-card {{
+      border: 1px solid rgba(20, 184, 166, 0.25);
+      border-radius: 13px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.76);
+    }}
+    .ipo-rank-card h4 {{ margin: 0 0 6px; color: #0f766e; font-size: 15px; }}
+    .ipo-rank-card p {{ margin: 0; color: #475569; font-size: 12px; line-height: 1.35; }}
+    .ipo-detail-grid {{
+      display: grid;
+      grid-template-columns: minmax(260px, 1.15fr) minmax(260px, 1fr) minmax(260px, 1fr);
+      gap: 12px;
+    }}
+    .ipo-detail-card {{
+      border: 1px solid rgba(20, 184, 166, 0.25);
+      border-radius: 14px;
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.78);
+    }}
+    .ipo-detail-card h4 {{ margin: 0 0 8px; color: #0f172a; }}
+    .ipo-detail-card p {{ margin: 0; color: #334155; line-height: 1.38; }}
+    .ipo-alert-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+    }}
+    .ipo-alert-card {{
+      border: 1px solid #bae6fd;
+      border-left-width: 5px;
+      border-radius: 12px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.78);
+    }}
+    .ipo-alert-card.red {{ border-color: #fca5a5; background: #fff1f2; }}
+    .ipo-alert-card.green {{ border-color: #86efac; background: #ecfdf5; }}
+    .ipo-alert-card.yellow {{ border-color: #fde68a; background: #fffbeb; }}
+    .ipo-alert-card.blue {{ border-color: #93c5fd; background: #eff6ff; }}
+    .ipo-alert-card strong {{ display: block; color: #0f172a; margin-bottom: 4px; }}
+    .ipo-alert-card p {{ margin: 0; color: #334155; line-height: 1.35; }}
+    .ipo-mini-trend {{
+      display: grid;
+      gap: 6px;
+      margin-top: 10px;
+    }}
+    .ipo-mini-trend div {{
+      display: grid;
+      grid-template-columns: 110px 1fr 54px;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+      font-weight: 800;
+      color: #334155;
+    }}
+    .ipo-mini-trend i {{
+      display: block;
+      height: 8px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #14b8a6, #86efac);
     }}
     label {{ display: block; margin-bottom: 12px; }}
     label span {{ display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }}
@@ -25650,6 +27382,14 @@ def render_page(state: PageState) -> bytes:
       .investing-summary-panel .summary-grid {{ grid-template-columns: 1fr; }}
       .equity-hero {{ align-items: flex-start; flex-direction: column; }}
       .equity-summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .ipo-hero-panel,
+      .ipo-control-strip,
+      .ipo-command-top {{ grid-template-columns: 1fr; }}
+      .ipo-command-top .actions {{ justify-content: flex-start; }}
+      .ipo-decision-panel {{ grid-template-columns: 1fr; }}
+      .ipo-summary-panel .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .ipo-section-head {{ flex-direction: column; }}
+      .ipo-health-panel .summary-grid.compact {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .position-summary-strip {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .position-summary-chip {{ align-items: flex-start; flex-direction: column; gap: 4px; }}
       .position-settings-grid,
@@ -25663,6 +27403,16 @@ def render_page(state: PageState) -> bytes:
       .income-pe-order-modal-card {{
         width: min(680px, calc(100vw - 16px));
         max-height: calc(100vh - 16px);
+      }}
+      #ce-sell-order-modal .income-pe-order-modal-card {{
+        width: min(760px, calc(100vw - 16px));
+      }}
+      #ce-sell-order-modal .ce-sell-metrics {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      #ce-sell-order-modal .ce-sell-metrics .ce-sell-wide,
+      #ce-sell-order-modal .ce-sell-metrics .ce-sell-full {{
+        grid-column: 1 / -1;
       }}
       .compact-rules {{ grid-template-columns: 1fr; }}
       .decision-tile {{ min-height: auto; }}
@@ -25710,6 +27460,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Modify / Cancel</button>
       <button class="tab-button utility-action {investing_tab_class}" type="button" data-tab="investing">Investing</button>
       <button class="tab-button utility-action {equity_tab_class}" type="button" data-tab="equity">Equity</button>
+      <button class="tab-button utility-action {ipo_tab_class}" type="button" data-tab="ipo">IPO</button>
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       {f'<button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>' if nifty_income_enabled else ''}
@@ -25741,8 +27492,8 @@ def render_page(state: PageState) -> bytes:
               <span class="backend-spinner" aria-hidden="true"></span>
               <strong>Revalidating coverage, position risk, quote, analytics, and news...</strong>
             </div>
-            <div class="income-equity-metrics">
-              <div><span>Option</span><strong id="ce-sell-option">--</strong></div>
+            <div class="income-equity-metrics ce-sell-metrics">
+              <div class="ce-sell-wide"><span>Option</span><strong id="ce-sell-option">--</strong></div>
               <div><span>Fresh LTP</span><strong id="ce-sell-ltp">--</strong></div>
               <div><span>SELL limit</span><strong id="ce-sell-limit">--</strong></div>
               <div><span>Holding / quantity</span><strong id="ce-sell-coverage">--</strong><small id="ce-sell-holding-source">--</small></div>
@@ -25750,19 +27501,21 @@ def render_page(state: PageState) -> bytes:
               <div><span>Maximum profit</span><strong id="ce-sell-max-profit">--</strong></div>
               <div><span>OTM / yield</span><strong id="ce-sell-yield">--</strong></div>
               <div><span>Score / risk</span><strong id="ce-sell-risk">--</strong></div>
+              <div class="ce-sell-full"><span>Next result / event</span><strong id="ce-sell-result-date">--</strong></div>
             </div>
             <div class="option-position-info" id="ce-sell-active-position-info">Checking active PE/CE SELL positions...</div>
             <div class="income-equity-order-summary" id="ce-sell-summary">Loading fresh covered CE order...</div>
             <div class="trade-news-panel"><strong>Recent stock news</strong><div id="ce-sell-news">Loading news...</div></div>
-            <input type="hidden" name="ce_sell_underlying" id="ce-sell-underlying">
-            <input type="hidden" name="ce_sell_confirmed" id="ce-sell-confirmed" value="0">
+            <input form="place-panel" type="hidden" name="ce_sell_underlying" id="ce-sell-underlying">
+            <input form="place-panel" type="hidden" name="ce_sell_snapshot" id="ce-sell-snapshot">
+            <input form="place-panel" type="hidden" name="ce_sell_confirmed" id="ce-sell-confirmed" value="0">
             <div class="breath-circle income-pe-breath" id="ce-sell-breath"></div>
             <div class="breath-text" id="ce-sell-breath-text">Review order first</div>
             <div class="countdown" id="ce-sell-countdown">10</div>
             <div class="modal-actions">
               <button type="button" class="secondary" id="ce-sell-cancel">Cancel</button>
               <button type="button" id="ce-sell-review" disabled>Review &amp; Start 10s</button>
-              <button type="submit" class="danger" formaction="/ce-scan/sell" id="ce-sell-go" disabled>GO</button>
+              <button form="place-panel" type="submit" class="danger" formaction="/ce-scan/sell" id="ce-sell-go" disabled>GO</button>
             </div>
           </div>
         </div>
@@ -25847,6 +27600,7 @@ def render_page(state: PageState) -> bytes:
     {render_nifty_grow_panel(state)}
     {render_investing_panel(state)}
     {render_equity_panel(state)}
+    {render_ipo_panel(state)}
     {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
   </main>
@@ -26045,6 +27799,10 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(document.getElementById('income-growth-table'));
     enableTableSorting(document.getElementById('dividend-income-table'));
     enableTableSorting(document.getElementById('equity-holdings-table'));
+    enableTableSorting(document.getElementById('ipo-listed-table'));
+    enableTableSorting(document.getElementById('ipo-data-issues-table'));
+    enableTableSorting(document.getElementById('ipo-top10-table'));
+    enableTableSorting(document.getElementById('ipo-snapshot-table'));
     const ordersSelectAll = document.getElementById('orders-select-all');
     const ordersUnselectAll = document.getElementById('orders-unselect-all');
     function setOrderCheckboxes(checked) {{
@@ -26101,6 +27859,7 @@ def render_page(state: PageState) -> bytes:
       if (niftyGrowPanel) niftyGrowPanel.style.display = active === 'nifty-grow' ? '' : 'none';
       document.getElementById('investing-panel').style.display = active === 'investing' ? '' : 'none';
       document.getElementById('equity-panel').style.display = active === 'equity' ? '' : 'none';
+      document.getElementById('ipo-panel').style.display = active === 'ipo' ? '' : 'none';
       document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
       document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
       for (const item of document.querySelectorAll('.tab-button')) {{
@@ -26127,6 +27886,7 @@ def render_page(state: PageState) -> bytes:
           'nifty-grow': '/nifty-grow',
           investing: '/investing',
           equity: '/equity',
+          ipo: '/ipo',
           'income-growth': '/income-growth',
           commodity: '/commodity',
           'order-management': '/orders',
@@ -26360,10 +28120,12 @@ def render_page(state: PageState) -> bytes:
     const ceSellMaxProfit = document.getElementById('ce-sell-max-profit');
     const ceSellYield = document.getElementById('ce-sell-yield');
     const ceSellRisk = document.getElementById('ce-sell-risk');
+    const ceSellResultDate = document.getElementById('ce-sell-result-date');
     const ceSellActiveInfo = document.getElementById('ce-sell-active-position-info');
     const ceSellSummary = document.getElementById('ce-sell-summary');
     const ceSellNews = document.getElementById('ce-sell-news');
     const ceSellUnderlying = document.getElementById('ce-sell-underlying');
+    const ceSellSnapshot = document.getElementById('ce-sell-snapshot');
     const ceSellConfirmed = document.getElementById('ce-sell-confirmed');
     const ceSellReview = document.getElementById('ce-sell-review');
     const ceSellGo = document.getElementById('ce-sell-go');
@@ -26831,40 +28593,75 @@ def render_page(state: PageState) -> bytes:
         ceSellNews.textContent = compactClientError(error.message, 'Could not load stock news');
       }}
     }}
+    function parseCeSellSnapshot(button) {{
+      if (!button || !button.dataset || !button.dataset.ceSnapshot) return null;
+      try {{
+        const parsed = JSON.parse(button.dataset.ceSnapshot);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+      }} catch (_error) {{
+        return null;
+      }}
+    }}
+    function applyCeSellData(data, sourceLabel) {{
+      if (!data) return false;
+      if (ceSellOption) ceSellOption.textContent = data.symbol || '--';
+      if (ceSellLtp) ceSellLtp.textContent = Number(data.ltp || 0).toFixed(2);
+      if (ceSellLimit) ceSellLimit.textContent = Number(data.limit_price || 0).toFixed(2);
+      if (ceSellCoverage) ceSellCoverage.textContent = `${{data.holding_qty || 0}} / ${{data.quantity || 0}}`;
+      if (ceSellHoldingSource) ceSellHoldingSource.textContent = `${{data.holding_source || 'Unknown source'}} | Kite ${{data.kite_holding_qty || 0}} | Income Growth ${{data.income_growth_holding_qty || 0}}`;
+      if (ceSellStrike) ceSellStrike.textContent = `${{Number(data.cmp || 0).toFixed(2)}} / ${{Number(data.strike || 0).toFixed(2)}}`;
+      if (ceSellMaxProfit) ceSellMaxProfit.textContent = Number(data.max_profit || 0).toFixed(0);
+      if (ceSellYield) ceSellYield.textContent = `${{Number(data.otm_percent || 0).toFixed(2)}}% / ${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
+      if (ceSellRisk) ceSellRisk.textContent = `${{Number(data.score || 0).toFixed(0)}} / ${{data.event_risk || 'N/A'}} event / ${{data.breakout_risk || 'N/A'}} breakout`;
+      if (ceSellResultDate) {{
+        const resultRisk = String(data.result_event_risk || data.event_risk || 'CHECK').toUpperCase();
+        ceSellResultDate.textContent = data.next_result_date || 'Verify NSE/BSE result calendar before GO';
+        ceSellResultDate.className = resultRisk === 'RED' ? 'signal-red' : resultRisk === 'GREEN' ? 'signal-green' : 'signal-yellow';
+      }}
+      if (ceSellActiveInfo) {{
+        ceSellActiveInfo.textContent = data.active_sell_summary || 'No active PE/CE SELL position found for this stock.';
+        ceSellActiveInfo.classList.toggle('has-risk', Boolean(data.has_active_pe_sell || data.has_active_ce_sell));
+      }}
+      const quoteLabel = sourceLabel || (data.client_snapshot ? 'latest main-page LTP' : 'fresh LTP');
+      if (ceSellSummary) ceSellSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | ${{Number(data.markup_percent || 0).toFixed(2)}}% above ${{quoteLabel}} ${{Number(data.ltp || 0).toFixed(2)}} | Effective holding ${{data.holding_qty}} from ${{data.holding_source || 'holding record'}}`;
+      if (ceSellReview) ceSellReview.disabled = !(Number(data.quantity || 0) > 0 && Number(data.limit_price || 0) > 0);
+      return true;
+    }}
     async function openCeSellModal(button) {{
       if (!ceSellModal) return;
+      if (ceSellModal.parentElement !== document.body) {{
+        document.body.appendChild(ceSellModal);
+      }}
       resetCeSellConfirmation();
       const underlying = button.dataset.underlying || '';
       ceSellModal.style.display = 'flex';
       if (ceSellTitle) ceSellTitle.textContent = `${{underlying}} Covered CE SELL Review`;
       if (ceSellUnderlying) ceSellUnderlying.value = underlying;
-      if (ceSellSummary) ceSellSummary.textContent = 'Revalidating Top 3 status, coverage, positions, and fresh CE premium...';
+      const cardSnapshot = parseCeSellSnapshot(button);
+      if (ceSellSnapshot) ceSellSnapshot.value = cardSnapshot ? JSON.stringify(cardSnapshot) : '';
+      if (ceSellSummary) ceSellSummary.textContent = cardSnapshot ? 'Using latest Top 3 CE data from this page...' : 'Revalidating Top 3 status, coverage, positions, and fresh CE premium...';
       if (ceSellActiveInfo) {{
         ceSellActiveInfo.textContent = 'Checking active PE/CE SELL positions...';
         ceSellActiveInfo.classList.remove('has-risk');
       }}
-      setQuoteLoading(ceSellModal, ceSellLoading, true, 'Revalidating covered CE SELL candidate...');
+      if (ceSellResultDate) {{
+        ceSellResultDate.textContent = 'Checking result calendar...';
+        ceSellResultDate.className = '';
+      }}
       const newsPromise = loadCeSellNews(underlying);
+      if (cardSnapshot && applyCeSellData(cardSnapshot, 'latest main-page LTP')) {{
+        setQuoteLoading(ceSellModal, ceSellLoading, false);
+        newsPromise.catch(() => {{}});
+        return;
+      }}
+      setQuoteLoading(ceSellModal, ceSellLoading, true, 'Revalidating covered CE SELL candidate...');
       try {{
         const response = await fetch(`/ce-scan/quote?underlying=${{encodeURIComponent(underlying)}}`, {{ cache: 'no-store' }});
         const data = await response.json();
         if (!data.ok) throw new Error(data.error || 'Could not load covered CE quote');
-        if (ceSellOption) ceSellOption.textContent = data.symbol || '--';
-        if (ceSellLtp) ceSellLtp.textContent = Number(data.ltp || 0).toFixed(2);
-        if (ceSellLimit) ceSellLimit.textContent = Number(data.limit_price || 0).toFixed(2);
-        if (ceSellCoverage) ceSellCoverage.textContent = `${{data.holding_qty || 0}} / ${{data.quantity || 0}}`;
-        if (ceSellHoldingSource) ceSellHoldingSource.textContent = `${{data.holding_source || 'Unknown source'}} | Kite ${{data.kite_holding_qty || 0}} | Income Growth ${{data.income_growth_holding_qty || 0}}`;
-        if (ceSellStrike) ceSellStrike.textContent = `${{Number(data.cmp || 0).toFixed(2)}} / ${{Number(data.strike || 0).toFixed(2)}}`;
-        if (ceSellMaxProfit) ceSellMaxProfit.textContent = Number(data.max_profit || 0).toFixed(0);
-        if (ceSellYield) ceSellYield.textContent = `${{Number(data.otm_percent || 0).toFixed(2)}}% / ${{Number(data.premium_yield_percent || 0).toFixed(2)}}%`;
-        if (ceSellRisk) ceSellRisk.textContent = `${{Number(data.score || 0).toFixed(0)}} / ${{data.event_risk || 'N/A'}} event / ${{data.breakout_risk || 'N/A'}} breakout`;
-        if (ceSellActiveInfo) {{
-          ceSellActiveInfo.textContent = data.active_sell_summary || 'No active PE/CE SELL position found for this stock.';
-          ceSellActiveInfo.classList.toggle('has-risk', Boolean(data.has_active_pe_sell || data.has_active_ce_sell));
-        }}
-        if (ceSellSummary) ceSellSummary.textContent = `SELL ${{data.quantity}} ${{data.symbol}} at LIMIT ${{Number(data.limit_price || 0).toFixed(2)}} | ${{Number(data.markup_percent || 0).toFixed(2)}}% above fresh LTP ${{Number(data.ltp || 0).toFixed(2)}} | Effective holding ${{data.holding_qty}} from ${{data.holding_source || 'holding record'}}`;
+        if (ceSellSnapshot) ceSellSnapshot.value = JSON.stringify(data);
+        applyCeSellData(data, 'fresh LTP');
         newsPromise.catch(() => {{}});
-        if (ceSellReview) ceSellReview.disabled = false;
       }} catch (error) {{
         if (ceSellActiveInfo) {{
           ceSellActiveInfo.textContent = 'Active PE/CE SELL check unavailable in this quote load.';
@@ -27925,6 +29722,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.error = f"{state.order_book_error}\n\n{traceback.format_exc()}"
             self.send_page(state)
             return
+        if parsed_url.path == "/ipo":
+            self.send_page(PageState(active_tab="ipo"))
+            return
         if parsed_url.path == "/income":
             state = PageState(active_tab="income")
             try:
@@ -28246,6 +30046,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/csv")
                 else "commodity"
                 if request_path.startswith("/commodity")
+                else "ipo"
+                if request_path.startswith("/ipo")
                 else "income-growth"
                 if request_path.startswith("/income-growth")
                 else "income"
@@ -28325,6 +30127,31 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             income_growth_research_count=int(float(first(form, "income_growth_research_count", "0") or 0)),
             research_gpt_output=first(form, "research_gpt_output"),
             research_gpt_response_id=first(form, "research_gpt_response_id"),
+            ipo_year=int(
+                float(
+                    first(
+                        form,
+                        "ipo_year",
+                        str(datetime.now(INDIA_TIME_ZONE).year),
+                    )
+                    or datetime.now(INDIA_TIME_ZONE).year
+                )
+            ),
+            ipo_quarter=first(form, "ipo_quarter", "Latest Available"),
+            ipo_market_type=first(form, "ipo_market_type", "All"),
+            ipo_theme=first(form, "ipo_theme", "All"),
+            ipo_ranking_view=first(
+                form,
+                "ipo_ranking_view",
+                "Best IPOs by long-term score",
+            ),
+            ipo_only_multibagger=(
+                checked(form, "ipo_only_multibagger")
+                if "ipo_only_multibagger_present" in form
+                else False
+            ),
+            ipo_export_csv=first(form, "ipo_export_csv"),
+            ipo_export_filename=first(form, "ipo_export_filename"),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -28443,13 +30270,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if first(form, "ce_sell_confirmed") != "1":
                     raise PermissionError("Covered CE SELL order needs 10-second breathe confirmation.")
                 underlying = first(form, "ce_sell_underlying")
+                snapshot_override = parse_ce_sell_client_snapshot(first(form, "ce_sell_snapshot"))
                 result, order_log = call_with_console(
                     place_approved_ce_sell_order,
                     underlying,
+                    snapshot_override,
                 )
                 state.results = [result]
                 state.console_log = f"{order_log}{state.console_log}"
-                load_ce_sell_dashboard(state, True)
                 if result.get("status") == "LIVE_SENT":
                     state.message = f"Submitted approved covered CE order for {underlying.upper()}."
             elif request_path == "/csv/save-today":
@@ -28799,6 +30627,168 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     f"{str(result.get('status') or 'UNKNOWN').upper()}: "
                     f"{result.get('message', '')}"
                 )
+            elif request_path in {"/ipo/load", "/ipo/force-refresh"}:
+                force_refresh = request_path == "/ipo/force-refresh"
+                state.ipo_dashboard, state.console_log = call_with_console(
+                    build_ipo_dashboard,
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    force_refresh=force_refresh,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                state.message = (
+                    f"{'Force refreshed' if force_refresh else 'Loaded'} IPO data "
+                    f"for {state.ipo_year} ({state.ipo_quarter})."
+                )
+            elif request_path == "/ipo/save-snapshot":
+                dashboard = build_ipo_dashboard(
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                state.ipo_dashboard = dashboard
+                count, state.console_log = call_with_console(
+                    save_ipo_top10_snapshot,
+                    APP_DB_PATH,
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    dashboard.get("top10") or [],
+                )
+                dashboard["snapshots"] = load_ipo_snapshots(APP_DB_PATH, state.ipo_year)
+                state.message = f"Saved Top {count} IPO snapshot for {state.ipo_year}."
+            elif request_path == "/ipo/export-year":
+                dashboard = build_ipo_dashboard(
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                state.ipo_dashboard = dashboard
+                state.ipo_export_csv = export_ipo_records_csv(
+                    dashboard.get("listed") or [],
+                    IPO_EXPORT_FIELDS,
+                )
+                state.ipo_export_filename = ipo_export_filename(
+                    "year",
+                    state.ipo_year,
+                    state.ipo_quarter,
+                )
+                state.message = f"Prepared selected-year IPO export: {state.ipo_export_filename}."
+            elif request_path == "/ipo/export-watchlist":
+                dashboard = build_ipo_dashboard(
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                state.ipo_dashboard = dashboard
+                records = (((dashboard.get("screener") or {}).get("exports") or {}).get("watchlist") or [])
+                state.ipo_export_csv = export_ipo_records_csv(records, IPO_WATCHLIST_FIELDS)
+                state.ipo_export_filename = ipo_export_filename("watchlist", state.ipo_year, state.ipo_quarter)
+                state.message = f"Prepared IPO watchlist export: {state.ipo_export_filename}."
+            elif request_path == "/ipo/export-buy-zone":
+                dashboard = build_ipo_dashboard(
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                state.ipo_dashboard = dashboard
+                records = (((dashboard.get("screener") or {}).get("exports") or {}).get("buy_zone") or [])
+                state.ipo_export_csv = export_ipo_records_csv(records, IPO_BUY_ZONE_FIELDS)
+                state.ipo_export_filename = ipo_export_filename("buy_zone", state.ipo_year, state.ipo_quarter)
+                state.message = f"Prepared IPO buy-zone export: {state.ipo_export_filename}."
+            elif request_path == "/ipo/export-risk-alerts":
+                dashboard = build_ipo_dashboard(
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                state.ipo_dashboard = dashboard
+                records = (((dashboard.get("screener") or {}).get("exports") or {}).get("risk_alerts") or [])
+                state.ipo_export_csv = export_ipo_records_csv(records, IPO_RISK_ALERT_FIELDS)
+                state.ipo_export_filename = ipo_export_filename("risk_alerts", state.ipo_year, state.ipo_quarter)
+                state.message = f"Prepared IPO risk-alert export: {state.ipo_export_filename}."
+            elif request_path == "/ipo/export-quarterly":
+                dashboard = build_ipo_dashboard(
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                state.ipo_dashboard = dashboard
+                records = (((dashboard.get("screener") or {}).get("exports") or {}).get("quarterly") or [])
+                state.ipo_export_csv = export_ipo_records_csv(records, IPO_QUARTERLY_FIELDS)
+                state.ipo_export_filename = ipo_export_filename("quarterly", state.ipo_year, state.ipo_quarter)
+                state.message = f"Prepared IPO quarterly monitor export: {state.ipo_export_filename}."
+            elif request_path == "/ipo/export-top10":
+                dashboard = build_ipo_dashboard(
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                state.ipo_dashboard = dashboard
+                state.ipo_export_csv = export_ipo_records_csv(
+                    dashboard.get("top10") or [],
+                    IPO_TOP10_FIELDS,
+                )
+                state.ipo_export_filename = ipo_export_filename(
+                    "top10",
+                    state.ipo_year,
+                    state.ipo_quarter,
+                )
+                state.message = f"Prepared Top 10 IPO export: {state.ipo_export_filename}."
+            elif request_path == "/ipo/export-snapshots":
+                dashboard = build_ipo_dashboard(
+                    state.ipo_year,
+                    state.ipo_quarter,
+                    APP_DB_PATH,
+                    state.ipo_only_multibagger,
+                    market_type=state.ipo_market_type,
+                    theme=state.ipo_theme,
+                    ranking_view=state.ipo_ranking_view,
+                )
+                snapshots = load_ipo_snapshots(APP_DB_PATH, state.ipo_year, 200)
+                dashboard["snapshots"] = snapshots
+                state.ipo_dashboard = dashboard
+                state.ipo_export_csv = export_ipo_records_csv(
+                    snapshots,
+                    IPO_SNAPSHOT_FIELDS,
+                )
+                state.ipo_export_filename = ipo_export_filename(
+                    "snapshots",
+                    state.ipo_year,
+                    state.ipo_quarter,
+                )
+                state.message = f"Prepared IPO snapshot export: {state.ipo_export_filename}."
             elif request_path == "/analytics/load":
                 state.analytics_data, state.console_log = call_with_console(
                     option_analytics_for_symbol,

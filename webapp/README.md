@@ -22,6 +22,16 @@ npm run dev
 
 The site runs at `http://localhost:3000`.
 
+## Google Analytics
+
+IndianKumbh.com uses Google Analytics 4 with this measurement ID:
+
+```bash
+NEXT_PUBLIC_GA_MEASUREMENT_ID=G-HW223XXYK2
+```
+
+If the environment variable is missing, the app falls back to `G-HW223XXYK2` so production tracking still works for the current site.
+
 ## Booking.com affiliate hotel redirects
 
 IndianKumbh.com uses an internal redirect route for hotel affiliate links:
@@ -108,7 +118,7 @@ pm2 save
 Use `deploy/nginx.conf.example` as the Nginx starting point, add SSL with Certbot, and replace:
 
 - `https://ujjain2028.in` with the final domain
-- `G-XXXXXXXXXX` with the Google Analytics measurement ID
+- `NEXT_PUBLIC_GA_MEASUREMENT_ID` with the Google Analytics measurement ID if it changes
 - contact form placeholders with a real endpoint
 
 Content is static-first in focused JSON files under `data/`, ready to move into MDX or a CMS as editorial needs grow.

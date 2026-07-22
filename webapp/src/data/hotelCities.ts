@@ -61,6 +61,30 @@ export const hotelCities: HotelCity[] = [
     priority: 4,
   },
   {
+    slug: "pune",
+    cityName: "Pune",
+    state: "Maharashtra",
+    country: "India",
+    bookingSearchText: "Pune, Maharashtra, India",
+    defaultNights: 1,
+    isKumbhCity: false,
+    nearbyAirport: "Pune",
+    recommendedFor: "Arrival hub, family hotels, road access to Nashik Kumbh",
+    priority: 5,
+  },
+  {
+    slug: "mumbai",
+    cityName: "Mumbai",
+    state: "Maharashtra",
+    country: "India",
+    bookingSearchText: "Mumbai, Maharashtra, India",
+    defaultNights: 1,
+    isKumbhCity: false,
+    nearbyAirport: "Mumbai",
+    recommendedFor: "International airport access, arrival/departure buffer, premium hotel choice",
+    priority: 6,
+  },
+  {
     slug: "prayagraj",
     cityName: "Prayagraj",
     state: "Uttar Pradesh",
@@ -70,7 +94,7 @@ export const hotelCities: HotelCity[] = [
     isKumbhCity: true,
     nearbyAirport: "Prayagraj / Varanasi / Lucknow",
     recommendedFor: "Sangam snan, future Kumbh and Ardh Kumbh planning",
-    priority: 5,
+    priority: 7,
   },
   {
     slug: "haridwar",
@@ -82,7 +106,7 @@ export const hotelCities: HotelCity[] = [
     isKumbhCity: true,
     nearbyAirport: "Dehradun",
     recommendedFor: "Ganga snan, Har Ki Pauri, future Haridwar Kumbh planning",
-    priority: 6,
+    priority: 8,
   },
   {
     slug: "varanasi",
@@ -94,7 +118,7 @@ export const hotelCities: HotelCity[] = [
     isKumbhCity: false,
     nearbyAirport: "Varanasi",
     recommendedFor: "Spiritual extension, Kashi Vishwanath, family pilgrimage add-on",
-    priority: 7,
+    priority: 9,
   },
   {
     slug: "omkareshwar",
@@ -106,7 +130,7 @@ export const hotelCities: HotelCity[] = [
     isKumbhCity: false,
     nearbyAirport: "Indore",
     recommendedFor: "Jyotirlinga circuit, Narmada stay, slower pilgrimage extension",
-    priority: 8,
+    priority: 10,
   },
   {
     slug: "maheshwar",
@@ -118,7 +142,7 @@ export const hotelCities: HotelCity[] = [
     isKumbhCity: false,
     nearbyAirport: "Indore",
     recommendedFor: "Narmada ghats, heritage stay, Maheshwar-Mandu extension",
-    priority: 9,
+    priority: 11,
   },
 ];
 

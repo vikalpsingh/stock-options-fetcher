@@ -33,10 +33,10 @@ export function RecommendedRouteCards({
               <p className="mt-3 text-sm leading-7 text-stone-600">{route.advice}</p>
               <p className="mt-4 rounded-2xl bg-orange-50 p-3 text-xs leading-5 text-maroon"><strong>Recommended stay:</strong> {stay.cityName}</p>
               <div className="mt-5 grid gap-2 sm:grid-cols-2">
-                <Button asChild variant="outline" size="sm"><Link href={`/go/travel?mode=bus&from=${source.slug}&to=${busTo.slug}&date=${date}&${common}`}><BusFront className="h-4 w-4" />Bus</Link></Button>
-                <Button asChild variant="outline" size="sm"><Link href={`/go/travel?mode=flight&from=${source.slug}&to=${flightTo.slug}&departureDate=${date}&adults=2&${common}`}><Plane className="h-4 w-4" />Flight</Link></Button>
-                <Button asChild variant="outline" size="sm"><Link href={`/go/travel?mode=train&from=${source.slug}&to=${trainTo.slug}&date=${date}&${common}`}><TrainFront className="h-4 w-4" />Train</Link></Button>
-                <Button asChild size="sm"><Link href={`/go/travel?mode=hotel&city=${stay.slug}&checkin=${date}&checkout=${checkout}&adults=2&rooms=1&${common}`}><BedDouble className="h-4 w-4" />Hotel</Link></Button>
+                <Button asChild variant="outline" size="sm"><Link href={`/go/travel?mode=bus&from=${source.slug}&to=${busTo.slug}&date=${date}&${common}`} target="_blank" rel="noopener noreferrer"><BusFront className="h-4 w-4" />Bus</Link></Button>
+                <Button asChild variant="outline" size="sm"><Link href={`/go/travel?mode=flight&from=${source.slug}&to=${flightTo.slug}&departureDate=${date}&adults=2&${common}`} target="_blank" rel="noopener noreferrer"><Plane className="h-4 w-4" />Flight</Link></Button>
+                <Button asChild variant="outline" size="sm"><Link href={`/go/travel?mode=train&from=${source.slug}&to=${trainTo.slug}&date=${date}&${common}`} target="_blank" rel="noopener noreferrer"><TrainFront className="h-4 w-4" />Train</Link></Button>
+                <Button asChild size="sm"><Link href={`/go/travel?mode=hotel&city=${stay.slug}&checkin=${date}&checkout=${checkout}&adults=2&rooms=1&${common}`} target="_blank" rel="noopener noreferrer"><BedDouble className="h-4 w-4" />Hotel</Link></Button>
               </div>
               <p className="mt-4 text-[11px] leading-5 text-stone-500">Booking is completed on partner website. IndianKumbh.com may earn a referral commission.</p>
             </CardContent>

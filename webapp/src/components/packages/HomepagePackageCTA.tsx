@@ -26,8 +26,8 @@ export function HomepagePackageCTA() {
         </div>
         <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:items-center">
           <Button asChild size="lg"><Link href="/ujjain-kumbh-2028/packages">Get Ujjain Package Quote<ArrowRight className="h-4 w-4" /></Link></Button>
-          <Button asChild variant="outline"><Link href="/go/booking?city=ujjain&campaign=ujjain-kumbh-2028&sourcePage=home-package-cta"><BedDouble className="h-4 w-4" />Check Ujjain Hotels</Link></Button>
-          <Button asChild variant="outline"><Link href="/go/booking?city=indore&campaign=ujjain-kumbh-2028&sourcePage=home-package-cta"><Building2 className="h-4 w-4" />Check Indore Hotels</Link></Button>
+          <Button asChild variant="outline"><Link href="/go/booking?city=ujjain&campaign=ujjain-kumbh-2028&sourcePage=home-package-cta" target="_blank" rel="noopener noreferrer"><BedDouble className="h-4 w-4" />Check Ujjain Hotels</Link></Button>
+          <Button asChild variant="outline"><Link href="/go/booking?city=indore&campaign=ujjain-kumbh-2028&sourcePage=home-package-cta" target="_blank" rel="noopener noreferrer"><Building2 className="h-4 w-4" />Check Indore Hotels</Link></Button>
         </div>
         <p className="mt-5 text-xs leading-5 text-stone-500">Packages are fulfilled by independent travel partners. IndianKumbh.com does not operate tours directly.</p>
       </div>

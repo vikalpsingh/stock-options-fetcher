@@ -4,6 +4,7 @@ import { FormEvent, useMemo, useState } from "react";
 import Link from "next/link";
 import { ArrowRight, BedDouble, BusFront, PackageCheck, Plane, ShieldCheck, TrainFront } from "lucide-react";
 import { travelCities } from "@/src/data/travelCities";
+import { inferTravelDefaults } from "@/src/lib/travel/defaults";
 import { addDays } from "@/src/lib/travel/validation";
 import { Button } from "@/components/ui/button";
 
@@ -13,21 +14,37 @@ export function TravelSearchWidget({
   sourcePage = "travel-widget",
   campaign = "ujjain-kumbh-2028",
   title = "Plan Your Kumbh Travel",
+  defaultFromCity,
+  defaultToCity,
+  defaultHotelCity,
+  defaultFlightToCity,
+  packageHref,
 }: {
   sourcePage?: string;
   campaign?: string;
   title?: string;
+  defaultFromCity?: string;
+  defaultToCity?: string;
+  defaultHotelCity?: string;
+  defaultFlightToCity?: string;
+  packageHref?: string;
 }) {
+  const inferredDefaults = useMemo(() => inferTravelDefaults({ sourcePage, campaign, title }), [sourcePage, campaign, title]);
+  const resolvedFromCity = defaultFromCity || inferredDefaults.defaultFromCity;
+  const resolvedToCity = defaultToCity || inferredDefaults.defaultToCity;
+  const resolvedHotelCity = defaultHotelCity || inferredDefaults.defaultHotelCity;
+  const resolvedFlightToCity = defaultFlightToCity || inferredDefaults.defaultFlightToCity;
+  const resolvedPackageHref = packageHref || inferredDefaults.packageHref;
   const today = useMemo(() => new Date().toISOString().slice(0, 10), []);
   const defaultDate = useMemo(() => addDays(today, 30), [today]);
   const [mode, setMode] = useState<Mode>("hotel");
-  const [from, setFrom] = useState("bengaluru");
-  const [to, setTo] = useState("ujjain");
-  const [hotelCity, setHotelCity] = useState("indore");
+  const [from, setFrom] = useState(resolvedFromCity);
+  const [to, setTo] = useState(resolvedToCity);
+  const [hotelCity, setHotelCity] = useState(resolvedHotelCity);
   const [date, setDate] = useState(defaultDate);
   const [checkin, setCheckin] = useState(defaultDate);
   const [checkout, setCheckout] = useState(addDays(defaultDate, 1));
-  const [flightTo, setFlightTo] = useState("indore");
+  const [flightTo, setFlightTo] = useState(resolvedFlightToCity);
   const [tripType, setTripType] = useState<"oneway" | "roundtrip">("oneway");
   const [returnDate, setReturnDate] = useState(addDays(defaultDate, 3));
   const [adults, setAdults] = useState(2);
@@ -39,7 +56,7 @@ export function TravelSearchWidget({
     event.preventDefault();
     setError("");
     if (mode === "package") {
-      window.location.href = `/ujjain-kumbh-2028/packages?sourcePage=${encodeURIComponent(sourcePage)}#package-enquiry`;
+      window.location.href = `${resolvedPackageHref}?sourcePage=${encodeURIComponent(sourcePage)}#package-enquiry`;
       return;
     }
     if (mode === "hotel" && checkout <= checkin) {
@@ -59,7 +76,9 @@ export function TravelSearchWidget({
     if (mode === "train") {
       sp.set("from", from); sp.set("to", to); sp.set("date", date);
     }
-    window.location.href = `/go/travel?${sp.toString()}`;
+    const travelUrl = `/go/travel?${sp.toString()}`;
+    const opened = window.open(travelUrl, "_blank", "noopener,noreferrer");
+    if (!opened) setError("Your browser blocked the new booking window. Please allow pop-ups for IndianKumbh.com and try again.");
   }
 
   const modeTabs = [
@@ -94,7 +113,7 @@ export function TravelSearchWidget({
           {(mode === "hotel" || mode === "flight") && <Field label="Adults"><input min="1" max="30" type="number" value={adults} onChange={(event) => setAdults(Number(event.target.value))} className="form-control" /></Field>}
           {(mode === "hotel" || mode === "flight") && <Field label="Children"><input min="0" max="20" type="number" value={children} onChange={(event) => setChildren(Number(event.target.value))} className="form-control" /></Field>}
           {mode === "hotel" && <Field label="Rooms"><input min="1" max="15" type="number" value={rooms} onChange={(event) => setRooms(Number(event.target.value))} className="form-control" /></Field>}
-          {mode === "package" && <><CityField label="Destination" value="ujjain" onChange={() => {}} /><Field label="Package type"><select className="form-control"><option>Family Kumbh Yatra</option><option>Senior Citizen Assisted Yatra</option><option>Indore Stay + Ujjain Day Trip</option></select></Field><div className="text-sm leading-7 text-stone-600">Packages are handled through enquiry. Thrillophilia/local operators can be added after partner verification.</div></>}
+          {mode === "package" && <><CityField label="Destination" value={resolvedToCity} onChange={() => {}} /><Field label="Package type"><select className="form-control"><option>Family Kumbh Yatra</option><option>Senior Citizen Assisted Yatra</option><option>Indore Stay + Ujjain Day Trip</option></select></Field><div className="text-sm leading-7 text-stone-600">Packages are handled through enquiry. Thrillophilia/local operators can be added after partner verification.</div></>}
         </div>
 
         {error && <p className="mt-5 rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-800">{error}</p>}

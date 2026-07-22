@@ -1,1 +1,29 @@
-[]
+[
+  {
+    "fullName": "vikalp singh",
+    "mobile": "9686372789",
+    "whatsappNumber": "",
+    "email": "vikalp.singh@gmail.com",
+    "sourceCity": "Bangalore Rural",
+    "travelMonth": "",
+    "numberOfAdults": 2,
+    "numberOfChildren": 0,
+    "hasSeniorCitizens": true,
+    "budgetPerPerson": "",
+    "stayPreference": "Not Sure",
+    "packageType": "ujjain-family-2n-3d",
+    "needMahakalDarshanSupport": false,
+    "needTransport": false,
+    "message": "",
+    "consentAccepted": true,
+    "sourcePage": "/ujjain-kumbh-2028/packages",
+    "utmSource": "",
+    "utmMedium": "",
+    "utmCampaign": "",
+    "id": "d1df4589-3dbd-42e4-9a52-b36345cce1db",
+    "createdAt": "2026-07-18T09:21:11.233Z",
+    "status": "new",
+    "assignedPartnerId": null,
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+  }
+]

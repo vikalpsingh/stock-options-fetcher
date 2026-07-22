@@ -14,8 +14,8 @@ export function SacredImportanceSection({ title = "Why this pilgrimage matters",
   return <section className="bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto grid max-w-7xl gap-8 lg:grid-cols-[.85fr_1.15fr]"><SectionTitle eyebrow="Sacred importance" title={title} text={text} /><div className="grid gap-4 sm:grid-cols-2">{points.map((point) => <InfoCard key={point} icon={Landmark} title={point} text="Use this as a planning anchor; verify specific darshan rules and timings from official sources before travel." />)}</div></div></section>;
 }
 
-export function HowToReachSection({ title = "How to reach", text = "Compare train, flight, bus and hotel options using validated redirect links. Bookings are completed on partner websites." }: { title?: string; text?: string }) {
-  return <section className="bg-white px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl"><SectionTitle eyebrow="Travel planning" title={title} text={text} /><div className="mt-10"><TravelSearchWidget title="Search travel options" sourcePage="pilgrimage-template" /></div></div></section>;
+export function HowToReachSection({ title = "How to reach", text = "Compare train, flight, bus and hotel options using validated redirect links. Bookings are completed on partner websites.", sourcePage = "pilgrimage-template", campaign }: { title?: string; text?: string; sourcePage?: string; campaign?: string }) {
+  return <section className="bg-white px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl"><SectionTitle eyebrow="Travel planning" title={title} text={text} /><div className="mt-10"><TravelSearchWidget title={`${title} travel options`} sourcePage={sourcePage} campaign={campaign} /></div></div></section>;
 }
 
 export function BestTimeToVisitSection({ bestTime, duration }: { bestTime: string; duration: string }) {
@@ -34,8 +34,8 @@ export function StayRecommendation({ sourcePage = "pilgrimage-page" }: { sourceP
   return <section className="bg-white px-4 py-16 sm:px-6 lg:px-8"><div className="mx-auto max-w-7xl"><HotelBookingCTA title="Stay and hotel planning" sourcePage={sourcePage} /></div></section>;
 }
 
-export function TravelBookingWidget({ sourcePage = "pilgrimage-page" }: { sourcePage?: string }) {
-  return <TravelSearchWidget title="Book travel on partner websites" sourcePage={sourcePage} />;
+export function TravelBookingWidget({ sourcePage = "pilgrimage-page", campaign, title = "Book travel on partner websites" }: { sourcePage?: string; campaign?: string; title?: string }) {
+  return <TravelSearchWidget title={title} sourcePage={sourcePage} campaign={campaign} />;
 }
 
 export function PackageCTA({ title = "Need assisted yatra planning?", text = "Request package support for family, senior citizen or group travel. Packages are fulfilled by independent travel partners.", href = "/packages" }: { title?: string; text?: string; href?: string }) {

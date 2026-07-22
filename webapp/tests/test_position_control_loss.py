@@ -1,6 +1,46 @@
+from datetime import date, datetime
 from unittest.mock import patch
 
 import app
+
+
+def test_option_symbol_parts_parses_nifty_weekly_numeric_expiry():
+    parts = app.option_symbol_parts("NIFTY2681122600PE")
+
+    assert parts is not None
+    assert parts["underlying"] == "NIFTY"
+    assert parts["expiry_kind"] == "WEEKLY"
+    assert parts["option_type"] == "PE"
+    assert parts["strike"] == "22600"
+    assert app.expiry_date_for_parts(parts) == date(2026, 8, 11)
+
+
+def test_missing_close_guard_builds_buy_order_for_nifty_weekly_short_position():
+    position = {
+        "exchange": "NFO",
+        "tradingsymbol": "NIFTY2681122600PE",
+        "quantity": -65,
+        "product": "NRML",
+        "average_price": 16.0,
+        "ltp": 15.65,
+    }
+    with patch.object(app, "open_option_positions", return_value=[position]), patch.object(
+        app, "refresh_option_positions_with_live_ltp", return_value=[position]
+    ), patch.object(app, "open_option_close_orders_by_symbol_side", return_value={}), patch.object(
+        app, "app_now", return_value=datetime(2026, 7, 22, 10, 32, tzinfo=app.INDIA_TIME_ZONE)
+    ), patch.object(
+        app, "intraday_hard_stop_start_dte_setting", return_value=9
+    ):
+        orders, evaluations = app.build_missing_option_close_orders(kite=None, discount_percent=20)
+
+    assert evaluations[0]["action"] == "PLACE_BUY_CLOSE"
+    assert evaluations[0]["dte"] == 14
+    assert evaluations[0]["dte_gate_applied"] is True
+    assert orders[0]["tradingsymbol"] == "NIFTY2681122600PE"
+    assert orders[0]["transaction_type"] == "BUY"
+    assert orders[0]["quantity"] == 65
+    assert orders[0]["price"] == 12.5
+    assert orders[0]["price_basis"] == "min_ltp_average_price"
 
 
 def test_intraday_guard_uses_hard_stop_price_when_crossed():
@@ -51,10 +91,14 @@ def test_intraday_guard_does_not_chase_spike_above_entry_before_hard_stop():
             ltp_discount_percent=20,
         )
 
-    assert orders == []
-    assert evaluations[0]["action"] == "SKIP_SPIKE_ABOVE_ENTRY"
-    assert evaluations[0]["skipped_limit_price"] == 10.35
-    assert "above entry premium" in evaluations[0]["skip_reason"]
+    assert evaluations[0]["action"] == "MODIFY_OR_PLACE_BUY_CLOSE"
+    assert evaluations[0]["probability_risk_state"] == "FORCE_EXIT"
+    assert orders[0]["tradingsymbol"] == "NAUKRI26JUL950PE"
+    assert orders[0]["transaction_type"] == "BUY"
+    assert orders[0]["price"] == 10.35
+    assert orders[0]["price"] < position["ltp"]
+    assert orders[0]["price_basis"] == "probability_force_exit_passive_ltp"
+    assert "Hard stop 24.45 has not crossed" in orders[0]["risk_note"]
 
 
 def test_intraday_probability_risk_close_stays_below_ltp_before_hard_stop():
@@ -77,13 +121,13 @@ def test_intraday_probability_risk_close_stays_below_ltp_before_hard_stop():
             ltp_discount_percent=20,
         )
 
-    assert evaluations[0]["probability_risk_state"] == "PANIC"
+    assert evaluations[0]["probability_risk_state"] == "FORCE_EXIT"
     assert evaluations[0]["hard_stop_triggered"] is False
     assert orders[0]["tradingsymbol"] == "ETERNAL26JUL315CE"
     assert orders[0]["transaction_type"] == "BUY"
     assert orders[0]["price"] == 2.55
     assert orders[0]["price"] < position["ltp"]
-    assert orders[0]["price_basis"] == "probability_panic_passive_ltp"
+    assert orders[0]["price_basis"] == "probability_force_exit_passive_ltp"
     assert "PROBABILITY RISK PASSIVE CLOSE" in orders[0]["risk_note"]
 
 

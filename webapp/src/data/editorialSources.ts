@@ -13,6 +13,7 @@ export const editorialSources: EditorialSource[] = [
   { id: "ujjain-kumbh-editorial", title: "Ujjain Kumbh editorial planning note", sourceType: "editorial", url: "/kumbh-mela/ujjain-kumbh-2028", lastChecked: "2026-07-15", reliability: "medium", notes: "Use official Madhya Pradesh government, Ujjain district and Mahakal temple sources before publishing final dates, routes and service locations." },
 ];
 
-export function getEditorialSource(id: string) {
+export function getEditorialSource(id?: string) {
+  if (!id) return undefined;
   return editorialSources.find((source) => source.id === id);
 }

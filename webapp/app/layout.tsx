@@ -30,6 +30,8 @@ const travelSchema = {
   about: ["Kumbh Mela", "Char Dham Yatra", "12 Jyotirlinga", "Temple Circuits", "Sacred Cities"].map((name) => ({ "@type": "TouristDestination", name })),
 };
 
+const gaMeasurementId = process.env.NEXT_PUBLIC_GA_MEASUREMENT_ID || "G-HW223XXYK2";
+
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
@@ -40,9 +42,8 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
         <Footer />
         <MobileStickyCTA />
         <Script id="travel-guide-schema" type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(travelSchema) }} />
-        {/* Google Analytics placeholder: replace G-XXXXXXXXXX and enable when ready. */}
-        <Script src="https://www.googletagmanager.com/gtag/js?id=G-XXXXXXXXXX" strategy="afterInteractive" />
-        <Script id="google-analytics" strategy="afterInteractive">{`window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}gtag('js',new Date());gtag('config','G-XXXXXXXXXX');`}</Script>
+        <Script src={`https://www.googletagmanager.com/gtag/js?id=${gaMeasurementId}`} strategy="afterInteractive" />
+        <Script id="google-analytics" strategy="afterInteractive">{`window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}gtag('js',new Date());gtag('config','${gaMeasurementId}');`}</Script>
       </body>
     </html>
   );

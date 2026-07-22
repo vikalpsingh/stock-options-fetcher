@@ -1,32 +1,35 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { charDhamStops, getCharDhamStop } from "@/src/data/charDham";
-import { BestTimeToVisitSection, FAQSection, HowToReachSection, OfficialDisclaimer, PackageCTA, PilgrimageHero, SacredImportanceSection, SeniorCitizenTips } from "@/src/components/pilgrimage/PilgrimageTemplates";
+import { charDhamGuides, getCharDhamGuide } from "@/src/data/charDhamGuides";
+import { HistoryStoriesPage, ItineraryPage, PackagesPage, PlaceGuidePage, RegistrationPage, SeniorGuidePage, ServicesPage, charDhamFaqs } from "@/src/components/pilgrimage/RichPilgrimagePages";
+import { FAQSection, HowToReachSection, StayRecommendation } from "@/src/components/pilgrimage/PilgrimageTemplates";
+import { VerificationNote } from "@/src/components/common/VerificationNote";
 
-const planningPages = {
-  registration: { title: "Char Dham Yatra Registration", text: "Registration requirements and official portals can change by season. Verify the current Uttarakhand government process before booking travel." },
-  "route-map": { title: "Char Dham Route Map", text: "The usual sequence is Yamunotri, Gangotri, Kedarnath and Badrinath, but route conditions and weather can change quickly." },
-  "senior-citizen-guide": { title: "Char Dham Senior Citizen Guide", text: "Plan medical checks, altitude buffers, rest days, helicopter/pony/palki choices and slower transfers." },
-  packages: { title: "Char Dham Packages", text: "Request assisted Char Dham package guidance. Final inclusions, price and cancellation terms are confirmed by travel partners." },
-} as const;
+const sections = ["history", "registration", "route-map", "how-to-reach", "stay", "services", "senior-citizen-guide", "packages", "faqs"] as const;
 
 export function generateStaticParams() {
-  return [...charDhamStops.map((stop) => ({ slug: stop.slug })), ...Object.keys(planningPages).map((slug) => ({ slug }))];
+  return [...charDhamGuides.map((site) => ({ slug: site.slug })), ...sections.map((slug) => ({ slug }))];
 }
 
 export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }): Promise<Metadata> {
   const { slug } = await params;
-  const stop = getCharDhamStop(slug);
-  const planning = planningPages[slug as keyof typeof planningPages];
-  return { title: stop ? `${stop.templeName} | Char Dham Yatra` : planning ? `${planning.title} | Char Dham Yatra` : "Char Dham", description: stop?.shortDescription || planning?.text, alternates: { canonical: `/char-dham-yatra/${slug}` } };
+  const site = getCharDhamGuide(slug);
+  const title = site ? `${site.templeName} | Char Dham Yatra Guide` : `Char Dham ${slug.replaceAll("-", " ")} | IndianKumbh.com`;
+  return { title, description: site?.shortDescription || "Char Dham Yatra practical planning guide for families and senior citizens.", alternates: { canonical: `/char-dham-yatra/${slug}` }, keywords: site?.seoKeywords };
 }
 
-export default async function CharDhamDetailPage({ params }: { params: Promise<{ slug: string }> }) {
+export default async function CharDhamSlugPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const stop = getCharDhamStop(slug);
-  const planning = planningPages[slug as keyof typeof planningPages];
-  if (!stop && !planning) notFound();
-  const title = stop?.templeName || planning.title;
-  const text = stop?.shortDescription || planning.text;
-  return <main><PilgrimageHero eyebrow="Char Dham Yatra" title={title} subtitle={text} primaryLabel="Search travel" primaryHref="/travel-tools" secondaryLabel="Package quote" secondaryHref="/packages" /><OfficialDisclaimer /><SacredImportanceSection text={text} points={stop ? [`Altitude: ${stop.altitude}`, `Base town: ${stop.nearestBaseTown}`, stop.registrationRequired ? "Registration required" : "Verify registration"] : ["Registration", "Route map", "Senior citizen planning"]} />{stop && <BestTimeToVisitSection bestTime={stop.openingSeason} duration={`Difficulty: ${stop.difficulty}`} />}<HowToReachSection title={`How to reach ${title}`} /><SeniorCitizenTips difficulty={stop?.difficulty || "moderate"} notes={stop?.seniorCitizenNotes || "Keep health, altitude, weather and rest-day buffers central to the plan."} /><PackageCTA title={`Need help with ${title}?`} href="/packages" /><FAQSection faqs={[{ question: "Should official details be verified?", answer: "Yes. Registration, road status, opening dates and helicopter/pony/palki rules must be verified from official sources." }, { question: "Is this suitable for senior citizens?", answer: "It can be, but the plan should be slower and medically cautious, especially for Kedarnath and Yamunotri." }]} /></main>;
+  const site = getCharDhamGuide(slug);
+  if (site) return <PlaceGuidePage pillar="char-dham" site={site} />;
+  if (slug === "history") return <HistoryStoriesPage pillar="char-dham" />;
+  if (slug === "registration") return <RegistrationPage />;
+  if (slug === "route-map") return <ItineraryPage pillar="char-dham" />;
+  if (slug === "services") return <ServicesPage pillar="char-dham" />;
+  if (slug === "senior-citizen-guide") return <SeniorGuidePage pillar="char-dham" />;
+  if (slug === "packages") return <PackagesPage pillar="char-dham" />;
+  if (slug === "faqs") return <FAQSection faqs={charDhamFaqs} />;
+  if (slug === "how-to-reach") return <main><HowToReachSection title="How to reach Char Dham Yatra" text="Most Char Dham plans start from Haridwar, Rishikesh, Dehradun or Delhi. Verify road status, weather and official traffic rules before travel." /><VerificationNote context="char-dham" /></main>;
+  if (slug === "stay") return <main><StayRecommendation sourcePage="char-dham-stay" /><VerificationNote context="char-dham" /></main>;
+  notFound();
 }

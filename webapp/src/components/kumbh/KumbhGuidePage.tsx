@@ -1,5 +1,5 @@
 import Link from "next/link";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { ArrowRight, BedDouble, BusFront, HeartHandshake, Plane, ShieldCheck, TrainFront } from "lucide-react";
 import type { KumbhGuide } from "@/src/data/kumbhGuides";
 import { VerificationNote } from "@/src/components/common/VerificationNote";
@@ -14,14 +14,23 @@ import { Card, CardContent } from "@/components/ui/card";
 export function KumbhGuideLanding({ guide }: { guide: KumbhGuide }) {
   const isNashik = guide.slug === "nashik-kumbh-2027";
   const badge = guide.status === "current_focus" ? "Current Focus" : "Next Major Focus";
+  const travelDefaults = travelDefaultsFor(guide.slug);
+  const heroStyle: CSSProperties | undefined = isNashik
+    ? {
+        backgroundImage:
+          "linear-gradient(90deg, rgba(52, 13, 18, 0.95), rgba(122, 39, 23, 0.84), rgba(65, 32, 14, 0.48)), url('/images/nashik-godavari-kumbh.jpg')",
+        backgroundPosition: "center",
+        backgroundSize: "cover",
+      }
+    : undefined;
   return (
     <main>
-      <section className="brand-gradient temple-silhouette pattern-mandala px-4 py-20 text-white sm:px-6 lg:px-8 lg:py-28">
+      <section style={heroStyle} className={`${isNashik ? "bg-maroon" : "brand-gradient"} temple-silhouette pattern-mandala px-4 py-20 text-white sm:px-6 lg:px-8 lg:py-28`}>
         <div className="mx-auto max-w-7xl">
           <p className="inline-flex rounded-full border border-gold/40 bg-black/15 px-4 py-2 text-xs font-black uppercase tracking-[.18em] text-gold">{badge}: {guide.shortTitle}</p>
           <h1 className="mt-6 max-w-5xl font-serif text-5xl font-semibold leading-[1.05] sm:text-6xl lg:text-7xl">{guide.heroTitle}</h1>
           <p className="mt-6 max-w-3xl text-lg leading-8 text-orange-50/90 sm:text-xl">{guide.heroSubtitle}</p>
-          <div className="mt-8 flex flex-col gap-3 sm:flex-row"><Button asChild size="lg"><Link href={`/kumbh-mela/${guide.slug}/packages`}>Need help planning?<ArrowRight className="h-4 w-4" /></Link></Button><Button asChild variant="outline" size="lg"><Link href={`/kumbh-mela/${guide.slug}/places`}>See important places</Link></Button></div>
+          <div className="mt-8 flex flex-col gap-3 sm:flex-row"><Button asChild size="lg"><Link href="#travel-options">Search hotel, bus, train and flight options<ArrowRight className="h-4 w-4" /></Link></Button><Button asChild variant="outline" size="lg"><Link href={`/kumbh-mela/${guide.slug}/places`}>See important places</Link></Button></div>
         </div>
       </section>
       <section className="bg-cream px-4 py-8 sm:px-6 lg:px-8"><div className="mx-auto max-w-7xl"><VerificationNote sourceId={isNashik ? "nashik-kumbh-editorial" : "ujjain-kumbh-editorial"} /></div></section>
@@ -35,8 +44,7 @@ export function KumbhGuideLanding({ guide }: { guide: KumbhGuide }) {
       <section className="bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl"><SectionTitle eyebrow="Useful services" title="Services travellers should look for" /><div className="mt-8 grid gap-4 md:grid-cols-3">{[...guide.usefulServices].sort((a, b) => a.priority - b.priority).map((service) => <InfoCard key={service.title} title={service.title} text={service.description} />)}</div></div></section>
       <KumbhTraditionsSection guide={guide} />
       <section className="bg-white px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-2"><TipList title="Senior citizen tips" icon={<HeartHandshake className="h-6 w-6 text-saffron" />} items={guide.seniorCitizenTips} /><TipList title="Family travel tips" icon={<ShieldCheck className="h-6 w-6 text-saffron" />} items={guide.familyTips} /></div></section>
-      <section className="bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl"><SectionTitle eyebrow="Travel widgets" title="Search hotel, bus, train and flight options" /><div className="mt-8"><TravelSearchWidget title={`Plan travel for ${guide.shortTitle}`} sourcePage={`kumbh-${guide.slug}`} /></div><div className="mt-8"><HotelBookingCTA title={`Hotel options for ${guide.shortTitle}`} sourcePage={`kumbh-${guide.slug}`} campaign={guide.slug} /></div></div></section>
-      <section className="bg-maroon px-4 py-12 text-white sm:px-6 lg:px-8"><div className="mx-auto flex max-w-7xl flex-col justify-between gap-5 md:flex-row md:items-center"><div><p className="text-xs font-black uppercase tracking-[.2em] text-gold">Package quote</p><h2 className="mt-2 font-serif text-3xl text-white">Need help planning {guide.shortTitle}?</h2><p className="mt-2 text-sm text-orange-50/80">Packages are fulfilled by independent travel partners. IndianKumbh.com does not operate tours directly.</p></div><Button asChild size="lg"><Link href={`/kumbh-mela/${guide.slug}/packages`}>Get package quote<ArrowRight className="h-4 w-4" /></Link></Button></div></section>
+      <section id="travel-options" className="scroll-mt-24 bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl"><SectionTitle eyebrow="Travel widgets" title="Search hotel, bus, train and flight options" /><div className="mt-8"><TravelSearchWidget title={`Plan travel for ${guide.shortTitle}`} sourcePage={`kumbh-${guide.slug}`} campaign={guide.slug} {...travelDefaults} /></div><div className="mt-8"><HotelBookingCTA title={`Hotel options for ${guide.shortTitle}`} sourcePage={`kumbh-${guide.slug}`} campaign={guide.slug} /></div></div></section>
       <KumbhFAQ guide={guide} />
       <KumbhSchemas guide={guide} pageType="landing" />
     </main>
@@ -85,6 +93,12 @@ function stayOptions(slug: string) {
   return slug.includes("nashik")
     ? [{ title: "Nashik city", text: "Best for families, hotels, city access and Ramkund." }, { title: "Trimbakeshwar", text: "Best for Jyotirlinga darshan and Kushavarta Kund." }, { title: "Shirdi", text: "Best for combined Sai Baba + Trimbakeshwar trips." }, { title: "Mumbai/Pune", text: "Arrival/departure hubs, not daily Kumbh stay bases." }]
     : [{ title: "Ujjain", text: "Best for Mahakal darshan, Shipra snan and short stays." }, { title: "Indore", text: "Best for airport, better hotels and family comfort." }, { title: "Bhopal", text: "Best for extended MP trip and Sanchi/Bhojpur add-ons." }];
+}
+
+function travelDefaultsFor(slug: string) {
+  return slug.includes("nashik")
+    ? { defaultFromCity: "pune", defaultToCity: "nashik", defaultHotelCity: "nashik", defaultFlightToCity: "nashik", packageHref: "/kumbh-mela/nashik-kumbh-2027/packages" }
+    : { defaultFromCity: "bengaluru", defaultToCity: "ujjain", defaultHotelCity: "ujjain", defaultFlightToCity: "ujjain", packageHref: "/kumbh-mela/ujjain-kumbh-2028/packages" };
 }
 
 export const nashikFaqs = [

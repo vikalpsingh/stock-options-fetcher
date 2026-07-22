@@ -37,9 +37,10 @@ export function Header() {
   const navItems = locale === "en" ? [
     { label: "Kumbh Mela", path: "/kumbh-mela", focus: true },
     { label: "Char Dham", path: "/char-dham-yatra" },
-    { label: "Jyotirlinga", path: "/12-jyotirlinga" },
+    { label: "12 Jyotirlinga", path: "/12-jyotirlinga" },
     { label: "Temple Circuits", path: "/temple-circuits" },
     { label: "Sacred Cities", path: "/sacred-cities" },
+    { label: "Senior Citizen Yatra", path: "/senior-citizen-yatra" },
     { label: "Packages", path: "/packages" },
     { label: "Travel Tools", path: "/travel-tools" },
   ] : [

@@ -12,7 +12,7 @@ type HotelBookingCTAProps = {
   checkout?: string;
 };
 
-const cards = [
+const ujjainHotelCards = [
   {
     city: "ujjain",
     title: "Ujjain Hotels",
@@ -37,6 +37,31 @@ const cards = [
   },
 ];
 
+const nashikHotelCards = [
+  {
+    city: "nashik",
+    title: "Nashik Hotels",
+    bestFor: "Ramkund, Godavari snan, family stay and city access",
+    cta: "Check Nashik Hotels",
+    icon: Landmark,
+    featured: true,
+  },
+  {
+    city: "pune",
+    title: "Pune Hotels",
+    bestFor: "Flight/road access, family comfort and arrival buffer",
+    cta: "Check Pune Hotels",
+    icon: Building2,
+  },
+  {
+    city: "mumbai",
+    title: "Mumbai Hotels",
+    bestFor: "International airport access, premium hotels and departure buffer",
+    cta: "Check Mumbai Hotels",
+    icon: BedDouble,
+  },
+];
+
 export function HotelBookingCTA({
   title = "Book Stay for Ujjain Kumbh 2028",
   sourcePage,
@@ -44,13 +69,18 @@ export function HotelBookingCTA({
   checkin,
   checkout,
 }: HotelBookingCTAProps) {
+  const isNashik = campaign.includes("nashik") || sourcePage.includes("nashik") || title.toLowerCase().includes("nashik");
+  const cards = isNashik ? nashikHotelCards : ujjainHotelCards;
+  const intro = isNashik
+    ? "Stay in Nashik for Ramkund and city access, or use Pune/Mumbai as practical arrival and departure hotel hubs for family travellers."
+    : "Stay in Indore, visit Ujjain for Kumbh Snan and Mahakal Darshan, or choose Ujjain for a shorter high-intent pilgrimage stay.";
   return (
     <div className="rounded-[2rem] border border-gold/30 bg-[#fffdf8] p-5 shadow-soft sm:p-8">
       <div className="flex flex-col justify-between gap-4 md:flex-row md:items-end">
         <div>
           <p className="text-xs font-black uppercase tracking-[.2em] text-saffron">Hotel booking partner</p>
           <h2 className="mt-2 font-serif text-3xl font-semibold text-ink sm:text-4xl">{title}</h2>
-          <p className="mt-3 max-w-3xl text-sm leading-7 text-stone-600">Stay in Indore, visit Ujjain for Kumbh Snan and Mahakal Darshan, or choose Ujjain for a shorter high-intent pilgrimage stay.</p>
+          <p className="mt-3 max-w-3xl text-sm leading-7 text-stone-600">{intro}</p>
         </div>
         <p className="rounded-full bg-amber-50 px-4 py-2 text-xs font-bold text-amber-900">Sponsored / affiliate link</p>
       </div>
@@ -75,7 +105,7 @@ export function HotelBookingCTA({
                 <h3 className="mt-5 font-serif text-2xl">{card.title}</h3>
                 <p className="mt-3 text-sm leading-7 text-stone-600"><strong>Best for:</strong> {card.bestFor}</p>
                 <Button asChild className="mt-6 w-full" variant={card.featured ? "default" : "outline"}>
-                  <Link href={href}>{card.cta}<ArrowRight className="h-4 w-4" /></Link>
+                  <Link href={href} target="_blank" rel="noopener noreferrer">{card.cta}<ArrowRight className="h-4 w-4" /></Link>
                 </Button>
               </CardContent>
             </Card>

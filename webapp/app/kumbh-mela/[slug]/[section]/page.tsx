@@ -10,7 +10,6 @@ import { KumbhTraditionsSection } from "@/src/components/kumbh/KumbhTraditionsSe
 import { KumbhFAQ, KumbhSchemas, SectionTitle, InfoCard, nashikFaqs, ujjainFaqs } from "@/src/components/kumbh/KumbhGuidePage";
 import { TravelSearchWidget } from "@/src/components/travel/TravelSearchWidget";
 import { HotelBookingCTA } from "@/src/components/travel/HotelBookingCTA";
-import { PackageLeadForm } from "@/src/components/packages/PackageLeadForm";
 import { getKumbhGuide, kumbhGuides, type KumbhGuide } from "@/src/data/kumbhGuides";
 
 const sections = ["history", "places", "how-to-reach", "stay", "services", "packages", "faqs"] as const;
@@ -105,6 +104,7 @@ function PlacesPage({ guide }: { guide: KumbhGuide }) {
 
 function HowToReachPage({ guide }: { guide: KumbhGuide }) {
   const routes = routeCards(guide.slug);
+  const travelDefaults = travelDefaultsFor(guide.slug);
   return (
     <>
       <section className="bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl">
@@ -113,8 +113,8 @@ function HowToReachPage({ guide }: { guide: KumbhGuide }) {
       </div></section>
       <section className="bg-white px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl">
         <SectionTitle eyebrow="Route cards" title="Best ways to reach for families and groups" />
-        <div className="mt-8 grid gap-5 md:grid-cols-2 lg:grid-cols-3">{routes.map((route) => <Card key={route.title} className="border-gold/35"><CardContent><p className="text-xs font-black uppercase tracking-wider text-saffron">{route.label}</p><h2 className="mt-2 font-serif text-2xl">{route.title}</h2><p className="mt-3 text-sm leading-7 text-stone-600">{route.note}</p><Button asChild variant="outline" className="mt-5 w-full"><Link href={route.href}>Open travel search<ArrowRight className="h-4 w-4" /></Link></Button></CardContent></Card>)}</div>
-        <div className="mt-10"><TravelSearchWidget title={`Search travel for ${guide.shortTitle}`} sourcePage={`${guide.slug}-how-to-reach`} /></div>
+        <div className="mt-8 grid gap-5 md:grid-cols-2 lg:grid-cols-3">{routes.map((route) => <Card key={route.title} className="border-gold/35"><CardContent><p className="text-xs font-black uppercase tracking-wider text-saffron">{route.label}</p><h2 className="mt-2 font-serif text-2xl">{route.title}</h2><p className="mt-3 text-sm leading-7 text-stone-600">{route.note}</p><Button asChild variant="outline" className="mt-5 w-full"><Link href={route.href} target="_blank" rel="noopener noreferrer">Open travel search<ArrowRight className="h-4 w-4" /></Link></Button></CardContent></Card>)}</div>
+        <div className="mt-10"><TravelSearchWidget title={`Search travel for ${guide.shortTitle}`} sourcePage={`${guide.slug}-how-to-reach`} campaign={guide.slug} {...travelDefaults} /></div>
       </div></section>
     </>
   );
@@ -157,14 +157,15 @@ function ServicesPage({ guide }: { guide: KumbhGuide }) {
 function PackagesPage({ guide }: { guide: KumbhGuide }) {
   const isNashik = guide.slug.includes("nashik");
   const categories = packageCategoriesFor(guide.slug);
+  const travelDefaults = travelDefaultsFor(guide.slug);
   return (
     <>
       <section className="bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl">
         <VerificationNote sourceId={isNashik ? "nashik-kumbh-editorial" : "ujjain-kumbh-editorial"} />
         <div className="mt-10 grid gap-5 md:grid-cols-2 lg:grid-cols-4">{categories.map((category) => <Card key={category.slug} className="border-gold/35 bg-white"><CardContent><h2 className="font-serif text-2xl">{category.title}</h2><p className="mt-3 text-sm leading-7 text-stone-600">Can include stay, local transport, route planning and family/senior citizen support depending on partner availability.</p><Link className="mt-5 inline-flex text-sm font-bold text-maroon" href={`?packageType=${category.slug}`}>Select package</Link></CardContent></Card>)}</div>
       </div></section>
-      <section className="bg-white px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto grid max-w-7xl gap-8 lg:grid-cols-[.75fr_1.25fr]"><div><SectionTitle eyebrow="Package support" title="What can be included" /><ul className="mt-6 space-y-3 text-sm leading-7 text-stone-600"><li>• Hotel, dharamshala or group stay support</li><li>• Local transport and station/airport transfers</li><li>• Darshan/snana-day movement guidance where available</li><li>• Senior citizen and group coordination support</li><li>• Usually excluded: personal expenses, official paid entries, insurance, cancellations and items not confirmed by the partner.</li></ul><p className="mt-6 rounded-2xl bg-amber-50 p-4 text-sm leading-6 text-amber-950">IndianKumbh.com does not operate tours directly. Packages are fulfilled by independent travel partners. Final price, availability, inclusions, cancellation and refund terms are confirmed by the partner.</p></div><PackageLeadForm packageCategories={categories} destination={guide.title} /></div></section>
-      <section className="bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl"><TravelSearchWidget title="Prefer self-booking travel?" sourcePage={`${guide.slug}-packages`} /></div></section>
+      <section className="bg-white px-4 py-10 sm:px-6 lg:px-8"><div className="mx-auto max-w-7xl"><p className="rounded-2xl bg-amber-50 p-4 text-sm leading-6 text-amber-950">Phase 1 focuses on self-booking tools. IndianKumbh.com does not operate tours or confirm package bookings directly.</p></div></section>
+      <section className="bg-cream px-4 py-16 sm:px-6 lg:px-8 lg:py-24"><div className="mx-auto max-w-7xl"><TravelSearchWidget title="Self booking travel" sourcePage={`${guide.slug}-packages`} campaign={guide.slug} {...travelDefaults} /></div></section>
     </>
   );
 }
@@ -226,6 +227,12 @@ function stayCards(slug: string) {
       { title: "Indore", text: "Best for airport, better hotels and family comfort." },
       { title: "Bhopal", text: "Best for extended MP trip, Sanchi/Bhojpur add-ons and slower itineraries." },
     ];
+}
+
+function travelDefaultsFor(slug: string) {
+  return slug.includes("nashik")
+    ? { defaultFromCity: "pune", defaultToCity: "nashik", defaultHotelCity: "nashik", defaultFlightToCity: "nashik", packageHref: "/kumbh-mela/nashik-kumbh-2027/packages" }
+    : { defaultFromCity: "bengaluru", defaultToCity: "ujjain", defaultHotelCity: "ujjain", defaultFlightToCity: "ujjain", packageHref: "/kumbh-mela/ujjain-kumbh-2028/packages" };
 }
 
 function packageCategoriesFor(slug: string) {
