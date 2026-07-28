@@ -17,6 +17,7 @@ import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -46,9 +47,52 @@ IPO_HTTP_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
-DEFAULT_CHITTORGARH_LISTED_URL = (
-    "https://www.chittorgarh.com/report/ipo-in-india-list-main-board-sme/82/"
-)
+CHITTORGARH_MAINBOARD_YEAR_URL = "https://www.chittorgarh.com/ipo/ipo_perf_tracker.asp?year={year}"
+CHITTORGARH_MAINBOARD_FALLBACK_URL = "https://www.chittorgarh.com/ipo/ipo_perf_tracker.asp"
+CHITTORGARH_SME_YEAR_URL = "https://www.chittorgarh.com/ipo/ipo_perf_tracker.asp?exchange=sme&year={year}"
+CHITTORGARH_SME_FALLBACK_URL = "https://www.chittorgarh.com/ipo/ipo_perf_tracker.asp?exchange=sme"
+IPOMARKET_YEAR_URL = "https://www.ipomarket.in/performance/{year}"
+IPOGURU_MAINBOARD_URL = "https://www.ipoguru.in/ipo-performance"
+IPOGURU_SME_URL = "https://www.ipoguru.in/sme-ipo-performance"
+IPO_DATA_SOURCE_PRIORITY = [
+    "ipomarket",
+    "ipoguru",
+    "economic_times",
+    "hdfcsec",
+    "mint",
+    "nse_verification",
+    "chittorgarh",
+]
+IPO_SOURCE_URLS = {
+    "ipomarket": {
+        "all_by_year": IPOMARKET_YEAR_URL,
+    },
+    "ipoguru": {
+        "mainboard": IPOGURU_MAINBOARD_URL,
+        "sme": IPOGURU_SME_URL,
+    },
+    "economic_times": {
+        "all": "https://economictimes.indiatimes.com/markets/ipo/recently-listed",
+        "mainboard": "https://economictimes.indiatimes.com/markets/ipo/recently-listed/mainboard",
+        "sme": "https://economictimes.indiatimes.com/markets/ipo/recently-listed/sme",
+    },
+    "mint": {
+        "performance": "https://www.livemint.com/market/ipo/performance-tracker",
+    },
+    "hdfcsec": {
+        "past_ipo": "https://www.hdfcsec.com/offering/past-ipo",
+    },
+    "nse": {
+        "ipo_tracker": "https://www.nseindia.com/ipo-tracker",
+        "ipo_tracker_sme": "https://www.nseindia.com/ipo-tracker?type=nse_sme_segment",
+        "securities_master": "https://www.nseindia.com/static/market-data/securities-available-for-trading",
+    },
+    "chittorgarh_optional": {
+        "mainboard_by_year": CHITTORGARH_MAINBOARD_YEAR_URL,
+        "sme_by_year": CHITTORGARH_SME_YEAR_URL,
+    },
+}
+DEFAULT_CHITTORGARH_LISTED_URL = CHITTORGARH_MAINBOARD_FALLBACK_URL
 DEFAULT_IPOWATCH_GMP_URL = "https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/"
 DEFAULT_NSE_UPCOMING_URL = "https://www.nseindia.com/api/ipo-current-issue"
 IPO_NO_VERIFIED_DATA_MESSAGE = "No verified IPO companies available. Please load NSE/BSE IPO master data."
@@ -61,6 +105,13 @@ IPO_DEMO_COMPANY_NAMES = {
     "bharat defence systems",
 }
 IPO_DEMO_SOURCE_MARKERS = ("demo", "mock", "sample", "fallback", "seed")
+IPO_REAL_SOURCE_MARKERS = ("ipomarket", "ipoguru", "chittorgarh", "nse", "bse", "screener")
+IPO_SCREENER_SYMBOL_ALIASES = {
+    # Public IPO trackers sometimes show "Symbol pending" even after listing.
+    # Keep only hand-verified aliases here; unknown rows fall back to Screener search.
+    "RUBICON RESEARCH": "RUBICON",
+    "XTRANET TECHNOLOGIES": "XTRANET",
+}
 IPO_FINANCIAL_REQUIRED_FIELDS = (
     "latest_revenue_growth_yoy",
     "revenue_growth_yoy",
@@ -158,6 +209,25 @@ IPO_EXPORT_FIELDS = [
     "risk_flags",
     "data_source",
     "last_updated_at",
+]
+
+IPO_SIMPLE_EXPORT_FIELDS = [
+    "rank",
+    "company_name",
+    "symbol",
+    "ipo_type",
+    "listing_date",
+    "ipo_price",
+    "listing_price",
+    "current_price",
+    "listing_gain_pct",
+    "current_gain_pct",
+    "gain_from_ipo_rs",
+    "issue_size",
+    "ipo_market_cap",
+    "status_badge",
+    "screener_url",
+    "source_url",
 ]
 
 IPO_TOP10_FIELDS = [
@@ -445,6 +515,38 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _ipo_price_reference(value: Any) -> float | None:
+    """Return the highest price from an IPO price band for GMP percentage math."""
+    text = _clean_text(value)
+    if not text or text.upper() in {"N/A", "NA", "-", "--"}:
+        return None
+    normalized = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " ", text)
+    matches = re.findall(r"\d+(?:,\d{2,3})*(?:\.\d+)?|\d+(?:\.\d+)?", normalized)
+    prices: list[float] = []
+    for match in matches:
+        try:
+            prices.append(float(match.replace(",", "")))
+        except ValueError:
+            continue
+    return max(prices) if prices else None
+
+
+def _gmp_percent(gmp: Any, ipo_price_or_band: Any) -> float | None:
+    """Calculate GMP as a percent of IPO price; existing percent text is preserved."""
+    gmp_text = _clean_text(gmp)
+    if not gmp_text or gmp_text.upper() in {"N/A", "NA", "-", "--"}:
+        return None
+    gmp_value = _number(gmp_text)
+    if gmp_value is None:
+        return None
+    if "%" in gmp_text:
+        return round(gmp_value, 2)
+    price = _ipo_price_reference(ipo_price_or_band)
+    if price in {None, 0}:
+        return None
+    return round(float(gmp_value) / float(price) * 100, 2)
+
+
 def ipo_data_mode() -> str:
     return str(os.getenv("IPO_DATA_MODE", "production") or "production").strip().lower()
 
@@ -477,6 +579,13 @@ def _is_demo_ipo_record(row: dict[str, Any]) -> bool:
     return any(marker in source for marker in IPO_DEMO_SOURCE_MARKERS)
 
 
+def _is_real_ipo_source(row: dict[str, Any], is_demo: bool | None = None) -> bool:
+    if is_demo is None:
+        is_demo = _is_demo_ipo_record(row)
+    source = str(row.get("data_source") or row.get("source") or "").strip().lower()
+    return (not is_demo) and any(marker in source for marker in IPO_REAL_SOURCE_MARKERS)
+
+
 def _exchange_value(row: dict[str, Any]) -> str:
     exchange = (
         row.get("exchange")
@@ -488,11 +597,19 @@ def _exchange_value(row: dict[str, Any]) -> str:
     return str(exchange or "").strip().upper()
 
 
-def _missing_ipo_fields(row: dict[str, Any], is_demo: bool) -> list[str]:
+def _missing_ipo_fields(
+    row: dict[str, Any],
+    is_demo: bool,
+    is_real_source: bool | None = None,
+) -> list[str]:
     missing: list[str] = []
     exchange = _exchange_value(row)
+    if is_real_source is None:
+        is_real_source = _is_real_ipo_source(row, is_demo)
     if is_demo:
         missing.append("non_demo_verified_source")
+    if not is_real_source:
+        missing.append("real_ipo_source")
     if not str(row.get("symbol") or "").strip():
         missing.append("symbol")
     if not str(row.get("isin") or row.get("ISIN") or "").strip():
@@ -501,6 +618,8 @@ def _missing_ipo_fields(row: dict[str, Any], is_demo: bool) -> list[str]:
         missing.append("listing_date")
     if exchange not in IPO_VERIFIED_EXCHANGES:
         missing.append("exchange")
+    if _number(row.get("ipo_price") or row.get("issue_price")) is None:
+        missing.append("ipo_price")
     if _number(row.get("current_price")) is None:
         missing.append("current_price")
     if _number(row.get("current_market_cap") or row.get("market_cap")) is None:
@@ -519,22 +638,38 @@ def _missing_ipo_fields(row: dict[str, Any], is_demo: bool) -> list[str]:
 def _verify_ipo_record(record: dict[str, Any]) -> dict[str, Any]:
     row = normalize_ipo_record(record)
     is_demo = _is_demo_ipo_record(row)
+    is_real_source = _is_real_ipo_source(row, is_demo)
     exchange = _exchange_value(row)
     row["exchange"] = exchange
     row["isin"] = row.get("isin") or row.get("ISIN") or ""
     row["screener_url"] = row.get("screener_url") or row.get("screener_link") or _ipo_screener_url(row.get("symbol"), exchange)
-    missing = _missing_ipo_fields(row, is_demo)
-    listed_required = {"symbol", "isin", "listing_date", "exchange", "non_demo_verified_source"}
+    missing = _missing_ipo_fields(row, is_demo, is_real_source)
+    listed_required = {
+        "symbol",
+        "isin",
+        "listing_date",
+        "exchange",
+        "non_demo_verified_source",
+        "real_ipo_source",
+    }
     is_listed_verified = not any(field in listed_required for field in missing)
+    has_price_data = "current_price" not in missing and "ipo_price" not in missing
+    has_financial_data = "latest_financial_data" not in missing
+    has_shareholding_data = "shareholding_data" not in missing
     eligible = (
         is_listed_verified
-        and "current_price" not in missing
+        and has_price_data
         and "market_cap" not in missing
-        and "latest_financial_data" not in missing
+        and has_financial_data
+        and has_shareholding_data
         and not is_demo
     )
     row["is_demo"] = is_demo
+    row["is_real_ipo_source"] = is_real_source
     row["is_listed_verified"] = bool(is_listed_verified)
+    row["has_price_data"] = bool(has_price_data)
+    row["has_financial_data"] = bool(has_financial_data)
+    row["has_shareholding_data"] = bool(has_shareholding_data)
     row["eligible_for_scoring"] = bool(eligible)
     row["missing_fields"] = ", ".join(missing)
     row["exclusion_reason"] = "Missing/invalid: " + ", ".join(missing) if missing else ""
@@ -569,12 +704,20 @@ def _ipo_validation_report(rows: list[dict[str, Any]]) -> dict[str, int]:
 
     return {
         "total_rows_loaded": len(rows),
+        "real_ipo_source_rows": sum(1 for row in rows if row.get("is_real_ipo_source")),
         "verified_listed_companies": sum(1 for row in rows if row.get("is_listed_verified")),
         "eligible_for_scoring": sum(1 for row in rows if row.get("eligible_for_scoring")),
         "excluded_unverified_rows": sum(1 for row in rows if not row.get("eligible_for_scoring")),
+        "data_pending_rows": sum(
+            1
+            for row in rows
+            if row.get("is_listed_verified") and not row.get("eligible_for_scoring")
+        ),
         "rows_missing_price": sum(1 for row in rows if has_missing(row, "current_price")),
         "rows_missing_financials": sum(1 for row in rows if has_missing(row, "latest_financial_data")),
         "rows_missing_shareholding": sum(1 for row in rows if has_missing(row, "shareholding_data")),
+        "mainboard_rows": sum(1 for row in rows if "main" in str(row.get("market_type") or "").lower()),
+        "sme_rows": sum(1 for row in rows if "sme" in str(row.get("market_type") or "").lower()),
     }
 
 
@@ -589,6 +732,50 @@ def _first_present(row: dict[str, str], aliases: list[str]) -> str:
         for alias in aliases:
             if alias in normalized and value:
                 return value
+    return ""
+
+
+def _clean_chittorgarh_company_name(value: Any) -> str:
+    text = _clean_text(value)
+    text = re.sub(r"\s*\bIPO\s+Detail\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\s*\bStock\s+Quotes\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\s*\bSymbol\s+pending\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\s*\bListed\s*:\s*\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2}\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\s*\bListed\s*:.*$", "", text, flags=re.I)
+    text = re.sub(r"\s*\bListed\s+On\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" -|")
+
+
+def _ipo_company_lookup_key(value: Any) -> str:
+    text = _clean_chittorgarh_company_name(value).upper()
+    text = re.sub(r"\b(LIMITED|LTD|LTD\.|PRIVATE|PVT|PVT\.|INDIA|THE)\b", " ", text)
+    return re.sub(r"[^A-Z0-9]+", " ", text).strip()
+
+
+def _infer_ipo_screener_symbol(row: dict[str, Any]) -> str:
+    raw_symbol_text = str(row.get("symbol") or "").strip()
+    symbol_placeholder = raw_symbol_text.upper() in {
+        "",
+        "-",
+        "--",
+        "NA",
+        "N/A",
+        "NONE",
+        "PENDING",
+        "SYMBOL PENDING",
+        "SYMBOLPENDING",
+        "TO BE UPDATED",
+    }
+    symbol = re.sub(r"[^A-Z0-9-]", "", raw_symbol_text.upper())
+    if symbol and not symbol_placeholder:
+        return symbol
+    company_key = _ipo_company_lookup_key(
+        row.get("company_name") or row.get("company") or row.get("ipo_name") or ""
+    )
+    for alias_key, alias_symbol in IPO_SCREENER_SYMBOL_ALIASES.items():
+        if alias_key in company_key or company_key in alias_key:
+            return alias_symbol
     return ""
 
 
@@ -610,9 +797,8 @@ def _html_table_rows(markup: str) -> list[list[str]]:
             cells = [
                 _clean_text(cell.get_text(" "))
                 for cell in tr.find_all(["th", "td"])
-                if _clean_text(cell.get_text(" "))
             ]
-            if cells:
+            if any(cells):
                 rows.append(cells)
         return rows
 
@@ -622,8 +808,7 @@ def _html_table_rows(markup: str) -> list[list[str]]:
             _clean_text(cell)
             for cell in re.findall(r"<t[hd]\b[^>]*>(.*?)</t[hd]>", row_html, flags=re.I | re.S)
         ]
-        cells = [cell for cell in cells if cell]
-        if cells:
+        if any(cells):
             rows.append(cells)
     return rows
 
@@ -632,9 +817,28 @@ def _records_from_html_tables(markup: str) -> list[dict[str, str]]:
     rows = _html_table_rows(markup)
     records: list[dict[str, str]] = []
     header: list[str] | None = None
+    header_markers = (
+        "company",
+        "company_name",
+        "symbol",
+        "isin",
+        "listing",
+        "listed_on",
+        "issue_price",
+        "current_price",
+        "profit_loss",
+        "gain",
+        "market_cap",
+        "ipo_price",
+    )
     for cells in rows:
         normalized = [_normalize_key(cell) for cell in cells]
-        looks_like_header = any("company" in item or "ipo" in item for item in normalized)
+        marker_hits = sum(
+            1
+            for item in normalized
+            if any(marker in item for marker in header_markers)
+        )
+        looks_like_header = marker_hits >= 2 or (header is None and marker_hits >= 1)
         if header is None or looks_like_header:
             header = cells
             continue
@@ -872,47 +1076,920 @@ def _merge_by_symbol(
     return list(merged.values())
 
 
+def _ipo_year_from_row(raw: dict[str, str], listing_date: str) -> int | None:
+    return _parse_year(listing_date) or _parse_year(" ".join(str(value) for value in raw.values()))
+
+
+def _chittorgarh_url_plan(year: int, ipo_type: str) -> list[tuple[str, str]]:
+    normalized_type = str(ipo_type or "mainboard").strip().lower()
+    if normalized_type == "sme":
+        return [
+            ("year", CHITTORGARH_SME_YEAR_URL.format(year=int(year))),
+            ("fallback", CHITTORGARH_SME_FALLBACK_URL),
+        ]
+
+    override = os.getenv("IPO_CHITTORGARH_LISTED_URL")
+    if override:
+        return [("override", override)]
+    return [
+        ("year", CHITTORGARH_MAINBOARD_YEAR_URL.format(year=int(year))),
+        ("fallback", CHITTORGARH_MAINBOARD_FALLBACK_URL),
+    ]
+
+
+def _chittorgarh_source_name(ipo_type: str) -> str:
+    return (
+        "Chittorgarh SME IPO performance tracker"
+        if str(ipo_type or "").strip().lower() == "sme"
+        else "Chittorgarh Mainboard IPO performance tracker"
+    )
+
+
+def _ipo_market_type_from_text(value: Any, default: str = "Mainboard") -> str:
+    text = _clean_text(value).lower()
+    if "sme" in text:
+        return "SME"
+    if "mainboard" in text or "main board" in text or text == "main":
+        return "Mainboard"
+    return default
+
+
+def _normalize_ipo_performance_record(
+    raw: dict[str, str],
+    year: int,
+    ipo_type: str,
+    source_url: str,
+    source_label: str,
+    default_market_type: str | None = None,
+    require_year: bool = True,
+) -> dict[str, Any] | None:
+    company = _clean_chittorgarh_company_name(
+        _first_present(raw, ["company_name", "company", "ipo_name", "issuer", "name"])
+    )
+    if not company or _normalize_key(company) in {"company", "company_name", "name"}:
+        return None
+
+    listing_date = _first_present(
+        raw,
+        ["listed_on", "listing_date", "list_date", "date_of_listing", "listing"],
+    )
+    row_year = _ipo_year_from_row(raw, listing_date)
+    if require_year:
+        if row_year and row_year != int(year):
+            return None
+        if row_year is None and str(int(year)) not in " ".join(str(value) for value in raw.values()):
+            return None
+
+    normalized_type = "SME" if str(ipo_type or "").strip().lower() == "sme" else "Mainboard"
+    market_type_text = _first_present(raw, ["market_type", "ipo_type", "segment", "category", "exchange"])
+    market_type = _ipo_market_type_from_text(
+        market_type_text,
+        default_market_type or normalized_type,
+    )
+    if normalized_type == "SME" and market_type != "SME":
+        if market_type_text:
+            return None
+        market_type = "SME"
+    if normalized_type == "Mainboard" and market_type == "SME":
+        return None
+
+    raw_symbol = _first_present(raw, ["symbol", "nse_symbol", "bse_symbol", "scrip", "code"])
+    symbol = _infer_ipo_screener_symbol({"symbol": raw_symbol, "company_name": company})
+    ipo_price = _number(_first_present(raw, ["issue_price", "ipo_price", "offer_price", "issue_pr", "price_band"]))
+    listing_price = _number(
+        _first_present(raw, ["listing_day_close", "listing_price", "list_price", "listing_close"])
+    )
+    current_price = _number(
+        _first_present(raw, ["current_price", "cmp", "ltp", "last_traded_price", "last_price"])
+    )
+    listing_gain = _number(
+        _first_present(raw, ["listing_day_gain", "listing_gain", "listing_return", "return_from_listing"])
+    )
+    current_gain = _number(
+        _first_present(
+            raw,
+            [
+                "profit_loss",
+                "current_gain",
+                "current_return",
+                "gain_from_ipo",
+                "return_from_issue",
+                "return_since_ipo",
+            ],
+        )
+    )
+    if current_gain is None:
+        current_gain = _pct(current_price, ipo_price)
+
+    gain_rs = None
+    if current_price is not None and ipo_price is not None:
+        gain_rs = round(float(current_price) - float(ipo_price), 2)
+
+    sector = _first_present(raw, ["sector", "industry"]) or "N/A"
+    issue_size = _first_present(raw, ["issue_size", "ipo_size", "issue_amount", "issue"])
+    market_cap = _number(_first_present(raw, ["current_market_cap", "market_cap", "mcap"]))
+    ipo_market_cap = _number(_first_present(raw, ["ipo_market_cap", "issue_market_cap"]))
+    high_52w = _number(_first_present(raw, ["high_52w", "52w_high", "52_week_high", "year_high"]))
+    drawdown = _number(_first_present(raw, ["drawdown_from_52w_high", "52w_drawdown", "drawdown"]))
+    exchange = _first_present(raw, ["exchange", "listed_on", "listing_exchange"])
+    if not exchange:
+        exchange = "SME" if market_type == "SME" else "NSE"
+
+    record: dict[str, Any] = {
+        "company_name": company,
+        "symbol": symbol,
+        "isin": _first_present(raw, ["isin"]),
+        "exchange": str(exchange or "").strip().upper(),
+        "ipo_year": int(year),
+        "listing_date": listing_date,
+        "ipo_price": ipo_price,
+        "issue_price": ipo_price,
+        "listing_price": listing_price,
+        "current_price": current_price,
+        "current_market_cap": market_cap,
+        "market_cap": market_cap,
+        "ipo_market_cap": ipo_market_cap,
+        "gain_from_ipo_pct": current_gain,
+        "return_from_issue_pct": current_gain,
+        "return_from_listing_pct": listing_gain,
+        "drawdown_from_52w_high_pct": drawdown,
+        "high_52w": high_52w,
+        "sector": sector,
+        "issue_size": issue_size or "N/A",
+        "theme": infer_theme({"company_name": company, "sector": sector}),
+        "market_type": market_type,
+        "data_source": source_label,
+        "source_url": source_url,
+        "screener_url": _simple_ipo_screener_url(
+            {"company_name": company, "symbol": symbol, "exchange": exchange}
+        ),
+        "last_updated_at": _now_text(),
+    }
+    if record["ipo_market_cap"] is None and market_cap is not None and ipo_price and current_price:
+        record["ipo_market_cap"] = round(float(market_cap) * float(ipo_price) / float(current_price), 2)
+    if record["drawdown_from_52w_high_pct"] is None and current_price is not None and high_52w:
+        record["drawdown_from_52w_high_pct"] = _pct(current_price, high_52w)
+    return record
+
+
+def _normalize_chittorgarh_record(
+    raw: dict[str, str],
+    year: int,
+    ipo_type: str,
+    source_url: str,
+) -> dict[str, Any] | None:
+    company = _clean_chittorgarh_company_name(_first_present(raw, ["company", "ipo_name", "issuer", "name"]))
+    if not company or "company" == _normalize_key(company):
+        return None
+    listing_date = _first_present(raw, ["listing_date", "list_date", "listing", "listed_on"])
+    row_year = _ipo_year_from_row(raw, listing_date)
+    if row_year and row_year != int(year):
+        return None
+    if row_year is None and str(int(year)) not in " ".join(str(value) for value in raw.values()):
+        return None
+
+    raw_symbol = _first_present(raw, ["symbol", "code", "scrip"])
+    symbol = _infer_ipo_screener_symbol({"symbol": raw_symbol, "company_name": company})
+    issue_price = _number(
+        _first_present(raw, ["issue_price", "offer_price", "ipo_price", "price_band", "price"])
+    )
+    listing_price = _number(
+        _first_present(
+            raw,
+            ["listing_price", "list_price", "list_price_rs", "listing_day_close", "listing_close"],
+        )
+    )
+    current_price = _number(_first_present(raw, ["current_price", "cmp", "ltp", "current", "last_price"]))
+    gain_from_ipo = _number(
+        _first_present(
+            raw,
+            [
+                "change_percent_from_ipo",
+                "gain_from_ipo",
+                "current_gain",
+                "return_from_issue",
+                "profit_loss",
+            ],
+        )
+    )
+    sector = _first_present(raw, ["sector", "industry"]) or "N/A"
+    issue_size = _first_present(raw, ["issue_size", "issue_size_rs", "issue_size_cr", "issue", "size"])
+    market_cap = _number(_first_present(raw, ["current_market_cap", "market_cap", "mcap"]))
+    ipo_market_cap = _number(_first_present(raw, ["ipo_market_cap", "issue_market_cap"]))
+    exchange = _first_present(raw, ["exchange", "listed_on", "listing_exchange"])
+    if not exchange:
+        exchange = "SME" if str(ipo_type or "").strip().lower() == "sme" else "NSE"
+    market_type = "SME" if str(ipo_type or "").strip().lower() == "sme" else "Mainboard"
+    high_52w = _number(_first_present(raw, ["high_52w", "52w_high", "52_week_high", "year_high"]))
+    drawdown = _number(_first_present(raw, ["drawdown_from_52w_high", "52w_drawdown", "drawdown"]))
+
+    record: dict[str, Any] = {
+        "company_name": company,
+        "symbol": symbol,
+        "isin": _first_present(raw, ["isin"]),
+        "exchange": str(exchange or "").strip().upper(),
+        "ipo_year": int(year),
+        "listing_date": listing_date,
+        "ipo_price": issue_price,
+        "issue_price": issue_price,
+        "listing_price": listing_price,
+        "current_price": current_price,
+        "current_market_cap": market_cap,
+        "market_cap": market_cap,
+        "ipo_market_cap": ipo_market_cap,
+        "gain_from_ipo_pct": gain_from_ipo,
+        "return_from_issue_pct": gain_from_ipo,
+        "return_from_listing_pct": _number(
+            _first_present(raw, ["return_from_listing", "listing_gain", "listing_day_gain"])
+        ),
+        "drawdown_from_52w_high_pct": drawdown,
+        "high_52w": high_52w,
+        "sector": sector,
+        "issue_size": issue_size or "N/A",
+        "theme": infer_theme({"company_name": company, "sector": sector}),
+        "market_type": market_type,
+        "data_source": _chittorgarh_source_name(ipo_type),
+        "source_url": source_url,
+        "screener_url": _simple_ipo_screener_url(
+            {"company_name": company, "symbol": symbol, "exchange": exchange}
+        ),
+        "last_updated_at": _now_text(),
+    }
+    if record["gain_from_ipo_pct"] is None:
+        record["gain_from_ipo_pct"] = _pct(current_price, issue_price)
+        record["return_from_issue_pct"] = record["gain_from_ipo_pct"]
+    if record["ipo_market_cap"] is None and market_cap is not None and issue_price and current_price:
+        record["ipo_market_cap"] = round(float(market_cap) * float(issue_price) / float(current_price), 2)
+    if record["drawdown_from_52w_high_pct"] is None and current_price is not None and high_52w:
+        record["drawdown_from_52w_high_pct"] = _pct(current_price, high_52w)
+    return record
+
+
+def fetch_chittorgarh_ipos(year: int, ipo_type: str = "mainboard") -> dict[str, Any]:
+    """Fetch listed IPO rows from Chittorgarh, trying year URL then fallback.
+
+    The adapter intentionally does not invent exchange symbols. If the public
+    table lacks symbol/ISIN/financials, the row is shown as data-pending and is
+    excluded from scoring until a verified source enriches it.
+    """
+    errors: list[str] = []
+    tried_sources: list[str] = []
+    for source_kind, url in _chittorgarh_url_plan(year, ipo_type):
+        tried_sources.append(url)
+        try:
+            html_text = _http_get_text(url)
+        except Exception as exc:
+            errors.append(f"{url}: {_clean_text(exc)}")
+            continue
+
+        records = [
+            record
+            for raw in _records_from_html_tables(html_text)
+            if (record := _normalize_chittorgarh_record(raw, year, ipo_type, url)) is not None
+        ]
+        if records:
+            return {
+                "records": records,
+                "source": url,
+                "source_kind": source_kind,
+                "tried_sources": tried_sources,
+                "error": "; ".join(errors),
+            }
+        if source_kind != "fallback":
+            errors.append(f"{url}: no usable {int(year)} rows")
+
+    return {
+        "records": [],
+        "source": tried_sources[-1] if tried_sources else "",
+        "source_kind": "none",
+        "tried_sources": tried_sources,
+        "error": "; ".join(errors),
+    }
+
+
 def fetch_chittorgarh_listed_ipos(year: int) -> dict[str, Any]:
-    """Fetch listed IPO rows from Chittorgarh's public report when reachable."""
-    url = os.getenv("IPO_CHITTORGARH_LISTED_URL", DEFAULT_CHITTORGARH_LISTED_URL)
-    html_text = _http_get_text(url)
+    """Fetch mainboard and SME IPO tracker rows from Chittorgarh."""
+    all_records: list[dict[str, Any]] = []
+    sources: list[str] = []
+    errors: list[str] = []
+    for ipo_type in ("mainboard", "sme"):
+        result = fetch_chittorgarh_ipos(year, ipo_type)
+        all_records.extend(list(result.get("records") or []))
+        if result.get("source"):
+            sources.append(str(result.get("source")))
+        if result.get("error"):
+            errors.append(str(result.get("error")))
+    return {"records": all_records, "source": ", ".join(sources), "error": "; ".join(errors)}
+
+
+def _filter_source_records_for_ipo_type(
+    records: list[dict[str, Any]],
+    ipo_type: str,
+) -> list[dict[str, Any]]:
+    target = "sme" if str(ipo_type or "").strip().lower() == "sme" else "mainboard"
+    filtered: list[dict[str, Any]] = []
+    for row in records:
+        market_type = str(row.get("market_type") or row.get("ipo_type") or "").strip().lower()
+        if target == "sme":
+            if "sme" in market_type:
+                filtered.append(row)
+        else:
+            if "sme" not in market_type:
+                filtered.append(row)
+    return filtered
+
+
+def _usable_simple_performance_source_row(row: dict[str, Any]) -> bool:
+    return (
+        bool(_clean_text(row.get("company_name")))
+        and _number(row.get("ipo_price") or row.get("issue_price")) is not None
+        and (
+            _number(row.get("current_price")) is not None
+            or _number(row.get("current_gain_pct") or row.get("gain_from_ipo_pct") or row.get("return_from_issue_pct")) is not None
+        )
+    )
+
+
+def fetch_ipomarket_ipos(year: int, ipo_type: str = "mainboard") -> dict[str, Any]:
+    """Fetch year-wise IPO performance rows from IPO Market.
+
+    IPO Market is preferred for the simple research tab because its public
+    performance view is year-oriented and usually includes issue/current prices.
+    """
+    url = IPOMARKET_YEAR_URL.format(year=int(year))
+    try:
+        html_text = _http_get_text(url)
+    except Exception as exc:
+        return {"records": [], "source": url, "source_kind": "ipomarket", "error": f"{url}: {_clean_text(exc)}"}
+
+    normalized: list[dict[str, Any]] = []
+    for raw in _records_from_html_tables(html_text):
+        record = _normalize_ipo_performance_record(
+            raw,
+            year,
+            ipo_type,
+            url,
+            "IPO Market IPO performance tracker",
+            require_year=True,
+        )
+        if record and _usable_simple_performance_source_row(record):
+            normalized.append(record)
+    records = _filter_source_records_for_ipo_type(normalized, ipo_type)
+    return {
+        "records": records,
+        "source": url,
+        "source_kind": "ipomarket",
+        "tried_sources": [url],
+        "error": "" if records else f"{url}: no usable {int(year)} {ipo_type} rows",
+    }
+
+
+def _fetch_generic_ipo_performance_url(
+    source_key: str,
+    url: str,
+    year: int,
+    ipo_type: str,
+    default_market_type: str,
+    require_year: bool,
+) -> dict[str, Any]:
+    try:
+        html_text = _http_get_text(url)
+    except Exception as exc:
+        return {"records": [], "source": url, "source_kind": source_key, "error": f"{url}: {_clean_text(exc)}"}
+
     records: list[dict[str, Any]] = []
     for raw in _records_from_html_tables(html_text):
-        company = _first_present(raw, ["company", "ipo_name", "issuer", "name"])
-        if not company:
-            continue
-        listing_date = _first_present(raw, ["listing_date", "list_date", "listing"])
-        row_year = _parse_year(listing_date) or _parse_year(" ".join(raw.values()))
-        if row_year and row_year != int(year):
-            continue
-        if row_year is None and str(int(year)) not in " ".join(raw.values()):
-            continue
-        symbol = _first_present(raw, ["symbol", "code", "scrip"]) or re.sub(
-            r"[^A-Z0-9]",
-            "",
-            company.upper().split()[0],
-        )[:14]
-        issue_price = _number(
-            _first_present(raw, ["issue_price", "offer_price", "ipo_price", "price_band", "price"])
+        record = _normalize_ipo_performance_record(
+            raw,
+            year,
+            ipo_type,
+            url,
+            f"{source_key.replace('_', ' ').title()} IPO performance tracker",
+            default_market_type=default_market_type,
+            require_year=require_year,
         )
-        listing_price = _number(_first_present(raw, ["listing_price", "list_price"]))
-        current_price = _number(_first_present(raw, ["current_price", "cmp", "ltp", "current"]))
-        sector = _first_present(raw, ["sector", "industry"]) or "N/A"
-        market_cap = _number(_first_present(raw, ["market_cap", "mcap"]))
-        record = _listed_record(
-            company,
-            symbol,
-            int(year),
-            listing_date,
-            issue_price,
-            listing_price,
-            current_price,
-            sector,
-            market_cap,
+        if record and _usable_simple_performance_source_row(record):
+            records.append(record)
+    records = _filter_source_records_for_ipo_type(records, ipo_type)
+    return {
+        "records": records,
+        "source": url,
+        "source_kind": source_key,
+        "tried_sources": [url],
+        "error": "" if records else f"{url}: no usable {int(year)} {ipo_type} rows",
+    }
+
+
+def fetch_ipoguru_ipos(year: int, ipo_type: str = "mainboard") -> dict[str, Any]:
+    source_type = "sme" if str(ipo_type or "").strip().lower() == "sme" else "mainboard"
+    url = IPOGURU_SME_URL if source_type == "sme" else IPOGURU_MAINBOARD_URL
+    default_market_type = "SME" if source_type == "sme" else "Mainboard"
+    return _fetch_generic_ipo_performance_url(
+        "ipoguru",
+        url,
+        year,
+        ipo_type,
+        default_market_type,
+        require_year=True,
+    )
+
+
+def fetch_secondary_ipo_source(source_key: str, year: int, ipo_type: str = "mainboard") -> dict[str, Any]:
+    """Best-effort parser for simple public performance sources.
+
+    These sites may change markup frequently. They are intentionally treated as
+    fallback sources and never produce demo rows.
+    """
+    source_type = "sme" if str(ipo_type or "").strip().lower() == "sme" else "mainboard"
+    source_map = {
+        "economic_times": IPO_SOURCE_URLS["economic_times"].get(source_type) or IPO_SOURCE_URLS["economic_times"]["all"],
+        "hdfcsec": IPO_SOURCE_URLS["hdfcsec"]["past_ipo"],
+        "mint": IPO_SOURCE_URLS["mint"]["performance"],
+    }
+    url = source_map.get(source_key)
+    if not url:
+        return {"records": [], "source": "", "source_kind": source_key, "error": f"{source_key}: no configured URL"}
+    return _fetch_generic_ipo_performance_url(
+        source_key,
+        url,
+        year,
+        ipo_type,
+        "SME" if source_type == "sme" else "Mainboard",
+        require_year=True,
+    )
+
+
+def _fetch_simple_ipo_performance_by_priority(year: int, ipo_type: str) -> dict[str, Any]:
+    errors: list[str] = []
+    tried_sources: list[str] = []
+    for source_key in IPO_DATA_SOURCE_PRIORITY:
+        if source_key == "ipomarket":
+            result = fetch_ipomarket_ipos(year, ipo_type)
+        elif source_key == "ipoguru":
+            result = fetch_ipoguru_ipos(year, ipo_type)
+        elif source_key in {"economic_times", "hdfcsec", "mint"}:
+            result = fetch_secondary_ipo_source(source_key, year, ipo_type)
+        elif source_key == "chittorgarh":
+            result = fetch_chittorgarh_ipos(year, ipo_type)
+        else:
+            errors.append(f"{source_key}: used only for listing verification, not year-wise performance parsing")
+            continue
+
+        tried_sources.extend(str(item) for item in (result.get("tried_sources") or [result.get("source")]) if item)
+        if result.get("records"):
+            return {
+                **result,
+                "tried_sources": tried_sources,
+                "source_mode": "live",
+                "source_priority": source_key,
+                "error": "; ".join([*errors, str(result.get("error") or "")]).strip("; "),
+            }
+        if result.get("error"):
+            errors.append(str(result.get("error")))
+
+    return {
+        "records": [],
+        "source": tried_sources[-1] if tried_sources else "",
+        "source_kind": "none",
+        "tried_sources": tried_sources,
+        "source_priority": "",
+        "error": "; ".join(errors),
+    }
+
+
+def _simple_ipo_cache_dir() -> Path:
+    return Path(__file__).resolve().parent / "data" / "ipo"
+
+
+def _simple_ipo_cache_path(year: int, ipo_type: str) -> Path:
+    clean_type = "sme" if str(ipo_type or "").strip().lower() == "sme" else "mainboard"
+    return _simple_ipo_cache_dir() / f"ipo_performance_{clean_type}_{int(year)}.csv"
+
+
+def _simple_ipo_screener_url(row: dict[str, Any]) -> str:
+    symbol = _infer_ipo_screener_symbol(row)
+    if symbol:
+        return f"https://www.screener.in/company/{symbol}/"
+    company = _clean_chittorgarh_company_name(row.get("company_name") or "")
+    return f"https://www.screener.in/search/?q={quote_plus(company)}" if company else "https://www.screener.in/"
+
+
+def _simple_ipo_status(current_gain_pct: float | None) -> tuple[str, str]:
+    if current_gain_pct is None:
+        return "Data Pending", "neutral"
+    if current_gain_pct >= 100:
+        return "Strong Gainer", "strong"
+    if current_gain_pct >= 50:
+        return "Good Gainer", "good"
+    if current_gain_pct >= 20:
+        return "Moderate Gainer", "watch"
+    if current_gain_pct >= 0:
+        return "Flat / Low Return", "flat"
+    return "Below IPO Price", "bad"
+
+
+def _simple_ipo_performance_row(row: dict[str, Any], ipo_type: str) -> dict[str, Any]:
+    company = _clean_chittorgarh_company_name(row.get("company_name") or "")
+    symbol = _infer_ipo_screener_symbol({**row, "company_name": company})
+    ipo_price = _number(row.get("ipo_price") or row.get("issue_price"))
+    listing_price = _number(row.get("listing_price"))
+    current_price = _number(row.get("current_price"))
+    current_gain = _number(row.get("current_gain_pct") or row.get("gain_from_ipo_pct") or row.get("return_from_issue_pct"))
+    if current_gain is None:
+        current_gain = _pct(current_price, ipo_price)
+    listing_gain = _number(row.get("listing_gain_pct") or row.get("return_from_listing_pct"))
+    if listing_gain is None:
+        listing_gain = _pct(listing_price, ipo_price)
+    gain_rs = None
+    if current_price is not None and ipo_price is not None:
+        gain_rs = round(float(current_price) - float(ipo_price), 2)
+    status, status_class = _simple_ipo_status(current_gain)
+    normalized_type = "SME" if str(ipo_type or "").strip().lower() == "sme" else "Mainboard"
+    simplified = {
+        "rank": "",
+        "company_name": company,
+        "symbol": symbol,
+        "ipo_type": normalized_type,
+        "listing_date": _clean_text(row.get("listing_date") or ""),
+        "ipo_price": ipo_price,
+        "listing_price": listing_price,
+        "current_price": current_price,
+        "listing_gain_pct": listing_gain,
+        "current_gain_pct": current_gain,
+        "gain_from_ipo_rs": gain_rs,
+        "issue_size": _clean_text(row.get("issue_size") or "N/A"),
+        "ipo_market_cap": _number(row.get("ipo_market_cap")),
+        "status_badge": status,
+        "status_class": status_class,
+        "screener_url": _simple_ipo_screener_url({**row, "company_name": company, "symbol": symbol}),
+        "source_url": _clean_text(row.get("source_url") or row.get("source") or ""),
+    }
+    return simplified
+
+
+def _simple_ipo_sort_key(row: dict[str, Any]) -> tuple[int, float]:
+    gain = _number(row.get("current_gain_pct"))
+    return (1 if gain is not None else 0, float(gain or -10_000))
+
+
+def _rank_simple_ipo_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked = sorted(rows, key=_simple_ipo_sort_key, reverse=True)
+    for index, row in enumerate(ranked, start=1):
+        row["rank"] = index
+    return ranked
+
+
+def _write_simple_ipo_csv_cache(year: int, ipo_type: str, rows: list[dict[str, Any]], fetched_at: str) -> None:
+    path = _simple_ipo_cache_path(year, ipo_type)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [*IPO_SIMPLE_EXPORT_FIELDS, "status_class", "_cache_fetched_at"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({**row, "_cache_fetched_at": fetched_at})
+
+
+def _read_simple_ipo_csv_cache(year: int, ipo_type: str) -> tuple[list[dict[str, Any]], str]:
+    path = _simple_ipo_cache_path(year, ipo_type)
+    if not path.exists():
+        return [], ""
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    timestamp = ""
+    for row in rows:
+        timestamp = str(row.pop("_cache_fetched_at", "") or timestamp)
+        for field in (
+            "rank",
+            "ipo_price",
+            "listing_price",
+            "current_price",
+            "listing_gain_pct",
+            "current_gain_pct",
+            "gain_from_ipo_rs",
+            "ipo_market_cap",
+        ):
+            if field == "rank":
+                try:
+                    row[field] = int(float(row.get(field) or 0))
+                except (TypeError, ValueError):
+                    row[field] = ""
+            else:
+                row[field] = _number(row.get(field))
+        clean_company = _clean_chittorgarh_company_name(row.get("company_name") or "")
+        row["company_name"] = clean_company
+        symbol = _infer_ipo_screener_symbol(row)
+        row["symbol"] = symbol
+        row["screener_url"] = _simple_ipo_screener_url({**row, "symbol": symbol, "company_name": clean_company})
+    if not timestamp:
+        timestamp = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+    return rows, timestamp
+
+
+def _load_simple_chittorgarh_performance(
+    year: int,
+    ipo_type: str,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    if not force_refresh:
+        cached_rows, cached_at = _read_simple_ipo_csv_cache(year, ipo_type)
+        if cached_rows:
+            return {
+                "rows": _rank_simple_ipo_rows(cached_rows),
+                "source": str(_simple_ipo_cache_path(year, ipo_type)),
+                "source_mode": "cache",
+                "last_refreshed": cached_at,
+                "messages": [],
+            }
+
+    fetched_at = _now_text()
+    result = _fetch_simple_ipo_performance_by_priority(year, ipo_type)
+    raw_rows = list(result.get("records") or [])
+    rows = _rank_simple_ipo_rows([
+        _simple_ipo_performance_row(row, ipo_type)
+        for row in raw_rows
+        if not _is_demo_ipo_record(row)
+    ])
+    messages: list[str] = []
+    if result.get("error"):
+        messages.append(str(result.get("error")))
+    if rows:
+        _write_simple_ipo_csv_cache(year, ipo_type, rows, fetched_at)
+        return {
+            "rows": rows,
+            "source": str(result.get("source") or ""),
+            "source_mode": "live",
+            "last_refreshed": fetched_at,
+            "messages": [
+                f"Loaded {len(rows)} {ipo_type} IPO row(s) from {result.get('source_priority') or result.get('source_kind') or 'live source'}.",
+                *messages,
+            ],
+        }
+
+    cached_rows, cached_at = _read_simple_ipo_csv_cache(year, ipo_type)
+    if cached_rows:
+        messages.append(
+            f"Live {ipo_type} IPO source-priority fetch returned no usable rows; showing cached data from {cached_at}."
         )
-        record["data_source"] = "Chittorgarh public IPO report"
-        records.append(record)
-    return {"records": records, "source": url, "error": ""}
+        return {
+            "rows": _rank_simple_ipo_rows(cached_rows),
+            "source": str(_simple_ipo_cache_path(year, ipo_type)),
+            "source_mode": "cache_fallback",
+            "last_refreshed": cached_at,
+            "messages": messages,
+        }
+    messages.append(
+        f"No verified {ipo_type} IPO performance data available for {int(year)}. Use Refresh IPO Data after checking network access."
+    )
+    return {
+        "rows": [],
+        "source": str(result.get("source") or ""),
+        "source_mode": "empty",
+        "last_refreshed": "",
+        "messages": messages,
+    }
+
+
+def _parse_ipo_date_text(value: Any, default_year: int | None = None) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = _clean_text(value)
+    if not text:
+        return None
+    first_part = re.split(r"\s+(?:to|-)\s+", text, maxsplit=1, flags=re.I)[0].strip()
+    candidates = [first_part, text]
+    for candidate in candidates:
+        try:
+            return datetime.fromisoformat(candidate[:10]).date()
+        except ValueError:
+            pass
+        for fmt in ("%d %b %Y", "%d %B %Y", "%d-%m-%Y", "%d/%m/%Y", "%b %d %Y", "%B %d %Y"):
+            try:
+                return datetime.strptime(candidate.replace(",", ""), fmt).date()
+            except ValueError:
+                continue
+    month_match = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(20\d{2}))?", text)
+    if month_match:
+        day, month, year_text = month_match.groups()
+        year = int(year_text or default_year or date.today().year)
+        for fmt in ("%d %b %Y", "%d %B %Y"):
+            try:
+                return datetime.strptime(f"{day} {month} {year}", fmt).date()
+            except ValueError:
+                continue
+    month_first = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2})(?:,?\s+(20\d{2}))?", text)
+    if month_first:
+        month, day, year_text = month_first.groups()
+        year = int(year_text or default_year or date.today().year)
+        for fmt in ("%b %d %Y", "%B %d %Y"):
+            try:
+                return datetime.strptime(f"{month} {day} {year}", fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _upcoming_ipos_next_7_days(today: date | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    anchor = today or date.today()
+    rows, notes = _load_research_ready_upcoming_ipos(anchor)
+    next_week = anchor + timedelta(days=7)
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        ipo_date = _parse_ipo_date_text(row.get("ipo_date"), anchor.year)
+        if ipo_date is None or not (anchor <= ipo_date <= next_week):
+            continue
+        gmp_pct = row.get("gmp_pct")
+        if gmp_pct in {None, ""}:
+            gmp_pct = _gmp_percent(row.get("gmp"), row.get("price_band"))
+        filtered.append(
+            {
+                **row,
+                "ipo_date": ipo_date.isoformat(),
+                "gmp_pct": gmp_pct,
+                "screener_url": _simple_ipo_screener_url(row),
+            }
+        )
+    filtered.sort(key=lambda item: str(item.get("ipo_date") or ""))
+    return filtered, notes
+
+
+def build_simple_ipo_performance_dashboard(
+    year: int,
+    force_refresh: bool = False,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Build a fast IPO performance tracker with no demo/mock rows."""
+    selected_year = int(year)
+    mainboard = _load_simple_chittorgarh_performance(selected_year, "mainboard", force_refresh)
+    sme = _load_simple_chittorgarh_performance(selected_year, "sme", force_refresh)
+    main_rows = list(mainboard.get("rows") or [])
+    sme_rows = list(sme.get("rows") or [])
+    positive_main_rows = [
+        row for row in main_rows if (_number(row.get("current_gain_pct")) or -10_000) >= 0
+    ]
+    positive_sme_rows = [
+        row for row in sme_rows if (_number(row.get("current_gain_pct")) or -10_000) >= 0
+    ]
+    main_top20 = _rank_simple_ipo_rows([dict(row) for row in positive_main_rows[:20]])
+    sme_top20 = _rank_simple_ipo_rows([dict(row) for row in positive_sme_rows[:20]])
+    combined_top40 = _rank_simple_ipo_rows([dict(row) for row in [*main_top20, *sme_top20]])[:40]
+    upcoming, upcoming_notes = _upcoming_ipos_next_7_days(today)
+
+    def count_gain(rows: list[dict[str, Any]], threshold: float) -> int:
+        return sum(1 for row in rows if (_number(row.get("current_gain_pct")) or -10_000) >= threshold)
+
+    def best_name(rows: list[dict[str, Any]]) -> str:
+        return str(rows[0].get("company_name") or "N/A") if rows else "N/A"
+
+    timestamps = [
+        value
+        for value in (mainboard.get("last_refreshed"), sme.get("last_refreshed"))
+        if value
+    ]
+    last_refreshed = max(timestamps) if timestamps else _now_text()
+    messages = [
+        *list(mainboard.get("messages") or []),
+        *list(sme.get("messages") or []),
+        *upcoming_notes,
+    ]
+    if not main_rows and not sme_rows:
+        messages.append(IPO_NO_VERIFIED_DATA_MESSAGE)
+    return {
+        "mode": "simple_performance",
+        "year": selected_year,
+        "generated_at": _now_text(),
+        "last_refreshed": last_refreshed,
+        "mainboard_all_count": len(main_rows),
+        "sme_all_count": len(sme_rows),
+        "mainboard_top20": main_top20,
+        "sme_top20": sme_top20,
+        "combined_top40": combined_top40,
+        "upcoming_next7": upcoming,
+        "messages": messages,
+        "sources": {
+            "mainboard": mainboard.get("source"),
+            "sme": sme.get("source"),
+            "mainboard_mode": mainboard.get("source_mode"),
+            "sme_mode": sme.get("source_mode"),
+        },
+        "summary": {
+            "total_mainboard_loaded": len(main_rows),
+            "total_sme_loaded": len(sme_rows),
+            "mainboard_positive_return": len(positive_main_rows),
+            "sme_positive_return": len(positive_sme_rows),
+            "mainboard_gt50_gain": count_gain(main_rows, 50),
+            "sme_gt50_gain": count_gain(sme_rows, 50),
+            "best_mainboard": best_name(main_rows),
+            "best_sme": best_name(sme_rows),
+            "last_refreshed": last_refreshed,
+            "upcoming_next7_count": len(upcoming),
+        },
+    }
+
+
+IPO_VALUE_INVESTOR_SYSTEM_PROMPT = """
+You are a senior Indian value investor and growth-in-India analyst.
+
+Analyze recently listed Indian IPO companies for long-term investment potential.
+Do not invent financials. If quarterly numbers, cash flow, valuation, promoter
+data, or balance-sheet data are missing, explicitly mark "Data needed".
+
+Use a value-investor lens:
+- sector tailwind and Indian economy growth runway
+- business quality and competitive position
+- growth quality and execution consistency
+- capital efficiency and cash conversion
+- valuation comfort after listing
+- governance, promoter, pledge, and dilution risk
+- when to wait for quarterly result confirmation or valuation correction
+
+Return a concise investment note with:
+1. Top 5 long-term candidates
+2. Watchlist / wait-for-correction names
+3. Avoid / data-risk names
+4. Data still required before buying
+5. Final action summary
+"""
+
+
+IPO_VALUE_INVESTOR_PROMPT_FIELDS = [
+    "rank",
+    "company_name",
+    "symbol",
+    "ipo_type",
+    "listing_date",
+    "ipo_price",
+    "listing_price",
+    "current_price",
+    "listing_gain_pct",
+    "current_gain_pct",
+    "gain_from_ipo_rs",
+    "issue_size",
+    "ipo_market_cap",
+    "status_badge",
+    "screener_url",
+    "source_url",
+]
+
+
+def selected_ipo_rows_for_value_analysis(
+    dashboard: dict[str, Any],
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Return the currently ranked IPO rows suitable for GPT value analysis."""
+    ranked_rows = list(dashboard.get("combined_top40") or [])
+    if not ranked_rows:
+        ranked_rows = [
+            *list(dashboard.get("mainboard_top20") or []),
+            *list(dashboard.get("sme_top20") or []),
+        ]
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in ranked_rows:
+        if _is_demo_ipo_record(row):
+            continue
+        key = str(row.get("symbol") or row.get("company_name") or "").strip().upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        selected.append(dict(row))
+        if len(selected) >= max(1, int(limit)):
+            break
+    return selected
+
+
+def build_ipo_value_investor_prompt(rows: list[dict[str, Any]], year: int) -> str:
+    """Build a compact CSV-backed prompt for IPO long-term research."""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=IPO_VALUE_INVESTOR_PROMPT_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                field: row.get(field, "")
+                for field in IPO_VALUE_INVESTOR_PROMPT_FIELDS
+            }
+        )
+    csv_payload = output.getvalue().strip()
+    return f"""
+Analyze these {int(year)} Indian IPO performance candidates from my IPO Screener page.
+
+Context:
+- I am a long-term investor looking for Indian economy growth compounders.
+- Listing gains alone are not enough; prefer result confirmation, cash-flow quality,
+  valuation comfort, governance comfort, and sector tailwind.
+- Screener links are included for manual follow-up research.
+- If a row has missing symbol, financials, market cap, or quarterly data, downgrade
+  confidence and clearly say what data is needed.
+
+Please rank the best companies to study for long-term investment and explain the
+buy/watch/avoid decision in practical language.
+
+IPO rows:
+{csv_payload}
+""".strip()
 
 
 def fetch_nse_upcoming_ipos(today: date | None = None) -> dict[str, Any]:
@@ -960,6 +2037,7 @@ def fetch_nse_upcoming_ipos(today: date | None = None) -> dict[str, Any]:
                 "issue_size": _clean_text(row.get("issueSize") or row.get("issueSizeInCr") or "N/A"),
                 "price_band": _clean_text(row.get("priceBand") or row.get("priceRange") or "N/A"),
                 "gmp": "N/A",
+                "gmp_pct": None,
                 "source": "NSE upcoming IPO API",
                 "last_updated_at": now,
             }
@@ -982,6 +2060,8 @@ def fetch_ipowatch_upcoming_ipos(today: date | None = None) -> dict[str, Any]:
             "",
             company.upper().split()[0],
         )[:14]
+        price_band = _first_present(raw, ["price_band", "price"]) or "N/A"
+        gmp = _first_present(raw, ["gmp", "premium"]) or "N/A"
         records.append(
             {
                 "company_name": company,
@@ -989,8 +2069,9 @@ def fetch_ipowatch_upcoming_ipos(today: date | None = None) -> dict[str, Any]:
                 "ipo_date": _first_present(raw, ["ipo_date", "open", "date"]) or "N/A",
                 "sector": _first_present(raw, ["sector", "industry"]) or "N/A",
                 "issue_size": _first_present(raw, ["issue_size", "size"]) or "N/A",
-                "price_band": _first_present(raw, ["price_band", "price"]) or "N/A",
-                "gmp": _first_present(raw, ["gmp", "premium"]) or "N/A",
+                "price_band": price_band,
+                "gmp": gmp,
+                "gmp_pct": _gmp_percent(gmp, price_band),
                 "source": "IPOWatch GMP/upcoming table",
                 "last_updated_at": now,
             }
@@ -1042,7 +2123,6 @@ def _load_research_ready_upcoming_ipos(today: date | None = None) -> tuple[list[
             continue
         if rows:
             live_records.extend(rows)
-            notes.append(f"Loaded {len(rows)} upcoming IPO row(s) from {label}.")
     if not live_records:
         notes.append(
             "Upcoming IPO live sources returned no usable rows."
@@ -1094,6 +2174,52 @@ def _ipo_research_decision(
         ],
         "source_notes": source_notes[:8],
     }
+
+
+def _ipo_return_pct(row: dict[str, Any]) -> float | None:
+    value = _number(row.get("gain_from_ipo_pct"))
+    if value is None:
+        value = _number(row.get("return_from_issue_pct"))
+    return value
+
+
+def _filter_listed_tracker_rows(
+    rows: list[dict[str, Any]],
+    market_type: str = "All",
+    theme: str = "All",
+    only_positive: bool = False,
+) -> tuple[list[dict[str, Any]], str]:
+    """Rows shown immediately after Load Screener.
+
+    This is deliberately separate from the ranking engine. It may show
+    real-source rows that are still data-pending, but mock/demo rows never
+    appear here and only eligible rows can be scored or marked buy-zone.
+    """
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("is_demo") or not row.get("is_real_ipo_source"):
+            continue
+        if market_type != "All" and str(row.get("market_type") or "").lower() != market_type.lower():
+            continue
+        if theme != "All" and str(row.get("theme") or "").lower() != theme.lower():
+            continue
+        return_pct = _ipo_return_pct(row)
+        if only_positive and (return_pct is None or return_pct <= 0):
+            continue
+        filtered.append(dict(row))
+
+    filtered.sort(
+        key=lambda item: (
+            1 if item.get("eligible_for_scoring") else 0,
+            float(item.get("lt_score") or item.get("total_score") or -1),
+            _ipo_return_pct(item) if _ipo_return_pct(item) is not None else -9999,
+            str(item.get("listing_date") or ""),
+        ),
+        reverse=True,
+    )
+    if only_positive:
+        return filtered, f"Showing {len(filtered)} real-source IPO row(s) with positive return from issue price."
+    return filtered, f"Showing {len(filtered)} real-source IPO row(s) after {market_type} / {theme} filters."
 
 
 def _upsert_ipo_master(db_path: Path, records: list[dict[str, Any]]) -> None:
@@ -1250,6 +2376,12 @@ def _build_dashboard_payload(
     validation_report = _ipo_validation_report(listed_all)
     eligible_listed = [dict(row) for row in listed_all if row.get("eligible_for_scoring")]
     data_issues = [dict(row) for row in listed_all if not row.get("eligible_for_scoring")]
+    listed_tracker, tracker_message = _filter_listed_tracker_rows(
+        listed_all,
+        market_type=market_type,
+        theme=theme,
+        only_positive=only_multibagger,
+    )
     upcoming, upcoming_notes = _load_research_ready_upcoming_ipos(today)
     source_notes = [*listed_notes, *upcoming_notes]
     screener = build_ipo_screener_payload(
@@ -1270,7 +2402,9 @@ def _build_dashboard_payload(
         )
     ranked_all = rank_ipo_candidates(eligible_listed)
     ranked_visible = list(screener.get("master") or [])
-    if not eligible_listed:
+    if listed_tracker:
+        filter_message = tracker_message
+    elif not eligible_listed:
         filter_message = IPO_NO_VERIFIED_DATA_MESSAGE
     if data_issues:
         source_notes.append(
@@ -1291,6 +2425,8 @@ def _build_dashboard_payload(
         "validation_report": validation_report,
         "data_issues": data_issues,
         "listed": ranked_visible,
+        "listed_tracker": listed_tracker,
+        "listed_tracker_count": len(listed_tracker),
         "quality": ranked_visible,
         "top10": ranked_all[:10],
         "screener": screener,
@@ -1324,7 +2460,7 @@ def build_ipo_dashboard(
     safe_view = _normalize_key(ranking_view or "score")
     mode = _normalize_key(ipo_data_mode())
     key_suffix = f"{mode}:multibagger" if only_multibagger else f"{mode}:{safe_market}:{safe_theme}:{safe_view}"
-    cache_key = make_ipo_cache_key(year, quarter, f"dashboard:{key_suffix}")
+    cache_key = make_ipo_cache_key(year, quarter, f"dashboard_v4:{key_suffix}")
     payload = load_or_generate(
         db_path,
         cache_key,
@@ -1341,7 +2477,7 @@ def build_ipo_dashboard(
         force_refresh=force_refresh,
         today=today,
     )
-    _upsert_ipo_master(db_path, list(payload.get("listed") or []))
+    _upsert_ipo_master(db_path, list(payload.get("listed_tracker") or payload.get("listed") or []))
     payload["snapshots"] = load_ipo_snapshots(db_path, year)
     return payload
 

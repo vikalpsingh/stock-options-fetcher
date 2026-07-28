@@ -132,7 +132,7 @@
       "NIFTY_INCOME_ENABLED": true
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "uoFjo4sVtmD2Nsb0I6lCEiQXDN8edxUo",
+      "KITE_ACCESS_TOKEN": "sRANRpNFy3U7ZT1G8Rsi2yYH3Dx3OhWw",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
@@ -287,5 +287,5 @@
     "schedule_time": "09:20",
     "status": "ERROR"
   },
-  "selected_kite_profile": "Monika"
+  "selected_kite_profile": "Shanti"
 }

@@ -100,7 +100,7 @@ def normalize_ipo_record(record: dict[str, Any]) -> dict[str, Any]:
     row.update(
         {
             "company_name": _text(row.get("company_name")),
-            "symbol": _text(row.get("symbol")).upper(),
+            "symbol": _text(row.get("symbol"), "").upper(),
             "ipo_price": issue_price,
             "issue_price": issue_price,
             "listing_price": listing_price,

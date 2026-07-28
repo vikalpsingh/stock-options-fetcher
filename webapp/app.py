@@ -82,17 +82,22 @@ from ipo_data_service import (
     IPO_QUARTERLY_FIELDS,
     IPO_RANKING_VIEW_OPTIONS,
     IPO_RISK_ALERT_FIELDS,
+    IPO_SIMPLE_EXPORT_FIELDS,
     IPO_SNAPSHOT_FIELDS,
     IPO_THEME_FILTER_OPTIONS,
     IPO_TOP10_FIELDS,
+    IPO_VALUE_INVESTOR_SYSTEM_PROMPT,
     IPO_WATCHLIST_FIELDS,
     QUARTER_OPTIONS,
+    build_ipo_value_investor_prompt,
     build_ipo_dashboard,
+    build_simple_ipo_performance_dashboard,
     export_ipo_records_csv,
     ipo_export_filename,
     ipo_year_options,
     load_ipo_snapshots,
     save_ipo_top10_snapshot,
+    selected_ipo_rows_for_value_analysis,
 )
 from income.covered_call import (
     CoveredCallInput,
@@ -5721,6 +5726,9 @@ class PageState:
     ipo_dashboard: dict[str, Any] | None = None
     ipo_export_csv: str = ""
     ipo_export_filename: str = ""
+    ipo_gpt_prompt: str = ""
+    ipo_gpt_output: str = ""
+    ipo_gpt_response_id: str = ""
 
 
 def mask_secret(value: str | None) -> str:
@@ -14988,6 +14996,102 @@ def generate_csv_with_openai(prompt: str, model: str, system_prompt: str) -> tup
             ) from second_error
 
 
+def generate_ipo_value_analysis_with_openai(
+    rows: list[dict[str, Any]],
+    year: int,
+    model: str,
+) -> tuple[str, str, str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Missing OPENAI_API_KEY. Enter it in Kite Setup or GPT tab.")
+    if not rows:
+        raise ValueError("No IPO rows available for GPT analysis. Load IPO Screener first.")
+    prompt = build_ipo_value_investor_prompt(rows, year)
+    output, response_id = call_openai_responses_api(
+        api_key,
+        model,
+        IPO_VALUE_INVESTOR_SYSTEM_PROMPT,
+        prompt,
+    )
+    return prompt, output, response_id
+
+
+def ipo_gpt_row_key(row: dict[str, Any]) -> str:
+    company = re.sub(r"\s+", " ", str(row.get("company_name") or "").strip())
+    company = re.sub(r"\s*\bSymbol pending\b.*$", "", company, flags=re.IGNORECASE).strip()
+    listing_date = str(row.get("listing_date") or "").strip()
+    ipo_type = str(row.get("ipo_type") or "").strip()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    seed = f"{symbol}|{company}|{listing_date}|{ipo_type}"
+    return hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def selected_ipo_rows_from_dashboard_keys(
+    dashboard: dict[str, Any],
+    selected_keys: set[str],
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    if selected_keys:
+        selected = [
+            dict(row)
+            for row in list(dashboard.get("combined_top40") or [])
+            if ipo_gpt_row_key(row) in selected_keys
+        ]
+        return selected[: max(1, int(limit))]
+    return selected_ipo_rows_for_value_analysis(dashboard, limit=limit)
+
+
+def form_values(form: dict[str, list[str]], key: str) -> list[str]:
+    value = form.get(key, [])
+    if isinstance(value, str):
+        return [value]
+    return list(value or [])
+
+
+def save_ipo_gpt_analysis_to_db(
+    db_path: Path,
+    year: int,
+    prompt: str,
+    output: str,
+    response_id: str = "",
+    selected_count: int = 0,
+) -> int:
+    if not str(output or "").strip():
+        raise ValueError("No IPO GPT analysis output to save.")
+    created_at = datetime.now(INDIA_TIME_ZONE).isoformat(timespec="seconds")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ipo_gpt_analysis (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                selected_count INTEGER NOT NULL DEFAULT 0,
+                response_id TEXT,
+                prompt TEXT NOT NULL,
+                output TEXT NOT NULL
+            )
+            """
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO ipo_gpt_analysis
+                (created_at, year, selected_count, response_id, prompt, output)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created_at,
+                int(year),
+                int(selected_count),
+                str(response_id or ""),
+                str(prompt or ""),
+                str(output or ""),
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+
+
 def default_args(no_ltp_price: bool, keep_existing_orders: bool) -> argparse.Namespace:
     if kite_orders is None:
         raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
@@ -18431,6 +18535,369 @@ def render_ipo_panel(state: PageState) -> str:
       {env_hidden_fields_for_render()}
     </form>"""
     dashboard = state.ipo_dashboard
+    if dashboard is None or dashboard.get("mode") != "simple_performance":
+        try:
+            dashboard = build_simple_ipo_performance_dashboard(
+                state.ipo_year,
+                today=datetime.now(INDIA_TIME_ZONE).date(),
+            )
+        except Exception as exc:
+            dashboard = {
+                "mode": "simple_performance",
+                "year": state.ipo_year,
+                "generated_at": "",
+                "last_refreshed": "",
+                "mainboard_top20": [],
+                "sme_top20": [],
+                "combined_top40": [],
+                "upcoming_next7": [],
+                "messages": [friendly_external_error(exc, "IPO performance tracker")],
+                "summary": {
+                    "total_mainboard_loaded": 0,
+                    "total_sme_loaded": 0,
+                    "mainboard_gt50_gain": 0,
+                    "sme_gt50_gain": 0,
+                    "best_mainboard": "N/A",
+                    "best_sme": "N/A",
+                    "upcoming_next7_count": 0,
+                    "last_refreshed": "",
+                },
+            }
+            state.error = f"{friendly_external_error(exc, 'IPO performance tracker')}\n\n{traceback.format_exc()}"
+    panel_style = "" if state.active_tab == "ipo" else ' style="display:none"'
+    summary = dashboard.get("summary") or {}
+    combined_top40 = list(dashboard.get("combined_top40") or [])
+    upcoming_next7 = list(dashboard.get("upcoming_next7") or [])
+    messages = list(dashboard.get("messages") or [])
+
+    def text_value(value: Any, default: str = "N/A") -> str:
+        if value in {None, ""}:
+            return default
+        return str(value)
+
+    def num_text(value: Any, decimals: int = 2) -> str:
+        if value in {None, ""}:
+            return "N/A"
+        try:
+            return f"{float(value):.{decimals}f}"
+        except (TypeError, ValueError):
+            return text_value(value)
+
+    def pct_text(value: Any) -> str:
+        if value in {None, ""}:
+            return "N/A"
+        try:
+            return f"{float(value):+.2f}%"
+        except (TypeError, ValueError):
+            return text_value(value)
+
+    def money_text(value: Any) -> str:
+        if value in {None, ""}:
+            return "N/A"
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return text_value(value)
+
+    def badge_class(value: Any) -> str:
+        key = str(value or "").strip().lower()
+        if key in {"strong", "good", "strong gainer", "good gainer"}:
+            return "good"
+        if key in {"watch", "moderate gainer", "yellow"}:
+            return "warn"
+        if key in {"bad", "below ipo price", "red"}:
+            return "bad"
+        return "neutral"
+
+    def status_badge(row: dict[str, Any]) -> str:
+        label = text_value(row.get("status_badge"), "Data Pending")
+        return f'<span class="ipo-badge {badge_class(row.get("status_class") or label)}">{html.escape(label)}</span>'
+
+    def screener_link(row: dict[str, Any]) -> str:
+        url = text_value(row.get("screener_url"), "")
+        if not url:
+            return '<span class="muted-cell">N/A</span>'
+        return f'<a class="mini-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">Screener</a>'
+
+    def source_link(row: dict[str, Any]) -> str:
+        url = text_value(row.get("source_url"), "")
+        if not url:
+            return '<span class="muted-cell">N/A</span>'
+        return f'<a class="mini-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">Source</a>'
+
+    def clean_company_display(value: Any) -> str:
+        company = text_value(value, "N/A")
+        company = re.sub(r"\s*\bListed\s*:\s*[^|]+$", "", company, flags=re.IGNORECASE).strip()
+        company = re.sub(r"\s*\bSymbol pending\b.*$", "", company, flags=re.IGNORECASE).strip()
+        return company or "N/A"
+
+    def company_cell(row: dict[str, Any]) -> str:
+        company = clean_company_display(row.get("company_name"))
+        symbol = text_value(row.get("symbol"), "")
+        url = text_value(row.get("screener_url"), "")
+        symbol_html = f"<small>{html.escape(symbol)}</small>" if symbol else ""
+        if url:
+            return (
+                f'<td><a class="ipo-company-link" href="{html.escape(url, quote=True)}" '
+                f'target="_blank" rel="noopener">{html.escape(company)}</a>{symbol_html}</td>'
+            )
+        return f"<td><strong>{html.escape(company)}</strong>{symbol_html}</td>"
+
+    def row_html(row: dict[str, Any]) -> str:
+        row_key = ipo_gpt_row_key(row)
+        return (
+            "<tr>"
+            f'<td class="ipo-select-cell"><input type="checkbox" name="ipo_selected_key" value="{html.escape(row_key, quote=True)}"></td>'
+            f"<td>{html.escape(text_value(row.get('rank'), ''))}</td>"
+            f"{company_cell(row)}"
+            f"<td>{html.escape(text_value(row.get('ipo_type')))}</td>"
+            f"<td>{html.escape(text_value(row.get('listing_date')))}</td>"
+            f"<td>{html.escape(money_text(row.get('ipo_price')))}</td>"
+            f"<td>{html.escape(money_text(row.get('listing_price')))}</td>"
+            f"<td>{html.escape(money_text(row.get('current_price')))}</td>"
+            f"<td>{html.escape(pct_text(row.get('listing_gain_pct')))}</td>"
+            f"<td>{html.escape(pct_text(row.get('current_gain_pct')))}</td>"
+            f"<td>{html.escape(money_text(row.get('gain_from_ipo_rs')))}</td>"
+            f"<td>{html.escape(text_value(row.get('issue_size')))}</td>"
+            f"<td>{html.escape(money_text(row.get('ipo_market_cap')))}</td>"
+            f"<td>{status_badge(row)}</td>"
+            f"<td>{screener_link(row)}</td>"
+            f"<td>{source_link(row)}</td>"
+            "</tr>"
+        )
+
+    def render_table(title: str, rows: list[dict[str, Any]], table_id: str, empty_text: str) -> str:
+        rows_html = "".join(row_html(row) for row in rows)
+        if not rows_html:
+            rows_html = f'<tr><td colspan="16" class="muted-cell">{html.escape(empty_text)}</td></tr>'
+        return f"""
+      <section class="panel ipo-table-panel ipo-results-panel">
+        <div class="ipo-section-head">
+          <div>
+            <div class="panel-title">{html.escape(title)}</div>
+            <p class="status">Select companies, sort the columns, then send the shortlist to GPT for a value-investor review. The app tries IPO Market first, then other configured public trackers, with Chittorgarh as optional fallback.</p>
+          </div>
+          <div class="actions">
+            <a class="mini-link" href="{html.escape(ipo_custom_gpt_url, quote=True)}" target="_blank" rel="noopener">Open Custom GPT manually</a>
+            <button type="submit" formaction="/ipo/gpt-analyze" class="secondary">Analyze Selected with GPT</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="{html.escape(table_id, quote=True)}" class="ipo-table ipo-sortable">
+            <thead><tr>
+              <th class="ipo-select-cell">Select</th>
+              <th data-sort-type="number">Rank</th><th data-sort-type="text">Company</th><th data-sort-type="text">IPO Type</th><th data-sort-type="date">Listing Date</th><th data-sort-type="number">IPO Price</th>
+              <th data-sort-type="number">Listing Price</th><th data-sort-type="number">Current Price</th><th data-sort-type="number">Listing Gain %</th><th data-sort-type="number">Current Gain %</th>
+              <th data-sort-type="number">Gain from IPO in Rs</th><th data-sort-type="text">Issue Size</th><th data-sort-type="number">IPO Market Cap</th><th data-sort-type="text">Status Badge</th>
+              <th data-sort-type="text">Screener</th><th data-sort-type="text">Data Source</th>
+            </tr></thead>
+            <tbody>{rows_html}</tbody>
+          </table>
+        </div>
+      </section>"""
+
+    sortable_script = """
+      <script>
+      (() => {
+        const parseValue = (text, type) => {
+          const cleaned = (text || '').replace(/[₹,%]/g, '').replace(/,/g, '').trim();
+          if (type === 'number') {
+            const number = parseFloat(cleaned);
+            return Number.isFinite(number) ? number : -Infinity;
+          }
+          if (type === 'date') {
+            const time = Date.parse(cleaned);
+            return Number.isFinite(time) ? time : 0;
+          }
+          return (text || '').toLowerCase();
+        };
+        document.querySelectorAll('.ipo-sortable th[data-sort-type]').forEach((th) => {
+          if (th.dataset.ipoSortBound === '1') return;
+          th.dataset.ipoSortBound = '1';
+          th.addEventListener('click', () => {
+            const table = th.closest('table');
+            const tbody = table && table.querySelector('tbody');
+            if (!tbody) return;
+            const index = Array.prototype.indexOf.call(th.parentElement.children, th);
+            const ascending = th.dataset.sortDirection !== 'asc';
+            th.dataset.sortDirection = ascending ? 'asc' : 'desc';
+            const type = th.dataset.sortType || 'text';
+            const rows = Array.from(tbody.querySelectorAll('tr')).filter((row) => row.children.length > index);
+            rows.sort((a, b) => {
+              const av = parseValue(a.children[index].innerText, type);
+              const bv = parseValue(b.children[index].innerText, type);
+              if (av < bv) return ascending ? -1 : 1;
+              if (av > bv) return ascending ? 1 : -1;
+              return 0;
+            });
+            rows.forEach((row) => tbody.appendChild(row));
+          });
+        });
+      })();
+      </script>
+    """
+
+    year_options = [2026, 2025, 2024]
+    if int(state.ipo_year) not in year_options:
+        year_options.insert(0, int(state.ipo_year))
+    year_options_html = "".join(
+        f'<option value="{year}"{" selected" if int(year) == int(state.ipo_year) else ""}>{year}</option>'
+        for year in year_options
+    )
+    best_row = combined_top40[0] if combined_top40 else {}
+    best_name = clean_company_display(best_row.get("company_name")) if best_row else "N/A"
+    best_gain = pct_text(best_row.get("current_gain_pct")) if best_row else "N/A"
+    summary_cards = [
+        ("Best performer", best_name, f"{best_gain} current gain"),
+        ("Top 40 rows", len(combined_top40), "Positive-return IPO performers"),
+        ("Upcoming 7 days", summary.get("upcoming_next7_count", len(upcoming_next7)), "Only near-term IPOs shown"),
+    ]
+    summary_cards_html = "".join(
+        f'<div class="ipo-stat-card"><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong><small>{html.escape(str(help_text))}</small></div>'
+        for label, value, help_text in summary_cards
+    )
+    upcoming_rows_html = "".join(
+        f"""
+        <tr>
+          <td><a class="ipo-company-link" href="{html.escape(text_value(item.get("screener_url"), "https://www.screener.in/"), quote=True)}" target="_blank" rel="noopener">{html.escape(text_value(item.get("company_name")))}</a></td>
+          <td>{html.escape(text_value(item.get("ipo_date")))}</td>
+          <td>{html.escape(text_value(item.get("sector")))}</td>
+          <td>{html.escape(text_value(item.get("issue_size")))}</td>
+          <td>{html.escape(text_value(item.get("price_band")))}</td>
+          <td>{html.escape(text_value(item.get("gmp")))}</td>
+          <td>{html.escape(pct_text(item.get("gmp_pct")))}</td>
+          <td>{html.escape(text_value(item.get("source")))}</td>
+        </tr>
+        """
+        for item in upcoming_next7
+    )
+    if not upcoming_rows_html:
+        upcoming_rows_html = '<tr><td colspan="8" class="muted-cell">No upcoming IPOs in the next 7 days from verified sources.</td></tr>'
+    upcoming_html = f"""
+        <div class="table-wrap compact">
+          <table id="ipo-upcoming-table" class="ipo-table ipo-upcoming-table">
+            <thead><tr>
+              <th>Company</th><th>IPO Date</th><th>Sector</th><th>Issue</th><th>Price Band</th><th>GMP</th><th>GMP %</th><th>Source</th>
+            </tr></thead>
+            <tbody>{upcoming_rows_html}</tbody>
+          </table>
+        </div>
+    """
+    visible_messages = [
+        str(message)
+        for message in messages
+        if "loaded cached" not in str(message).lower()
+        and "upcoming ipo row" not in str(message).lower()
+    ]
+    messages_html = "".join(
+        f'<div class="ipo-message">{html.escape(str(message))}</div>'
+        for message in visible_messages[:6]
+    )
+    export_panel = ""
+    if state.ipo_export_csv:
+        export_panel = f"""
+      <section class="panel ipo-export-panel">
+        <div class="panel-title">CSV Export</div>
+        <p class="status">Prepared file: <strong>{html.escape(state.ipo_export_filename or "ipo_export.csv")}</strong></p>
+        <textarea class="ipo-export-box" readonly>{html.escape(state.ipo_export_csv)}</textarea>
+      </section>"""
+    gpt_panel = ""
+    ipo_custom_gpt_url = "https://chatgpt.com/g/g-6a031ff323688191872d730b281c71f0-next-multi-bagger-of-indian-market"
+    if state.ipo_gpt_output:
+        response_meta = (
+            f'OpenAI response id: <code>{html.escape(state.ipo_gpt_response_id)}</code>. '
+            if state.ipo_gpt_response_id
+            else ""
+        )
+        gpt_panel = f"""
+      <section class="panel ipo-export-panel">
+        <div class="ipo-section-head">
+          <div>
+            <div class="panel-title">Value Investor GPT Analysis</div>
+            <p class="status">{response_meta}Review the saved API response in a popup, or continue the same research manually in the Custom GPT.</p>
+          </div>
+          <div class="actions">
+            <button type="button" class="secondary show-gpt-response" data-target="ipo-gpt-response-modal">Show GPT output</button>
+            <button type="submit" formaction="/ipo/save-gpt-analysis" class="secondary">Save to DB</button>
+            <a class="mini-link" href="{html.escape(ipo_custom_gpt_url, quote=True)}" target="_blank" rel="noopener">Open Custom GPT manually</a>
+          </div>
+        </div>
+        <div class="live-modal-backdrop gpt-error-modal" id="ipo-gpt-response-modal">
+          <div class="live-modal gpt-response-modal">
+            <h2>IPO Value Investor GPT Output</h2>
+            <p class="status">This is the OpenAI API response for the selected Top 40 IPO performer rows.</p>
+            <textarea class="conversation ipo-gpt-popup-preview" readonly>{html.escape(state.ipo_gpt_output)}</textarea>
+            <details class="compact-details">
+              <summary>Show prompt sent</summary>
+              <textarea class="conversation" readonly>{html.escape(state.ipo_gpt_prompt)}</textarea>
+            </details>
+            <div class="modal-actions">
+              <button type="button" class="secondary close-gpt-response" data-target="ipo-gpt-response-modal">Close</button>
+            </div>
+          </div>
+        </div>
+      </section>"""
+    else:
+        gpt_panel = f"""
+      <section class="panel ipo-export-panel">
+        <div class="panel-title">Value Investor GPT Analysis</div>
+        <p class="status">Select companies in Top 40 IPO Performers, then click Analyze Selected with GPT. If nothing is selected, the app sends the highest-ranked rows.</p>
+        <p class="status"><a class="mini-link" href="{html.escape(ipo_custom_gpt_url, quote=True)}" target="_blank" rel="noopener">Open Custom GPT manually</a> if you want to continue the same research in ChatGPT.</p>
+      </section>"""
+
+    return f"""
+    <form id="ipo-panel" method="post" action="/ipo/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <input type="hidden" name="ipo_quarter" value="Latest Available">
+      <input type="hidden" name="ipo_market_type" value="All">
+      <input type="hidden" name="ipo_theme" value="All">
+      <input type="hidden" name="ipo_ranking_view" value="Best IPOs by long-term score">
+      <input type="hidden" name="ipo_only_multibagger_present" value="1">
+      <input type="hidden" name="ipo_export_csv" value="{html.escape(state.ipo_export_csv, quote=True)}">
+      <input type="hidden" name="ipo_export_filename" value="{html.escape(state.ipo_export_filename, quote=True)}">
+      <textarea name="ipo_gpt_prompt" style="display:none">{html.escape(state.ipo_gpt_prompt)}</textarea>
+      <textarea name="ipo_gpt_output" style="display:none">{html.escape(state.ipo_gpt_output)}</textarea>
+      <input type="hidden" name="ipo_gpt_response_id" value="{html.escape(state.ipo_gpt_response_id, quote=True)}">
+      <section class="panel ipo-command-panel">
+        <div class="ipo-command-top">
+          <div>
+            <div class="panel-title">Listed IPO Performance Tracker</div>
+            <p class="status">Simple view: choose 2026, 2025, or 2024, compare top positive-return Mainboard and SME IPO performers, and research candidates through Screener links.</p>
+          </div>
+          <div class="actions">
+            <label><span>Year</span><select name="ipo_year">{year_options_html}</select></label>
+            <button type="submit" formaction="/ipo/load">Load Screener</button>
+            <button type="submit" formaction="/ipo/force-refresh" class="secondary">Refresh IPO Data</button>
+          </div>
+        </div>
+      </section>
+      <section class="panel ipo-summary-panel compact-top-performers"><div class="summary-grid">{summary_cards_html}</div></section>
+      {messages_html}
+      {render_table("Top 40 IPO Performers", combined_top40, "ipo-combined-table", "No verified IPO performance rows available for this year.")}
+      <section class="panel ipo-upcoming-panel">
+        <div class="panel-title">Upcoming IPOs - Next 7 Days</div>
+        <p class="status">Only IPOs dated within the next 7 days are shown here; the rest stay hidden to keep this screen decision-ready.</p>
+        {upcoming_html}
+      </section>
+      {gpt_panel}
+      <section class="panel">
+        <div class="panel-title">Exports</div>
+        <div class="actions">
+          <button type="submit" formaction="/ipo/export-combined" class="secondary">Export Top 40 CSV</button>
+        </div>
+      </section>
+      {export_panel}
+      {sortable_script}
+    </form>"""
+
+
+def _render_ipo_panel_legacy(state: PageState) -> str:
+    if state.active_tab != "ipo" and state.ipo_dashboard is None:
+        return f"""
+    <form id="ipo-panel" method="post" action="/ipo/load" style="display:none">
+      {env_hidden_fields_for_render()}
+    </form>"""
+    dashboard = state.ipo_dashboard
     if dashboard is None:
         try:
             dashboard = build_ipo_dashboard(
@@ -18448,6 +18915,11 @@ def render_ipo_panel(state: PageState) -> str:
                 "quarter": state.ipo_quarter,
                 "upcoming": [],
                 "listed": [],
+                "listed_tracker": [],
+                "listed_tracker_count": 0,
+                "listed_all_count": 0,
+                "listed_verified_count": 0,
+                "listed_eligible_count": 0,
                 "top10": [],
                 "screener": {},
                 "quarterly_monitor": [],
@@ -18464,12 +18936,17 @@ def render_ipo_panel(state: PageState) -> str:
             }
             state.error = f"{friendly_external_error(exc, 'IPO dashboard')}\n\n{traceback.format_exc()}"
     upcoming = list(dashboard.get("upcoming") or [])
-    listed = list(dashboard.get("listed") or [])
+    eligible_listed = list(dashboard.get("listed") or [])
+    listed = list(dashboard.get("listed_tracker") or eligible_listed)
     quarterly = list(dashboard.get("quarterly_monitor") or [])
     alerts = list(dashboard.get("alerts") or [])
     rankings = dashboard.get("rankings") or {}
-    selected_ranking = list(rankings.get(state.ipo_ranking_view) or listed)
-    detail = dashboard.get("detail") or (selected_ranking[0] if selected_ranking else {})
+    selected_ranking = list(rankings.get(state.ipo_ranking_view) or eligible_listed)
+    detail = dashboard.get("detail") or (
+        selected_ranking[0]
+        if selected_ranking
+        else (eligible_listed[0] if eligible_listed else (listed[0] if listed else {}))
+    )
     summary = dashboard.get("summary") or {}
     screener = dashboard.get("screener") or {}
     exports = screener.get("exports") or {}
@@ -18647,7 +19124,7 @@ def render_ipo_panel(state: PageState) -> str:
     validation_cards = [
         ("Total rows loaded", validation_report.get("total_rows_loaded", dashboard.get("listed_all_count", 0)), "Raw listed IPO rows from verified adapters / explicit demo mode"),
         ("Verified listed", validation_report.get("verified_listed_companies", dashboard.get("listed_verified_count", 0)), "Symbol, ISIN, listing date, exchange verified"),
-        ("Eligible scoring", validation_report.get("eligible_for_scoring", dashboard.get("listed_eligible_count", len(listed))), "Rows allowed into ranking and buy-zone engine"),
+        ("Eligible scoring", validation_report.get("eligible_for_scoring", dashboard.get("listed_eligible_count", len(eligible_listed))), "Rows allowed into ranking and buy-zone engine"),
         ("Excluded rows", validation_report.get("excluded_unverified_rows", len(data_issues)), "Unverified, demo, or incomplete rows"),
         ("Missing price", validation_report.get("rows_missing_price", 0), "No current price available"),
         ("Missing financials", validation_report.get("rows_missing_financials", 0), "Latest quarterly / valuation data missing"),
@@ -18803,7 +19280,7 @@ def render_ipo_panel(state: PageState) -> str:
       <section class="panel ipo-table-panel ipo-results-panel">
         <div class="ipo-section-head">
           <div>
-            <div class="panel-title">IPO Results</div>
+            <div class="panel-title">Listed IPO Tracker</div>
             <p class="status">Results are shown immediately after Load Screener. The positive-return filter keeps current-year names that are above IPO price and still eligible for serious follow-up.</p>
           </div>
           <div class="ipo-results-tags">
@@ -25363,6 +25840,22 @@ def render_page(state: PageState) -> bytes:
     .ipo-export-box {{ min-height: 180px; }}
     .ipo-table th, .ipo-table td {{ white-space: nowrap; }}
     .ipo-table td:last-child {{ white-space: normal; min-width: 220px; }}
+    .ipo-table th[data-sort-type] {{
+      cursor: pointer;
+      user-select: none;
+    }}
+    .ipo-table th[data-sort-type]::after {{
+      content: " ↕";
+      font-size: 10px;
+      opacity: 0.7;
+    }}
+    .ipo-select-cell, .ipo-table th.ipo-select-cell {{
+      text-align: center;
+      width: 58px;
+    }}
+    .ipo-gpt-popup-preview {{
+      min-height: 260px;
+    }}
     .ipo-filter-grid {{
       display: grid;
       grid-template-columns: repeat(4, minmax(180px, 1fr));
@@ -27800,6 +28293,9 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(document.getElementById('dividend-income-table'));
     enableTableSorting(document.getElementById('equity-holdings-table'));
     enableTableSorting(document.getElementById('ipo-listed-table'));
+    enableTableSorting(document.getElementById('ipo-mainboard-table'));
+    enableTableSorting(document.getElementById('ipo-sme-table'));
+    enableTableSorting(document.getElementById('ipo-combined-table'));
     enableTableSorting(document.getElementById('ipo-data-issues-table'));
     enableTableSorting(document.getElementById('ipo-top10-table'));
     enableTableSorting(document.getElementById('ipo-snapshot-table'));
@@ -30152,6 +30648,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             ),
             ipo_export_csv=first(form, "ipo_export_csv"),
             ipo_export_filename=first(form, "ipo_export_filename"),
+            ipo_gpt_prompt=first(form, "ipo_gpt_prompt"),
+            ipo_gpt_output=first(form, "ipo_gpt_output"),
+            ipo_gpt_response_id=first(form, "ipo_gpt_response_id"),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -30630,20 +31129,95 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             elif request_path in {"/ipo/load", "/ipo/force-refresh"}:
                 force_refresh = request_path == "/ipo/force-refresh"
                 state.ipo_dashboard, state.console_log = call_with_console(
-                    build_ipo_dashboard,
+                    build_simple_ipo_performance_dashboard,
                     state.ipo_year,
-                    state.ipo_quarter,
-                    APP_DB_PATH,
-                    state.ipo_only_multibagger,
                     force_refresh=force_refresh,
-                    market_type=state.ipo_market_type,
-                    theme=state.ipo_theme,
-                    ranking_view=state.ipo_ranking_view,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
                 )
                 state.message = (
-                    f"{'Force refreshed' if force_refresh else 'Loaded'} IPO data "
-                    f"for {state.ipo_year} ({state.ipo_quarter})."
+                    f"{'Force refreshed' if force_refresh else 'Loaded'} IPO performance data "
+                    f"for {state.ipo_year}."
                 )
+            elif request_path == "/ipo/gpt-analyze":
+                dashboard = build_simple_ipo_performance_dashboard(
+                    state.ipo_year,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                state.ipo_dashboard = dashboard
+                selected_values = form_values(form, "ipo_selected_key")
+                selected_keys = {
+                    str(value).strip()
+                    for value in selected_values
+                    if str(value).strip()
+                }
+                rows = selected_ipo_rows_from_dashboard_keys(dashboard, selected_keys, limit=20)
+                if not rows:
+                    state.ipo_gpt_prompt = ""
+                    state.ipo_gpt_output = ""
+                    state.ipo_gpt_response_id = ""
+                    state.message = "No IPO rows available for GPT analysis. Load or refresh IPO Screener first."
+                else:
+                    (
+                        state.ipo_gpt_prompt,
+                        state.ipo_gpt_output,
+                        state.ipo_gpt_response_id,
+                    ), state.console_log = call_with_console(
+                        generate_ipo_value_analysis_with_openai,
+                        rows,
+                        state.ipo_year,
+                        state.openai_model,
+                    )
+                    state.gpt_api_output = state.ipo_gpt_output
+                    state.gpt_api_response_id = state.ipo_gpt_response_id
+                    choice_text = "selected" if selected_keys else "top"
+                    state.message = (
+                        f"GPT analyzed {len(rows)} {choice_text} IPO candidate(s) for long-term value investing. "
+                        "Result is shown in IPO and copied to GPT output state."
+                    )
+            elif request_path == "/ipo/save-gpt-analysis":
+                dashboard = build_simple_ipo_performance_dashboard(
+                    state.ipo_year,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                state.ipo_dashboard = dashboard
+                if not str(state.ipo_gpt_output or "").strip():
+                    state.message = "No IPO GPT analysis output to save. Run Analyze Selected with GPT first."
+                else:
+                    selected_count = len(form_values(form, "ipo_selected_key"))
+                    saved_id, state.console_log = call_with_console(
+                        save_ipo_gpt_analysis_to_db,
+                        APP_DB_PATH,
+                        state.ipo_year,
+                        state.ipo_gpt_prompt,
+                        state.ipo_gpt_output,
+                        state.ipo_gpt_response_id,
+                        selected_count,
+                    )
+                    state.message = f"Saved IPO GPT analysis #{saved_id} for later review."
+            elif request_path in {
+                "/ipo/export-mainboard",
+                "/ipo/export-sme",
+                "/ipo/export-combined",
+            }:
+                dashboard = build_simple_ipo_performance_dashboard(
+                    state.ipo_year,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                state.ipo_dashboard = dashboard
+                export_map = {
+                    "/ipo/export-mainboard": ("mainboard_top20", "top20_mainboard"),
+                    "/ipo/export-sme": ("sme_top20", "top20_sme"),
+                    "/ipo/export-combined": ("combined_top40", "combined_top40"),
+                }
+                record_key, filename_kind = export_map[request_path]
+                records = list(dashboard.get(record_key) or [])
+                state.ipo_export_csv = export_ipo_records_csv(records, IPO_SIMPLE_EXPORT_FIELDS)
+                state.ipo_export_filename = ipo_export_filename(
+                    filename_kind,
+                    state.ipo_year,
+                    "latest_available",
+                )
+                state.message = f"Prepared IPO export: {state.ipo_export_filename}."
             elif request_path == "/ipo/save-snapshot":
                 dashboard = build_ipo_dashboard(
                     state.ipo_year,
