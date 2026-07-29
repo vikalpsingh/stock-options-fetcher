@@ -99,6 +99,16 @@ from ipo_data_service import (
     save_ipo_top10_snapshot,
     selected_ipo_rows_for_value_analysis,
 )
+from ipo.research import (
+    IPO_RESEARCH_CUSTOM_GPT_URL,
+    build_ipo_research_analysis,
+    build_ipo_research_prompt,
+    enforce_gpt_research_hard_rules,
+    load_research_index,
+    render_ipo_research_html,
+    save_ipo_research,
+)
+from ipo.symbol_resolution.symbol_resolver import clean_company_name
 from income.covered_call import (
     CoveredCallInput,
     build_covered_call_recommendation,
@@ -5729,6 +5739,11 @@ class PageState:
     ipo_gpt_prompt: str = ""
     ipo_gpt_output: str = ""
     ipo_gpt_response_id: str = ""
+    ipo_add_sector_leaders: bool = False
+    ipo_research_json: str = ""
+    ipo_research_html: str = ""
+    ipo_research_message: str = ""
+    ipo_research_saved_id: str = ""
 
 
 def mask_secret(value: str | None) -> str:
@@ -15000,20 +15015,27 @@ def generate_ipo_value_analysis_with_openai(
     rows: list[dict[str, Any]],
     year: int,
     model: str,
-) -> tuple[str, str, str]:
+    add_sector_leaders: bool = False,
+) -> tuple[str, str, str, dict[str, Any]]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Missing OPENAI_API_KEY. Enter it in Kite Setup or GPT tab.")
     if not rows:
         raise ValueError("No IPO rows available for GPT analysis. Load IPO Screener first.")
-    prompt = build_ipo_value_investor_prompt(rows, year)
+    analysis = build_ipo_research_analysis(
+        rows,
+        year,
+        add_sector_leaders=add_sector_leaders,
+    )
+    prompt = build_ipo_research_prompt(analysis)
     output, response_id = call_openai_responses_api(
         api_key,
         model,
         IPO_VALUE_INVESTOR_SYSTEM_PROMPT,
         prompt,
     )
-    return prompt, output, response_id
+    output = enforce_gpt_research_hard_rules(analysis, output)
+    return prompt, output, response_id, analysis
 
 
 def ipo_gpt_row_key(row: dict[str, Any]) -> str:
@@ -18569,6 +18591,14 @@ def render_ipo_panel(state: PageState) -> str:
     combined_top40 = list(dashboard.get("combined_top40") or [])
     upcoming_next7 = list(dashboard.get("upcoming_next7") or [])
     messages = list(dashboard.get("messages") or [])
+    selected_ipo_type = str(state.ipo_market_type or "All").strip()
+    if selected_ipo_type.lower() != "all":
+        combined_top40 = [
+            row
+            for row in combined_top40
+            if str(row.get("ipo_type") or row.get("market_type") or "").strip().lower()
+            == selected_ipo_type.lower()
+        ]
 
     def text_value(value: Any, default: str = "N/A") -> str:
         if value in {None, ""}:
@@ -18582,6 +18612,14 @@ def render_ipo_panel(state: PageState) -> str:
             return f"{float(value):.{decimals}f}"
         except (TypeError, ValueError):
             return text_value(value)
+
+    def _safe_float_for_attr(value: Any) -> float:
+        if value in {None, ""}:
+            return -1000000.0
+        try:
+            return float(str(value).replace("%", "").replace(",", "").strip())
+        except (TypeError, ValueError):
+            return -1000000.0
 
     def pct_text(value: Any) -> str:
         if value in {None, ""}:
@@ -18601,17 +18639,77 @@ def render_ipo_panel(state: PageState) -> str:
 
     def badge_class(value: Any) -> str:
         key = str(value or "").strip().lower()
-        if key in {"strong", "good", "strong gainer", "good gainer"}:
+        if key in {
+            "strong",
+            "good",
+            "strong gainer",
+            "good gainer",
+            "buy zone reached",
+            "tracking buy",
+            "green",
+            "financial data available",
+            "strong data",
+            "complete",
+            "excellent",
+            "hot",
+            "high gmp",
+            "high gmp >40%",
+        }:
             return "good"
-        if key in {"watch", "moderate gainer", "yellow"}:
+        if key in {
+            "buy on correction",
+            "result confirmed",
+            "blue",
+            "ok",
+            "resolved",
+        }:
+            return "blue"
+        if key in {
+            "watch",
+            "watchlist",
+            "moderate gainer",
+            "yellow",
+            "data pending",
+            "symbol review needed",
+            "financial data pending",
+            "medium data",
+            "needs review",
+            "n/a",
+        }:
             return "warn"
-        if key in {"bad", "below ipo price", "red"}:
+        if key in {
+            "bad",
+            "below ipo price",
+            "red",
+            "avoid",
+            "remove from watchlist",
+            "unverified - excluded",
+            "weak data",
+            "risk",
+        }:
             return "bad"
         return "neutral"
 
+    def badge(label: Any, style_key: Any | None = None) -> str:
+        text = text_value(label)
+        return f'<span class="ipo-badge {badge_class(style_key or text)}">{html.escape(text)}</span>'
+
     def status_badge(row: dict[str, Any]) -> str:
         label = text_value(row.get("status_badge"), "Data Pending")
-        return f'<span class="ipo-badge {badge_class(row.get("status_class") or label)}">{html.escape(label)}</span>'
+        return badge(label, row.get("status_class") or label)
+
+    def action_badge(row: dict[str, Any]) -> str:
+        return badge(row.get("action") or "WATCHLIST")
+
+    def yes_no_text(value: Any) -> str:
+        if isinstance(value, bool):
+            return "YES" if value else "NO"
+        text = str(value or "").strip()
+        if text.lower() in {"true", "yes", "1"}:
+            return "YES"
+        if text.lower() in {"false", "no", "0"}:
+            return "NO"
+        return text_value(value)
 
     def screener_link(row: dict[str, Any]) -> str:
         url = text_value(row.get("screener_url"), "")
@@ -18645,21 +18743,59 @@ def render_ipo_panel(state: PageState) -> str:
 
     def row_html(row: dict[str, Any]) -> str:
         row_key = ipo_gpt_row_key(row)
+        company = clean_company_display(row.get("company_name"))
+        search_blob = " ".join(
+            [
+                company,
+                text_value(row.get("symbol"), ""),
+                text_value(row.get("sector"), ""),
+                text_value(row.get("theme"), ""),
+                text_value(row.get("action"), ""),
+            ]
+        ).lower()
+        data_financial = str(row.get("financial_data_status") or "").lower().startswith("financial data available")
+        risk_alert = str(row.get("risk_alerts") or "").strip() not in {"", "None", "N/A"}
+        action_text = text_value(row.get("action"), "WATCHLIST")
         return (
-            "<tr>"
+            "<tr "
+            f'data-search="{html.escape(search_blob, quote=True)}" '
+            f'data-type="{html.escape(text_value(row.get("ipo_type"), "").lower(), quote=True)}" '
+            f'data-gain="{html.escape(str(_safe_float_for_attr(row.get("current_gain_pct"))), quote=True)}" '
+            f'data-drawdown="{html.escape(str(_safe_float_for_attr(row.get("drawdown_from_52w_high_pct"))), quote=True)}" '
+            f'data-score="{html.escape(str(_safe_float_for_attr(row.get("value_score"))), quote=True)}" '
+            f'data-financial="{"1" if data_financial else "0"}" '
+            f'data-action="{html.escape(action_text.lower(), quote=True)}" '
+            f'data-risk="{"1" if risk_alert else "0"}">'
             f'<td class="ipo-select-cell"><input type="checkbox" name="ipo_selected_key" value="{html.escape(row_key, quote=True)}"></td>'
             f"<td>{html.escape(text_value(row.get('rank'), ''))}</td>"
             f"{company_cell(row)}"
+            f"<td>{html.escape(text_value(row.get('symbol'), ''))}</td>"
+            f"<td>{html.escape(text_value(row.get('exchange'), ''))}</td>"
             f"<td>{html.escape(text_value(row.get('ipo_type')))}</td>"
             f"<td>{html.escape(text_value(row.get('listing_date')))}</td>"
             f"<td>{html.escape(money_text(row.get('ipo_price')))}</td>"
-            f"<td>{html.escape(money_text(row.get('listing_price')))}</td>"
             f"<td>{html.escape(money_text(row.get('current_price')))}</td>"
-            f"<td>{html.escape(pct_text(row.get('listing_gain_pct')))}</td>"
             f"<td>{html.escape(pct_text(row.get('current_gain_pct')))}</td>"
+            f"<td>{html.escape(pct_text(row.get('one_month_return_pct')))}</td>"
+            f"<td>{html.escape(pct_text(row.get('three_month_return_pct')))}</td>"
+            f"<td>{html.escape(pct_text(row.get('drawdown_from_52w_high_pct')))}</td>"
             f"<td>{html.escape(money_text(row.get('gain_from_ipo_rs')))}</td>"
-            f"<td>{html.escape(text_value(row.get('issue_size')))}</td>"
-            f"<td>{html.escape(money_text(row.get('ipo_market_cap')))}</td>"
+            f"<td>{html.escape(money_text(row.get('market_cap') or row.get('ipo_market_cap')))}</td>"
+            f"<td>{html.escape(text_value(row.get('sector')))}</td>"
+            f"<td>{html.escape(text_value(row.get('theme')))}</td>"
+            f"<td>{html.escape(num_text(row.get('sector_score'), 0))}</td>"
+            f"<td>{html.escape(num_text(row.get('value_score'), 0))}</td>"
+            f"<td>{badge(row.get('financial_data_status') or 'Financial Data Pending')}</td>"
+            f"<td>{html.escape(num_text(row.get('symbol_resolution_confidence'), 0))}</td>"
+            f"<td>{badge(row.get('data_quality_status') or 'Data Pending')}</td>"
+            f"<td>{html.escape(num_text(row.get('liquidity_score'), 0))}</td>"
+            f"<td>{badge(row.get('valuation_status') or 'Data Pending')}</td>"
+            f"<td>{badge(row.get('cash_flow_flag') or 'Data Pending')}</td>"
+            f"<td>{badge(row.get('governance_flag') or 'Data Pending')}</td>"
+            f"<td>{action_badge(row)}</td>"
+            f"<td>{html.escape(text_value(row.get('suggested_buy_zone')))}</td>"
+            f"<td>{html.escape(text_value(row.get('suggested_allocation')))}</td>"
+            f"<td>{html.escape(text_value(row.get('risk_alerts'), 'None'))}</td>"
             f"<td>{status_badge(row)}</td>"
             f"<td>{screener_link(row)}</td>"
             f"<td>{source_link(row)}</td>"
@@ -18669,27 +18805,31 @@ def render_ipo_panel(state: PageState) -> str:
     def render_table(title: str, rows: list[dict[str, Any]], table_id: str, empty_text: str) -> str:
         rows_html = "".join(row_html(row) for row in rows)
         if not rows_html:
-            rows_html = f'<tr><td colspan="16" class="muted-cell">{html.escape(empty_text)}</td></tr>'
+            rows_html = f'<tr><td colspan="32" class="muted-cell">{html.escape(empty_text)}</td></tr>'
         return f"""
       <section class="panel ipo-table-panel ipo-results-panel">
         <div class="ipo-section-head">
           <div>
             <div class="panel-title">{html.escape(title)}</div>
-            <p class="status">Select companies, sort the columns, then send the shortlist to GPT for a value-investor review. The app tries IPO Market first, then other configured public trackers, with Chittorgarh as optional fallback.</p>
+            <p class="status">Select companies, sort columns, and send a shortlist to GPT for value-investor review. This table blends price action with symbol confidence, data quality, financial readiness, risk flags, and action classification.</p>
           </div>
           <div class="actions">
             <a class="mini-link" href="{html.escape(ipo_custom_gpt_url, quote=True)}" target="_blank" rel="noopener">Open Custom GPT manually</a>
-            <button type="submit" formaction="/ipo/gpt-analyze" class="secondary">Analyze Selected with GPT</button>
+            <label class="inline-check"><input type="checkbox" name="ipo_add_sector_leaders" value="1"{' checked' if state.ipo_add_sector_leaders else ''}> Add sector leaders</label>
+            <button type="submit" formaction="/ipo/research-build" class="secondary">Build Research View</button>
+            <button type="submit" formaction="/ipo/gpt-analyze" class="secondary">Generate GPT Research Note</button>
           </div>
         </div>
         <div class="table-wrap">
           <table id="{html.escape(table_id, quote=True)}" class="ipo-table ipo-sortable">
             <thead><tr>
               <th class="ipo-select-cell">Select</th>
-              <th data-sort-type="number">Rank</th><th data-sort-type="text">Company</th><th data-sort-type="text">IPO Type</th><th data-sort-type="date">Listing Date</th><th data-sort-type="number">IPO Price</th>
-              <th data-sort-type="number">Listing Price</th><th data-sort-type="number">Current Price</th><th data-sort-type="number">Listing Gain %</th><th data-sort-type="number">Current Gain %</th>
-              <th data-sort-type="number">Gain from IPO in Rs</th><th data-sort-type="text">Issue Size</th><th data-sort-type="number">IPO Market Cap</th><th data-sort-type="text">Status Badge</th>
-              <th data-sort-type="text">Screener</th><th data-sort-type="text">Data Source</th>
+              <th data-sort-type="number">Rank</th><th data-sort-type="text">Company</th><th data-sort-type="text">Symbol</th><th data-sort-type="text">Exchange</th><th data-sort-type="text">IPO Type</th><th data-sort-type="date">Listing Date</th><th data-sort-type="number">IPO Price</th>
+              <th data-sort-type="number">LTP</th><th data-sort-type="number">Current Gain %</th><th data-sort-type="number">1M %</th><th data-sort-type="number">3M %</th><th data-sort-type="number">52W Drawdown %</th>
+              <th data-sort-type="number">Gain from IPO in Rs</th><th data-sort-type="number">Market Cap</th><th data-sort-type="text">Sector</th><th data-sort-type="text">Theme</th><th data-sort-type="number">Sector Score</th>
+              <th data-sort-type="number">Value Score</th><th data-sort-type="text">Financial Data</th><th data-sort-type="number">Symbol Confidence</th><th data-sort-type="text">Data Quality</th><th data-sort-type="number">Liquidity</th>
+              <th data-sort-type="text">Valuation</th><th data-sort-type="text">Cash Flow</th><th data-sort-type="text">Governance</th><th data-sort-type="text">Action</th><th data-sort-type="text">Buy Zone</th>
+              <th data-sort-type="text">Allocation</th><th data-sort-type="text">Risk Alerts</th><th data-sort-type="text">Status Badge</th><th data-sort-type="text">Screener</th><th data-sort-type="text">Data Source</th>
             </tr></thead>
             <tbody>{rows_html}</tbody>
           </table>
@@ -18733,6 +18873,31 @@ def render_ipo_panel(state: PageState) -> str:
             rows.forEach((row) => tbody.appendChild(row));
           });
         });
+        const applyIpoFilters = () => {
+          const query = (document.querySelector('#ipo-search-box')?.value || '').trim().toLowerCase();
+          const activeFilters = Array.from(document.querySelectorAll('input[data-ipo-filter]:checked')).map((item) => item.dataset.ipoFilter);
+          document.querySelectorAll('#ipo-combined-table tbody tr').forEach((row) => {
+            if (!row.dataset.search) return;
+            const gain = parseFloat(row.dataset.gain || '-1000000');
+            const drawdown = parseFloat(row.dataset.drawdown || '-1000000');
+            const score = parseFloat(row.dataset.score || '-1000000');
+            const action = row.dataset.action || '';
+            let visible = true;
+            if (query && !row.dataset.search.includes(query)) visible = false;
+            for (const filter of activeFilters) {
+              if (filter === 'gain50' && !(gain >= 50)) visible = false;
+              if (filter === 'gain100' && !(gain >= 100)) visible = false;
+              if (filter === 'corrected20' && !(drawdown <= -20)) visible = false;
+              if (filter === 'score75' && !(score >= 75)) visible = false;
+              if (filter === 'financial' && row.dataset.financial !== '1') visible = false;
+              if (filter === 'buyzone' && !action.includes('buy zone')) visible = false;
+              if (filter === 'risk' && row.dataset.risk !== '1') visible = false;
+            }
+            row.style.display = visible ? '' : 'none';
+          });
+        };
+        document.querySelector('#ipo-search-box')?.addEventListener('input', applyIpoFilters);
+        document.querySelectorAll('input[data-ipo-filter]').forEach((input) => input.addEventListener('change', applyIpoFilters));
       })();
       </script>
     """
@@ -18744,40 +18909,54 @@ def render_ipo_panel(state: PageState) -> str:
         f'<option value="{year}"{" selected" if int(year) == int(state.ipo_year) else ""}>{year}</option>'
         for year in year_options
     )
+    market_options = ["All", "Mainboard", "SME"]
+    market_options_html = "".join(
+        f'<option value="{html.escape(option, quote=True)}"{" selected" if option.lower() == selected_ipo_type.lower() else ""}>{html.escape(option)}</option>'
+        for option in market_options
+    )
     best_row = combined_top40[0] if combined_top40 else {}
     best_name = clean_company_display(best_row.get("company_name")) if best_row else "N/A"
     best_gain = pct_text(best_row.get("current_gain_pct")) if best_row else "N/A"
     summary_cards = [
+        ("Total IPOs", summary.get("total_ipos_loaded", len(combined_top40)), "Verified performance rows loaded"),
         ("Best performer", best_name, f"{best_gain} current gain"),
-        ("Top 40 rows", len(combined_top40), "Positive-return IPO performers"),
-        ("Upcoming 7 days", summary.get("upcoming_next7_count", len(upcoming_next7)), "Only near-term IPOs shown"),
+        ("Symbols resolved", summary.get("symbols_resolved", 0), "Direct Screener/company symbol confidence"),
+        ("Financial data", summary.get("financial_data_available", 0), "Rows with usable quarterly/fundamental data"),
+        ("Buy-zone", summary.get("buy_zone_candidates", 0), "Strict long-term candidates only"),
+        ("Tracking buy", summary.get("tracking_buy_candidates", 0), "Small tracking allocation candidates"),
+        ("Risk alerts", summary.get("risk_alert_count", 0), "Rows needing extra caution"),
+        ("Upcoming 7 days", summary.get("upcoming_next7_count", len(upcoming_next7)), "Near-term IPO watch only"),
     ]
     summary_cards_html = "".join(
         f'<div class="ipo-stat-card"><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong><small>{html.escape(str(help_text))}</small></div>'
         for label, value, help_text in summary_cards
     )
-    upcoming_rows_html = "".join(
-        f"""
-        <tr>
-          <td><a class="ipo-company-link" href="{html.escape(text_value(item.get("screener_url"), "https://www.screener.in/"), quote=True)}" target="_blank" rel="noopener">{html.escape(text_value(item.get("company_name")))}</a></td>
+    def upcoming_row_html(item: dict[str, Any]) -> str:
+        hot_class = ' class="ipo-upcoming-hot"' if _safe_float_for_attr(item.get("gmp_pct")) >= 40 else ""
+        return f"""
+        <tr{hot_class}>
+          <td><a class="ipo-company-link" href="{html.escape(text_value(item.get("screener_url"), "https://www.screener.in/"), quote=True)}" target="_blank" rel="noopener">{html.escape(clean_company_display(item.get("company_name")))}</a><br><small>{html.escape(text_value(item.get("symbol") or item.get("ipo_type")))}</small></td>
           <td>{html.escape(text_value(item.get("ipo_date")))}</td>
+          <td>{html.escape(text_value(item.get("days_to_ipo")))}</td>
           <td>{html.escape(text_value(item.get("sector")))}</td>
+          <td>{html.escape(text_value(item.get("ipo_type")))}</td>
           <td>{html.escape(text_value(item.get("issue_size")))}</td>
           <td>{html.escape(text_value(item.get("price_band")))}</td>
           <td>{html.escape(text_value(item.get("gmp")))}</td>
-          <td>{html.escape(pct_text(item.get("gmp_pct")))}</td>
-          <td>{html.escape(text_value(item.get("source")))}</td>
+          <td>{badge(pct_text(item.get("gmp_pct")), item.get("status_class") or item.get("status_badge"))}</td>
+          <td>{status_badge(item)}</td>
+          <td>{source_link(item)}</td>
         </tr>
         """
-        for item in upcoming_next7
-    )
+
+    upcoming_rows_html = "".join(upcoming_row_html(item) for item in upcoming_next7)
     if not upcoming_rows_html:
-        upcoming_rows_html = '<tr><td colspan="8" class="muted-cell">No upcoming IPOs in the next 7 days from verified sources.</td></tr>'
+        upcoming_rows_html = '<tr><td colspan="11" class="muted-cell">No upcoming IPOs in the next 7 days from verified sources.</td></tr>'
     upcoming_html = f"""
         <div class="table-wrap compact">
           <table id="ipo-upcoming-table" class="ipo-table ipo-upcoming-table">
             <thead><tr>
-              <th>Company</th><th>IPO Date</th><th>Sector</th><th>Issue</th><th>Price Band</th><th>GMP</th><th>GMP %</th><th>Source</th>
+              <th>Company</th><th>IPO Date</th><th>Days</th><th>Sector</th><th>Type</th><th>Issue</th><th>Price Band</th><th>GMP</th><th>GMP %</th><th>Status</th><th>Source</th>
             </tr></thead>
             <tbody>{upcoming_rows_html}</tbody>
           </table>
@@ -18801,8 +18980,145 @@ def render_ipo_panel(state: PageState) -> str:
         <p class="status">Prepared file: <strong>{html.escape(state.ipo_export_filename or "ipo_export.csv")}</strong></p>
         <textarea class="ipo-export-box" readonly>{html.escape(state.ipo_export_csv)}</textarea>
       </section>"""
+
+    ipo_research_analysis: dict[str, Any] = {}
+    if str(state.ipo_research_json or "").strip():
+        try:
+            parsed_research = json.loads(state.ipo_research_json)
+            if isinstance(parsed_research, dict):
+                ipo_research_analysis = parsed_research
+        except json.JSONDecodeError:
+            ipo_research_analysis = {}
+
+    def render_research_panel() -> str:
+        if not ipo_research_analysis:
+            return f"""
+      <section class="panel ipo-research-panel">
+        <div class="ipo-section-head">
+          <div>
+            <div class="panel-title">IPO Research View</div>
+            <p class="status">Select one or more companies in Top 40 IPO Performers, then build a research view. One selected company automatically adds two sector leaders; multiple selected companies compare only those names unless Add sector leaders is checked.</p>
+          </div>
+          <div class="actions">
+            <a class="mini-link" href="{html.escape(IPO_RESEARCH_CUSTOM_GPT_URL, quote=True)}" target="_blank" rel="noopener">Open Custom GPT manually</a>
+          </div>
+        </div>
+        <div class="ipo-message">No IPO research view built yet. Select company rows above and click Build Research View.</div>
+      </section>"""
+
+        selected = list(ipo_research_analysis.get("selected_companies") or [])
+        peers = list(ipo_research_analysis.get("peer_companies") or [])
+        all_companies = list(ipo_research_analysis.get("all_companies") or [])
+        dq_gate = ipo_research_analysis.get("data_quality_gate") or {}
+        report_html = state.ipo_research_html or render_ipo_research_html(
+            ipo_research_analysis,
+            state.ipo_gpt_output,
+        )
+        row_html_parts: list[str] = []
+        for row in all_companies:
+            row_html_parts.append(
+                "<tr>"
+                f"<td>{html.escape(text_value(row.get('role')))}</td>"
+                f"<td><a class=\"ipo-company-link\" href=\"{html.escape(text_value(row.get('screener_url'), 'https://www.screener.in/'), quote=True)}\" target=\"_blank\" rel=\"noopener\">{html.escape(clean_company_display(row.get('company_name')))}</a><br><small>{html.escape(text_value(row.get('symbol')))}</small></td>"
+                f"<td>{html.escape(text_value(row.get('sector') or row.get('theme')))}</td>"
+                f"<td>{html.escape(num_text(row.get('data_quality_score'), 0))}</td>"
+                f"<td>{html.escape(num_text(row.get('value_score'), 0))}</td>"
+                f"<td>{badge(row.get('final_action') or 'Data Pending')}</td>"
+                f"<td>{html.escape(', '.join(str(code) for code in (row.get('hard_rule_blocks') or [])) or 'None')}</td>"
+                "</tr>"
+            )
+        if not row_html_parts:
+            row_html_parts.append('<tr><td colspan="7" class="muted-cell">No research rows available.</td></tr>')
+
+        research_cards = [
+            ("Selected", len(selected), "Companies chosen from Top 40"),
+            ("Sector peers", len(peers), "Auto-added only when useful"),
+            ("Data gate", dq_gate.get("selected_avg_score", 0), "Average selected data quality"),
+            ("Python action", ipo_research_analysis.get("final_action") or "Data Pending", "Hard rules own final gate"),
+        ]
+        research_cards_html = "".join(
+            f'<div class="ipo-stat-card"><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong><small>{html.escape(str(help_text))}</small></div>'
+            for label, value, help_text in research_cards
+        )
+        message_html = (
+            f'<div class="ipo-message">{html.escape(state.ipo_research_message)}</div>'
+            if state.ipo_research_message
+            else ""
+        )
+        saved_badge = (
+            f'<span class="ipo-badge good">Saved: {html.escape(state.ipo_research_saved_id)}</span>'
+            if state.ipo_research_saved_id
+            else ""
+        )
+        return f"""
+      <section class="panel ipo-research-panel">
+        <div class="ipo-section-head">
+          <div>
+            <div class="panel-title">IPO Research View</div>
+            <p class="status">Python verified identity, data quality, hard-rule blocks, peer context, and final action before GPT explanation. GPT cannot override a Python block.</p>
+            {saved_badge}
+          </div>
+          <div class="actions">
+            <button type="button" class="secondary show-gpt-response" data-target="ipo-research-html-modal">Open Pretty HTML Research View</button>
+            <button type="submit" formaction="/ipo/research-save" class="secondary">Save Research</button>
+            <button type="submit" formaction="/ipo/gpt-analyze" class="secondary">Generate GPT Research Note</button>
+            <a class="mini-link" href="{html.escape(IPO_RESEARCH_CUSTOM_GPT_URL, quote=True)}" target="_blank" rel="noopener">Open Custom GPT manually</a>
+          </div>
+        </div>
+        {message_html}
+        <div class="summary-grid">{research_cards_html}</div>
+        <div class="table-wrap compact">
+          <table class="ipo-table ipo-sortable">
+            <thead><tr><th>Role</th><th>Company</th><th>Sector</th><th>Data Quality</th><th>Value Score</th><th>Final Action</th><th>Python Hard Rules</th></tr></thead>
+            <tbody>{''.join(row_html_parts)}</tbody>
+          </table>
+        </div>
+        <div class="live-modal-backdrop gpt-error-modal" id="ipo-research-html-modal">
+          <div class="live-modal gpt-response-modal">
+            <h2>IPO Research HTML View</h2>
+            <p class="status">Standalone HTML report generated from verified app data and optional GPT explanation.</p>
+            <iframe title="IPO Research Report" class="ipo-report-frame" style="width:100%;height:68vh;border:1px solid #bce9dc;border-radius:12px;background:white;" srcdoc="{html.escape(report_html, quote=True)}"></iframe>
+            <div class="modal-actions">
+              <button type="button" class="secondary close-gpt-response" data-target="ipo-research-html-modal">Close</button>
+            </div>
+          </div>
+        </div>
+      </section>"""
+
+    def render_saved_research_panel() -> str:
+        try:
+            saved_rows = load_research_index(limit=8, base_dir=APP_ROOT)
+        except Exception:
+            saved_rows = []
+        if not saved_rows:
+            rows_html = '<tr><td colspan="7" class="muted-cell">No saved IPO research yet.</td></tr>'
+        else:
+            rows_html = "".join(
+                "<tr>"
+                f"<td>{html.escape(text_value(row.get('research_id')))}</td>"
+                f"<td>{html.escape(text_value(row.get('research_date')))}</td>"
+                f"<td>{html.escape(text_value(row.get('company_names')))}</td>"
+                f"<td>{html.escape(text_value(row.get('peer_names')))}</td>"
+                f"<td>{html.escape(text_value(row.get('final_action')))}</td>"
+                f"<td>{html.escape(num_text(row.get('value_score'), 0))}</td>"
+                f"<td><code>{html.escape(text_value(row.get('html_path')))}</code></td>"
+                "</tr>"
+                for row in saved_rows
+            )
+        return f"""
+      <section class="panel ipo-saved-research-panel">
+        <div class="panel-title">Saved IPO Research</div>
+        <p class="status">Saved JSON and HTML reports are indexed in <code>research_store/research_index.csv</code> and copied under <code>reports/ipo_research</code>.</p>
+        <div class="table-wrap compact">
+          <table class="ipo-table">
+            <thead><tr><th>Research ID</th><th>Date</th><th>Companies</th><th>Peers</th><th>Action</th><th>Score</th><th>HTML Report</th></tr></thead>
+            <tbody>{rows_html}</tbody>
+          </table>
+        </div>
+      </section>"""
+
     gpt_panel = ""
-    ipo_custom_gpt_url = "https://chatgpt.com/g/g-6a031ff323688191872d730b281c71f0-next-multi-bagger-of-indian-market"
+    ipo_custom_gpt_url = IPO_RESEARCH_CUSTOM_GPT_URL
     if state.ipo_gpt_output:
         response_meta = (
             f'OpenAI response id: <code>{html.escape(state.ipo_gpt_response_id)}</code>. '
@@ -18841,7 +19157,7 @@ def render_ipo_panel(state: PageState) -> str:
         gpt_panel = f"""
       <section class="panel ipo-export-panel">
         <div class="panel-title">Value Investor GPT Analysis</div>
-        <p class="status">Select companies in Top 40 IPO Performers, then click Analyze Selected with GPT. If nothing is selected, the app sends the highest-ranked rows.</p>
+        <p class="status">Select companies in Top 40 IPO Performers, then click Generate GPT Research Note. This is the Analyze Selected with GPT flow; if nothing is selected, the app sends the highest-ranked rows.</p>
         <p class="status"><a class="mini-link" href="{html.escape(ipo_custom_gpt_url, quote=True)}" target="_blank" rel="noopener">Open Custom GPT manually</a> if you want to continue the same research in ChatGPT.</p>
       </section>"""
 
@@ -18849,7 +19165,6 @@ def render_ipo_panel(state: PageState) -> str:
     <form id="ipo-panel" method="post" action="/ipo/load"{panel_style}>
       {env_hidden_fields_for_render()}
       <input type="hidden" name="ipo_quarter" value="Latest Available">
-      <input type="hidden" name="ipo_market_type" value="All">
       <input type="hidden" name="ipo_theme" value="All">
       <input type="hidden" name="ipo_ranking_view" value="Best IPOs by long-term score">
       <input type="hidden" name="ipo_only_multibagger_present" value="1">
@@ -18858,28 +19173,46 @@ def render_ipo_panel(state: PageState) -> str:
       <textarea name="ipo_gpt_prompt" style="display:none">{html.escape(state.ipo_gpt_prompt)}</textarea>
       <textarea name="ipo_gpt_output" style="display:none">{html.escape(state.ipo_gpt_output)}</textarea>
       <input type="hidden" name="ipo_gpt_response_id" value="{html.escape(state.ipo_gpt_response_id, quote=True)}">
+      <input type="hidden" name="ipo_add_sector_leaders_present" value="1">
+      <textarea name="ipo_research_json" style="display:none">{html.escape(state.ipo_research_json)}</textarea>
+      <textarea name="ipo_research_html" style="display:none">{html.escape(state.ipo_research_html)}</textarea>
+      <input type="hidden" name="ipo_research_message" value="{html.escape(state.ipo_research_message, quote=True)}">
+      <input type="hidden" name="ipo_research_saved_id" value="{html.escape(state.ipo_research_saved_id, quote=True)}">
       <section class="panel ipo-command-panel">
         <div class="ipo-command-top">
           <div>
-            <div class="panel-title">Listed IPO Performance Tracker</div>
-            <p class="status">Simple view: choose 2026, 2025, or 2024, compare top positive-return Mainboard and SME IPO performers, and research candidates through Screener links.</p>
+            <div class="panel-title">IPO Decision Engine</div>
+            <p class="status">Listed IPO Performance Tracker for 2026, 2025, and 2024. Start with positive-return IPOs, then filter for symbol confidence, financial readiness, correction, valuation comfort, and long-term action.</p>
           </div>
           <div class="actions">
             <label><span>Year</span><select name="ipo_year">{year_options_html}</select></label>
+            <label><span>Market</span><select name="ipo_market_type">{market_options_html}</select></label>
             <button type="submit" formaction="/ipo/load">Load Screener</button>
             <button type="submit" formaction="/ipo/force-refresh" class="secondary">Refresh IPO Data</button>
           </div>
         </div>
+        <div class="ipo-filter-grid">
+          <label class="ipo-search-wide"><span>Search company / symbol / sector / action</span><input id="ipo-search-box" type="search" placeholder="Search IPO performers"></label>
+          <label><input type="checkbox" data-ipo-filter="gain50"> &gt;50% return</label>
+          <label><input type="checkbox" data-ipo-filter="gain100"> &gt;100% return</label>
+          <label><input type="checkbox" data-ipo-filter="score75"> Value score &gt;=75</label>
+          <label><input type="checkbox" data-ipo-filter="corrected20"> Corrected 20%+</label>
+          <label><input type="checkbox" data-ipo-filter="financial"> Financials available</label>
+          <label><input type="checkbox" data-ipo-filter="buyzone"> Buy-zone only</label>
+          <label><input type="checkbox" data-ipo-filter="risk"> Risk alerts</label>
+        </div>
+      </section>
+      <section class="panel ipo-upcoming-panel">
+        <div class="panel-title">Upcoming IPOs - Next 7 Days</div>
+        <p class="status">Use this first for near-term IPO watch. Rows keep clean company names, GMP %, status, Screener research link, and source link when available.</p>
+        {upcoming_html}
       </section>
       <section class="panel ipo-summary-panel compact-top-performers"><div class="summary-grid">{summary_cards_html}</div></section>
       {messages_html}
-      {render_table("Top 40 IPO Performers", combined_top40, "ipo-combined-table", "No verified IPO performance rows available for this year.")}
-      <section class="panel ipo-upcoming-panel">
-        <div class="panel-title">Upcoming IPOs - Next 7 Days</div>
-        <p class="status">Only IPOs dated within the next 7 days are shown here; the rest stay hidden to keep this screen decision-ready.</p>
-        {upcoming_html}
-      </section>
+      {render_table("Top 40 IPO Performers", combined_top40, "ipo-combined-table", "No IPO performance rows available for this year. Refresh IPO Data or check source access.")}
+      {render_research_panel()}
       {gpt_panel}
+      {render_saved_research_panel()}
       <section class="panel">
         <div class="panel-title">Exports</div>
         <div class="actions">
@@ -25891,6 +26224,19 @@ def render_page(state: PageState) -> bytes:
     .ipo-badge.bad {{ background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }}
     .ipo-badge.blue {{ background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }}
     .ipo-badge.neutral {{ background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; }}
+    .ipo-upcoming-table tr.ipo-upcoming-hot td {{
+      background: #ecfdf5;
+      border-top: 1px solid #86efac;
+      border-bottom: 1px solid #86efac;
+    }}
+    .ipo-upcoming-table tr.ipo-upcoming-hot td:first-child {{
+      border-left: 4px solid #16a34a;
+    }}
+    .ipo-upcoming-table tr.ipo-upcoming-hot .ipo-badge.good {{
+      background: #bbf7d0;
+      color: #14532d;
+      border-color: #22c55e;
+    }}
     .ipo-command-panel {{
       border: 1px solid rgba(20, 184, 166, 0.28);
       border-radius: 16px;
@@ -30651,6 +30997,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             ipo_gpt_prompt=first(form, "ipo_gpt_prompt"),
             ipo_gpt_output=first(form, "ipo_gpt_output"),
             ipo_gpt_response_id=first(form, "ipo_gpt_response_id"),
+            ipo_add_sector_leaders=(
+                checked(form, "ipo_add_sector_leaders")
+                if "ipo_add_sector_leaders_present" in form
+                else False
+            ),
+            ipo_research_json=first(form, "ipo_research_json"),
+            ipo_research_html=first(form, "ipo_research_html"),
+            ipo_research_message=first(form, "ipo_research_message"),
+            ipo_research_saved_id=first(form, "ipo_research_saved_id"),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -31138,6 +31493,53 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     f"{'Force refreshed' if force_refresh else 'Loaded'} IPO performance data "
                     f"for {state.ipo_year}."
                 )
+            elif request_path == "/ipo/research-build":
+                dashboard = build_simple_ipo_performance_dashboard(
+                    state.ipo_year,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                state.ipo_dashboard = dashboard
+                selected_values = form_values(form, "ipo_selected_key")
+                selected_keys = {
+                    str(value).strip()
+                    for value in selected_values
+                    if str(value).strip()
+                }
+                rows = selected_ipo_rows_from_dashboard_keys(
+                    dashboard,
+                    selected_keys,
+                    limit=20 if selected_keys else 1,
+                )
+                if not rows:
+                    state.ipo_research_json = ""
+                    state.ipo_research_html = ""
+                    state.ipo_research_message = "No IPO rows available. Load IPO Screener first, then select a company."
+                    state.message = state.ipo_research_message
+                else:
+                    analysis = build_ipo_research_analysis(
+                        rows,
+                        state.ipo_year,
+                        add_sector_leaders=state.ipo_add_sector_leaders,
+                    )
+                    state.ipo_research_json = json.dumps(
+                        analysis,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                    state.ipo_research_html = render_ipo_research_html(
+                        analysis,
+                        state.ipo_gpt_output,
+                    )
+                    companies = ", ".join(
+                        clean_company_name(row.get("company_name"))
+                        for row in analysis.get("selected_companies", [])
+                    )
+                    peer_count = len(analysis.get("peer_companies") or [])
+                    state.ipo_research_message = (
+                        f"Built IPO research view for {companies or len(rows)} with {peer_count} peer/leader row(s)."
+                    )
+                    state.message = state.ipo_research_message
             elif request_path == "/ipo/gpt-analyze":
                 dashboard = build_simple_ipo_performance_dashboard(
                     state.ipo_year,
@@ -31150,7 +31552,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     for value in selected_values
                     if str(value).strip()
                 }
-                rows = selected_ipo_rows_from_dashboard_keys(dashboard, selected_keys, limit=20)
+                rows = selected_ipo_rows_from_dashboard_keys(
+                    dashboard,
+                    selected_keys,
+                    limit=20 if selected_keys else 3,
+                )
                 if not rows:
                     state.ipo_gpt_prompt = ""
                     state.ipo_gpt_output = ""
@@ -31161,11 +31567,26 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         state.ipo_gpt_prompt,
                         state.ipo_gpt_output,
                         state.ipo_gpt_response_id,
+                        research_analysis,
                     ), state.console_log = call_with_console(
                         generate_ipo_value_analysis_with_openai,
                         rows,
                         state.ipo_year,
                         state.openai_model,
+                        state.ipo_add_sector_leaders,
+                    )
+                    state.ipo_research_json = json.dumps(
+                        research_analysis,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                    state.ipo_research_html = render_ipo_research_html(
+                        research_analysis,
+                        state.ipo_gpt_output,
+                    )
+                    state.ipo_research_message = (
+                        f"Generated GPT research note with Python hard-rule gates for {len(rows)} IPO candidate(s)."
                     )
                     state.gpt_api_output = state.ipo_gpt_output
                     state.gpt_api_response_id = state.ipo_gpt_response_id
@@ -31174,6 +31595,65 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         f"GPT analyzed {len(rows)} {choice_text} IPO candidate(s) for long-term value investing. "
                         "Result is shown in IPO and copied to GPT output state."
                     )
+            elif request_path == "/ipo/research-save":
+                dashboard = build_simple_ipo_performance_dashboard(
+                    state.ipo_year,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                state.ipo_dashboard = dashboard
+                analysis: dict[str, Any] = {}
+                if str(state.ipo_research_json or "").strip():
+                    try:
+                        parsed = json.loads(state.ipo_research_json)
+                        if isinstance(parsed, dict):
+                            analysis = parsed
+                    except json.JSONDecodeError:
+                        analysis = {}
+                if not analysis:
+                    selected_values = form_values(form, "ipo_selected_key")
+                    selected_keys = {
+                        str(value).strip()
+                        for value in selected_values
+                        if str(value).strip()
+                    }
+                    rows = selected_ipo_rows_from_dashboard_keys(
+                        dashboard,
+                        selected_keys,
+                        limit=20 if selected_keys else 1,
+                    )
+                    if rows:
+                        analysis = build_ipo_research_analysis(
+                            rows,
+                            state.ipo_year,
+                            add_sector_leaders=state.ipo_add_sector_leaders,
+                        )
+                if not analysis:
+                    state.message = "Build IPO research view before saving."
+                else:
+                    html_text = state.ipo_research_html or render_ipo_research_html(
+                        analysis,
+                        state.ipo_gpt_output,
+                    )
+                    saved, state.console_log = call_with_console(
+                        save_ipo_research,
+                        analysis,
+                        html_text,
+                        state.ipo_gpt_output,
+                        APP_ROOT,
+                    )
+                    state.ipo_research_json = json.dumps(
+                        analysis,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                    state.ipo_research_html = html_text
+                    state.ipo_research_saved_id = str(saved.get("research_id") or "")
+                    state.ipo_research_message = (
+                        f"Saved IPO research {state.ipo_research_saved_id}. "
+                        "JSON, HTML, report copy, and research index were updated."
+                    )
+                    state.message = state.ipo_research_message
             elif request_path == "/ipo/save-gpt-analysis":
                 dashboard = build_simple_ipo_performance_dashboard(
                     state.ipo_year,

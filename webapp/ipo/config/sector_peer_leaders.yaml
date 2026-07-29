@@ -1,0 +1,64 @@
+power_electrical_infra:
+  leaders:
+    - POLYCAB|Polycab India Ltd|NSE|Electricals|Power & electrical infra
+    - KEI|KEI Industries Ltd|NSE|Cables|Power & electrical infra
+    - HAVELLS|Havells India Ltd|NSE|Electricals|Power & electrical infra
+    - CGPOWER|CG Power and Industrial Solutions Ltd|NSE|Electrical equipment|Power & electrical infra
+    - SIEMENS|Siemens Ltd|NSE|Industrial automation|Power & electrical infra
+ems_electronics:
+  leaders:
+    - DIXON|Dixon Technologies India Ltd|NSE|EMS|EMS/electronics
+    - KAYNES|Kaynes Technology India Ltd|NSE|EMS|EMS/electronics
+    - SYRMA|Syrma SGS Technology Ltd|NSE|EMS|EMS/electronics
+    - PGEL|PG Electroplast Ltd|NSE|EMS|EMS/electronics
+    - AMBER|Amber Enterprises India Ltd|NSE|Consumer durables|EMS/electronics
+defence_aerospace:
+  leaders:
+    - BEL|Bharat Electronics Ltd|NSE|Defence electronics|Defence/aerospace
+    - HAL|Hindustan Aeronautics Ltd|NSE|Aerospace|Defence/aerospace
+    - BDL|Bharat Dynamics Ltd|NSE|Defence|Defence/aerospace
+    - MAZDOCK|Mazagon Dock Shipbuilders Ltd|NSE|Shipbuilding|Defence/aerospace
+    - COCHINSHIP|Cochin Shipyard Ltd|NSE|Shipbuilding|Defence/aerospace
+diagnostics_healthcare:
+  leaders:
+    - LALPATHLAB|Dr Lal PathLabs Ltd|NSE|Diagnostics|Healthcare/diagnostics
+    - METROPOLIS|Metropolis Healthcare Ltd|NSE|Diagnostics|Healthcare/diagnostics
+    - THYROCARE|Thyrocare Technologies Ltd|NSE|Diagnostics|Healthcare/diagnostics
+    - VIJAYA|Vijaya Diagnostic Centre Ltd|NSE|Diagnostics|Healthcare/diagnostics
+    - APOLLOHOSP|Apollo Hospitals Enterprise Ltd|NSE|Hospitals|Healthcare/diagnostics
+manufacturing_capex:
+  leaders:
+    - SKFINDIA|SKF India Ltd|NSE|Industrial manufacturing|Manufacturing capex
+    - TIMKEN|Timken India Ltd|NSE|Industrial manufacturing|Manufacturing capex
+    - ELECON|Elecon Engineering Company Ltd|NSE|Industrial machinery|Manufacturing capex
+    - GRINDWELL|Grindwell Norton Ltd|NSE|Industrial consumables|Manufacturing capex
+    - ESABINDIA|ESAB India Ltd|NSE|Industrial products|Manufacturing capex
+fmcg_ingredients:
+  leaders:
+    - TATACONSUM|Tata Consumer Products Ltd|NSE|FMCG|Consumer premiumization
+    - NESTLEIND|Nestle India Ltd|NSE|FMCG|Consumer premiumization
+    - BRITANNIA|Britannia Industries Ltd|NSE|FMCG|Consumer premiumization
+    - GODREJCP|Godrej Consumer Products Ltd|NSE|FMCG|Consumer premiumization
+    - HINDUNILVR|Hindustan Unilever Ltd|NSE|FMCG|Consumer premiumization
+specialty_chemicals:
+  leaders:
+    - AARTIIND|Aarti Industries Ltd|NSE|Specialty chemicals|Specialty chemicals
+    - CLEAN|Clean Science and Technology Ltd|NSE|Specialty chemicals|Specialty chemicals
+    - DEEPAKNTR|Deepak Nitrite Ltd|NSE|Specialty chemicals|Specialty chemicals
+    - SRF|SRF Ltd|NSE|Specialty chemicals|Specialty chemicals
+    - TATACHEM|Tata Chemicals Ltd|NSE|Chemicals|Specialty chemicals
+financialization_amc:
+  leaders:
+    - HDFCAMC|HDFC Asset Management Company Ltd|NSE|AMC|AMC/financialization
+    - NAM-INDIA|Nippon Life India Asset Management Ltd|NSE|AMC|AMC/financialization
+    - CAMS|Computer Age Management Services Ltd|NSE|Capital markets|AMC/financialization
+    - CDSL|Central Depository Services India Ltd|NSE|Capital markets|AMC/financialization
+    - BSE|BSE Ltd|NSE|Exchange|AMC/financialization
+data_centre_infra:
+  leaders:
+    - NETWEB|Netweb Technologies India Ltd|NSE|Data centre infra|Data centre infra
+    - ANANTRAJ|Anant Raj Ltd|NSE|Data centre infra|Data centre infra
+    - E2E|E2E Networks Ltd|NSE|Cloud infra|Data centre infra
+    - TECHNOE|Techno Electric and Engineering Company Ltd|NSE|Power infra|Data centre infra
+    - BLACKBOX|Black Box Ltd|NSE|Digital infra|Data centre infra
+

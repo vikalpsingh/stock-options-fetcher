@@ -28,6 +28,12 @@ from ipo_data_service import (
     selected_ipo_rows_for_value_analysis,
 )
 from ipo_scoring_engine import filter_multibaggers_or_all, score_ipo_company
+from ipo.symbol_resolution.symbol_resolver import (
+    load_symbol_overrides,
+    normalize_company_key,
+    resolve_ipo_identity,
+)
+from ipo.utils.ipo_price_cleaner import clean_price as clean_ipo_price
 
 
 def chittorgarh_table(rows: str) -> str:
@@ -150,6 +156,37 @@ def simple_perf_record(index: int, ipo_type: str, gain: float, listed_year: int 
         "return_from_listing_pct": 5,
         "issue_size": f"{100 + index} Cr",
         "ipo_market_cap": 1000 + index,
+        "market_cap": 1800 + index,
+        "current_market_cap": 1800 + index,
+        "sector": "Manufacturing capex" if ipo_type.lower() != "sme" else "EMS/electronics",
+        "theme": "Manufacturing capex" if ipo_type.lower() != "sme" else "EMS/electronics",
+        "revenue_growth_yoy": 22,
+        "latest_revenue_growth_yoy": 22,
+        "profit_growth_yoy": 24,
+        "pat_growth_yoy": 24,
+        "latest_pat_growth_yoy": 24,
+        "eps_growth_yoy": 20,
+        "roe": 18,
+        "roce": 22,
+        "debt_to_equity": 0.2,
+        "current_ratio": 1.4,
+        "operating_margin": 18,
+        "opm_trend_pct": 0,
+        "net_profit_margin": 10,
+        "pe_ratio": 28,
+        "industry_pe": 36,
+        "peer_median_pe": 36,
+        "promoter_holding": 60,
+        "promoter_holding_change": 0,
+        "fii_dii_holding": 10,
+        "fii_dii_change": 0,
+        "pledge_pct": 0,
+        "pledge_change": 0,
+        "cfo_pat": 0.8,
+        "fcf": 50,
+        "debtor_days": 45,
+        "inventory_days": 30,
+        "cash_conversion_cycle": 75,
         "market_type": "SME" if ipo_type.lower() == "sme" else "Mainboard",
         "source_url": f"https://www.chittorgarh.com/{prefix.lower()}{index}",
     }
@@ -485,9 +522,9 @@ def test_ipo_company_name_and_screener_search_strip_listing_suffixes():
         "sme",
     )
 
-    assert row["company_name"] == "Ap Apsis Aerocom"
-    assert row["symbol"] == ""
-    assert row["screener_url"] == "https://www.screener.in/search/?q=Ap+Apsis+Aerocom"
+    assert row["company_name"] == "Apsis Aerocom"
+    assert row["symbol"] == "APSISAERO"
+    assert row["screener_url"] == "https://www.screener.in/company/APSISAERO/"
     assert "Listed" not in row["screener_url"]
     assert "Symbol" not in row["screener_url"]
 
@@ -507,6 +544,347 @@ def test_ipo_company_name_removes_symbol_pending_and_uses_verified_alias():
     assert row["company_name"] == "Xtranet Technologies"
     assert row["symbol"] == "XTRANET"
     assert row["screener_url"] == "https://www.screener.in/company/XTRANET/"
+
+
+def test_ipo_identity_pipeline_uses_saved_override_after_cleaning():
+    resolution = resolve_ipo_identity(
+        {
+            "company_name": "Rubicon Research Listed: 16 Oct 2025 Symbol pending",
+            "symbol": "Symbol pending",
+            "screener_url": "https://www.screener.in/search/?q=Rubicon+Research+Listed%3A+16+Oct+2025",
+        }
+    )
+
+    assert resolution["clean_company_name"] == "Rubicon Research"
+    assert resolution["symbol"] == "RUBICON"
+    assert resolution["match_method"] == "SECURITY_MAP_SOURCE_VERIFIED"
+    assert resolution["screener_url"] == "https://www.screener.in/company/RUBICON/"
+    assert "Security map: NSE RUBICON" in resolution["resolution_pipeline"]
+    assert "Listed%3A" not in resolution["screener_url"]
+
+
+def test_ipo_identity_pipeline_matches_kite_master_and_isin():
+    instrument_master = [
+        {
+            "tradingsymbol": "TESTIPO",
+            "exchange": "NSE",
+            "name": "Test Systems",
+            "isin": "INE123456789",
+            "instrument_token": 12345,
+        }
+    ]
+
+    resolution = resolve_ipo_identity(
+        {
+            "company_name": "Test Systems Listed: 10 Jul 2026",
+            "symbol": "Symbol pending",
+            "isin": "INE123456789",
+            "instrument_master": instrument_master,
+        }
+    )
+
+    assert resolution["clean_company_name"] == "Test Systems"
+    assert resolution["symbol"] == "TESTIPO"
+    assert resolution["exchange"] == "NSE"
+    assert resolution["instrument_token"] == 12345
+    assert resolution["is_listed_verified"] is True
+    assert resolution["isin_match_status"] == "MATCHED"
+    assert resolution["match_method"] == "KITE_INSTRUMENT_ISIN"
+    assert resolution["screener_url"] == "https://www.screener.in/company/TESTIPO/"
+
+
+def test_ipo_identity_pipeline_keeps_unresolved_company_visible_with_clean_search():
+    resolution = resolve_ipo_identity(
+        {
+            "company_name": "Ap Apsis Aerocom Listed: 18 Mar 2026 Symbol pending",
+            "symbol": "Symbol pending",
+            "screener_url": "https://www.screener.in/search/?q=Ap+Apsis+Aerocom+Listed%3A+18+Mar+2026",
+        }
+    )
+
+    assert resolution["clean_company_name"] == "Apsis Aerocom"
+    assert resolution["symbol"] == "APSISAERO"
+    assert resolution["match_method"] == "SECURITY_MAP_SOURCE_VERIFIED"
+    assert resolution["is_listed_verified"] is True
+    assert resolution["screener_url"] == "https://www.screener.in/company/APSISAERO/"
+    assert "Source symbol: missing/pending" in resolution["resolution_pipeline"]
+
+
+@pytest.mark.parametrize(
+    ("raw_name", "expected"),
+    [
+        ("Ap Apsis Aerocom", "Apsis Aerocom"),
+        ("Te Teja Engineering Industries", "Teja Engineering Industries"),
+        ("In Indo SMC", "Indo SMC"),
+        ("Av Avana Electrosystems", "Avana Electrosystems"),
+        ("Me Merritronix", "Merritronix"),
+        ("Vi Vivid Electromech", "Vivid Electromech"),
+        ("Mi Millworks Technologies", "Millworks Technologies"),
+        ("Ve Vegorama Punjabi Angithi", "Vegorama Punjabi Angithi"),
+        ("Ac Accretion Nutraveda", "Accretion Nutraveda"),
+        ("Te Teamtech Formwork Solutions", "Teamtech Formwork Solutions"),
+        ("Ti Tipco Engineering India", "Tipco Engineering India"),
+        ("KR KRM Ayurveda", "KRM Ayurveda"),
+        ("De Devson Catalyst", "Devson Catalyst"),
+        ("RF RFBL Flexi Pack", "RFBL Flexi Pack"),
+        ("Gr Grover Jewells", "Grover Jewells"),
+        ("Su Susan Electricals India", "Susan Electricals India"),
+        ("GR GRE Renew Enertech", "GRE Renew Enertech"),
+        ("Sh Shreedhar Spinners", "Shreedhar Spinners"),
+        ("El Elfin Agro India", "Elfin Agro India"),
+        ("IC IC Electricals Company", "IC Electricals Company"),
+        ("Na Nanta Tech", "Nanta Tech"),
+        ("Ad Admach Systems", "Admach Systems"),
+        ("Dh Dhara Rail Projects", "Dhara Rail Projects"),
+        ("Ba Bai Kakaji Polymers", "Bai Kakaji Polymers"),
+        ("Rubicon Research", "Rubicon Research"),
+        ("KSH International", "KSH International"),
+        ("Groww", "Groww"),
+        ("Corona Remedies", "Corona Remedies"),
+        ("Aequs", "Aequs"),
+        ("Vidya Wires", "Vidya Wires"),
+        ("Meesho", "Meesho"),
+        ("ICICI Prudential AMC", "ICICI Prudential AMC"),
+        ("PhysicsWallah", "PhysicsWallah"),
+        ("LG Electronics India", "LG Electronics India"),
+        ("OnEMI Technology Solutions", "OnEMI Technology Solutions"),
+        ("SEDEMAC Mechatronics", "SEDEMAC Mechatronics"),
+        ("CMR Green Technologies", "CMR Green Technologies"),
+    ],
+)
+def test_ipo_company_name_cleaner_removes_only_duplicate_short_prefixes(raw_name, expected):
+    assert ipo_data_service._clean_chittorgarh_company_name(raw_name) == expected
+
+
+def test_simple_ipo_decision_engine_treats_zero_listing_price_as_missing():
+    row = ipo_data_service._simple_ipo_performance_row(
+        verified_live_record(
+            listing_price=0,
+            return_from_listing_pct=None,
+            listing_gain_pct=None,
+        ),
+        "mainboard",
+    )
+
+    assert row["listing_price"] is None
+    assert row["listing_price_status"] == "LISTING_PRICE_MISSING"
+
+
+def test_ipo_price_cleaner_handles_currency_commas_percent_and_zero_missing():
+    assert clean_ipo_price("₹1,234.50") == 1234.5
+    assert clean_ipo_price("â‚¹80.6") == 80.6
+    assert clean_ipo_price("16.88%") == 16.88
+    assert clean_ipo_price(" 0 ", zero_is_missing=True) is None
+    assert clean_ipo_price("N/A") is None
+
+
+def test_simple_ipo_decision_engine_marks_all_zero_prices_as_missing():
+    row = ipo_data_service._simple_ipo_performance_row(
+        verified_live_record(
+            company_name="Rubicon Research",
+            symbol="RUBICON",
+            isin="INERUBI01010",
+            ipo_price="0",
+            issue_price="0",
+            listing_price="₹0",
+            current_price="0",
+            ltp="0",
+            market_cap=5000,
+            sector="Pharma",
+            theme="Specialty pharma",
+        ),
+        "mainboard",
+    )
+
+    assert row["ipo_price"] is None
+    assert row["listing_price"] is None
+    assert row["current_price"] is None
+    assert row["ipo_price_status"] == "IPO_PRICE_MISSING"
+    assert row["listing_price_status"] == "LISTING_PRICE_MISSING"
+    assert row["price_data_status"] == "CURRENT_PRICE_MISSING"
+    assert row["action"] == "DATA PENDING"
+
+
+def test_simple_ipo_decision_engine_excludes_demo_rows_from_scoring():
+    row = ipo_data_service._simple_ipo_performance_row(
+        {
+            **verified_live_record(
+                company_name="GreenGrid Power Infra",
+                symbol="GGPOWER",
+                current_price=515,
+                current_gain_pct=60,
+            ),
+            "is_demo": True,
+        },
+        "mainboard",
+    )
+
+    assert row["action"] == "UNVERIFIED - EXCLUDED"
+    assert row["eligible_for_scoring"] is False
+    assert row["value_score"] is None
+    assert row["buy_zone_allowed"] is False
+
+
+def test_simple_ipo_decision_engine_blocks_strong_runup_without_valuation():
+    row_data = verified_live_record(
+        current_price=260,
+        current_gain_pct=160,
+        return_from_issue_pct=160,
+        gain_from_ipo_pct=160,
+    )
+    for field in ("pe_ratio", "pe", "industry_pe", "peer_median_pe", "price_to_sales", "ps_ratio", "pb_ratio", "ev_ebitda"):
+        row_data[field] = None
+
+    row = ipo_data_service._simple_ipo_performance_row(row_data, "mainboard")
+
+    assert row["action"] == "STRONG RUN-UP / AVOID CHASING"
+    assert row["valuation_status"] == "Valuation Data Pending"
+    assert row["eligible_for_scoring"] is False
+    assert row["value_score"] is None
+    assert row["buy_zone_allowed"] is False
+
+
+def test_simple_ipo_decision_engine_marks_unknown_sector_as_research_only():
+    row = ipo_data_service._simple_ipo_performance_row(
+        verified_live_record(
+            company_name="Unmapped Silent Alpha",
+            sector="",
+            theme="",
+            industry="",
+            business="",
+            description="",
+        ),
+        "mainboard",
+    )
+
+    assert row["sector"] == "Sector Review Needed"
+    assert row["theme"] == "Theme Review Needed"
+    assert row["action"] == "RESEARCH ONLY"
+    assert row["eligible_for_scoring"] is False
+    assert row["buy_zone_allowed"] is False
+
+
+def test_simple_ipo_decision_engine_buy_zone_requires_verified_financials():
+    row = ipo_data_service._simple_ipo_performance_row(
+        verified_live_record(
+            current_price=150,
+            current_gain_pct=50,
+            drawdown_from_52w_high_pct=-25,
+        ),
+        "mainboard",
+    )
+
+    assert row["action"] == "BUY ZONE REACHED"
+    assert row["value_score"] >= 75
+    assert row["financial_data_status"] == "Financial Data Available"
+    assert row["data_quality_score"] >= 80
+    assert row["suggested_allocation"] != "No order"
+
+
+def test_simple_ipo_decision_engine_missing_financials_stays_watchlist():
+    row = ipo_data_service._simple_ipo_performance_row(
+        {
+            **simple_perf_record(1, "mainboard", 45, 2026),
+            "symbol": "PEND",
+            "current_price": 145,
+            "current_gain_pct": 45,
+            "revenue_growth_yoy": None,
+            "latest_revenue_growth_yoy": None,
+            "profit_growth_yoy": None,
+            "pat_growth_yoy": None,
+            "latest_pat_growth_yoy": None,
+            "eps_growth_yoy": None,
+            "roe": None,
+            "roce": None,
+            "cfo_pat": None,
+            "fcf": None,
+        },
+        "mainboard",
+    )
+
+    assert row["action"] == "DATA PENDING"
+    assert row["financial_data_status"] == "Financial Data Pending"
+    assert row["value_score"] is None
+    assert "Financial data pending" in row["risk_alerts"]
+
+
+def test_simple_ipo_decision_engine_unresolved_symbol_needs_review():
+    row = ipo_data_service._simple_ipo_performance_row(
+        {
+            "company_name": "Ap Apsis Aerocom Listed: 18 Mar 2026",
+            "symbol": "Symbol pending",
+            "ipo_price": 100,
+            "current_price": 125,
+            "current_gain_pct": 25,
+        },
+        "sme",
+    )
+
+    assert row["company_name"] == "Apsis Aerocom"
+    assert row["symbol"] == "APSISAERO"
+    assert row["action"] == "DATA PENDING"
+    assert row["value_score"] is None
+    assert row["symbol_resolution_confidence"] >= 85
+
+
+def test_unverified_2025_alias_stays_symbol_review_but_sector_maps():
+    row = ipo_data_service._simple_ipo_performance_row(
+        {
+            "company_name": "Na Nanta Tech Listed: 20 Oct 2025",
+            "symbol": "Symbol pending",
+            "ipo_price": 100,
+            "listing_price": 112,
+            "current_price": 130,
+            "current_gain_pct": 30,
+            "market_cap": 1200,
+        },
+        "mainboard",
+    )
+
+    assert row["company_name"] == "Nanta Tech"
+    assert row["symbol"] == "544668"
+    assert row["action"] == "DATA PENDING"
+    assert row["sector"] == "Industrial technology"
+    assert row["theme"] == "Industrial technology"
+    assert row["eligible_for_scoring"] is False
+    assert row["screener_url"] == "https://www.screener.in/company/544668/"
+
+
+def test_unverified_seed_aliases_do_not_become_verified_symbols():
+    overrides = load_symbol_overrides()
+
+    assert normalize_company_key("Rubicon Research") in overrides
+    assert normalize_company_key("Nanta Tech") not in overrides
+    assert normalize_company_key("Admach Systems") not in overrides
+    assert normalize_company_key("Groww") not in overrides
+
+
+@pytest.mark.parametrize(
+    ("company", "expected_sector", "expected_theme"),
+    [
+        ("Rubicon Research", "Pharma", "Specialty pharma"),
+        ("Groww", "Financialization", "Capital markets / wealth platform"),
+        ("LG Electronics India", "Consumer durables", "Consumer appliances / premiumization"),
+        ("Dhara Rail Projects", "Rail infrastructure", "Rail projects / infrastructure capex"),
+        ("Bai Kakaji Polymers", "Polymer packaging", "Polymer packaging"),
+        ("CMR Green Technologies", "Aluminium recycling", "Aluminium recycling / circular economy"),
+    ],
+)
+def test_additional_ipo_sector_mapping(company, expected_sector, expected_theme):
+    row = ipo_data_service._simple_ipo_performance_row(
+        verified_live_record(
+            company_name=company,
+            sector="",
+            theme="",
+            industry="",
+            business="",
+            description="",
+        ),
+        "mainboard",
+    )
+
+    assert row["sector"] == expected_sector
+    assert row["theme"] == expected_theme
 
 
 def test_cached_simple_ipo_loader_does_not_emit_success_noise(tmp_path, monkeypatch):
@@ -697,6 +1075,132 @@ def test_simple_ipo_performance_dashboard_loads_top20_mainboard_and_sme(tmp_path
     assert dashboard["summary"]["sme_positive_return"] == 25
 
 
+def test_simple_ipo_dashboard_summary_counts_decision_quality(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ipo_data_service,
+        "_simple_ipo_cache_path",
+        lambda year, ipo_type: tmp_path / f"decision_{ipo_type}_{year}.csv",
+    )
+    verified = verified_live_record(
+        current_price=150,
+        current_gain_pct=50,
+        drawdown_from_52w_high_pct=-25,
+    )
+    unresolved = {
+        "company_name": "Ap Apsis Aerocom Listed: 18 Mar 2026",
+        "symbol": "Symbol pending",
+        "ipo_price": 100,
+        "current_price": 125,
+        "current_gain_pct": 25,
+    }
+
+    def fake_fetch(year, ipo_type="mainboard"):
+        if ipo_type == "mainboard":
+            return {"records": [verified, unresolved], "source": "https://source/mainboard", "error": ""}
+        return {"records": [], "source": "https://source/sme", "error": ""}
+
+    monkeypatch.setattr(ipo_data_service, "fetch_chittorgarh_ipos", fake_fetch)
+    monkeypatch.setattr(ipo_data_service, "fetch_ipomarket_ipos", lambda year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_ipoguru_ipos", lambda year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_secondary_ipo_source", lambda source_key, year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "_load_research_ready_upcoming_ipos", lambda today=None: ([], []))
+
+    dashboard = build_simple_ipo_performance_dashboard(2026, force_refresh=True, today=date(2026, 7, 20))
+
+    assert dashboard["summary"]["total_ipos_loaded"] == 2
+    assert dashboard["summary"]["symbols_resolved"] == 2
+    assert dashboard["summary"]["financial_data_available"] == 1
+    assert dashboard["summary"]["buy_zone_candidates"] == 1
+    assert dashboard["summary"]["symbol_review_needed"] == 0
+    assert [row["symbol"] for row in dashboard["combined_top40"]] == ["LIVEIPO", "APSISAERO"]
+    assert dashboard["combined_top40"][0]["eligible_for_scoring"] is True
+    assert dashboard["combined_top40"][1]["eligible_for_scoring"] is False
+    assert dashboard["combined_top40"][1]["action"] == "DATA PENDING"
+
+
+def test_simple_ipo_top40_shows_unverified_rows_as_research_only_across_years(monkeypatch):
+    def fake_loader(selected_year, ipo_type, force_refresh=False):
+        verified = ipo_data_service._simple_ipo_performance_row(
+            verified_live_record(
+                company_name=f"Live Quality IPO {selected_year}",
+                symbol=f"LIVE{str(selected_year)[-2:]}",
+                current_gain_pct=35,
+                source_url=f"https://example.test/{selected_year}",
+            ),
+            ipo_type,
+        )
+        unverified = ipo_data_service._simple_ipo_performance_row(
+            {
+                "company_name": "Na Nanta Tech Listed: 20 Oct 2025" if selected_year == 2025 else "Ap Apsis Aerocom Listed: 18 Mar 2026",
+                "symbol": "Symbol pending",
+                "ipo_price": 100,
+                "listing_price": 110,
+                "current_price": 150,
+                "current_gain_pct": 50,
+                "market_cap": 1500,
+                "source_url": f"https://example.test/unverified/{selected_year}",
+            },
+            ipo_type,
+        )
+        return {
+            "rows": [unverified, verified] if ipo_type == "mainboard" else [],
+            "source": "test",
+            "source_mode": "test",
+            "last_refreshed": "2026-07-20T10:00:00",
+            "messages": [],
+        }
+
+    monkeypatch.setattr(ipo_data_service, "_load_simple_chittorgarh_performance", fake_loader)
+    monkeypatch.setattr(ipo_data_service, "_upcoming_ipos_next_7_days", lambda today=None: ([], []))
+
+    for selected_year in (2024, 2025, 2026):
+        dashboard = build_simple_ipo_performance_dashboard(selected_year, force_refresh=True, today=date(2026, 7, 20))
+        top40_names = [row["company_name"] for row in dashboard["combined_top40"]]
+
+        expected_review_name = "Nanta Tech" if selected_year == 2025 else "Apsis Aerocom"
+        assert top40_names == [f"Live Quality IPO {selected_year}", expected_review_name]
+        review_row = dashboard["combined_top40"][1]
+        assert review_row["eligible_for_scoring"] is False
+        assert review_row["action"] == "DATA PENDING"
+        assert dashboard["summary"]["symbol_review_needed"] == 0
+
+
+def test_simple_ipo_dashboard_keeps_positive_source_rows_visible_when_no_verified(monkeypatch):
+    def fake_loader(selected_year, ipo_type, force_refresh=False):
+        unverified = ipo_data_service._simple_ipo_performance_row(
+            {
+                "company_name": "Omnitech Engineering Listed: 05 Mar 2026",
+                "symbol": "Symbol pending",
+                "ipo_price": 100,
+                "listing_price": 110,
+                "current_price": 150,
+                "current_gain_pct": 50,
+                "market_cap": 1500,
+                "source_url": "https://example.test/omnitech",
+            },
+            ipo_type,
+        )
+        return {
+            "rows": [unverified] if ipo_type == "mainboard" else [],
+            "source": "test",
+            "source_mode": "test",
+            "last_refreshed": "2026-07-20T10:00:00",
+            "messages": [],
+        }
+
+    monkeypatch.setattr(ipo_data_service, "_load_simple_chittorgarh_performance", fake_loader)
+    monkeypatch.setattr(ipo_data_service, "_upcoming_ipos_next_7_days", lambda today=None: ([], []))
+
+    dashboard = build_simple_ipo_performance_dashboard(2026, force_refresh=True, today=date(2026, 7, 20))
+
+    assert dashboard["summary"]["eligible_for_scoring"] == 0
+    assert dashboard["summary"]["display_positive_return"] == 1
+    assert dashboard["combined_top40"][0]["company_name"] == "Omnitech Engineering"
+    assert dashboard["combined_top40"][0]["eligible_for_scoring"] is False
+    assert dashboard["combined_top40"][0]["action"] == "DATA PENDING"
+    assert IPO_NO_VERIFIED_DATA_MESSAGE in dashboard["messages"]
+
+
 def test_simple_ipo_upcoming_filters_next_7_days(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ipo_data_service,
@@ -803,6 +1307,13 @@ def test_render_ipo_panel_has_default_controls(tmp_path, monkeypatch):
             "summary": {
                 "total_mainboard_loaded": 1,
                 "total_sme_loaded": 1,
+                "total_ipos_loaded": 2,
+                "symbols_resolved": 2,
+                "financial_data_available": 0,
+                "buy_zone_candidates": 0,
+                "tracking_buy_candidates": 0,
+                "risk_alert_count": 0,
+                "symbol_review_needed": 0,
                 "mainboard_positive_return": 1,
                 "sme_positive_return": 1,
                 "mainboard_gt50_gain": 0,
@@ -818,7 +1329,13 @@ def test_render_ipo_panel_has_default_controls(tmp_path, monkeypatch):
 
     html = app.render_ipo_panel(state)
 
+    assert "IPO Decision Engine" in html
     assert "Listed IPO Performance Tracker" in html
+    assert 'id="ipo-search-box"' in html
+    assert 'name="ipo_market_type"' in html
+    assert '<option value="Mainboard"' in html
+    assert "&gt;50% return" in html
+    assert "Financials available" in html
     assert "Top Mainboard" not in html
     assert "Top SME" not in html
     assert "Mainboard loaded" not in html
@@ -829,7 +1346,9 @@ def test_render_ipo_panel_has_default_controls(tmp_path, monkeypatch):
     assert "Loaded 25 upcoming IPO row(s) from IPOWatch GMP/upcoming table" not in html
     assert "Useful parser warning" in html
     assert "Upcoming IPOs - Next 7 Days" in html
+    assert html.index("Upcoming IPOs - Next 7 Days") < html.index("Top 40 IPO Performers")
     assert "GMP %" in html
+    assert "Days" in html
     assert 'id="ipo-upcoming-table"' in html
     assert "ipo-upcoming-card" not in html
     assert "Top 20 Mainboard IPOs" not in html
@@ -840,6 +1359,13 @@ def test_render_ipo_panel_has_default_controls(tmp_path, monkeypatch):
     assert 'name="ipo_selected_key"' in html
     assert "ipo-sortable" in html
     assert "data-sort-type" in html
+    assert "Value Score" in html
+    assert "Action" in html
+    assert "Data Quality" in html
+    assert "Financial Data" in html
+    assert "Symbol Confidence" in html
+    assert "Buy Zone" in html
+    assert "Risk Alerts" in html
     assert "Value Investor GPT Analysis" in html
     assert "g-6a031ff323688191872d730b281c71f0-next-multi-bagger-of-indian-market" in html
     assert 'option value="2026" selected' in html
@@ -879,6 +1405,132 @@ def test_simple_ipo_upcoming_adds_gmp_percent(tmp_path, monkeypatch):
     dashboard = build_simple_ipo_performance_dashboard(2026, force_refresh=True, today=date(2026, 7, 20))
 
     assert dashboard["upcoming_next7"][0]["gmp_pct"] == 20.0
+
+
+def test_simple_ipo_upcoming_accepts_open_date_range_and_highlights_gmp(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ipo_data_service,
+        "_simple_ipo_cache_path",
+        lambda year, ipo_type: tmp_path / f"simple_{ipo_type}_{year}.csv",
+    )
+    monkeypatch.setattr(ipo_data_service, "fetch_chittorgarh_ipos", lambda year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_ipomarket_ipos", lambda year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_ipoguru_ipos", lambda year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_secondary_ipo_source", lambda source_key, year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    upcoming_rows = [
+        {
+            "company_name": "High GMP IPO",
+            "symbol": "HIGHGMP",
+            "open_date": "Jul 24 - Jul 28, 2026",
+            "sector": "Manufacturing capex",
+            "price_band": "100",
+            "current_gmp": "45",
+        },
+        {
+            "company_name": "Listing Only IPO",
+            "symbol": "LISTIPO",
+            "listing_date": "2026-07-24",
+            "sector": "EMS",
+            "price_band": "100",
+            "gmp": "50",
+        },
+    ]
+    monkeypatch.setattr(ipo_data_service, "_load_research_ready_upcoming_ipos", lambda today=None: (upcoming_rows, []))
+
+    dashboard = build_simple_ipo_performance_dashboard(2026, force_refresh=True, today=date(2026, 7, 22))
+
+    assert [row["company_name"] for row in dashboard["upcoming_next7"]] == ["High GMP IPO"]
+    row = dashboard["upcoming_next7"][0]
+    assert row["ipo_date"] == "2026-07-24"
+    assert row["gmp_pct"] == 45.0
+    assert row["status_badge"] == "High GMP >40%"
+    assert row["status_class"] == "hot"
+
+
+def test_render_ipo_panel_highlights_high_gmp_upcoming_row(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "ipo.db")
+    monkeypatch.setattr(
+        app,
+        "build_simple_ipo_performance_dashboard",
+        lambda year, today=None: {
+            "mode": "simple_performance",
+            "year": year,
+            "generated_at": "2026-07-22T10:00:00",
+            "last_refreshed": "2026-07-22T10:00:00",
+            "mainboard_top20": [],
+            "sme_top20": [],
+            "combined_top40": [],
+            "upcoming_next7": [
+                {
+                    "company_name": "High GMP IPO",
+                    "symbol": "HIGHGMP",
+                    "ipo_date": "2026-07-24",
+                    "days_to_ipo": 2,
+                    "sector": "Manufacturing capex",
+                    "ipo_type": "Mainboard",
+                    "issue_size": "500 Cr",
+                    "price_band": "100",
+                    "gmp": "45",
+                    "gmp_pct": 45.0,
+                    "status_badge": "High GMP >40%",
+                    "status_class": "hot",
+                    "source": "IPOWatch GMP/upcoming table",
+                    "source_url": "https://example.test/high-gmp",
+                    "screener_url": "https://www.screener.in/company/HIGHGMP/",
+                }
+            ],
+            "messages": [],
+            "summary": {
+                "total_ipos_loaded": 0,
+                "symbols_resolved": 0,
+                "financial_data_available": 0,
+                "buy_zone_candidates": 0,
+                "tracking_buy_candidates": 0,
+                "risk_alert_count": 0,
+                "upcoming_next7_count": 1,
+            },
+        },
+    )
+    state = app.PageState(active_tab="ipo", ipo_year=2026, ipo_quarter="Latest Available")
+
+    html = app.render_ipo_panel(state)
+
+    assert "ipo-upcoming-hot" in html
+    assert "+45.00%" in html
+    assert "High GMP &gt;40%" in html
+
+
+def test_simple_ipo_upcoming_keeps_clean_unresolved_company_details(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ipo_data_service,
+        "_simple_ipo_cache_path",
+        lambda year, ipo_type: tmp_path / f"simple_{ipo_type}_{year}.csv",
+    )
+    monkeypatch.setattr(ipo_data_service, "fetch_chittorgarh_ipos", lambda year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_ipomarket_ipos", lambda year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_ipoguru_ipos", lambda year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_secondary_ipo_source", lambda source_key, year, ipo_type="mainboard": {"records": [], "source": "", "error": ""})
+    upcoming_rows = [
+        {
+            "company_name": "Unknown Future Systems Listed: 22 Jul 2026 Symbol pending",
+            "symbol": "Symbol pending",
+            "ipo_date": "2026-07-22",
+            "sector": "Industrial automation",
+            "price_band": "100",
+            "gmp": "20",
+            "source_url": "https://example.test/ipo",
+        }
+    ]
+    monkeypatch.setattr(ipo_data_service, "_load_research_ready_upcoming_ipos", lambda today=None: (upcoming_rows, []))
+
+    dashboard = build_simple_ipo_performance_dashboard(2026, force_refresh=True, today=date(2026, 7, 20))
+    row = dashboard["upcoming_next7"][0]
+
+    assert row["company_name"] == "Unknown Future Systems"
+    assert row["symbol"] == ""
+    assert row["gmp_pct"] == 20.0
+    assert "Listed" not in row["screener_url"]
+    assert row["source_url"] == "https://example.test/ipo"
 
 
 def test_selected_ipo_rows_from_dashboard_keys_filters_checked_rows():

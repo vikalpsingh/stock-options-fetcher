@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
@@ -35,6 +36,9 @@ from ipo_screener_engine import (
     infer_theme,
     normalize_ipo_record,
 )
+from ipo.symbol_resolution.symbol_resolver import resolve_ipo_identity, resolve_symbol, screener_url_for
+from ipo.utils.company_name_cleaner import clean_ipo_company_name
+from ipo.utils.ipo_price_cleaner import clean_price as clean_ipo_price
 
 
 QUARTER_OPTIONS = ["Latest Available", "Q1", "Q2", "Q3", "Q4"]
@@ -112,6 +116,7 @@ IPO_SCREENER_SYMBOL_ALIASES = {
     "RUBICON RESEARCH": "RUBICON",
     "XTRANET TECHNOLOGIES": "XTRANET",
 }
+IPO_CONFIG_DIR = Path(__file__).resolve().parent / "ipo" / "config"
 IPO_FINANCIAL_REQUIRED_FIELDS = (
     "latest_revenue_growth_yoy",
     "revenue_growth_yoy",
@@ -213,22 +218,119 @@ IPO_EXPORT_FIELDS = [
 
 IPO_SIMPLE_EXPORT_FIELDS = [
     "rank",
+    "raw_company_name",
+    "clean_company_name",
+    "display_company_name",
     "company_name",
     "symbol",
+    "resolved_tradingsymbol",
+    "kite_key",
+    "exchange",
     "ipo_type",
     "listing_date",
     "ipo_price",
+    "ipo_price_status",
+    "ltp",
     "listing_price",
+    "listing_price_status",
     "current_price",
+    "price_data_status",
     "listing_gain_pct",
     "current_gain_pct",
+    "one_month_return_pct",
+    "three_month_return_pct",
+    "drawdown_from_52w_high_pct",
     "gain_from_ipo_rs",
     "issue_size",
     "ipo_market_cap",
+    "market_cap",
+    "sector",
+    "theme",
+    "sector_score",
+    "value_score",
+    "lt_score",
+    "is_listed_verified",
+    "eligible_for_scoring",
+    "has_latest_financial_data",
+    "has_market_cap_data",
+    "has_valuation_data",
+    "has_shareholding_data",
+    "buy_zone_allowed",
+    "financial_data_status",
+    "symbol_resolution_confidence",
+    "symbol_resolution_status",
+    "symbol_resolution_pipeline",
+    "verification_status",
+    "isin_match_status",
+    "screener_url_status",
+    "liquidity_score",
+    "valuation_status",
+    "cash_flow_flag",
+    "governance_flag",
+    "action",
+    "suggested_buy_zone",
+    "suggested_allocation",
+    "data_quality_score",
+    "data_quality_status",
+    "risk_alerts",
     "status_badge",
+    "status_class",
     "screener_url",
+    "broker_url",
     "source_url",
 ]
+
+IPO_DECISION_ACTION_PRIORITY = {
+    "BUY ZONE REACHED": 1,
+    "STAGGERED ACCUMULATION": 2,
+    "TRACKING BUY": 3,
+    "BUY ON CORRECTION": 4,
+    "RESULT CONFIRMED": 5,
+    "WATCHLIST": 6,
+    "DATA PENDING": 7,
+    "SYMBOL REVIEW NEEDED": 8,
+    "RESEARCH ONLY": 9,
+    "STRONG RUN-UP / AVOID CHASING": 10,
+    "UNVERIFIED - EXCLUDED": 11,
+    "AVOID": 12,
+    "REMOVE FROM WATCHLIST": 13,
+}
+
+IPO_HIGH_PRIORITY_THEME_KEYWORDS = {
+    "power": "Power and electrical infrastructure",
+    "electrical": "Power and electrical infrastructure",
+    "grid": "Grid automation",
+    "data centre": "Data centre infrastructure",
+    "data center": "Data centre infrastructure",
+    "electronics": "EMS and electronics manufacturing",
+    "ems": "EMS and electronics manufacturing",
+    "defence": "Defence and aerospace",
+    "defense": "Defence and aerospace",
+    "aerospace": "Defence and aerospace",
+    "healthcare": "Healthcare and diagnostics",
+    "diagnostic": "Healthcare and diagnostics",
+    "amc": "AMC and financialization",
+    "asset management": "AMC and financialization",
+    "financial": "AMC and financialization",
+    "chemical": "Specialty chemicals",
+    "manufacturing": "Manufacturing capex",
+    "industrial": "Industrial automation",
+    "automation": "Industrial automation",
+    "water": "Water infrastructure",
+    "fmcg": "FMCG ingredients",
+    "consumer": "Consumer premiumization",
+    "pharma": "Pharma/CDMO",
+    "cdmo": "Pharma/CDMO",
+    "logistics": "Logistics with profitability visibility",
+}
+
+IPO_MODERATE_THEME_KEYWORDS = {
+    "packaging": "Packaging",
+    "food": "Food processing",
+    "construction": "Construction materials",
+    "building": "Building products",
+    "auto": "Auto ancillaries",
+}
 
 IPO_TOP10_FIELDS = [
     "rank",
@@ -506,6 +608,8 @@ def _number(value: Any) -> float | None:
     text = _clean_text(value)
     if not text or text.upper() in {"N/A", "NA", "-", "--"}:
         return None
+    text = text.replace("₹", " ").replace("â‚¹", " ")
+    text = text.replace("%", " ")
     match = re.search(r"-?\d+(?:,\d{2,3})*(?:\.\d+)?|-?\d+(?:\.\d+)?", text)
     if not match:
         return None
@@ -513,6 +617,10 @@ def _number(value: Any) -> float | None:
         return float(match.group(0).replace(",", ""))
     except ValueError:
         return None
+
+
+def clean_price(value: Any, *, zero_is_missing: bool = False) -> float | None:
+    return clean_ipo_price(value, zero_is_missing=zero_is_missing)
 
 
 def _ipo_price_reference(value: Any) -> float | None:
@@ -736,15 +844,7 @@ def _first_present(row: dict[str, str], aliases: list[str]) -> str:
 
 
 def _clean_chittorgarh_company_name(value: Any) -> str:
-    text = _clean_text(value)
-    text = re.sub(r"\s*\bIPO\s+Detail\b.*$", "", text, flags=re.I)
-    text = re.sub(r"\s*\bStock\s+Quotes\b.*$", "", text, flags=re.I)
-    text = re.sub(r"\s*\bSymbol\s+pending\b.*$", "", text, flags=re.I)
-    text = re.sub(r"\s*\bListed\s*:\s*\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2}\b.*$", "", text, flags=re.I)
-    text = re.sub(r"\s*\bListed\s*:.*$", "", text, flags=re.I)
-    text = re.sub(r"\s*\bListed\s+On\b.*$", "", text, flags=re.I)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip(" -|")
+    return clean_ipo_company_name(value)
 
 
 def _ipo_company_lookup_key(value: Any) -> str:
@@ -1566,12 +1666,47 @@ def _simple_ipo_cache_path(year: int, ipo_type: str) -> Path:
     return _simple_ipo_cache_dir() / f"ipo_performance_{clean_type}_{int(year)}.csv"
 
 
+@lru_cache(maxsize=1)
+def _load_sector_theme_mapping() -> list[dict[str, Any]]:
+    """Load the IPO sector/theme keyword map without requiring PyYAML."""
+
+    path = IPO_CONFIG_DIR / "sector_theme_mapping.yaml"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    in_keywords = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+        if indent == 0 and line.endswith(":"):
+            if current:
+                rows.append(current)
+            current = {"name": line[:-1].strip(), "keywords": []}
+            in_keywords = False
+            continue
+        if current is None:
+            continue
+        if line == "keywords:":
+            in_keywords = True
+            continue
+        if in_keywords and line.startswith("- "):
+            current.setdefault("keywords", []).append(line[2:].strip().lower())
+            continue
+        if ":" in line:
+            key, value = line.split(":", 1)
+            current[key.strip()] = value.strip()
+            in_keywords = False
+    if current:
+        rows.append(current)
+    return rows
+
+
 def _simple_ipo_screener_url(row: dict[str, Any]) -> str:
-    symbol = _infer_ipo_screener_symbol(row)
-    if symbol:
-        return f"https://www.screener.in/company/{symbol}/"
-    company = _clean_chittorgarh_company_name(row.get("company_name") or "")
-    return f"https://www.screener.in/search/?q={quote_plus(company)}" if company else "https://www.screener.in/"
+    resolution = resolve_ipo_identity(row)
+    return str(resolution.get("screener_url") or "https://www.screener.in/")
 
 
 def _simple_ipo_status(current_gain_pct: float | None) -> tuple[str, str]:
@@ -1588,17 +1723,518 @@ def _simple_ipo_status(current_gain_pct: float | None) -> tuple[str, str]:
     return "Below IPO Price", "bad"
 
 
+def _simple_symbol_resolution(row: dict[str, Any], company: str, symbol: str) -> tuple[int, str]:
+    resolution = resolve_ipo_identity({**row, "company_name": company, "symbol": symbol})
+    confidence = int(_number(resolution.get("resolution_confidence")) or 0)
+    status = str(resolution.get("match_method") or resolution.get("resolution_status") or "UNRESOLVED")
+    return confidence, status
+
+
+def _has_simple_financial_data(row: dict[str, Any]) -> bool:
+    has_growth_data = any(
+        clean_price(row.get(field), zero_is_missing=True) is not None
+        for field in IPO_FINANCIAL_REQUIRED_FIELDS
+    )
+    has_support_data = any(
+        clean_price(row.get(field), zero_is_missing=True) is not None
+        for field in IPO_FINANCIAL_SUPPORT_FIELDS
+    )
+    return has_growth_data and has_support_data
+
+
+def _has_simple_shareholding_data(row: dict[str, Any]) -> bool:
+    return any(row.get(field) not in {None, "", "N/A", "NA", "-"} for field in IPO_SHAREHOLDING_FIELDS)
+
+
+def _has_simple_market_cap_data(row: dict[str, Any]) -> bool:
+    return clean_price(row.get("market_cap") or row.get("current_market_cap") or row.get("ipo_market_cap"), zero_is_missing=True) is not None
+
+
+def _has_simple_valuation_data(row: dict[str, Any]) -> bool:
+    valuation_fields = (
+        "pe_ratio",
+        "pe",
+        "industry_pe",
+        "peer_median_pe",
+        "price_to_sales",
+        "ps_ratio",
+        "pb_ratio",
+        "ev_ebitda",
+    )
+    return any(clean_price(row.get(field), zero_is_missing=True) is not None for field in valuation_fields)
+
+
+def _simple_sector_and_score(row: dict[str, Any], company: str) -> tuple[str, str, float]:
+    context_text = " ".join(
+        _clean_text(row.get(field))
+        for field in ("sector", "theme", "business", "description", "industry")
+    ).strip()
+    text = f"{context_text} {company}".lower()
+    theme = _clean_text(row.get("theme") or "")
+    sector = _clean_text(row.get("sector") or row.get("industry") or "")
+    for mapping in _load_sector_theme_mapping():
+        if any(keyword and keyword in text for keyword in mapping.get("keywords", [])):
+            mapped_sector = _clean_text(mapping.get("sector") or mapping.get("name") or "")
+            mapped_theme = _clean_text(mapping.get("theme") or mapping.get("name") or "")
+            return sector or mapped_sector, theme or mapped_theme, 85.0
+    for keyword, mapped_theme in IPO_HIGH_PRIORITY_THEME_KEYWORDS.items():
+        if keyword in text:
+            return sector or mapped_theme, theme or mapped_theme, 85.0
+    for keyword, mapped_theme in IPO_MODERATE_THEME_KEYWORDS.items():
+        if keyword in text:
+            return sector or mapped_theme, theme or mapped_theme, 68.0
+    if sector or theme:
+        return sector or theme, theme or sector, 60.0
+    inferred_theme = ""
+    if context_text:
+        try:
+            inferred_theme = infer_theme({**row, "company_name": company})
+        except Exception:
+            inferred_theme = ""
+    if inferred_theme and inferred_theme != "Other":
+        return sector or inferred_theme, theme or inferred_theme, 62.0
+    return "Sector Review Needed", "Theme Review Needed", 0.0
+
+
+def _simple_liquidity_score(row: dict[str, Any], current_price: float | None, ipo_type: str) -> float:
+    if current_price is None:
+        return 30.0
+    issue_size = _number(row.get("issue_size"))
+    market_cap = _number(row.get("market_cap") or row.get("current_market_cap") or row.get("ipo_market_cap"))
+    volume = _number(row.get("volume") or row.get("average_volume"))
+    score = 70.0 if ipo_type.lower() != "sme" else 55.0
+    if issue_size and issue_size >= 500:
+        score += 8
+    if market_cap and market_cap >= 1000:
+        score += 8
+    if volume and volume >= 100_000:
+        score += 8
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def _simple_data_quality_score(
+    *,
+    symbol_confidence: int,
+    current_price: float | None,
+    ipo_price: float | None,
+    has_financials: bool,
+    has_market_cap: bool,
+    has_valuation: bool,
+    has_shareholding: bool,
+    liquidity_score: float,
+    source_url: str,
+) -> tuple[float, str]:
+    score = 0.0
+    if source_url:
+        score += 10
+    if symbol_confidence >= 85:
+        score += 20
+    elif symbol_confidence >= 70:
+        score += 10
+    if current_price is not None and ipo_price is not None:
+        score += 20
+    if has_financials:
+        score += 20
+    if has_market_cap:
+        score += 10
+    if has_valuation:
+        score += 10
+    if has_shareholding:
+        score += 5
+    if liquidity_score >= 60:
+        score += 5
+    status = "FULL" if score >= 80 else ("WATCH_ONLY" if score >= 60 else "DATA_GAP")
+    return round(score, 2), status
+
+
+def _simple_cash_flow_flag(row: dict[str, Any], has_financials: bool) -> str:
+    cfo_pat = _number(row.get("cfo_pat"))
+    fcf = _number(row.get("free_cash_flow") or row.get("fcf"))
+    if not has_financials:
+        return "DATA PENDING"
+    if cfo_pat is not None and cfo_pat < 0.4:
+        return "RED"
+    if fcf is not None and fcf < 0:
+        return "YELLOW"
+    if cfo_pat is not None and cfo_pat >= 0.7:
+        return "GREEN"
+    return "YELLOW"
+
+
+def _simple_governance_flag(row: dict[str, Any]) -> str:
+    pledge = _number(row.get("pledge_pct") or row.get("promoter_pledge"))
+    pledge_change = _number(row.get("pledge_change"))
+    promoter_change = _number(row.get("promoter_holding_change"))
+    if pledge is not None and pledge > 0:
+        return "RED"
+    if pledge_change is not None and pledge_change > 0:
+        return "RED"
+    if promoter_change is not None and promoter_change < -1:
+        return "YELLOW"
+    return "GREEN"
+
+
+def _simple_valuation_status(current_gain: float | None, drawdown: float | None) -> str:
+    if current_gain is None:
+        return "Price data pending"
+    if drawdown is not None and drawdown <= -25:
+        return "Corrected / research"
+    if drawdown is not None and drawdown <= -20:
+        return "Near buy-zone correction"
+    if current_gain >= 100:
+        return "Expensive / wait"
+    if current_gain >= 50:
+        return "Strong but watch valuation"
+    if current_gain >= 0:
+        return "Reasonable return zone"
+    return "Below IPO price / check risk"
+
+
+def _simple_value_score(
+    row: dict[str, Any],
+    *,
+    sector_score: float,
+    liquidity_score: float,
+    current_gain: float | None,
+    drawdown: float | None,
+    has_financials: bool,
+    cash_flow_flag: str,
+    governance_flag: str,
+) -> float | None:
+    if current_gain is None:
+        return None
+    score = 0.0
+    score += min(20.0, sector_score * 0.20)
+    score += 11.0 if sector_score >= 70 else (8.0 if sector_score >= 55 else 5.0)
+    if has_financials:
+        revenue_growth = _number(row.get("latest_revenue_growth_yoy") or row.get("revenue_growth_yoy")) or 0.0
+        pat_growth = _number(row.get("latest_pat_growth_yoy") or row.get("pat_growth_yoy") or row.get("profit_growth_yoy")) or 0.0
+        score += 20.0 if revenue_growth >= 20 and pat_growth >= 20 else (14.0 if revenue_growth >= 15 and pat_growth > 0 else 8.0)
+        roce = _number(row.get("roce")) or 0.0
+        roe = _number(row.get("roe")) or 0.0
+        score += 15.0 if roce >= 20 and roe >= 15 else (10.0 if roce >= 15 or roe >= 12 else 5.0)
+        score += 15.0 if cash_flow_flag == "GREEN" else (7.0 if cash_flow_flag == "YELLOW" else 0.0)
+    else:
+        score += 8.0 if current_gain >= 50 else 5.0
+        score += 5.0
+        score += 5.0
+    if drawdown is not None and drawdown <= -20:
+        score += 10.0
+    elif current_gain is not None and 0 <= current_gain <= 60:
+        score += 7.0
+    elif current_gain is not None and current_gain > 100:
+        score += 3.0
+    else:
+        score += 5.0
+    score += 5.0 if governance_flag == "GREEN" else (2.0 if governance_flag == "YELLOW" else 0.0)
+    if liquidity_score < 45:
+        score -= 8.0
+    if not has_financials:
+        score = min(score, 70.0)
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def _simple_suggested_allocation(action: str, ipo_type: str) -> str:
+    if action == "BUY ZONE REACHED":
+        return "0.5-1.5%" if ipo_type.lower() == "sme" else "1-2%"
+    if action == "STAGGERED ACCUMULATION":
+        return "0.5-1.0%" if ipo_type.lower() == "sme" else "1.0-1.5%"
+    if action == "TRACKING BUY":
+        return "0.25-0.50%"
+    if action in {"BUY ON CORRECTION", "RESULT CONFIRMED", "WATCHLIST"}:
+        return "Watch / no order"
+    return "No order"
+
+
+def _simple_action(
+    *,
+    symbol_confidence: int,
+    data_quality_score: float,
+    is_demo_record: bool,
+    is_listed_verified: bool,
+    has_financials: bool,
+    has_market_cap: bool,
+    has_valuation: bool,
+    has_shareholding: bool,
+    value_score: float | None,
+    sector_score: float,
+    sector: str,
+    current_price: float | None,
+    ipo_price: float | None,
+    current_gain: float | None,
+    drawdown: float | None,
+    cash_flow_flag: str,
+    governance_flag: str,
+    liquidity_score: float,
+    ipo_type: str,
+) -> str:
+    if is_demo_record:
+        return "UNVERIFIED - EXCLUDED"
+    if symbol_confidence < 85:
+        return "SYMBOL REVIEW NEEDED"
+    if not is_listed_verified:
+        return "UNVERIFIED - EXCLUDED"
+    if current_price is None or ipo_price is None:
+        return "DATA PENDING"
+    if not has_financials:
+        return "DATA PENDING"
+    if sector == "Sector Review Needed":
+        return "RESEARCH ONLY"
+    if current_gain is not None and current_gain > 100 and not has_valuation:
+        return "STRONG RUN-UP / AVOID CHASING"
+    if not has_market_cap or not has_valuation or not has_shareholding:
+        return "DATA PENDING"
+    if data_quality_score < 60:
+        return "DATA PENDING"
+    if cash_flow_flag == "RED" or governance_flag == "RED":
+        return "AVOID"
+    if liquidity_score < 40:
+        return "AVOID"
+    score = value_score or 0.0
+    corrected = drawdown is not None and drawdown <= -20
+    if score >= 85 and sector_score >= 70 and corrected:
+        return "BUY ZONE REACHED"
+    if score >= 80 and corrected and ipo_type.lower() == "sme":
+        return "TRACKING BUY"
+    if score >= 80 and corrected:
+        return "STAGGERED ACCUMULATION"
+    if score >= 75:
+        return "BUY ON CORRECTION"
+    if score >= 65:
+        return "RESULT CONFIRMED"
+    if score >= 50:
+        return "WATCHLIST"
+    return "AVOID"
+
+
+def _simple_action_rank(row: dict[str, Any]) -> int:
+    return IPO_DECISION_ACTION_PRIORITY.get(str(row.get("action") or "").upper(), 99)
+
+
+def _enrich_simple_ipo_decision(row: dict[str, Any], ipo_type: str | None = None) -> dict[str, Any]:
+    enriched = dict(row)
+    raw_company_name = _clean_text(
+        enriched.get("raw_company_name")
+        or enriched.get("company_name")
+        or enriched.get("company")
+        or enriched.get("ipo_name")
+        or ""
+    )
+    company = clean_ipo_company_name(raw_company_name)
+    enriched["raw_company_name"] = raw_company_name
+    enriched["clean_company_name"] = company
+    enriched["display_company_name"] = company
+    enriched["company_name"] = company
+    normalized_type = str(ipo_type or enriched.get("ipo_type") or enriched.get("market_type") or "Mainboard")
+    normalized_type = "SME" if normalized_type.strip().lower() == "sme" else "Mainboard"
+    enriched["ipo_type"] = normalized_type
+    source_symbol = _infer_ipo_screener_symbol({**enriched, "company_name": company})
+    resolution = resolve_ipo_identity({**enriched, "company_name": company, "symbol": source_symbol})
+    symbol = str(resolution.get("symbol") or "")
+    enriched["symbol"] = symbol
+    enriched["resolved_tradingsymbol"] = str(resolution.get("resolved_tradingsymbol") or symbol)
+    enriched["kite_key"] = str(resolution.get("kite_key") or "")
+    exchange = _clean_text(resolution.get("exchange") or enriched.get("exchange") or ("NSE SME" if normalized_type == "SME" else "NSE"))
+    enriched["exchange"] = exchange
+    enriched["isin"] = _clean_text(resolution.get("isin") or enriched.get("isin") or "")
+    enriched["screener_url"] = str(resolution.get("screener_url") or _simple_ipo_screener_url({**enriched, "company_name": company, "symbol": symbol}))
+    enriched["screener_url_status"] = str(resolution.get("screener_url_status") or "")
+    enriched["verification_status"] = str(resolution.get("verification_status") or "")
+    enriched["isin_match_status"] = str(resolution.get("isin_match_status") or "")
+    enriched["symbol_resolution_pipeline"] = str(resolution.get("resolution_pipeline") or "")
+    current_price = clean_price(enriched.get("ltp") or enriched.get("current_price"), zero_is_missing=True)
+    ipo_price = clean_price(enriched.get("ipo_price") or enriched.get("issue_price"), zero_is_missing=True)
+    listing_price = clean_price(enriched.get("listing_price"), zero_is_missing=True)
+    current_gain = _number(enriched.get("current_gain_pct") or enriched.get("gain_from_ipo_pct") or enriched.get("return_from_issue_pct"))
+    if current_gain is None:
+        current_gain = _pct(current_price, ipo_price)
+    drawdown = _number(enriched.get("drawdown_from_52w_high_pct"))
+    market_cap = clean_price(enriched.get("market_cap") or enriched.get("current_market_cap") or enriched.get("ipo_market_cap"), zero_is_missing=True)
+    sector, theme, sector_score = _simple_sector_and_score(enriched, company)
+    symbol_confidence = int(_number(resolution.get("resolution_confidence")) or 0)
+    symbol_status = str(resolution.get("match_method") or resolution.get("resolution_status") or "UNRESOLVED")
+    is_demo_record = _is_demo_ipo_record(enriched)
+    is_listed_verified = bool(resolution.get("is_listed_verified")) and not is_demo_record
+    has_financials = _has_simple_financial_data(enriched)
+    has_market_cap = market_cap is not None or _has_simple_market_cap_data(enriched)
+    has_valuation = _has_simple_valuation_data(enriched)
+    has_shareholding = _has_simple_shareholding_data(enriched)
+    liquidity_score = _simple_liquidity_score(enriched, current_price, normalized_type)
+    data_quality_score, data_quality_status = _simple_data_quality_score(
+        symbol_confidence=symbol_confidence,
+        current_price=current_price,
+        ipo_price=ipo_price,
+        has_financials=has_financials,
+        has_market_cap=has_market_cap,
+        has_valuation=has_valuation,
+        has_shareholding=has_shareholding,
+        liquidity_score=liquidity_score,
+        source_url=_clean_text(enriched.get("source_url") or ""),
+    )
+    cash_flow_flag = _simple_cash_flow_flag(enriched, has_financials)
+    governance_flag = _simple_governance_flag(enriched)
+    eligible_for_scoring = (
+        bool(is_listed_verified)
+        and current_price is not None
+        and market_cap is not None
+        and has_financials
+        and has_valuation
+        and has_shareholding
+        and sector != "Sector Review Needed"
+        and not is_demo_record
+    )
+    value_score = _simple_value_score(
+        enriched,
+        sector_score=sector_score,
+        liquidity_score=liquidity_score,
+        current_gain=current_gain,
+        drawdown=drawdown,
+        has_financials=has_financials,
+        cash_flow_flag=cash_flow_flag,
+        governance_flag=governance_flag,
+    ) if eligible_for_scoring else None
+    action = _simple_action(
+        symbol_confidence=symbol_confidence,
+        data_quality_score=data_quality_score,
+        is_demo_record=is_demo_record,
+        is_listed_verified=is_listed_verified,
+        has_financials=has_financials,
+        has_market_cap=has_market_cap,
+        has_valuation=has_valuation,
+        has_shareholding=has_shareholding,
+        value_score=value_score,
+        sector_score=sector_score,
+        sector=sector,
+        current_price=current_price,
+        ipo_price=ipo_price,
+        current_gain=current_gain,
+        drawdown=drawdown,
+        cash_flow_flag=cash_flow_flag,
+        governance_flag=governance_flag,
+        liquidity_score=liquidity_score,
+        ipo_type=normalized_type,
+    )
+    alerts: list[str] = []
+    if is_demo_record:
+        alerts.append("Demo/sample excluded")
+    if not is_listed_verified:
+        alerts.append("Unverified listing")
+    if symbol_confidence < 85:
+        alerts.append("Symbol review")
+    if not has_financials:
+        alerts.append("Financial data pending")
+    if not has_market_cap:
+        alerts.append("Market cap data pending")
+    if not has_valuation:
+        alerts.append("Valuation data pending")
+    if not has_shareholding:
+        alerts.append("Shareholding data pending")
+    if sector == "Sector Review Needed":
+        alerts.append("Sector review needed")
+    if liquidity_score < 50:
+        alerts.append("Liquidity risk")
+    if cash_flow_flag == "RED":
+        alerts.append("Cash-flow red flag")
+    if governance_flag == "RED":
+        alerts.append("Governance red flag")
+    if drawdown is not None and drawdown <= -25 and (value_score or 0) >= 75:
+        alerts.append("Valuation compression")
+
+    status, status_class = _simple_ipo_status(current_gain)
+    buy_zone_allowed = action == "BUY ZONE REACHED" and eligible_for_scoring
+    if action in {"BUY ZONE REACHED", "STAGGERED ACCUMULATION", "TRACKING BUY"}:
+        status, status_class = action.title(), "good"
+    elif action in {"BUY ON CORRECTION", "RESULT CONFIRMED"}:
+        status, status_class = action.title(), "blue"
+    elif action in {"SYMBOL REVIEW NEEDED", "DATA PENDING", "WATCHLIST", "RESEARCH ONLY", "STRONG RUN-UP / AVOID CHASING"}:
+        status, status_class = action.title(), "watch"
+    elif action in {"AVOID", "REMOVE FROM WATCHLIST", "UNVERIFIED - EXCLUDED"}:
+        status, status_class = action.title(), "bad"
+
+    enriched.update(
+        {
+            "ltp": current_price,
+            "current_price": current_price,
+            "listing_price": listing_price,
+            "ipo_price": ipo_price,
+            "ipo_price_status": "OK" if ipo_price is not None else "IPO_PRICE_MISSING",
+            "listing_price_status": "OK" if listing_price is not None else "LISTING_PRICE_MISSING",
+            "price_data_status": "OK" if current_price is not None else "CURRENT_PRICE_MISSING",
+            "current_gain_pct": current_gain,
+            "drawdown_from_52w_high_pct": drawdown,
+            "market_cap": market_cap,
+            "current_market_cap": market_cap,
+            "sector": sector,
+            "theme": theme,
+            "sector_score": sector_score,
+            "sector_quality_score": sector_score,
+            "value_score": value_score,
+            "lt_score": value_score,
+            "financial_data_status": "Financial Data Available" if has_financials else "Financial Data Pending",
+            "is_listed_verified": is_listed_verified,
+            "eligible_for_scoring": eligible_for_scoring,
+            "has_latest_financial_data": has_financials,
+            "has_market_cap_data": has_market_cap,
+            "has_valuation_data": has_valuation,
+            "has_shareholding_data": has_shareholding,
+            "buy_zone_allowed": buy_zone_allowed,
+            "symbol_resolution_confidence": symbol_confidence,
+            "symbol_resolution_status": symbol_status,
+            "symbol_resolution_pipeline": str(resolution.get("resolution_pipeline") or ""),
+            "verification_status": str(resolution.get("verification_status") or ""),
+            "isin_match_status": str(resolution.get("isin_match_status") or ""),
+            "screener_url_status": str(resolution.get("screener_url_status") or ""),
+            "liquidity_score": liquidity_score,
+            "valuation_status": _simple_valuation_status(current_gain, drawdown) if has_valuation else "Valuation Data Pending",
+            "cash_flow_flag": cash_flow_flag,
+            "governance_flag": governance_flag,
+            "action": action,
+            "suggested_buy_zone": (
+                f"<= {round(current_price, 2):.2f}"
+                if buy_zone_allowed and current_price is not None
+                else ("Wait for valuation + quarterly data" if action in {"DATA PENDING", "WATCHLIST", "BUY ON CORRECTION", "STRONG RUN-UP / AVOID CHASING"} else "N/A")
+            ),
+            "suggested_allocation": _simple_suggested_allocation(action, normalized_type),
+            "data_quality_score": data_quality_score,
+            "data_quality_status": data_quality_status,
+            "risk_alerts": "; ".join(alerts) if alerts else "None",
+            "status_badge": status,
+            "status_class": status_class,
+            "screener_url": str(resolution.get("screener_url") or _simple_ipo_screener_url({**enriched, "company_name": company, "symbol": symbol})),
+            "broker_url": f"https://kite.zerodha.com/quote/{exchange.replace(' ', '')}/{symbol}" if symbol else "",
+        }
+    )
+    return enriched
+
+
 def _simple_ipo_performance_row(row: dict[str, Any], ipo_type: str) -> dict[str, Any]:
-    company = _clean_chittorgarh_company_name(row.get("company_name") or "")
-    symbol = _infer_ipo_screener_symbol({**row, "company_name": company})
-    ipo_price = _number(row.get("ipo_price") or row.get("issue_price"))
-    listing_price = _number(row.get("listing_price"))
-    current_price = _number(row.get("current_price"))
+    raw_company = _clean_text(
+        row.get("raw_company_name")
+        or row.get("company_name")
+        or row.get("company")
+        or row.get("ipo_name")
+        or ""
+    )
+    company = _clean_chittorgarh_company_name(raw_company)
+    source_symbol = _clean_text(row.get("symbol") or row.get("tradingsymbol") or row.get("ticker") or "")
+    symbol = _infer_ipo_screener_symbol({**row, "company_name": company, "symbol": source_symbol})
+    ipo_price = clean_price(
+        row.get("ipo_price") or row.get("issue_price") or row.get("issue_price_rs"),
+        zero_is_missing=True,
+    )
+    listing_price = clean_price(
+        row.get("listing_price") or row.get("listing_day_close") or row.get("listing_day_price"),
+        zero_is_missing=True,
+    )
+    current_price = clean_price(
+        row.get("current_price") or row.get("ltp") or row.get("cmp"),
+        zero_is_missing=True,
+    )
     current_gain = _number(row.get("current_gain_pct") or row.get("gain_from_ipo_pct") or row.get("return_from_issue_pct"))
     if current_gain is None:
         current_gain = _pct(current_price, ipo_price)
     listing_gain = _number(row.get("listing_gain_pct") or row.get("return_from_listing_pct"))
-    if listing_gain is None:
+    if listing_gain is None and listing_price is not None:
         listing_gain = _pct(listing_price, ipo_price)
     gain_rs = None
     if current_price is not None and ipo_price is not None:
@@ -1607,29 +2243,93 @@ def _simple_ipo_performance_row(row: dict[str, Any], ipo_type: str) -> dict[str,
     normalized_type = "SME" if str(ipo_type or "").strip().lower() == "sme" else "Mainboard"
     simplified = {
         "rank": "",
+        "raw_company_name": raw_company,
+        "clean_company_name": company,
+        "display_company_name": company,
         "company_name": company,
         "symbol": symbol,
+        "isin": _clean_text(row.get("isin") or row.get("ISIN") or ""),
+        "exchange": _clean_text(row.get("exchange") or row.get("listing_exchange") or ("NSE SME" if normalized_type == "SME" else "NSE")),
         "ipo_type": normalized_type,
         "listing_date": _clean_text(row.get("listing_date") or ""),
         "ipo_price": ipo_price,
+        "ltp": current_price,
         "listing_price": listing_price,
         "current_price": current_price,
         "listing_gain_pct": listing_gain,
         "current_gain_pct": current_gain,
+        "one_month_return_pct": _number(row.get("one_month_return_pct") or row.get("one_month_return") or row.get("return_1m_pct")),
+        "three_month_return_pct": _number(row.get("three_month_return_pct") or row.get("three_month_return") or row.get("return_3m_pct")),
+        "drawdown_from_52w_high_pct": _number(row.get("drawdown_from_52w_high_pct") or row.get("drawdown_52w_high_pct")),
         "gain_from_ipo_rs": gain_rs,
         "issue_size": _clean_text(row.get("issue_size") or "N/A"),
-        "ipo_market_cap": _number(row.get("ipo_market_cap")),
+        "ipo_market_cap": clean_price(row.get("ipo_market_cap") or row.get("issue_market_cap"), zero_is_missing=True),
+        "market_cap": clean_price(
+            row.get("market_cap") or row.get("current_market_cap") or row.get("ipo_market_cap"),
+            zero_is_missing=True,
+        ),
+        "sector": _clean_text(row.get("sector") or row.get("industry") or ""),
+        "theme": _clean_text(row.get("theme") or ""),
         "status_badge": status,
         "status_class": status_class,
         "screener_url": _simple_ipo_screener_url({**row, "company_name": company, "symbol": symbol}),
-        "source_url": _clean_text(row.get("source_url") or row.get("source") or ""),
+        "source_url": _clean_text(row.get("source_url") or ""),
+        "source": _clean_text(row.get("source") or ""),
+        "data_source": _clean_text(row.get("data_source") or row.get("source") or ""),
+        "instrument_token": row.get("instrument_token") or "",
+        "is_demo": row.get("is_demo") or row.get("is_mock") or row.get("is_sample") or False,
     }
-    return simplified
+    passthrough_fields = (
+        *IPO_FINANCIAL_REQUIRED_FIELDS,
+        *IPO_FINANCIAL_SUPPORT_FIELDS,
+        *IPO_SHAREHOLDING_FIELDS,
+        "pe",
+        "pe_ratio",
+        "industry_pe",
+        "peer_median_pe",
+        "price_to_sales",
+        "ps_ratio",
+        "pb_ratio",
+        "ev_ebitda",
+        "volume",
+        "average_volume",
+        "turnover",
+        "free_float_market_cap",
+        "current_market_cap",
+        "promoter_pledge",
+        "promoter_change_qoq",
+        "pledge_change_qoq",
+        "latest_revenue_growth_yoy",
+        "latest_pat_growth_yoy",
+        "opm_trend_pct",
+    )
+    for field in passthrough_fields:
+        if field in row:
+            simplified[field] = row.get(field)
+    return _enrich_simple_ipo_decision(simplified, normalized_type)
 
 
-def _simple_ipo_sort_key(row: dict[str, Any]) -> tuple[int, float]:
+def _simple_ipo_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float, float, float, float, float, float]:
+    eligible = 1.0 if row.get("eligible_for_scoring") is True else 0.0
+    verified = 1.0 if row.get("is_listed_verified") is True else 0.0
+    confidence = _number(row.get("symbol_resolution_confidence")) or 0.0
     gain = _number(row.get("current_gain_pct"))
-    return (1 if gain is not None else 0, float(gain or -10_000))
+    value_score = _number(row.get("value_score")) or -1
+    sector_score = _number(row.get("sector_score") or row.get("sector_quality_score")) or -1
+    drawdown = _number(row.get("drawdown_from_52w_high_pct"))
+    drawdown_opportunity = abs(drawdown) if drawdown is not None and drawdown < 0 else 0
+    liquidity_score = _number(row.get("liquidity_score")) or -1
+    return (
+        eligible,
+        verified,
+        float(confidence),
+        float(gain or -10_000),
+        float(100 - _simple_action_rank(row)),
+        float(value_score),
+        float(sector_score),
+        float(drawdown_opportunity),
+        float(liquidity_score),
+    )
 
 
 def _rank_simple_ipo_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1639,10 +2339,29 @@ def _rank_simple_ipo_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ranked
 
 
+def _simple_ipo_display_candidate(row: dict[str, Any]) -> bool:
+    """Keep research rows visible even when symbol resolution is still pending."""
+    if _is_demo_ipo_record(row):
+        return False
+    if not _clean_text(row.get("company_name") or row.get("clean_company_name")):
+        return False
+    current_gain = _number(row.get("current_gain_pct"))
+    if current_gain is not None:
+        return current_gain >= 0
+    current_price = clean_price(row.get("current_price") or row.get("ltp"), zero_is_missing=True)
+    ipo_price = clean_price(row.get("ipo_price"), zero_is_missing=True)
+    if current_price is not None and ipo_price is not None:
+        return current_price >= ipo_price
+    return False
+
+
 def _write_simple_ipo_csv_cache(year: int, ipo_type: str, rows: list[dict[str, Any]], fetched_at: str) -> None:
     path = _simple_ipo_cache_path(year, ipo_type)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [*IPO_SIMPLE_EXPORT_FIELDS, "status_class", "_cache_fetched_at"]
+    fields = [*IPO_SIMPLE_EXPORT_FIELDS]
+    if "status_class" not in fields:
+        fields.append("status_class")
+    fields.append("_cache_fetched_at")
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -1662,12 +2381,23 @@ def _read_simple_ipo_csv_cache(year: int, ipo_type: str) -> tuple[list[dict[str,
         for field in (
             "rank",
             "ipo_price",
+            "ltp",
             "listing_price",
             "current_price",
             "listing_gain_pct",
             "current_gain_pct",
+            "one_month_return_pct",
+            "three_month_return_pct",
+            "drawdown_from_52w_high_pct",
             "gain_from_ipo_rs",
             "ipo_market_cap",
+            "market_cap",
+            "sector_score",
+            "value_score",
+            "lt_score",
+            "symbol_resolution_confidence",
+            "liquidity_score",
+            "data_quality_score",
         ):
             if field == "rank":
                 try:
@@ -1676,11 +2406,13 @@ def _read_simple_ipo_csv_cache(year: int, ipo_type: str) -> tuple[list[dict[str,
                     row[field] = ""
             else:
                 row[field] = _number(row.get(field))
-        clean_company = _clean_chittorgarh_company_name(row.get("company_name") or "")
+        raw_company = _clean_text(row.get("raw_company_name") or row.get("company_name") or "")
+        clean_company = _clean_chittorgarh_company_name(raw_company)
+        row["raw_company_name"] = raw_company
+        row["clean_company_name"] = clean_company
+        row["display_company_name"] = clean_company
         row["company_name"] = clean_company
-        symbol = _infer_ipo_screener_symbol(row)
-        row["symbol"] = symbol
-        row["screener_url"] = _simple_ipo_screener_url({**row, "symbol": symbol, "company_name": clean_company})
+        row.update(_enrich_simple_ipo_decision(row))
     if not timestamp:
         timestamp = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
     return rows, timestamp
@@ -1758,16 +2490,49 @@ def _parse_ipo_date_text(value: Any, default_year: int | None = None) -> date | 
     text = _clean_text(value)
     if not text:
         return None
+    text = re.sub(r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", text, flags=re.I)
+    text = text.replace("–", " - ").replace("—", " - ")
+    text = re.sub(r"\s+", " ", text).strip()
     first_part = re.split(r"\s+(?:to|-)\s+", text, maxsplit=1, flags=re.I)[0].strip()
     candidates = [first_part, text]
+    for pattern in (
+        r"\b20\d{2}-\d{1,2}-\d{1,2}\b",
+        r"\b\d{1,2}[/-]\d{1,2}[/-]20\d{2}\b",
+        r"\b\d{1,2}\s+[A-Za-z]{3,9}(?:\s+20\d{2})?\b",
+        r"\b[A-Za-z]{3,9}\s+\d{1,2}(?:,?\s+20\d{2})?\b",
+    ):
+        candidates.extend(match.group(0) for match in re.finditer(pattern, text))
+    seen_candidates: set[str] = set()
     for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate or candidate.lower() in seen_candidates:
+            continue
+        seen_candidates.add(candidate.lower())
         try:
             return datetime.fromisoformat(candidate[:10]).date()
         except ValueError:
             pass
-        for fmt in ("%d %b %Y", "%d %B %Y", "%d-%m-%Y", "%d/%m/%Y", "%b %d %Y", "%B %d %Y"):
+        for fmt in (
+            "%d %b %Y",
+            "%d %B %Y",
+            "%d-%m-%Y",
+            "%d/%m/%Y",
+            "%b %d %Y",
+            "%B %d %Y",
+            "%d %b",
+            "%d %B",
+            "%b %d",
+            "%B %d",
+        ):
             try:
-                return datetime.strptime(candidate.replace(",", ""), fmt).date()
+                candidate_text = candidate.replace(",", "")
+                parse_fmt = fmt
+                if "%Y" not in fmt:
+                    if default_year is None:
+                        continue
+                    candidate_text = f"{candidate_text} {int(default_year)}"
+                    parse_fmt = f"{fmt} %Y"
+                return datetime.strptime(candidate_text, parse_fmt).date()
             except ValueError:
                 continue
     month_match = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(20\d{2}))?", text)
@@ -1791,26 +2556,139 @@ def _parse_ipo_date_text(value: Any, default_year: int | None = None) -> date | 
     return None
 
 
+def _upcoming_ipo_status(gmp_pct: float | None) -> tuple[str, str]:
+    if gmp_pct is None:
+        return "Watch", "neutral"
+    if gmp_pct >= 40:
+        return "High GMP >40%", "hot"
+    if gmp_pct >= 25:
+        return "Strong GMP", "good"
+    if gmp_pct >= 10:
+        return "Positive GMP", "blue"
+    if gmp_pct >= 0:
+        return "Flat GMP", "warn"
+    return "Negative GMP", "bad"
+
+
+UPCOMING_IPO_DATE_KEYS = (
+    "ipo_date",
+    "ipo_open_date",
+    "open_date",
+    "opening_date",
+    "open_close",
+    "open_close_date",
+    "issue_open_date",
+    "issue_start_date",
+    "bidding_start_date",
+    "offer_start_date",
+    "subscription_date",
+    "subscription",
+    "date",
+    "open",
+)
+
+
+def _upcoming_ipo_date_value(row: dict[str, Any]) -> Any:
+    """Return the best open/start date field from inconsistent IPO source rows."""
+    exact_keys = {_normalize_key(key) for key in UPCOMING_IPO_DATE_KEYS}
+    for key, value in row.items():
+        normalized = _normalize_key(key)
+        if normalized in exact_keys and _clean_text(value):
+            return value
+    for key, value in row.items():
+        normalized = _normalize_key(key)
+        if not _clean_text(value):
+            continue
+        if "listing" in normalized or "listed" in normalized or "last_updated" in normalized:
+            continue
+        if (
+            ("ipo" in normalized and "date" in normalized)
+            or ("open" in normalized and ("date" in normalized or "close" in normalized))
+            or ("issue" in normalized and "start" in normalized)
+            or ("bidding" in normalized and "start" in normalized)
+        ):
+            return value
+    return row.get("ipo_date")
+
+
+def _enrich_upcoming_ipo_row(row: dict[str, Any], ipo_date: date, anchor: date) -> dict[str, Any]:
+    """Clean and enrich upcoming IPO rows for display-only research.
+
+    Upcoming IPO tables often do not have a listed tradingsymbol yet. Keep the
+    company visible, clean noisy date/symbol text, calculate GMP %, and build a
+    Screener search link instead of dropping the row.
+    """
+
+    raw_company = _clean_text(
+        row.get("raw_company_name")
+        or row.get("company_name")
+        or row.get("company")
+        or row.get("ipo_name")
+        or row.get("name")
+        or ""
+    )
+    company = clean_ipo_company_name(raw_company)
+    source_symbol = _infer_ipo_screener_symbol({**row, "company_name": company})
+    resolution = resolve_ipo_identity({**row, "company_name": company, "symbol": source_symbol})
+    symbol = str(resolution.get("symbol") or source_symbol or "").strip()
+    gmp_value = _first_present(
+        row,
+        ["gmp", "current_gmp", "grey_market_premium", "gmp_rs", "premium"],
+    )
+    price_band_value = _first_present(
+        row,
+        ["price_band", "ipo_price", "issue_price", "price_range", "price"],
+    )
+    gmp_pct = row.get("gmp_pct")
+    if gmp_pct in {None, ""}:
+        gmp_pct = _gmp_percent(gmp_value, price_band_value)
+    else:
+        gmp_pct = _number(gmp_pct)
+    status, status_class = _upcoming_ipo_status(gmp_pct)
+    return {
+        **row,
+        "raw_company_name": raw_company,
+        "company_name": company,
+        "display_company_name": company,
+        "symbol": symbol,
+        "exchange": _clean_text(resolution.get("exchange") or row.get("exchange") or "NSE"),
+        "ipo_date": ipo_date.isoformat(),
+        "days_to_ipo": (ipo_date - anchor).days,
+        "sector": _clean_text(row.get("sector") or row.get("theme") or row.get("industry") or "N/A"),
+        "ipo_type": _clean_text(row.get("ipo_type") or row.get("market_type") or row.get("issue_type") or "N/A"),
+        "issue_size": _clean_text(row.get("issue_size") or row.get("issue") or row.get("offer_size") or "N/A"),
+        "price_band": _clean_text(price_band_value or "N/A"),
+        "gmp": _clean_text(gmp_value or "N/A"),
+        "gmp_pct": gmp_pct,
+        "lot_size": _clean_text(row.get("lot_size") or row.get("lot") or "N/A"),
+        "status_badge": status,
+        "status_class": status_class,
+        "action": "UPCOMING WATCH",
+        "screener_url": str(resolution.get("screener_url") or _simple_ipo_screener_url({**row, "company_name": company, "symbol": symbol})),
+        "symbol_resolution_confidence": int(_number(resolution.get("resolution_confidence")) or 0),
+        "symbol_resolution_status": str(resolution.get("match_method") or resolution.get("resolution_status") or "UNRESOLVED"),
+        "symbol_resolution_pipeline": str(resolution.get("resolution_pipeline") or ""),
+        "verification_status": str(resolution.get("verification_status") or "DATA_PENDING"),
+        "isin_match_status": str(resolution.get("isin_match_status") or "MISSING"),
+        "screener_url_status": str(resolution.get("screener_url_status") or ""),
+        "source": _clean_text(row.get("source") or row.get("data_source") or "IPO source"),
+        "source_url": _clean_text(row.get("source_url") or row.get("ipo_detail_url") or ""),
+        "is_listed_verified": False,
+        "eligible_for_scoring": False,
+        "exclusion_reason": "Upcoming IPO; score after listing and verified financial data.",
+    }
+
+
 def _upcoming_ipos_next_7_days(today: date | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     anchor = today or date.today()
     rows, notes = _load_research_ready_upcoming_ipos(anchor)
     next_week = anchor + timedelta(days=7)
     filtered: list[dict[str, Any]] = []
     for row in rows:
-        ipo_date = _parse_ipo_date_text(row.get("ipo_date"), anchor.year)
+        ipo_date = _parse_ipo_date_text(_upcoming_ipo_date_value(row), anchor.year)
         if ipo_date is None or not (anchor <= ipo_date <= next_week):
             continue
-        gmp_pct = row.get("gmp_pct")
-        if gmp_pct in {None, ""}:
-            gmp_pct = _gmp_percent(row.get("gmp"), row.get("price_band"))
-        filtered.append(
-            {
-                **row,
-                "ipo_date": ipo_date.isoformat(),
-                "gmp_pct": gmp_pct,
-                "screener_url": _simple_ipo_screener_url(row),
-            }
-        )
+        filtered.append(_enrich_upcoming_ipo_row(row, ipo_date, anchor))
     filtered.sort(key=lambda item: str(item.get("ipo_date") or ""))
     return filtered, notes
 
@@ -1826,15 +2704,16 @@ def build_simple_ipo_performance_dashboard(
     sme = _load_simple_chittorgarh_performance(selected_year, "sme", force_refresh)
     main_rows = list(mainboard.get("rows") or [])
     sme_rows = list(sme.get("rows") or [])
-    positive_main_rows = [
-        row for row in main_rows if (_number(row.get("current_gain_pct")) or -10_000) >= 0
-    ]
-    positive_sme_rows = [
-        row for row in sme_rows if (_number(row.get("current_gain_pct")) or -10_000) >= 0
-    ]
-    main_top20 = _rank_simple_ipo_rows([dict(row) for row in positive_main_rows[:20]])
-    sme_top20 = _rank_simple_ipo_rows([dict(row) for row in positive_sme_rows[:20]])
-    combined_top40 = _rank_simple_ipo_rows([dict(row) for row in [*main_top20, *sme_top20]])[:40]
+    all_rows = [*main_rows, *sme_rows]
+    rankable_main_rows = [row for row in main_rows if row.get("eligible_for_scoring") is True]
+    rankable_sme_rows = [row for row in sme_rows if row.get("eligible_for_scoring") is True]
+    positive_main_rows = [row for row in main_rows if _simple_ipo_display_candidate(row)]
+    positive_sme_rows = [row for row in sme_rows if _simple_ipo_display_candidate(row)]
+    eligible_positive_main_rows = [row for row in rankable_main_rows if _simple_ipo_display_candidate(row)]
+    eligible_positive_sme_rows = [row for row in rankable_sme_rows if _simple_ipo_display_candidate(row)]
+    main_top20 = _rank_simple_ipo_rows([dict(row) for row in positive_main_rows])[:20]
+    sme_top20 = _rank_simple_ipo_rows([dict(row) for row in positive_sme_rows])[:20]
+    combined_top40 = _rank_simple_ipo_rows([dict(row) for row in [*positive_main_rows, *positive_sme_rows]])[:40]
     upcoming, upcoming_notes = _upcoming_ipos_next_7_days(today)
 
     def count_gain(rows: list[dict[str, Any]], threshold: float) -> int:
@@ -1854,8 +2733,12 @@ def build_simple_ipo_performance_dashboard(
         *list(sme.get("messages") or []),
         *upcoming_notes,
     ]
-    if not main_rows and not sme_rows:
+    if not rankable_main_rows and not rankable_sme_rows:
         messages.append(IPO_NO_VERIFIED_DATA_MESSAGE)
+        if combined_top40:
+            messages.append(
+                "Showing positive-return IPO rows for research only; symbol or financial verification is pending."
+            )
     return {
         "mode": "simple_performance",
         "year": selected_year,
@@ -1877,12 +2760,57 @@ def build_simple_ipo_performance_dashboard(
         "summary": {
             "total_mainboard_loaded": len(main_rows),
             "total_sme_loaded": len(sme_rows),
+            "total_ipos_loaded": len(main_rows) + len(sme_rows),
+            "eligible_for_scoring": sum(1 for row in all_rows if row.get("eligible_for_scoring") is True),
+            "verified_listed_companies": sum(1 for row in all_rows if row.get("is_listed_verified") is True),
+            "excluded_unverified_rows": sum(1 for row in all_rows if row.get("is_listed_verified") is not True),
+            "missing_price_rows": sum(
+                1
+                for row in all_rows
+                if clean_price(row.get("current_price") or row.get("ltp"), zero_is_missing=True) is None
+            ),
+            "missing_financial_rows": sum(1 for row in all_rows if not row.get("has_latest_financial_data")),
+            "missing_market_cap_rows": sum(1 for row in all_rows if not row.get("has_market_cap_data")),
+            "missing_valuation_rows": sum(1 for row in all_rows if not row.get("has_valuation_data")),
+            "missing_shareholding_rows": sum(1 for row in all_rows if not row.get("has_shareholding_data")),
+            "symbols_resolved": sum(
+                1
+                for row in all_rows
+                if (_number(row.get("symbol_resolution_confidence")) or 0) >= 85
+            ),
+            "financial_data_available": sum(
+                1
+                for row in all_rows
+                if str(row.get("financial_data_status") or "").lower().startswith("financial data available")
+            ),
+            "buy_zone_candidates": sum(
+                1
+                for row in all_rows
+                if str(row.get("action") or "").upper() == "BUY ZONE REACHED" and row.get("eligible_for_scoring") is True
+            ),
+            "tracking_buy_candidates": sum(
+                1
+                for row in all_rows
+                if str(row.get("action") or "").upper() == "TRACKING BUY" and row.get("eligible_for_scoring") is True
+            ),
+            "risk_alert_count": sum(
+                1
+                for row in all_rows
+                if str(row.get("risk_alerts") or "").strip() not in {"", "None", "N/A"}
+            ),
+            "symbol_review_needed": sum(
+                1
+                for row in all_rows
+                if str(row.get("action") or "").upper() == "SYMBOL REVIEW NEEDED"
+            ),
             "mainboard_positive_return": len(positive_main_rows),
             "sme_positive_return": len(positive_sme_rows),
-            "mainboard_gt50_gain": count_gain(main_rows, 50),
-            "sme_gt50_gain": count_gain(sme_rows, 50),
-            "best_mainboard": best_name(main_rows),
-            "best_sme": best_name(sme_rows),
+            "eligible_positive_return": len(eligible_positive_main_rows) + len(eligible_positive_sme_rows),
+            "display_positive_return": len(positive_main_rows) + len(positive_sme_rows),
+            "mainboard_gt50_gain": count_gain(positive_main_rows, 50),
+            "sme_gt50_gain": count_gain(positive_sme_rows, 50),
+            "best_mainboard": best_name(main_top20),
+            "best_sme": best_name(sme_top20),
             "last_refreshed": last_refreshed,
             "upcoming_next7_count": len(upcoming),
         },
@@ -1918,6 +2846,7 @@ IPO_VALUE_INVESTOR_PROMPT_FIELDS = [
     "rank",
     "company_name",
     "symbol",
+    "exchange",
     "ipo_type",
     "listing_date",
     "ipo_price",
@@ -1925,9 +2854,30 @@ IPO_VALUE_INVESTOR_PROMPT_FIELDS = [
     "current_price",
     "listing_gain_pct",
     "current_gain_pct",
+    "one_month_return_pct",
+    "three_month_return_pct",
+    "drawdown_from_52w_high_pct",
     "gain_from_ipo_rs",
     "issue_size",
     "ipo_market_cap",
+    "market_cap",
+    "sector",
+    "theme",
+    "sector_score",
+    "value_score",
+    "financial_data_status",
+    "symbol_resolution_confidence",
+    "symbol_resolution_status",
+    "data_quality_score",
+    "data_quality_status",
+    "liquidity_score",
+    "valuation_status",
+    "cash_flow_flag",
+    "governance_flag",
+    "action",
+    "suggested_buy_zone",
+    "suggested_allocation",
+    "risk_alerts",
     "status_badge",
     "screener_url",
     "source_url",
@@ -2060,15 +3010,38 @@ def fetch_ipowatch_upcoming_ipos(today: date | None = None) -> dict[str, Any]:
             "",
             company.upper().split()[0],
         )[:14]
-        price_band = _first_present(raw, ["price_band", "price"]) or "N/A"
-        gmp = _first_present(raw, ["gmp", "premium"]) or "N/A"
+        price_band = _first_present(
+            raw,
+            ["price_band", "ipo_price", "issue_price", "price_range", "price"],
+        ) or "N/A"
+        gmp = _first_present(
+            raw,
+            ["current_gmp", "grey_market_premium", "gmp_rs", "gmp", "premium"],
+        ) or "N/A"
+        ipo_date_value = _first_present(
+            raw,
+            [
+                "ipo_open_date",
+                "open_date",
+                "opening_date",
+                "open_close",
+                "ipo_date",
+                "issue_open_date",
+                "issue_start_date",
+                "bidding_start_date",
+                "subscription_date",
+                "subscription",
+                "open",
+                "date",
+            ],
+        )
         records.append(
             {
                 "company_name": company,
                 "symbol": symbol,
-                "ipo_date": _first_present(raw, ["ipo_date", "open", "date"]) or "N/A",
+                "ipo_date": ipo_date_value or "N/A",
                 "sector": _first_present(raw, ["sector", "industry"]) or "N/A",
-                "issue_size": _first_present(raw, ["issue_size", "size"]) or "N/A",
+                "issue_size": _first_present(raw, ["issue_size", "offer_size", "size"]) or "N/A",
                 "price_band": price_band,
                 "gmp": gmp,
                 "gmp_pct": _gmp_percent(gmp, price_band),

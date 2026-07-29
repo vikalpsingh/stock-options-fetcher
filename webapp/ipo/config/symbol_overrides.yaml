@@ -1,0 +1,309 @@
+# Only verified entries under overrides are used for production symbol resolution.
+# Review-only blocks below preserve aliases without creating fake symbols.
+overrides:
+  RUBICON RESEARCH: RUBICON
+  XTRANET TECHNOLOGIES: XTRANET
+
+Rubicon Research:
+  aliases:
+    - Rubicon Research
+  preferred_exchange: NSE
+  tradingsymbol: RUBICON
+  exchange: NSE
+  verified: true
+
+Xtranet Technologies:
+  aliases:
+    - Xtranet Technologies
+  preferred_exchange: NSE
+  tradingsymbol: XTRANET
+  exchange: NSE
+  verified: true
+
+KSH International:
+  aliases:
+    - KSH International
+  preferred_exchange: NSE
+  verified: false
+
+Nanta Tech:
+  aliases:
+    - Na Nanta Tech
+    - Nanta Tech
+  preferred_exchange: NSE
+  verified: false
+
+Groww:
+  aliases:
+    - Groww
+  preferred_exchange: NSE
+  verified: false
+
+Corona Remedies:
+  aliases:
+    - Corona Remedies
+  preferred_exchange: NSE
+  verified: false
+
+Aequs:
+  aliases:
+    - Aequs
+  preferred_exchange: NSE
+  verified: false
+
+Park Medi World:
+  aliases:
+    - Park Medi World
+  preferred_exchange: NSE
+  verified: false
+
+Vidya Wires:
+  aliases:
+    - Vidya Wires
+  preferred_exchange: NSE
+  verified: false
+
+Fujiyama Power Systems:
+  aliases:
+    - Fujiyama Power Systems
+  preferred_exchange: NSE
+  verified: false
+
+Meesho:
+  aliases:
+    - Meesho
+  preferred_exchange: NSE
+  verified: false
+
+Admach Systems:
+  aliases:
+    - Ad Admach Systems
+    - Admach Systems
+  preferred_exchange: NSE
+  verified: false
+
+Emmvee Photovoltaic Power:
+  aliases:
+    - Emmvee Photovoltaic Power
+  preferred_exchange: NSE
+  verified: false
+
+Jain Resource Recycling:
+  aliases:
+    - Jain Resource Recycling
+  preferred_exchange: NSE
+  verified: false
+
+Nephrocare Health Services:
+  aliases:
+    - Nephrocare Health Services
+  preferred_exchange: NSE
+  verified: false
+
+ICICI Prudential AMC:
+  aliases:
+    - ICICI Prudential AMC
+  preferred_exchange: NSE
+  verified: false
+
+Sudeep Pharma:
+  aliases:
+    - Sudeep Pharma
+  preferred_exchange: NSE
+  verified: false
+
+Canara HSBC Life Insurance Co:
+  aliases:
+    - Canara HSBC Life Insurance Co
+  preferred_exchange: NSE
+  verified: false
+
+Tenneco Clean Air India:
+  aliases:
+    - Tenneco Clean Air India
+  preferred_exchange: NSE
+  verified: false
+
+LG Electronics India:
+  aliases:
+    - LG Electronics India
+  preferred_exchange: NSE
+  verified: false
+
+Epack Prefab Technologies:
+  aliases:
+    - Epack Prefab Technologies
+  preferred_exchange: NSE
+  verified: false
+
+PhysicsWallah:
+  aliases:
+    - PhysicsWallah
+  preferred_exchange: NSE
+  verified: false
+
+Midwest:
+  aliases:
+    - Midwest
+  preferred_exchange: NSE
+  verified: false
+
+Dhara Rail Projects:
+  aliases:
+    - Dh Dhara Rail Projects
+    - Dhara Rail Projects
+  preferred_exchange: NSE
+  verified: false
+
+Bai Kakaji Polymers:
+  aliases:
+    - Ba Bai Kakaji Polymers
+    - Bai Kakaji Polymers
+  preferred_exchange: NSE
+  verified: false
+
+CMR Green Technologies:
+  aliases:
+    - CMR Green Technologies
+  preferred_exchange: NSE
+  verified: false
+
+Apsis Aerocom:
+  aliases:
+    - Ap Apsis Aerocom
+    - Apsis Aerocom
+  preferred_exchange: NSE
+  verified: false
+
+Teja Engineering Industries:
+  aliases:
+    - Te Teja Engineering Industries
+    - Teja Engineering Industries
+  preferred_exchange: NSE
+  verified: false
+
+Indo SMC:
+  aliases:
+    - In Indo SMC
+    - Indo SMC
+  preferred_exchange: NSE
+  verified: false
+
+Avana Electrosystems:
+  aliases:
+    - Av Avana Electrosystems
+    - Avana Electrosystems
+  preferred_exchange: NSE
+  verified: false
+
+Merritronix:
+  aliases:
+    - Me Merritronix
+    - Merritronix
+  preferred_exchange: NSE
+  verified: false
+
+Vivid Electromech:
+  aliases:
+    - Vi Vivid Electromech
+    - Vivid Electromech
+  preferred_exchange: NSE
+  verified: false
+
+Millworks Technologies:
+  aliases:
+    - Mi Millworks Technologies
+    - Millworks Technologies
+  preferred_exchange: NSE
+  verified: false
+
+Vegorama Punjabi Angithi:
+  aliases:
+    - Ve Vegorama Punjabi Angithi
+    - Vegorama Punjabi Angithi
+  preferred_exchange: NSE
+  verified: false
+
+Accretion Nutraveda:
+  aliases:
+    - Ac Accretion Nutraveda
+    - Accretion Nutraveda
+  preferred_exchange: NSE
+  verified: false
+
+Teamtech Formwork Solutions:
+  aliases:
+    - Te Teamtech Formwork Solutions
+    - Teamtech Formwork Solutions
+  preferred_exchange: NSE
+  verified: false
+
+Tipco Engineering India:
+  aliases:
+    - Ti Tipco Engineering India
+    - Tipco Engineering India
+  preferred_exchange: NSE
+  verified: false
+
+KRM Ayurveda:
+  aliases:
+    - KR KRM Ayurveda
+    - KRM Ayurveda
+  preferred_exchange: NSE
+  verified: false
+
+Devson Catalyst:
+  aliases:
+    - De Devson Catalyst
+    - Devson Catalyst
+  preferred_exchange: NSE
+  verified: false
+
+RFBL Flexi Pack:
+  aliases:
+    - RF RFBL Flexi Pack
+    - RFBL Flexi Pack
+  preferred_exchange: NSE
+  verified: false
+
+Grover Jewells:
+  aliases:
+    - Gr Grover Jewells
+    - Grover Jewells
+  preferred_exchange: NSE
+  verified: false
+
+Susan Electricals India:
+  aliases:
+    - Su Susan Electricals India
+    - Susan Electricals India
+  preferred_exchange: NSE
+  verified: false
+
+GRE Renew Enertech:
+  aliases:
+    - GR GRE Renew Enertech
+    - GRE Renew Enertech
+  preferred_exchange: NSE
+  verified: false
+
+Shreedhar Spinners:
+  aliases:
+    - Sh Shreedhar Spinners
+    - Shreedhar Spinners
+  preferred_exchange: NSE
+  verified: false
+
+Elfin Agro India:
+  aliases:
+    - El Elfin Agro India
+    - Elfin Agro India
+  preferred_exchange: NSE
+  verified: false
+
+IC Electricals Company:
+  aliases:
+    - IC IC Electricals Company
+    - IC Electricals Company
+  preferred_exchange: NSE
+  verified: false
