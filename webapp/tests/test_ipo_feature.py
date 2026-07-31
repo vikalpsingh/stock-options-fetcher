@@ -1499,6 +1499,14 @@ def test_render_ipo_panel_has_default_controls(tmp_path, monkeypatch):
     assert "IPO Px" in compact_table
     assert "LTP" in compact_table
     assert "IPO Gain" in compact_header
+    assert "1M" not in compact_header
+    assert "3M" not in compact_header
+    assert "52W DD" not in compact_header
+    assert "P/E" not in compact_header
+    assert "Sales YoY" not in compact_header
+    assert "PAT YoY" not in compact_header
+    assert "OPM" not in compact_header
+    assert "ROCE" not in compact_header
     assert "Data" in compact_header
     assert "Decision" in compact_header
     assert "Risk" in compact_header
@@ -1561,7 +1569,7 @@ def test_ipo_compact_table_combines_market_and_keeps_only_one_price_column(tmp_p
     compact = table_html(app.render_ipo_panel(state))
     compact_header = table_header_html(app.render_ipo_panel(state))
 
-    assert header_count(app.render_ipo_panel(state)) == 19
+    assert header_count(app.render_ipo_panel(state)) == 11
     assert "Apsis Aerocom<" in compact
     assert "Apsis AerocomAPSISAERO" not in compact
     assert "APSISAERO · NSE SME" in compact

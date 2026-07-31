@@ -1,0 +1,2 @@
+"""Company research data models."""
+

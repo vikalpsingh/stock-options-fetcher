@@ -60,6 +60,7 @@ from nifty_tactical import (
     validate_nifty_income_allocation,
     validate_spread_credit_quality,
 )
+from company_research.services.company_detail_service import CompanyDetailService, company_key_from_row
 from nifty_options_engine.config import NIFTY_OPTIONS_ENGINE_CONFIG
 from nifty_options_engine.workflow import (
     build_capital_router,
@@ -5744,6 +5745,8 @@ class PageState:
     ipo_add_sector_leaders: bool = False
     ipo_table_view: str = "Compact"
     ipo_show_unavailable_columns: bool = False
+    ipo_selected_company_key: str = ""
+    ipo_company_detail_message: str = ""
     ipo_research_json: str = ""
     ipo_research_html: str = ""
     ipo_research_message: str = ""
@@ -18824,13 +18827,14 @@ def render_ipo_panel(state: PageState) -> str:
 
     def company_cell(row: dict[str, Any]) -> str:
         company = clean_company_display(row.get("company_name"), row)
-        url = text_value(row.get("screener_url"), "")
-        if url:
-            return (
-                f'<td><a class="ipo-company-link" href="{html.escape(url, quote=True)}" '
-                f'target="_blank" rel="noopener">{html.escape(company)}</a></td>'
-            )
-        return f"<td><strong>{html.escape(company)}</strong></td>"
+        row_key = ipo_gpt_row_key(row)
+        return (
+            '<td>'
+            f'<button type="submit" class="link-button ipo-company-link" '
+            f'name="ipo_company_detail_key" value="{html.escape(row_key, quote=True)}" '
+            f'formaction="/ipo/company-detail">{html.escape(company)}</button>'
+            '</td>'
+        )
 
     def build_market_label(row: dict[str, Any]) -> str:
         symbol = str(row.get("symbol") or "").strip()
@@ -18921,6 +18925,10 @@ def render_ipo_panel(state: PageState) -> str:
         report_path = text_value(row.get("html_report") or row.get("research_report_url") or "")
         if report_path:
             links.append(f'<a class="mini-link" href="{html.escape(report_path, quote=True)}" target="_blank" rel="noopener">Research</a>')
+        links.append(
+            f'<button type="submit" class="mini-link button-link" name="ipo_company_detail_key" '
+            f'value="{html.escape(ipo_gpt_row_key(row), quote=True)}" formaction="/ipo/company-detail">View</button>'
+        )
         detail = row_detail_html(row)
         return f"<td>{' | '.join(links)}{detail}</td>"
 
@@ -18985,6 +18993,144 @@ def render_ipo_panel(state: PageState) -> str:
             for title, items in sections
         )
         return f'<details class="ipo-row-details"><summary>View Details</summary><div>{body}</div></details>'
+
+    def card_value(label: str, value: Any, formatter: Callable[[Any], str] | None = None) -> str:
+        rendered = formatter(value) if formatter else missing_text(value)
+        return f'<article class="ipo-detail-mini-card"><span>{html.escape(label)}</span><strong>{html.escape(rendered)}</strong></article>'
+
+    def source_cards(detail: dict[str, Any]) -> str:
+        sources = list(detail.get("sources") or [])
+        if not sources:
+            return '<p class="status">No source mappings stored yet. Save Snapshot to create local source cards.</p>'
+        cards = []
+        for source in sources:
+            url = text_value(source.get("source_url"), "")
+            open_link = (
+                f'<a class="mini-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">Open</a>'
+                if url
+                else '<span class="muted-cell">No verified URL</span>'
+            )
+            cards.append(
+                f"""
+                <article class="ipo-source-card">
+                  <strong>{html.escape(text_value(source.get("source_name"), "Source"))}</strong>
+                  <span>{html.escape(text_value(source.get("mapping_status"), "MAPPING_UNAVAILABLE"))}</span>
+                  <small>{html.escape(text_value(source.get("updated_at"), ""))}</small>
+                  {open_link}
+                </article>
+                """
+            )
+        return "".join(cards)
+
+    def history_rows(detail: dict[str, Any]) -> str:
+        rows = []
+        for item in list(detail.get("history") or [])[:20]:
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(missing_text(item.get('captured_at')))}</td>"
+                f"<td>{html.escape(short_money(item.get('ltp')))}</td>"
+                f"<td>{html.escape(missing_text(item.get('pe')))}</td>"
+                f"<td>{html.escape(short_pct(item.get('sales_yoy')))}</td>"
+                f"<td>{html.escape(short_pct(item.get('pat_yoy')))}</td>"
+                f"<td>{html.escape(short_pct(item.get('opm')))}</td>"
+                f"<td>{html.escape(short_pct(item.get('roce')))}</td>"
+                f"<td>{html.escape(missing_text(item.get('source')))}</td>"
+                "</tr>"
+            )
+        return "".join(rows) or '<tr><td colspan="8" class="muted-cell">No local snapshot history yet.</td></tr>'
+
+    def render_company_detail_dialog() -> str:
+        selected_key = text_value(state.ipo_selected_company_key, "")
+        if not selected_key:
+            return ""
+        try:
+            service = CompanyDetailService()
+            detail = service.detail(selected_key)
+        except Exception as exc:
+            return render_graceful_error(f"Company detail unavailable: {friendly_external_error(exc, 'company research')}", "Company Research")
+        identity = detail.get("identity") or {}
+        market = detail.get("market") or {}
+        financial = detail.get("financial") or {}
+        row = detail.get("row") or {}
+        company = clean_company_display(identity.get("canonical_name") or row.get("company_name"), row)
+        market_cards = "".join(
+            [
+                card_value("Kite LTP", market.get("ltp"), short_money),
+                card_value("1M", market.get("one_month_return"), short_pct),
+                card_value("3M", market.get("three_month_return"), short_pct),
+                card_value("52W DD", market.get("drawdown_52w"), short_pct),
+                card_value("20D Value", market.get("average_traded_value_20d"), short_money),
+                card_value("Liquidity", market.get("liquidity_status")),
+            ]
+        )
+        financial_cards = "".join(
+            [
+                card_value("Market Cap", financial.get("market_cap"), short_money),
+                card_value("P/E", financial.get("pe")),
+                card_value("Sales YoY", financial.get("sales_yoy"), short_pct),
+                card_value("PAT YoY", financial.get("pat_yoy"), short_pct),
+                card_value("OPM", financial.get("opm"), short_pct),
+                card_value("ROCE", financial.get("roce"), short_pct),
+                card_value("Debt/Equity", financial.get("debt_equity"), num_text),
+                card_value("CFO/PAT", financial.get("cfo_pat"), num_text),
+                card_value("Promoter", financial.get("promoter_holding"), short_pct),
+                card_value("Pledge", financial.get("promoter_pledge"), short_pct),
+            ]
+        )
+        message = (
+            f'<p class="status good-note">{html.escape(state.ipo_company_detail_message)}</p>'
+            if state.ipo_company_detail_message
+            else ""
+        )
+        return f"""
+        <section class="ipo-modal-backdrop">
+          <div class="ipo-company-modal" role="dialog" aria-modal="true" aria-label="Company Research">
+            <div class="ipo-modal-header">
+              <div>
+                <span class="mini-kicker">Company Research</span>
+                <h2>{html.escape(company)}</h2>
+                <p class="status">{html.escape(build_market_label(row or identity))} · {html.escape(missing_text(identity.get("isin")))} · {html.escape(missing_text(identity.get("kite_key")))}</p>
+              </div>
+              <button type="submit" class="secondary" name="ipo_company_detail_key" value="" formaction="/ipo/company-detail">Close</button>
+            </div>
+            {message}
+            <div class="actions ipo-modal-actions">
+              <input type="hidden" name="ipo_company_detail_key" value="{html.escape(selected_key, quote=True)}">
+              <button type="submit" formaction="/ipo/company-detail-refresh-market" class="secondary">Refresh Market</button>
+              <button type="submit" formaction="/ipo/company-detail-refresh-financials" class="secondary">Refresh Financials</button>
+              <button type="submit" formaction="/ipo/company-detail-save" class="secondary">Save Snapshot</button>
+              <button type="submit" formaction="/ipo/company-detail-gpt" class="secondary">Generate GPT Analysis</button>
+            </div>
+            <div class="ipo-modal-tabs">
+              <details open><summary>Snapshot</summary>
+                <div class="ipo-card-grid compact">{market_cards}</div>
+                <dl class="ipo-detail-list">
+                  <dt>Legal name</dt><dd>{html.escape(missing_text(identity.get("legal_name")))}</dd>
+                  <dt>NSE symbol</dt><dd>{html.escape(missing_text(identity.get("nse_symbol")))}</dd>
+                  <dt>BSE code</dt><dd>{html.escape(missing_text(identity.get("bse_security_code")))}</dd>
+                  <dt>Instrument token</dt><dd>{html.escape(missing_text(identity.get("instrument_token")))}</dd>
+                  <dt>IPO price</dt><dd>{html.escape(short_money(row.get("ipo_price")))}</dd>
+                  <dt>Listing date</dt><dd>{html.escape(missing_text(row.get("listing_date")))}</dd>
+                </dl>
+              </details>
+              <details open><summary>Financials</summary>
+                <p class="status">Period: {html.escape(missing_text(financial.get("financial_period")))} · Source: {html.escape(missing_text(financial.get("source")))} · Captured: {html.escape(missing_text(financial.get("captured_at")))}</p>
+                <div class="ipo-card-grid compact">{financial_cards}</div>
+              </details>
+              <details open><summary>Sources</summary>
+                <p class="status">External research pages open in a new browser tab. Nothing is embedded in an iframe.</p>
+                <div class="ipo-source-grid">{source_cards(detail)}</div>
+              </details>
+              <details open><summary>History</summary>
+                <div class="table-wrap compact"><table class="ipo-table">
+                  <thead><tr><th>Snapshot</th><th>LTP</th><th>P/E</th><th>Sales YoY</th><th>PAT YoY</th><th>OPM</th><th>ROCE</th><th>Source</th></tr></thead>
+                  <tbody>{history_rows(detail)}</tbody>
+                </table></div>
+              </details>
+            </div>
+          </div>
+        </section>
+        """
 
     def cell_html(row: dict[str, Any], key: str) -> str:
         if key == "select":
@@ -19083,7 +19229,7 @@ def render_ipo_panel(state: PageState) -> str:
         "links": {"key": "links", "label": "Links", "sort": "text"},
     }
     view_columns = {
-        "Compact": ["select", "rank", "company", "market", "ipo_px", "ltp", "ipo_gain", "one_month", "three_month", "drawdown", "pe", "sales_yoy", "pat_yoy", "opm", "roce", "data", "decision", "risk", "links"],
+        "Compact": ["select", "rank", "company", "market", "ipo_px", "ltp", "ipo_gain", "data", "decision", "risk", "links"],
         "Price": ["select", "rank", "company", "market", "ipo_px", "ltp", "day", "week", "one_month", "three_month", "six_month", "one_year", "ipo_gain", "drawdown", "volume", "traded_value", "spread", "liquidity", "links"],
         "Fundamentals": ["select", "rank", "company", "market", "ltp", "market_cap", "pe", "pb", "ev_ebitda", "sales_qoq", "sales_yoy", "pat_qoq", "pat_yoy", "opm", "roce", "roe", "debt", "cfo_pat", "data", "decision", "links"],
         "Research": ["select", "rank", "company", "market", "ltp", "data", "investment", "sector_score", "python", "gpt", "decision", "blocks", "missing", "buy_zone", "risk", "links"],
@@ -19536,6 +19682,8 @@ def render_ipo_panel(state: PageState) -> str:
       <textarea name="ipo_gpt_output" style="display:none">{html.escape(state.ipo_gpt_output)}</textarea>
       <input type="hidden" name="ipo_gpt_response_id" value="{html.escape(state.ipo_gpt_response_id, quote=True)}">
       <input type="hidden" name="ipo_add_sector_leaders_present" value="1">
+      <input type="hidden" name="ipo_selected_company_key" value="{html.escape(state.ipo_selected_company_key, quote=True)}">
+      <input type="hidden" name="ipo_company_detail_message" value="{html.escape(state.ipo_company_detail_message, quote=True)}">
       <textarea name="ipo_research_json" style="display:none">{html.escape(state.ipo_research_json)}</textarea>
       <textarea name="ipo_research_html" style="display:none">{html.escape(state.ipo_research_html)}</textarea>
       <input type="hidden" name="ipo_research_message" value="{html.escape(state.ipo_research_message, quote=True)}">
@@ -19582,6 +19730,7 @@ def render_ipo_panel(state: PageState) -> str:
         </div>
       </section>
       {render_table("Top 40 IPO Performers", combined_top40, "ipo-combined-table", "No IPO performance rows available for this year. Refresh IPO Data or check source access.")}
+      {render_company_detail_dialog()}
       {render_research_panel()}
       {gpt_panel}
       {render_saved_research_panel()}
@@ -26432,6 +26581,110 @@ def render_page(state: PageState) -> bytes:
     }}
     .ipo-card-grid span {{ color: #64748b; font-size: 12px; font-weight: 800; text-transform: uppercase; }}
     .ipo-card-grid strong {{ color: #0f172a; }}
+    .ipo-card-grid.compact {{
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    }}
+    .ipo-detail-mini-card {{
+      border: 1px solid #dbeafe;
+      border-radius: 8px;
+      padding: 10px;
+      background: #ffffff;
+    }}
+    .ipo-detail-mini-card span {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 900;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }}
+    .ipo-detail-mini-card strong {{
+      color: #0f172a;
+      font-size: 15px;
+    }}
+    .link-button {{
+      border: 0;
+      padding: 0;
+      background: transparent;
+      color: #0f766e;
+      box-shadow: none;
+      font: inherit;
+      font-weight: 900;
+      cursor: pointer;
+    }}
+    .button-link.mini-link {{
+      border: 0;
+      padding: 0;
+      background: transparent;
+      color: #0f766e;
+      box-shadow: none;
+      font-size: inherit;
+    }}
+    .ipo-modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      background: rgba(15, 23, 42, 0.48);
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 28px 16px;
+      overflow: auto;
+    }}
+    .ipo-company-modal {{
+      width: min(1180px, 96vw);
+      border-radius: 10px;
+      background: #f8fafc;
+      border: 1px solid #bae6fd;
+      box-shadow: 0 28px 70px rgba(15, 23, 42, 0.28);
+      padding: 18px;
+    }}
+    .ipo-modal-header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      border-bottom: 1px solid #dbeafe;
+      padding-bottom: 12px;
+      margin-bottom: 12px;
+    }}
+    .ipo-modal-header h2 {{ margin: 2px 0; color: #0f172a; }}
+    .ipo-modal-actions {{ margin: 10px 0 14px; }}
+    .ipo-modal-tabs details {{
+      border: 1px solid #dbeafe;
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 12px;
+      margin-bottom: 10px;
+    }}
+    .ipo-modal-tabs summary {{
+      cursor: pointer;
+      font-weight: 950;
+      color: #1e3a8a;
+      margin-bottom: 10px;
+    }}
+    .ipo-source-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 10px;
+    }}
+    .ipo-source-card {{
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 10px;
+      background: #f8fafc;
+      display: grid;
+      gap: 4px;
+    }}
+    .ipo-source-card span {{ color: #475569; font-weight: 800; }}
+    .ipo-source-card small {{ color: #64748b; }}
+    .ipo-detail-list {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 8px 12px;
+    }}
+    .ipo-detail-list dt {{ color: #64748b; font-weight: 900; }}
+    .ipo-detail-list dd {{ margin: 0; color: #0f172a; font-weight: 700; }}
     .ipo-gmp-note {{
       display: inline-block;
       padding: 6px 10px;
@@ -31392,6 +31645,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if "ipo_show_unavailable_columns_present" in form
                 else False
             ),
+            ipo_selected_company_key=first(form, "ipo_selected_company_key"),
+            ipo_company_detail_message=first(form, "ipo_company_detail_message"),
             ipo_research_json=first(form, "ipo_research_json"),
             ipo_research_html=first(form, "ipo_research_html"),
             ipo_research_message=first(form, "ipo_research_message"),
@@ -31883,6 +32138,68 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     f"{'Force refreshed' if force_refresh else 'Loaded'} IPO performance data "
                     f"for {state.ipo_year}."
                 )
+            elif request_path in {
+                "/ipo/company-detail",
+                "/ipo/company-detail-save",
+                "/ipo/company-detail-refresh-market",
+                "/ipo/company-detail-refresh-financials",
+                "/ipo/company-detail-gpt",
+            }:
+                dashboard = build_simple_ipo_performance_dashboard(
+                    state.ipo_year,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                state.ipo_dashboard = dashboard
+                selected_key = first(form, "ipo_company_detail_key", state.ipo_selected_company_key)
+                state.ipo_selected_company_key = selected_key
+                if not selected_key:
+                    state.ipo_company_detail_message = ""
+                    state.message = "Company research dialog closed."
+                else:
+                    selected_rows = selected_ipo_rows_from_dashboard_keys(
+                        dashboard,
+                        {selected_key},
+                        limit=1,
+                    )
+                    if not selected_rows:
+                        state.ipo_company_detail_message = "Selected company was not found in the current Top 40 dashboard."
+                        state.message = state.ipo_company_detail_message
+                    else:
+                        row = selected_rows[0]
+                        service = CompanyDetailService()
+                        if request_path == "/ipo/company-detail":
+                            company_key = service.ensure_company(row)
+                            service.refresh_market_from_row(row)
+                            service.refresh_financials_from_providers(row)
+                            state.ipo_selected_company_key = company_key
+                            state.ipo_company_detail_message = "Loaded local company detail. External finance pages are links, not embedded."
+                        elif request_path == "/ipo/company-detail-save":
+                            result = service.save_snapshot_from_row(row)
+                            state.ipo_selected_company_key = result["company_key"]
+                            state.ipo_company_detail_message = (
+                                "Saved local snapshot. "
+                                f"Market saved: {'YES' if result['market_saved'] else 'NO'}; "
+                                f"financials saved: {'YES' if result['financial_saved'] else 'NO'}."
+                            )
+                        elif request_path == "/ipo/company-detail-refresh-market":
+                            result = service.refresh_market_from_row(row)
+                            state.ipo_selected_company_key = result["company_key"]
+                            state.ipo_company_detail_message = f"Market snapshot refreshed from {result['status']} data."
+                        elif request_path == "/ipo/company-detail-refresh-financials":
+                            result = service.refresh_financials_from_providers(row)
+                            state.ipo_selected_company_key = result["company_key"]
+                            state.ipo_company_detail_message = (
+                                f"Financials refreshed via {result['provider']} ({result['status']}). "
+                                "Add data/company_research/screener_fundamentals.csv for richer local imports."
+                            )
+                        else:
+                            company_key = service.ensure_company(row)
+                            service.save_snapshot_from_row(row)
+                            evidence = service.local_gpt_evidence(company_key)
+                            state.ipo_selected_company_key = company_key
+                            state.ipo_gpt_prompt = json.dumps(evidence, indent=2, default=str)
+                            state.ipo_company_detail_message = "Built GPT evidence from locally saved company snapshots."
+                        state.message = state.ipo_company_detail_message
             elif request_path == "/ipo/research-build":
                 dashboard = build_simple_ipo_performance_dashboard(
                     state.ipo_year,

@@ -1,0 +1,2 @@
+"""Company research storage helpers."""
+
