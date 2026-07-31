@@ -35,10 +35,15 @@ from ipo_screener_engine import (
     infer_market_type,
     infer_theme,
     normalize_ipo_record,
+    score_quarterly_results,
 )
 from ipo.symbol_resolution.symbol_resolver import resolve_ipo_identity, resolve_symbol, screener_url_for
-from ipo.utils.company_name_cleaner import clean_ipo_company_name
+from ipo.utils.company_name_cleaner import clean_display_company_name, clean_ipo_company_name
 from ipo.utils.ipo_price_cleaner import clean_price as clean_ipo_price
+from ipo_evaluation.service import evaluate_legacy_ipo_row, evaluation_fields
+from ipo_evaluation.service import legacy_evaluation_input
+from ipo_evaluation.gpt.batch_evaluator import build_batch_requests, serialize_batch_jsonl
+from ipo_evaluation.gpt.evidence_builder import build_evidence_package
 
 
 QUARTER_OPTIONS = ["Latest Available", "Q1", "Q2", "Q3", "Q4"]
@@ -99,6 +104,7 @@ IPO_SOURCE_URLS = {
 DEFAULT_CHITTORGARH_LISTED_URL = CHITTORGARH_MAINBOARD_FALLBACK_URL
 DEFAULT_IPOWATCH_GMP_URL = "https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/"
 DEFAULT_NSE_UPCOMING_URL = "https://www.nseindia.com/api/ipo-current-issue"
+IPO_UPCOMING_PIPELINE_VERSION = 2
 IPO_NO_VERIFIED_DATA_MESSAGE = "No verified IPO companies available. Please load NSE/BSE IPO master data."
 IPO_DEMO_MODE_VALUES = {"demo", "sample", "mock", "development"}
 IPO_VERIFIED_EXCHANGES = {"NSE", "BSE", "NSE SME", "BSE SME", "SME"}
@@ -248,6 +254,21 @@ IPO_SIMPLE_EXPORT_FIELDS = [
     "theme",
     "sector_score",
     "value_score",
+    "quarterly_results_score",
+    "quarterly_results_rating",
+    "quarterly_results_coverage_pct",
+    "quarterly_results_explanation",
+    "lt_data_quality_score",
+    "lt_data_quality_status",
+    "lt_investment_score",
+    "lt_python_decision",
+    "lt_gpt_decision",
+    "lt_final_decision",
+    "lt_decision_confidence",
+    "lt_buy_zone",
+    "lt_allocation",
+    "lt_key_risk",
+    "lt_missing_evidence",
     "lt_score",
     "is_listed_verified",
     "eligible_for_scoring",
@@ -1865,6 +1886,9 @@ def _simple_governance_flag(row: dict[str, Any]) -> str:
     pledge = _number(row.get("pledge_pct") or row.get("promoter_pledge"))
     pledge_change = _number(row.get("pledge_change"))
     promoter_change = _number(row.get("promoter_holding_change"))
+    promoter_holding = _number(row.get("promoter_holding"))
+    if pledge is None and pledge_change is None and promoter_change is None and promoter_holding is None:
+        return "DATA PENDING"
     if pledge is not None and pledge > 0:
         return "RED"
     if pledge_change is not None and pledge_change > 0:
@@ -2020,7 +2044,8 @@ def _enrich_simple_ipo_decision(row: dict[str, Any], ipo_type: str | None = None
         or enriched.get("ipo_name")
         or ""
     )
-    company = clean_ipo_company_name(raw_company_name)
+    candidate_symbol = _clean_text(enriched.get("symbol") or enriched.get("source_symbol") or enriched.get("bse_security_code"))
+    company = clean_display_company_name(raw_company_name, candidate_symbol, enriched.get("bse_security_code"))
     enriched["raw_company_name"] = raw_company_name
     enriched["clean_company_name"] = company
     enriched["display_company_name"] = company
@@ -2042,7 +2067,9 @@ def _enrich_simple_ipo_decision(row: dict[str, Any], ipo_type: str | None = None
     enriched["verification_status"] = str(resolution.get("verification_status") or "")
     enriched["isin_match_status"] = str(resolution.get("isin_match_status") or "")
     enriched["symbol_resolution_pipeline"] = str(resolution.get("resolution_pipeline") or "")
-    current_price = clean_price(enriched.get("ltp") or enriched.get("current_price"), zero_is_missing=True)
+    source_current_price = clean_price(enriched.get("source_current_price") or enriched.get("current_price"), zero_is_missing=True)
+    kite_ltp = clean_price(enriched.get("kite_ltp") or enriched.get("ltp"), zero_is_missing=True)
+    current_price = kite_ltp if kite_ltp is not None else source_current_price
     ipo_price = clean_price(enriched.get("ipo_price") or enriched.get("issue_price"), zero_is_missing=True)
     listing_price = clean_price(enriched.get("listing_price"), zero_is_missing=True)
     current_gain = _number(enriched.get("current_gain_pct") or enriched.get("gain_from_ipo_pct") or enriched.get("return_from_issue_pct"))
@@ -2073,6 +2100,7 @@ def _enrich_simple_ipo_decision(row: dict[str, Any], ipo_type: str | None = None
     )
     cash_flow_flag = _simple_cash_flow_flag(enriched, has_financials)
     governance_flag = _simple_governance_flag(enriched)
+    quarterly_result = score_quarterly_results(enriched)
     eligible_for_scoring = (
         bool(is_listed_verified)
         and current_price is not None
@@ -2154,7 +2182,11 @@ def _enrich_simple_ipo_decision(row: dict[str, Any], ipo_type: str | None = None
     enriched.update(
         {
             "ltp": current_price,
+            "kite_ltp": kite_ltp,
             "current_price": current_price,
+            "source_current_price": source_current_price,
+            "preferred_display_price_status": "KITE_LTP" if kite_ltp is not None else "UNVERIFIED_SOURCE_PRICE" if source_current_price is not None else "PRICE_MISSING",
+            "market_data_status": "LIVE_KITE" if kite_ltp is not None else "UNVERIFIED_SOURCE_PRICE" if source_current_price is not None else "QUOTE_MISSING",
             "listing_price": listing_price,
             "ipo_price": ipo_price,
             "ipo_price_status": "OK" if ipo_price is not None else "IPO_PRICE_MISSING",
@@ -2171,6 +2203,10 @@ def _enrich_simple_ipo_decision(row: dict[str, Any], ipo_type: str | None = None
             "value_score": value_score,
             "lt_score": value_score,
             "financial_data_status": "Financial Data Available" if has_financials else "Financial Data Pending",
+            "quarterly_results_score": quarterly_result.score,
+            "quarterly_results_rating": quarterly_result.rating,
+            "quarterly_results_coverage_pct": quarterly_result.coverage_pct,
+            "quarterly_results_explanation": quarterly_result.explanation,
             "is_listed_verified": is_listed_verified,
             "eligible_for_scoring": eligible_for_scoring,
             "has_latest_financial_data": has_financials,
@@ -2204,6 +2240,24 @@ def _enrich_simple_ipo_decision(row: dict[str, Any], ipo_type: str | None = None
             "broker_url": f"https://kite.zerodha.com/quote/{exchange.replace(' ', '')}/{symbol}" if symbol else "",
         }
     )
+    try:
+        enriched.update(evaluation_fields(evaluate_legacy_ipo_row(enriched)))
+    except (TypeError, ValueError, KeyError) as exc:
+        enriched.update(
+            {
+                "lt_data_quality_score": 0.0,
+                "lt_data_quality_status": "INSUFFICIENT_DATA",
+                "lt_investment_score": 0.0,
+                "lt_python_decision": "DATA_INSUFFICIENT",
+                "lt_gpt_decision": "NOT_RUN",
+                "lt_final_decision": "DATA_INSUFFICIENT",
+                "lt_decision_confidence": 0.0,
+                "lt_buy_zone": "NOT_CALCULABLE",
+                "lt_allocation": "0.00%",
+                "lt_key_risk": f"EVALUATION_INPUT_ERROR:{type(exc).__name__}",
+                "lt_missing_evidence": "evaluation_input",
+            }
+        )
     return enriched
 
 
@@ -2515,10 +2569,14 @@ def _parse_ipo_date_text(value: Any, default_year: int | None = None) -> date | 
         for fmt in (
             "%d %b %Y",
             "%d %B %Y",
+            "%d-%b-%Y",
+            "%d-%B-%Y",
             "%d-%m-%Y",
             "%d/%m/%Y",
             "%b %d %Y",
             "%B %d %Y",
+            "%b-%d-%Y",
+            "%B-%d-%Y",
             "%d %b",
             "%d %B",
             "%b %d",
@@ -2587,6 +2645,20 @@ UPCOMING_IPO_DATE_KEYS = (
     "open",
 )
 
+UPCOMING_IPO_CLOSE_DATE_KEYS = (
+    "ipo_close_date",
+    "close_date",
+    "closing_date",
+    "ipo_end_date",
+    "end_date",
+    "issue_close_date",
+    "issue_end_date",
+    "bidding_close_date",
+    "bidding_end_date",
+    "offer_close_date",
+    "offer_end_date",
+)
+
 
 def _upcoming_ipo_date_value(row: dict[str, Any]) -> Any:
     """Return the best open/start date field from inconsistent IPO source rows."""
@@ -2611,7 +2683,110 @@ def _upcoming_ipo_date_value(row: dict[str, Any]) -> Any:
     return row.get("ipo_date")
 
 
-def _enrich_upcoming_ipo_row(row: dict[str, Any], ipo_date: date, anchor: date) -> dict[str, Any]:
+def _upcoming_ipo_close_date_value(row: dict[str, Any]) -> Any:
+    """Return an explicit close/end date without confusing it with listing dates."""
+    exact_keys = {_normalize_key(key) for key in UPCOMING_IPO_CLOSE_DATE_KEYS}
+    for key, value in row.items():
+        if _normalize_key(key) in exact_keys and _clean_text(value):
+            return value
+    for key, value in row.items():
+        normalized = _normalize_key(key)
+        if not _clean_text(value) or "listing" in normalized or "listed" in normalized:
+            continue
+        is_close_or_end = "close" in normalized or "closing" in normalized or "end" in normalized
+        is_subscription_field = any(
+            token in normalized for token in ("ipo", "issue", "bidding", "offer", "subscription")
+        )
+        if is_close_or_end and is_subscription_field:
+            return value
+    return None
+
+
+def _safe_calendar_date(year: int, month: int, day: int) -> date | None:
+    """Build a date from untrusted source fields without leaking parsing errors."""
+    try:
+        return date(int(year), int(month), int(day))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _parse_ipo_date_range_text(value: Any, default_year: int) -> tuple[date | None, date | None]:
+    """Parse common IPO subscription ranges while retaining both boundaries."""
+    text = _clean_text(value)
+    if not text:
+        return None, None
+    text = re.sub(r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", text, flags=re.I)
+    text = text.replace("â€“", " - ").replace("â€”", " - ").replace("–", " - ").replace("—", " - ")
+    text = re.sub(r"\s+", " ", text).strip()
+    common_year_match = re.search(r"\b(20\d{2})\b", text)
+    common_year = int(common_year_match.group(1)) if common_year_match else int(default_year)
+
+    parts = re.split(r"\s+(?:to|-)\s+", text, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        compact_match = re.fullmatch(
+            r"(\d{1,2})\s*-\s*(\d{1,2})\s+([A-Za-z]{3,9})(?:,?\s+(20\d{2}))?",
+            text,
+            flags=re.I,
+        )
+        if compact_match:
+            open_day, close_day, month, year_text = compact_match.groups()
+            year = int(year_text or common_year)
+            open_date = _parse_ipo_date_text(f"{open_day} {month} {year}", year)
+            close_date = _parse_ipo_date_text(f"{close_day} {month} {year}", year)
+            return open_date, close_date
+        return _parse_ipo_date_text(text, common_year), None
+
+    open_text, close_text = (part.strip(" ,") for part in parts)
+    open_date = _parse_ipo_date_text(open_text, common_year)
+    close_date = _parse_ipo_date_text(close_text, common_year)
+
+    if open_date is None and re.fullmatch(r"\d{1,2}", open_text):
+        parsed_close = close_date or _parse_ipo_date_text(close_text, common_year)
+        if parsed_close is not None:
+            open_date = _safe_calendar_date(parsed_close.year, parsed_close.month, int(open_text))
+    if close_date is None and open_date is not None:
+        close_day_match = re.fullmatch(r"(\d{1,2})(?:,?\s+(20\d{2}))?", close_text)
+        if close_day_match:
+            close_day, close_year = close_day_match.groups()
+            close_date = _safe_calendar_date(
+                int(close_year or open_date.year),
+                open_date.month,
+                int(close_day),
+            )
+
+    close_has_year = bool(re.search(r"\b20\d{2}\b", close_text))
+    if open_date is not None and close_date is not None and close_date < open_date and not close_has_year:
+        close_date = _safe_calendar_date(open_date.year + 1, close_date.month, close_date.day)
+    return open_date, close_date
+
+
+def _upcoming_ipo_subscription_window(
+    row: dict[str, Any],
+    default_year: int,
+) -> tuple[date | None, date | None]:
+    """Normalize separate or combined IPO open/close fields into one date window."""
+    open_value = _upcoming_ipo_date_value(row)
+    open_date, range_close_date = _parse_ipo_date_range_text(open_value, default_year)
+    close_value = _upcoming_ipo_close_date_value(row)
+    close_date = _parse_ipo_date_text(
+        close_value,
+        open_date.year if open_date is not None else default_year,
+    )
+    if close_date is None:
+        close_date = range_close_date
+    if open_date is not None and close_date is not None and close_date < open_date:
+        close_text = _clean_text(close_value)
+        if close_text and not re.search(r"\b20\d{2}\b", close_text):
+            close_date = _safe_calendar_date(open_date.year + 1, close_date.month, close_date.day)
+    return open_date, close_date
+
+
+def _enrich_upcoming_ipo_row(
+    row: dict[str, Any],
+    ipo_date: date,
+    anchor: date,
+    close_date: date | None = None,
+) -> dict[str, Any]:
     """Clean and enrich upcoming IPO rows for display-only research.
 
     Upcoming IPO tables often do not have a listed tradingsymbol yet. Keep the
@@ -2645,6 +2820,15 @@ def _enrich_upcoming_ipo_row(row: dict[str, Any], ipo_date: date, anchor: date) 
     else:
         gmp_pct = _number(gmp_pct)
     status, status_class = _upcoming_ipo_status(gmp_pct)
+    is_open_for_application = close_date is not None and ipo_date <= anchor <= close_date
+    if is_open_for_application:
+        application_status = "Open for application"
+    elif anchor < ipo_date:
+        application_status = "Opens soon"
+    elif close_date is not None and anchor > close_date:
+        application_status = "Closed"
+    else:
+        application_status = "Close date unavailable"
     return {
         **row,
         "raw_company_name": raw_company,
@@ -2653,7 +2837,11 @@ def _enrich_upcoming_ipo_row(row: dict[str, Any], ipo_date: date, anchor: date) 
         "symbol": symbol,
         "exchange": _clean_text(resolution.get("exchange") or row.get("exchange") or "NSE"),
         "ipo_date": ipo_date.isoformat(),
+        "ipo_open_date": ipo_date.isoformat(),
+        "ipo_close_date": close_date.isoformat() if close_date is not None else None,
         "days_to_ipo": (ipo_date - anchor).days,
+        "is_open_for_application": is_open_for_application,
+        "application_status": application_status,
         "sector": _clean_text(row.get("sector") or row.get("theme") or row.get("industry") or "N/A"),
         "ipo_type": _clean_text(row.get("ipo_type") or row.get("market_type") or row.get("issue_type") or "N/A"),
         "issue_size": _clean_text(row.get("issue_size") or row.get("issue") or row.get("offer_size") or "N/A"),
@@ -2685,10 +2873,13 @@ def _upcoming_ipos_next_7_days(today: date | None = None) -> tuple[list[dict[str
     next_week = anchor + timedelta(days=7)
     filtered: list[dict[str, Any]] = []
     for row in rows:
-        ipo_date = _parse_ipo_date_text(_upcoming_ipo_date_value(row), anchor.year)
-        if ipo_date is None or not (anchor <= ipo_date <= next_week):
+        ipo_date, close_date = _upcoming_ipo_subscription_window(row, anchor.year)
+        if ipo_date is None:
             continue
-        filtered.append(_enrich_upcoming_ipo_row(row, ipo_date, anchor))
+        is_currently_open = close_date is not None and ipo_date <= anchor <= close_date
+        if not is_currently_open and not (anchor <= ipo_date <= next_week):
+            continue
+        filtered.append(_enrich_upcoming_ipo_row(row, ipo_date, anchor, close_date))
     filtered.sort(key=lambda item: str(item.get("ipo_date") or ""))
     return filtered, notes
 
@@ -2741,6 +2932,7 @@ def build_simple_ipo_performance_dashboard(
             )
     return {
         "mode": "simple_performance",
+        "upcoming_pipeline_version": IPO_UPCOMING_PIPELINE_VERSION,
         "year": selected_year,
         "generated_at": _now_text(),
         "last_refreshed": last_refreshed,
@@ -2910,6 +3102,34 @@ def selected_ipo_rows_for_value_analysis(
     return selected
 
 
+def build_ipo_evaluation_batch_jsonl(
+    rows: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    """Prepare Batch API requests for eligible rows without submitting them."""
+    requests: list[tuple[str, dict[str, Any]]] = []
+    skipped: list[str] = []
+    seen_custom_ids: set[str] = set()
+    for row in rows:
+        try:
+            evidence = legacy_evaluation_input(row)
+            evaluation = evaluate_legacy_ipo_row(row)
+        except (TypeError, ValueError, KeyError) as exc:
+            skipped.append(f"{row.get('symbol') or row.get('company_name')}: {type(exc).__name__}")
+            continue
+        if not evidence.identity.is_valid or evaluation.data_quality_score < 70:
+            skipped.append(
+                f"{evaluation.symbol or evaluation.company_name}: identity/quality not eligible"
+            )
+            continue
+        stock_key = re.sub(r"[^A-Z0-9_-]+", "_", (evaluation.symbol or evaluation.company_name).upper())
+        custom_id = f"{stock_key}_{evaluation.snapshot_hash[:16]}"
+        if custom_id in seen_custom_ids:
+            continue
+        seen_custom_ids.add(custom_id)
+        requests.append((custom_id, build_evidence_package(evidence, evaluation)))
+    return serialize_batch_jsonl(build_batch_requests(requests)) if requests else "", skipped
+
+
 def build_ipo_value_investor_prompt(rows: list[dict[str, Any]], year: int) -> str:
     """Build a compact CSV-backed prompt for IPO long-term research."""
     output = io.StringIO()
@@ -2982,6 +3202,12 @@ def fetch_nse_upcoming_ipos(today: date | None = None) -> dict[str, Any]:
                     or row.get("openDate")
                     or row.get("biddingStartDate")
                     or row.get("date")
+                ),
+                "ipo_close_date": _clean_text(
+                    row.get("issueEndDate")
+                    or row.get("closeDate")
+                    or row.get("biddingEndDate")
+                    or row.get("endDate")
                 ),
                 "sector": _clean_text(row.get("sector") or row.get("industry") or "N/A"),
                 "issue_size": _clean_text(row.get("issueSize") or row.get("issueSizeInCr") or "N/A"),

@@ -1,0 +1,7 @@
+manufacturing: [order_book, order_book_to_sales, capacity_utilization, asset_turnover, working_capital_days]
+pharma: [export_revenue_pct, research_development_pct, regulatory_observations, gross_margin_trend]
+healthcare: [bed_count, occupancy, arpob, ebitda_per_occupied_bed]
+financial: [aum_growth, nim, gnpa, nnpa, capital_adequacy, roa, roe]
+insurance: [annualized_premium_equivalent, vnb_margin, persistency, solvency_ratio]
+consumer: [repeat_rate, contribution_margin, active_user_growth, distribution_expansion]
+power: [installed_capacity, order_pipeline, capacity_utilization, debtor_exposure]

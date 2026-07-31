@@ -1,0 +1,5 @@
+research_model_env: OPENAI_RESEARCH_MODEL
+batch_model_env: OPENAI_BATCH_MODEL
+store_responses: false
+prompt_version: "1.0"
+schema_version: "1.0"

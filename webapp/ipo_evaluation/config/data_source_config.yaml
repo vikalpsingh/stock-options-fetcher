@@ -1,0 +1,7 @@
+priority:
+  - structured_provider
+  - exchange_filings
+  - company_ir
+  - authorized_screener_export
+  - cached_snapshot
+allow_blocked_site_scraping: false

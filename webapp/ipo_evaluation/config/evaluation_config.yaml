@@ -1,0 +1,11 @@
+schema_version: "1.0"
+data_quality:
+  buy_minimum: 80
+  insufficient_below: 70
+investment_score:
+  buy_minimum: 78
+  avoid_below: 55
+hard_rules:
+  minimum_interest_coverage: 2.0
+  minimum_cumulative_cfo_pat: 0.50
+  minimum_listed_quarters: 2

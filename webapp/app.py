@@ -86,10 +86,12 @@ from ipo_data_service import (
     IPO_SNAPSHOT_FIELDS,
     IPO_THEME_FILTER_OPTIONS,
     IPO_TOP10_FIELDS,
+    IPO_UPCOMING_PIPELINE_VERSION,
     IPO_VALUE_INVESTOR_SYSTEM_PROMPT,
     IPO_WATCHLIST_FIELDS,
     QUARTER_OPTIONS,
     build_ipo_value_investor_prompt,
+    build_ipo_evaluation_batch_jsonl,
     build_ipo_dashboard,
     build_simple_ipo_performance_dashboard,
     export_ipo_records_csv,
@@ -5740,6 +5742,8 @@ class PageState:
     ipo_gpt_output: str = ""
     ipo_gpt_response_id: str = ""
     ipo_add_sector_leaders: bool = False
+    ipo_table_view: str = "Compact"
+    ipo_show_unavailable_columns: bool = False
     ipo_research_json: str = ""
     ipo_research_html: str = ""
     ipo_research_message: str = ""
@@ -15022,20 +15026,85 @@ def generate_ipo_value_analysis_with_openai(
         raise ValueError("Missing OPENAI_API_KEY. Enter it in Kite Setup or GPT tab.")
     if not rows:
         raise ValueError("No IPO rows available for GPT analysis. Load IPO Screener first.")
+    from ipo_evaluation.analytics.decision_engine import evaluate_company
+    from ipo_evaluation.gpt.evidence_builder import build_evidence_package
+    from ipo_evaluation.gpt.openai_client import IpoOpenAIClient
+    from ipo_evaluation.gpt.response_validator import validate_gpt_response
+    from ipo_evaluation.models.evaluation_output import EvaluationOutput
+    from ipo_evaluation.reports.html_report import save_html_report
+    from ipo_evaluation.service import legacy_evaluation_input
+    from ipo_evaluation.storage.repositories import EvaluationRepository
+
     analysis = build_ipo_research_analysis(
         rows,
         year,
         add_sector_leaders=add_sector_leaders,
     )
-    prompt = build_ipo_research_prompt(analysis)
-    output, response_id = call_openai_responses_api(
-        api_key,
-        model,
-        IPO_VALUE_INVESTOR_SYSTEM_PROMPT,
-        prompt,
+    client = IpoOpenAIClient(model=model)
+    repository = EvaluationRepository()
+    packages: list[dict[str, Any]] = []
+    outputs: list[dict[str, Any]] = []
+    response_ids: list[str] = []
+    for row in rows:
+        evidence = legacy_evaluation_input(row)
+        python_evaluation = evaluate_company(evidence)
+        evidence_package = build_evidence_package(evidence, python_evaluation)
+        packages.append(evidence_package)
+        company_key = str(
+            evidence.identity.kite_key
+            or evidence.identity.kite_tradingsymbol
+            or evidence.identity.canonical_name
+        ).upper()
+        cached = repository.find_unchanged(company_key, python_evaluation.snapshot_hash)
+        if cached:
+            cached_evaluation = EvaluationOutput.model_validate_json(cached["payload_json"])
+            outputs.append(
+                {
+                    "cache_reused": True,
+                    "run_id": cached["run_id"],
+                    "python": cached_evaluation.model_dump(mode="json"),
+                }
+            )
+            continue
+        gpt_response, metadata = client.evaluate(evidence_package)
+        validated = validate_gpt_response(gpt_response.model_dump(), python_evaluation)
+        final_evaluation = evaluate_company(evidence, validated.decision)
+        run_id = repository.save(
+            final_evaluation,
+            company_key=company_key,
+            model=str(metadata.get("model") or model),
+            payloads={
+                "security_identity": evidence.identity.model_dump(mode="json"),
+                "market_snapshot": evidence.market.model_dump(mode="json"),
+                "financial_snapshot": evidence.financials.model_dump(mode="json"),
+                "business_snapshot": evidence.business.model_dump(mode="json"),
+                "governance_snapshot": evidence.governance.model_dump(mode="json"),
+                "peer_snapshot": [peer.model_dump(mode="json") for peer in evidence.peers],
+                "source_evidence": evidence_package.get("sources") or [],
+            },
+        )
+        report_path = save_html_report(final_evaluation, APP_ROOT)
+        outputs.append(
+            {
+                "gpt": validated.model_dump(mode="json"),
+                "python": final_evaluation.model_dump(mode="json"),
+                "run_id": run_id,
+                "html_report": str(report_path),
+            }
+        )
+        if metadata.get("response_id"):
+            response_ids.append(str(metadata["response_id"]))
+    prompt = json.dumps(
+        {
+            "analysis_type": "selected",
+            "schema_version": "1.0",
+            "evidence_packages": packages,
+        },
+        indent=2,
+        default=str,
     )
-    output = enforce_gpt_research_hard_rules(analysis, output)
-    return prompt, output, response_id, analysis
+    output = json.dumps({"schema_version": "1.0", "evaluations": outputs}, indent=2, default=str)
+    return prompt, output, ",".join(response_ids), analysis
 
 
 def ipo_gpt_row_key(row: dict[str, Any]) -> str:
@@ -18557,15 +18626,22 @@ def render_ipo_panel(state: PageState) -> str:
       {env_hidden_fields_for_render()}
     </form>"""
     dashboard = state.ipo_dashboard
-    if dashboard is None or dashboard.get("mode") != "simple_performance":
+    needs_pipeline_refresh = (
+        dashboard is not None
+        and dashboard.get("mode") == "simple_performance"
+        and dashboard.get("upcoming_pipeline_version") != IPO_UPCOMING_PIPELINE_VERSION
+    )
+    if dashboard is None or dashboard.get("mode") != "simple_performance" or needs_pipeline_refresh:
         try:
             dashboard = build_simple_ipo_performance_dashboard(
                 state.ipo_year,
                 today=datetime.now(INDIA_TIME_ZONE).date(),
             )
+            state.ipo_dashboard = dashboard
         except Exception as exc:
             dashboard = {
                 "mode": "simple_performance",
+                "upcoming_pipeline_version": IPO_UPCOMING_PIPELINE_VERSION,
                 "year": state.ipo_year,
                 "generated_at": "",
                 "last_refreshed": "",
@@ -18585,6 +18661,7 @@ def render_ipo_panel(state: PageState) -> str:
                     "last_refreshed": "",
                 },
             }
+            state.ipo_dashboard = dashboard
             state.error = f"{friendly_external_error(exc, 'IPO performance tracker')}\n\n{traceback.format_exc()}"
     panel_style = "" if state.active_tab == "ipo" else ' style="display:none"'
     summary = dashboard.get("summary") or {}
@@ -18654,6 +18731,8 @@ def render_ipo_panel(state: PageState) -> str:
             "hot",
             "high gmp",
             "high gmp >40%",
+            "live_kite",
+            "kite_ltp",
         }:
             return "good"
         if key in {
@@ -18662,6 +18741,7 @@ def render_ipo_panel(state: PageState) -> str:
             "blue",
             "ok",
             "resolved",
+            "unverified_source_price",
         }:
             return "blue"
         if key in {
@@ -18675,6 +18755,8 @@ def render_ipo_panel(state: PageState) -> str:
             "medium data",
             "needs review",
             "n/a",
+            "quote_missing",
+            "price_missing",
         }:
             return "warn"
         if key in {
@@ -18714,36 +18796,220 @@ def render_ipo_panel(state: PageState) -> str:
     def screener_link(row: dict[str, Any]) -> str:
         url = text_value(row.get("screener_url"), "")
         if not url:
-            return '<span class="muted-cell">N/A</span>'
+            return '<span class="muted-cell">-</span>'
         return f'<a class="mini-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">Screener</a>'
 
     def source_link(row: dict[str, Any]) -> str:
         url = text_value(row.get("source_url"), "")
         if not url:
-            return '<span class="muted-cell">N/A</span>'
-        return f'<a class="mini-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">Source</a>'
+            return '<span class="muted-cell">-</span>'
+        return f'<a class="mini-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">Exchange</a>'
 
-    def clean_company_display(value: Any) -> str:
+    def missing_text(value: Any) -> str:
+        text = text_value(value, "")
+        if text.strip().upper() in {"", "N/A", "NA", "NONE", "NULL", "DATA UNAVAILABLE", "DATA PENDING"}:
+            return "-"
+        return text
+
+    def clean_company_display(value: Any, row: dict[str, Any] | None = None) -> str:
         company = text_value(value, "N/A")
         company = re.sub(r"\s*\bListed\s*:\s*[^|]+$", "", company, flags=re.IGNORECASE).strip()
         company = re.sub(r"\s*\bSymbol pending\b.*$", "", company, flags=re.IGNORECASE).strip()
+        if row:
+            for identifier in (row.get("symbol"), row.get("bse_security_code"), row.get("bse_code")):
+                identifier_text = str(identifier or "").strip()
+                if identifier_text and company.upper().endswith(identifier_text.upper()):
+                    company = company[: -len(identifier_text)].strip()
         return company or "N/A"
 
     def company_cell(row: dict[str, Any]) -> str:
-        company = clean_company_display(row.get("company_name"))
-        symbol = text_value(row.get("symbol"), "")
+        company = clean_company_display(row.get("company_name"), row)
         url = text_value(row.get("screener_url"), "")
-        symbol_html = f"<small>{html.escape(symbol)}</small>" if symbol else ""
         if url:
             return (
                 f'<td><a class="ipo-company-link" href="{html.escape(url, quote=True)}" '
-                f'target="_blank" rel="noopener">{html.escape(company)}</a>{symbol_html}</td>'
+                f'target="_blank" rel="noopener">{html.escape(company)}</a></td>'
             )
-        return f"<td><strong>{html.escape(company)}</strong>{symbol_html}</td>"
+        return f"<td><strong>{html.escape(company)}</strong></td>"
 
-    def row_html(row: dict[str, Any]) -> str:
-        row_key = ipo_gpt_row_key(row)
-        company = clean_company_display(row.get("company_name"))
+    def build_market_label(row: dict[str, Any]) -> str:
+        symbol = str(row.get("symbol") or "").strip()
+        exchange = str(row.get("exchange") or "").strip()
+        ipo_type = str(row.get("ipo_type") or "").strip()
+        values = [value for value in [symbol, exchange] if value.upper() not in {"", "N/A", "-", "—"}]
+        if ipo_type.upper() not in {"", "N/A", "-", "—"} and ipo_type.upper() not in exchange.upper():
+            values.append(ipo_type)
+        return " · ".join(values) if values else "-"
+
+    def display_price(row: dict[str, Any]) -> str:
+        kite_ltp = row.get("kite_ltp")
+        previous_close = row.get("previous_close") or row.get("kite_previous_close")
+        source_price = row.get("source_current_price") or row.get("current_price")
+        if kite_ltp not in {None, ""}:
+            return money_text(kite_ltp)
+        if previous_close not in {None, ""}:
+            return f"{money_text(previous_close)}<br><small>Prev close</small>"
+        if source_price not in {None, ""}:
+            return f"{money_text(source_price)}<br><small>Source</small>"
+        return "-"
+
+    def pe_text(row: dict[str, Any]) -> str:
+        pe_value = row.get("pe_ratio") or row.get("pe")
+        pe_status = str(row.get("pe_status") or "").upper()
+        if pe_status == "NM" or str(pe_value).upper() == "NM":
+            return "NM"
+        if pe_value in {None, ""}:
+            return "-"
+        try:
+            value = float(pe_value)
+        except (TypeError, ValueError):
+            return missing_text(pe_value)
+        return "NM" if value <= 0 else f"{value:.1f}x"
+
+    def short_pct(value: Any) -> str:
+        text = pct_text(value)
+        return "-" if text == "N/A" else text
+
+    def short_money(value: Any) -> str:
+        text = money_text(value)
+        return "-" if text == "N/A" else text
+
+    def format_data_quality(row: dict[str, Any]) -> str:
+        score = _safe_float_for_attr(row.get("lt_data_quality_score") or row.get("data_quality_score"))
+        if score == 0 and row.get("lt_data_quality_score") in {None, ""} and row.get("data_quality_score") in {None, ""}:
+            return "-"
+        status = "High" if score >= 90 else "Good" if score >= 80 else "Partial" if score >= 65 else "Insufficient"
+        missing = text_value(row.get("lt_missing_evidence") or row.get("missing_evidence") or "")
+        detail = "Complete" if not missing or missing in {"None", "N/A"} else f"Missing: {missing.split(';')[0].strip()}"
+        return f"{score:.0f} · {status}<br><small>{html.escape(detail)}</small>"
+
+    def decision_text(row: dict[str, Any]) -> str:
+        decision = text_value(row.get("lt_final_decision") or row.get("final_decision") or row.get("action"), "DATA_INSUFFICIENT")
+        decision = decision.replace("_", " ")
+        detail = text_value(row.get("action_detail") or row.get("lt_key_risk") or row.get("action") or "")
+        if detail and detail.upper().replace(" ", "_") != decision.upper().replace(" ", "_"):
+            return f"{html.escape(decision)}<br><small>{html.escape(detail[:42])}</small>"
+        return html.escape(decision)
+
+    def key_risk_text(row: dict[str, Any]) -> str:
+        risk_text = str(row.get("risk_alerts") or row.get("lt_key_risk") or "")
+        lowered = risk_text.lower()
+        if not row.get("is_listed_verified") or "unresolved" in lowered or "identity" in lowered:
+            return "Identity unresolved"
+        if str(row.get("governance_flag") or "").upper() == "RED" or "governance" in lowered:
+            return "Governance red flag"
+        if str(row.get("ipo_type") or "").upper() == "SME" and _safe_float_for_attr(row.get("liquidity_score")) < 50:
+            return "Illiquid SME"
+        if "financial" in lowered:
+            return "Financials missing"
+        if "quarter" in lowered:
+            return "Quarterly data missing"
+        if "cash" in lowered or str(row.get("cash_flow_flag") or "").upper() == "RED":
+            return "CFO conversion weak"
+        if "valuation" in lowered or "expensive" in lowered:
+            return "Valuation expensive"
+        if "opm" in lowered or _safe_float_for_attr(row.get("opm_change_qoq_bps")) < -100:
+            return "OPM declining"
+        if "revenue" in lowered or "pat" in lowered:
+            return "Revenue/PAT declining"
+        if "history" in lowered or "listed" in lowered:
+            return "Limited listed history"
+        return text_value(row.get("lt_key_risk"), "None").split(";")[0][:60]
+
+    def links_cell(row: dict[str, Any]) -> str:
+        links = [screener_link(row), source_link(row)]
+        report_path = text_value(row.get("html_report") or row.get("research_report_url") or "")
+        if report_path:
+            links.append(f'<a class="mini-link" href="{html.escape(report_path, quote=True)}" target="_blank" rel="noopener">Research</a>')
+        detail = row_detail_html(row)
+        return f"<td>{' | '.join(links)}{detail}</td>"
+
+    def detail_item(label: str, value: Any, formatter: Callable[[Any], str] | None = None) -> str:
+        rendered = formatter(value) if formatter else missing_text(value)
+        return f"<dt>{html.escape(label)}</dt><dd>{html.escape(rendered)}</dd>"
+
+    def row_detail_html(row: dict[str, Any]) -> str:
+        ipo_items = [
+            detail_item("Listing Date", row.get("listing_date")),
+            detail_item("Listing Price", row.get("listing_price"), short_money),
+            detail_item("Issue Size", row.get("issue_size"), short_money),
+            detail_item("Fresh Issue", row.get("fresh_issue"), short_money),
+            detail_item("OFS", row.get("offer_for_sale") or row.get("ofs"), short_money),
+            detail_item("Use of Proceeds", row.get("use_of_proceeds")),
+        ]
+        market_items = [
+            detail_item("Day %", row.get("day_return_pct") or row.get("daily_gain_pct"), short_pct),
+            detail_item("1W %", row.get("one_week_return_pct") or row.get("weekly_gain_pct"), short_pct),
+            detail_item("6M %", row.get("six_month_return_pct"), short_pct),
+            detail_item("1Y %", row.get("one_year_return_pct"), short_pct),
+            detail_item("52W High", row.get("high_52w"), short_money),
+            detail_item("52W Low", row.get("low_52w"), short_money),
+            detail_item("Volume", row.get("volume"), num_text),
+            detail_item("Avg Traded Value", row.get("average_traded_value_20d"), short_money),
+            detail_item("Spread", row.get("bid_ask_spread_pct"), short_pct),
+            detail_item("Liquidity", row.get("liquidity_score"), num_text),
+            detail_item("Quote Time", row.get("quote_timestamp")),
+        ]
+        fundamentals_items = [
+            detail_item("Market Cap", row.get("market_cap") or row.get("current_market_cap"), short_money),
+            detail_item("P/B", row.get("pb_ratio"), num_text),
+            detail_item("EV/EBITDA", row.get("ev_ebitda"), num_text),
+            detail_item("Sales QoQ", row.get("sales_qoq_pct"), short_pct),
+            detail_item("PAT QoQ", row.get("pat_qoq_pct"), short_pct),
+            detail_item("ROE", row.get("roe"), short_pct),
+            detail_item("Debt/Equity", row.get("debt_to_equity"), num_text),
+            detail_item("CFO/PAT", row.get("cfo_pat"), num_text),
+            detail_item("Debtor Days", row.get("debtor_days"), num_text),
+            detail_item("Promoter", row.get("promoter_holding"), short_pct),
+            detail_item("Pledge", row.get("pledge_pct") or row.get("promoter_pledge"), short_pct),
+        ]
+        research_items = [
+            detail_item("Sector Score", row.get("sector_score"), num_text),
+            detail_item("Investment Score", row.get("lt_investment_score"), num_text),
+            detail_item("Python Decision", row.get("lt_python_decision")),
+            detail_item("GPT Decision", row.get("lt_gpt_decision")),
+            detail_item("Hard Blocks", row.get("hard_rule_blocks") or row.get("lt_key_risk")),
+            detail_item("Buy Zone", row.get("lt_buy_zone") or row.get("suggested_buy_zone")),
+            detail_item("Allocation", row.get("lt_allocation") or row.get("suggested_allocation")),
+            detail_item("Missing Evidence", row.get("lt_missing_evidence")),
+            detail_item("Data Source", row.get("data_source") or row.get("source")),
+        ]
+        sections = [
+            ("IPO", ipo_items),
+            ("Market", market_items),
+            ("Fundamentals", fundamentals_items),
+            ("Research", research_items),
+        ]
+        body = "".join(
+            f"<strong>{title}</strong><dl>{''.join(items)}</dl>"
+            for title, items in sections
+        )
+        return f'<details class="ipo-row-details"><summary>View Details</summary><div>{body}</div></details>'
+
+    def cell_html(row: dict[str, Any], key: str) -> str:
+        if key == "select":
+            return f'<td class="ipo-select-cell"><input type="checkbox" name="ipo_selected_key" value="{html.escape(ipo_gpt_row_key(row), quote=True)}"></td>'
+        if key == "company":
+            return company_cell(row)
+        if key == "market":
+            return f"<td>{html.escape(build_market_label(row))}</td>"
+        if key == "ltp":
+            return f"<td>{display_price(row)}</td>"
+        if key == "data":
+            return f"<td>{format_data_quality(row)}</td>"
+        if key == "decision":
+            return f"<td>{decision_text(row)}</td>"
+        if key == "risk":
+            return f"<td>{html.escape(key_risk_text(row))}</td>"
+        if key == "links":
+            return links_cell(row)
+        column = COLUMN_RENDERERS[key]
+        value = column["value"](row)
+        rendered = column.get("format", missing_text)(value)
+        return f"<td>{html.escape(rendered)}</td>"
+
+    def row_html(row: dict[str, Any], columns: list[dict[str, Any]]) -> str:
+        company = clean_company_display(row.get("company_name"), row)
         search_blob = " ".join(
             [
                 company,
@@ -18766,56 +19032,150 @@ def render_ipo_panel(state: PageState) -> str:
             f'data-financial="{"1" if data_financial else "0"}" '
             f'data-action="{html.escape(action_text.lower(), quote=True)}" '
             f'data-risk="{"1" if risk_alert else "0"}">'
-            f'<td class="ipo-select-cell"><input type="checkbox" name="ipo_selected_key" value="{html.escape(row_key, quote=True)}"></td>'
-            f"<td>{html.escape(text_value(row.get('rank'), ''))}</td>"
-            f"{company_cell(row)}"
-            f"<td>{html.escape(text_value(row.get('symbol'), ''))}</td>"
-            f"<td>{html.escape(text_value(row.get('exchange'), ''))}</td>"
-            f"<td>{html.escape(text_value(row.get('ipo_type')))}</td>"
-            f"<td>{html.escape(text_value(row.get('listing_date')))}</td>"
-            f"<td>{html.escape(money_text(row.get('ipo_price')))}</td>"
-            f"<td>{html.escape(money_text(row.get('current_price')))}</td>"
-            f"<td>{html.escape(pct_text(row.get('current_gain_pct')))}</td>"
-            f"<td>{html.escape(pct_text(row.get('one_month_return_pct')))}</td>"
-            f"<td>{html.escape(pct_text(row.get('three_month_return_pct')))}</td>"
-            f"<td>{html.escape(pct_text(row.get('drawdown_from_52w_high_pct')))}</td>"
-            f"<td>{html.escape(money_text(row.get('gain_from_ipo_rs')))}</td>"
-            f"<td>{html.escape(money_text(row.get('market_cap') or row.get('ipo_market_cap')))}</td>"
-            f"<td>{html.escape(text_value(row.get('sector')))}</td>"
-            f"<td>{html.escape(text_value(row.get('theme')))}</td>"
-            f"<td>{html.escape(num_text(row.get('sector_score'), 0))}</td>"
-            f"<td>{html.escape(num_text(row.get('value_score'), 0))}</td>"
-            f"<td>{badge(row.get('financial_data_status') or 'Financial Data Pending')}</td>"
-            f"<td>{html.escape(num_text(row.get('symbol_resolution_confidence'), 0))}</td>"
-            f"<td>{badge(row.get('data_quality_status') or 'Data Pending')}</td>"
-            f"<td>{html.escape(num_text(row.get('liquidity_score'), 0))}</td>"
-            f"<td>{badge(row.get('valuation_status') or 'Data Pending')}</td>"
-            f"<td>{badge(row.get('cash_flow_flag') or 'Data Pending')}</td>"
-            f"<td>{badge(row.get('governance_flag') or 'Data Pending')}</td>"
-            f"<td>{action_badge(row)}</td>"
-            f"<td>{html.escape(text_value(row.get('suggested_buy_zone')))}</td>"
-            f"<td>{html.escape(text_value(row.get('suggested_allocation')))}</td>"
-            f"<td>{html.escape(text_value(row.get('risk_alerts'), 'None'))}</td>"
-            f"<td>{status_badge(row)}</td>"
-            f"<td>{screener_link(row)}</td>"
-            f"<td>{source_link(row)}</td>"
-            "</tr>"
+            + "".join(cell_html(row, column["key"]) for column in columns)
+            + "</tr>"
+        )
+
+    COLUMN_RENDERERS: dict[str, dict[str, Any]] = {
+        "rank": {"label": "Rank", "sort": "number", "value": lambda row: row.get("rank"), "format": missing_text},
+        "ipo_px": {"label": "IPO Px", "sort": "number", "value": lambda row: row.get("ipo_price"), "format": short_money},
+        "ipo_gain": {"label": "IPO Gain", "sort": "number", "value": lambda row: row.get("current_gain_pct"), "format": short_pct},
+        "one_month": {"label": "1M", "sort": "number", "value": lambda row: row.get("one_month_return_pct"), "format": short_pct},
+        "three_month": {"label": "3M", "sort": "number", "value": lambda row: row.get("three_month_return_pct"), "format": short_pct},
+        "drawdown": {"label": "52W DD", "sort": "number", "value": lambda row: row.get("drawdown_from_52w_high_pct"), "format": short_pct},
+        "pe": {"label": "P/E", "sort": "number", "value": lambda row: row.get("pe_ratio") or row.get("pe"), "format": lambda value: pe_text({"pe_ratio": value})},
+        "sales_yoy": {"label": "Sales YoY", "sort": "number", "value": lambda row: row.get("sales_yoy_pct") or row.get("latest_revenue_growth_yoy") or row.get("revenue_growth_yoy"), "format": short_pct},
+        "pat_yoy": {"label": "PAT YoY", "sort": "number", "value": lambda row: row.get("pat_yoy_pct") or row.get("latest_pat_growth_yoy") or row.get("pat_growth_yoy"), "format": short_pct},
+        "opm": {"label": "OPM", "sort": "number", "value": lambda row: row.get("opm_pct") or row.get("opm_trend_pct"), "format": short_pct},
+        "roce": {"label": "ROCE", "sort": "number", "value": lambda row: row.get("roce"), "format": short_pct},
+        "day": {"label": "Day", "sort": "number", "value": lambda row: row.get("day_return_pct") or row.get("daily_gain_pct"), "format": short_pct},
+        "week": {"label": "1W", "sort": "number", "value": lambda row: row.get("one_week_return_pct") or row.get("weekly_gain_pct"), "format": short_pct},
+        "six_month": {"label": "6M", "sort": "number", "value": lambda row: row.get("six_month_return_pct"), "format": short_pct},
+        "one_year": {"label": "1Y", "sort": "number", "value": lambda row: row.get("one_year_return_pct"), "format": short_pct},
+        "volume": {"label": "Volume", "sort": "number", "value": lambda row: row.get("volume"), "format": num_text},
+        "traded_value": {"label": "20D Value", "sort": "number", "value": lambda row: row.get("average_traded_value_20d"), "format": short_money},
+        "spread": {"label": "Spread", "sort": "number", "value": lambda row: row.get("bid_ask_spread_pct"), "format": short_pct},
+        "liquidity": {"label": "Liquidity", "sort": "number", "value": lambda row: row.get("liquidity_score"), "format": num_text},
+        "market_cap": {"label": "MCap", "sort": "number", "value": lambda row: row.get("market_cap") or row.get("current_market_cap"), "format": short_money},
+        "pb": {"label": "P/B", "sort": "number", "value": lambda row: row.get("pb_ratio"), "format": num_text},
+        "ev_ebitda": {"label": "EV/EBITDA", "sort": "number", "value": lambda row: row.get("ev_ebitda"), "format": num_text},
+        "sales_qoq": {"label": "Sales QoQ", "sort": "number", "value": lambda row: row.get("sales_qoq_pct"), "format": short_pct},
+        "pat_qoq": {"label": "PAT QoQ", "sort": "number", "value": lambda row: row.get("pat_qoq_pct"), "format": short_pct},
+        "roe": {"label": "ROE", "sort": "number", "value": lambda row: row.get("roe"), "format": short_pct},
+        "debt": {"label": "D/E", "sort": "number", "value": lambda row: row.get("debt_to_equity"), "format": num_text},
+        "cfo_pat": {"label": "CFO/PAT", "sort": "number", "value": lambda row: row.get("cfo_pat"), "format": num_text},
+        "sector_score": {"label": "Sector", "sort": "number", "value": lambda row: row.get("sector_score"), "format": num_text},
+        "investment": {"label": "Invest", "sort": "number", "value": lambda row: row.get("lt_investment_score"), "format": num_text},
+        "python": {"label": "Python", "sort": "text", "value": lambda row: row.get("lt_python_decision"), "format": missing_text},
+        "gpt": {"label": "GPT", "sort": "text", "value": lambda row: row.get("lt_gpt_decision"), "format": missing_text},
+        "blocks": {"label": "Blocks", "sort": "text", "value": lambda row: row.get("hard_rule_blocks") or row.get("lt_key_risk"), "format": missing_text},
+        "missing": {"label": "Missing", "sort": "text", "value": lambda row: row.get("lt_missing_evidence"), "format": missing_text},
+        "buy_zone": {"label": "Buy Zone", "sort": "text", "value": lambda row: row.get("lt_buy_zone") or row.get("suggested_buy_zone"), "format": missing_text},
+    }
+    base_columns = {
+        "select": {"key": "select", "label": "Select", "sort": ""},
+        "company": {"key": "company", "label": "Company", "sort": "text"},
+        "market": {"key": "market", "label": "Market", "sort": "text"},
+        "ltp": {"key": "ltp", "label": "LTP", "sort": "number"},
+        "data": {"key": "data", "label": "Data", "sort": "number"},
+        "decision": {"key": "decision", "label": "Decision", "sort": "text"},
+        "risk": {"key": "risk", "label": "Risk", "sort": "text"},
+        "links": {"key": "links", "label": "Links", "sort": "text"},
+    }
+    view_columns = {
+        "Compact": ["select", "rank", "company", "market", "ipo_px", "ltp", "ipo_gain", "one_month", "three_month", "drawdown", "pe", "sales_yoy", "pat_yoy", "opm", "roce", "data", "decision", "risk", "links"],
+        "Price": ["select", "rank", "company", "market", "ipo_px", "ltp", "day", "week", "one_month", "three_month", "six_month", "one_year", "ipo_gain", "drawdown", "volume", "traded_value", "spread", "liquidity", "links"],
+        "Fundamentals": ["select", "rank", "company", "market", "ltp", "market_cap", "pe", "pb", "ev_ebitda", "sales_qoq", "sales_yoy", "pat_qoq", "pat_yoy", "opm", "roce", "roe", "debt", "cfo_pat", "data", "decision", "links"],
+        "Research": ["select", "rank", "company", "market", "ltp", "data", "investment", "sector_score", "python", "gpt", "decision", "blocks", "missing", "buy_zone", "risk", "links"],
+    }
+    protected_columns = {
+        "select",
+        "rank",
+        "company",
+        "market",
+        "ipo_px",
+        "ltp",
+        "ipo_gain",
+        "one_month",
+        "three_month",
+        "drawdown",
+        "pe",
+        "sales_yoy",
+        "pat_yoy",
+        "opm",
+        "roce",
+        "data",
+        "decision",
+        "risk",
+        "links",
+    }
+    missing_values = {None, "", "N/A", "NA", "-", "—", "DATA UNAVAILABLE", "DATA PENDING"}
+
+    def column_for_key(key: str) -> dict[str, Any]:
+        if key in base_columns:
+            return base_columns[key]
+        return {"key": key, "label": COLUMN_RENDERERS[key]["label"], "sort": COLUMN_RENDERERS[key]["sort"]}
+
+    def rendered_missing_ratio(rows: list[dict[str, Any]], key: str) -> float:
+        if not rows or key in base_columns:
+            return 0.0
+        renderer = COLUMN_RENDERERS[key]
+        missing_count = 0
+        for row in rows:
+            value = renderer["value"](row)
+            rendered = renderer.get("format", missing_text)(value)
+            if value in missing_values or str(rendered).strip().upper() in missing_values:
+                missing_count += 1
+        return missing_count / max(len(rows), 1)
+
+    decision_priority = {"BUY": 0, "WAIT": 1, "DATA_INSUFFICIENT": 2, "DATA INSUFFICIENT": 2, "AVOID": 3}
+
+    def compact_sort_key(row: dict[str, Any]) -> tuple[float, int, float, float]:
+        decision = text_value(row.get("lt_final_decision") or row.get("final_decision") or "").upper()
+        return (
+            -_safe_float_for_attr(row.get("lt_data_quality_score") or row.get("data_quality_score")),
+            decision_priority.get(decision, 9),
+            -_safe_float_for_attr(row.get("lt_investment_score") or row.get("value_score")),
+            -_safe_float_for_attr(row.get("current_gain_pct")),
         )
 
     def render_table(title: str, rows: list[dict[str, Any]], table_id: str, empty_text: str) -> str:
-        rows_html = "".join(row_html(row) for row in rows)
+        active_view = state.ipo_table_view if state.ipo_table_view in view_columns else "Compact"
+        selected_keys = view_columns[active_view]
+        if not state.ipo_show_unavailable_columns:
+            selected_keys = [
+                key for key in selected_keys
+                if key in protected_columns or rendered_missing_ratio(rows, key) <= 0.85
+            ]
+        columns = [column_for_key(key) for key in selected_keys]
+        display_rows = sorted(rows, key=compact_sort_key) if active_view == "Compact" else rows
+        rows_html = "".join(row_html(row, columns) for row in display_rows)
         if not rows_html:
-            rows_html = f'<tr><td colspan="32" class="muted-cell">{html.escape(empty_text)}</td></tr>'
+            rows_html = f'<tr><td colspan="{len(columns)}" class="muted-cell">{html.escape(empty_text)}</td></tr>'
+        view_options = "".join(
+            f'<option value="{html.escape(view, quote=True)}"{" selected" if view == active_view else ""}>{html.escape(view)}</option>'
+            for view in ["Compact", "Price", "Fundamentals", "Research"]
+        )
+        def header_html(column: dict[str, Any]) -> str:
+            class_attr = ' class="ipo-select-cell"' if column["key"] == "select" else ""
+            sort_attr = f' data-sort-type="{html.escape(column["sort"], quote=True)}"' if column.get("sort") else ""
+            return f'<th{class_attr}{sort_attr}>{html.escape(column["label"])}</th>'
+
+        headers = "".join(header_html(column) for column in columns)
         return f"""
       <section class="panel ipo-table-panel ipo-results-panel">
         <div class="ipo-section-head">
           <div>
             <div class="panel-title">{html.escape(title)}</div>
-            <p class="status">Select companies, sort columns, and send a shortlist to GPT for value-investor review. This table blends price action with symbol confidence, data quality, financial readiness, risk flags, and action classification.</p>
+            <p class="status">Compact view is capped at {len(columns)} visible columns and keeps diagnostics inside View Details or Research view.</p>
           </div>
           <div class="actions">
             <a class="mini-link" href="{html.escape(ipo_custom_gpt_url, quote=True)}" target="_blank" rel="noopener">Open Custom GPT manually</a>
+            <label><span>View</span><select name="ipo_table_view">{view_options}</select></label>
+            <label class="inline-check"><input type="checkbox" name="ipo_show_unavailable_columns" value="1"{' checked' if state.ipo_show_unavailable_columns else ''}> Show unavailable columns</label>
+            <input type="hidden" name="ipo_show_unavailable_columns_present" value="1">
             <label class="inline-check"><input type="checkbox" name="ipo_add_sector_leaders" value="1"{' checked' if state.ipo_add_sector_leaders else ''}> Add sector leaders</label>
+            <button type="submit" formaction="/ipo/load" class="secondary">Apply View</button>
             <button type="submit" formaction="/ipo/research-build" class="secondary">Build Research View</button>
             <button type="submit" formaction="/ipo/gpt-analyze" class="secondary">Generate GPT Research Note</button>
           </div>
@@ -18823,13 +19183,7 @@ def render_ipo_panel(state: PageState) -> str:
         <div class="table-wrap">
           <table id="{html.escape(table_id, quote=True)}" class="ipo-table ipo-sortable">
             <thead><tr>
-              <th class="ipo-select-cell">Select</th>
-              <th data-sort-type="number">Rank</th><th data-sort-type="text">Company</th><th data-sort-type="text">Symbol</th><th data-sort-type="text">Exchange</th><th data-sort-type="text">IPO Type</th><th data-sort-type="date">Listing Date</th><th data-sort-type="number">IPO Price</th>
-              <th data-sort-type="number">LTP</th><th data-sort-type="number">Current Gain %</th><th data-sort-type="number">1M %</th><th data-sort-type="number">3M %</th><th data-sort-type="number">52W Drawdown %</th>
-              <th data-sort-type="number">Gain from IPO in Rs</th><th data-sort-type="number">Market Cap</th><th data-sort-type="text">Sector</th><th data-sort-type="text">Theme</th><th data-sort-type="number">Sector Score</th>
-              <th data-sort-type="number">Value Score</th><th data-sort-type="text">Financial Data</th><th data-sort-type="number">Symbol Confidence</th><th data-sort-type="text">Data Quality</th><th data-sort-type="number">Liquidity</th>
-              <th data-sort-type="text">Valuation</th><th data-sort-type="text">Cash Flow</th><th data-sort-type="text">Governance</th><th data-sort-type="text">Action</th><th data-sort-type="text">Buy Zone</th>
-              <th data-sort-type="text">Allocation</th><th data-sort-type="text">Risk Alerts</th><th data-sort-type="text">Status Badge</th><th data-sort-type="text">Screener</th><th data-sort-type="text">Data Source</th>
+              {headers}
             </tr></thead>
             <tbody>{rows_html}</tbody>
           </table>
@@ -18932,11 +19286,18 @@ def render_ipo_panel(state: PageState) -> str:
         for label, value, help_text in summary_cards
     )
     def upcoming_row_html(item: dict[str, Any]) -> str:
-        hot_class = ' class="ipo-upcoming-hot"' if _safe_float_for_attr(item.get("gmp_pct")) >= 40 else ""
+        row_classes: list[str] = []
+        if item.get("is_open_for_application") is True:
+            row_classes.append("ipo-upcoming-open")
+        if _safe_float_for_attr(item.get("gmp_pct")) >= 40:
+            row_classes.append("ipo-upcoming-hot")
+        class_attr = f' class="{" ".join(row_classes)}"' if row_classes else ""
+        application_style = "blue" if item.get("is_open_for_application") is True else "neutral"
         return f"""
-        <tr{hot_class}>
+        <tr{class_attr}>
           <td><a class="ipo-company-link" href="{html.escape(text_value(item.get("screener_url"), "https://www.screener.in/"), quote=True)}" target="_blank" rel="noopener">{html.escape(clean_company_display(item.get("company_name")))}</a><br><small>{html.escape(text_value(item.get("symbol") or item.get("ipo_type")))}</small></td>
-          <td>{html.escape(text_value(item.get("ipo_date")))}</td>
+          <td>{html.escape(text_value(item.get("ipo_open_date") or item.get("ipo_date")))}</td>
+          <td>{html.escape(text_value(item.get("ipo_close_date")))}</td>
           <td>{html.escape(text_value(item.get("days_to_ipo")))}</td>
           <td>{html.escape(text_value(item.get("sector")))}</td>
           <td>{html.escape(text_value(item.get("ipo_type")))}</td>
@@ -18945,18 +19306,19 @@ def render_ipo_panel(state: PageState) -> str:
           <td>{html.escape(text_value(item.get("gmp")))}</td>
           <td>{badge(pct_text(item.get("gmp_pct")), item.get("status_class") or item.get("status_badge"))}</td>
           <td>{status_badge(item)}</td>
+          <td>{badge(item.get("application_status") or "Date pending", application_style)}</td>
           <td>{source_link(item)}</td>
         </tr>
         """
 
     upcoming_rows_html = "".join(upcoming_row_html(item) for item in upcoming_next7)
     if not upcoming_rows_html:
-        upcoming_rows_html = '<tr><td colspan="11" class="muted-cell">No upcoming IPOs in the next 7 days from verified sources.</td></tr>'
+        upcoming_rows_html = '<tr><td colspan="13" class="muted-cell">No upcoming IPOs in the next 7 days from verified sources.</td></tr>'
     upcoming_html = f"""
         <div class="table-wrap compact">
           <table id="ipo-upcoming-table" class="ipo-table ipo-upcoming-table">
             <thead><tr>
-              <th>Company</th><th>IPO Date</th><th>Days</th><th>Sector</th><th>Type</th><th>Issue</th><th>Price Band</th><th>GMP</th><th>GMP %</th><th>Status</th><th>Source</th>
+              <th>Company</th><th>Open Date</th><th>Close Date</th><th>Days</th><th>Sector</th><th>Type</th><th>Issue</th><th>Price Band</th><th>GMP</th><th>GMP %</th><th>GMP Status</th><th>Application</th><th>Source</th>
             </tr></thead>
             <tbody>{upcoming_rows_html}</tbody>
           </table>
@@ -19204,11 +19566,21 @@ def render_ipo_panel(state: PageState) -> str:
       </section>
       <section class="panel ipo-upcoming-panel">
         <div class="panel-title">Upcoming IPOs - Next 7 Days</div>
-        <p class="status">Use this first for near-term IPO watch. Rows keep clean company names, GMP %, status, Screener research link, and source link when available.</p>
+        <p class="status">Light-blue rows are currently open for application: today falls on or between the IPO open and close dates. Dates are evaluated inclusively.</p>
         {upcoming_html}
       </section>
       <section class="panel ipo-summary-panel compact-top-performers"><div class="summary-grid">{summary_cards_html}</div></section>
       {messages_html}
+      <section class="panel ipo-long-term-evaluation-panel">
+        <div class="panel-title">Long-Term Evaluation</div>
+        <p class="status">Python verifies identity and evidence, calculates data quality, investment score, hard blocks, valuation and liquidity, then prevents GPT from upgrading the permitted decision.</p>
+        <div class="actions">
+          <label class="inline-check"><input type="checkbox" name="ipo_add_sector_leaders" value="1"{' checked' if state.ipo_add_sector_leaders else ''}> Add top 2 sector leaders</label>
+          <button type="submit" formaction="/ipo/research-build" class="secondary">Generate Selected Evaluation</button>
+          <button type="submit" formaction="/ipo/gpt-analyze" class="secondary">Explain Selected with GPT</button>
+          <button type="submit" formaction="/ipo/evaluate-all" class="secondary">Evaluate All Eligible IPOs</button>
+        </div>
+      </section>
       {render_table("Top 40 IPO Performers", combined_top40, "ipo-combined-table", "No IPO performance rows available for this year. Refresh IPO Data or check source access.")}
       {render_research_panel()}
       {gpt_panel}
@@ -19527,6 +19899,9 @@ def _render_ipo_panel_legacy(state: PageState) -> str:
         "<tr>"
         f'{ipo_symbol_cell(row)}'
         f'<td>{html.escape(text_value(row.get("quarter")))}</td>'
+        f'<td><strong>{html.escape(num_text(row.get("quarterly_results_score"), 1))}</strong>'
+        f'<span>{html.escape(text_value(row.get("quarterly_results_rating")))}</span></td>'
+        f'<td>{html.escape(text_value(row.get("quarterly_results_explanation")))}</td>'
         f'<td>{html.escape(pct_text(row.get("latest_revenue_growth_yoy") or row.get("revenue_growth_yoy")))}</td>'
         f'<td>{html.escape(pct_text(row.get("ebitda_growth_yoy")))}</td>'
         f'<td>{html.escape(pct_text(row.get("latest_pat_growth_yoy") or row.get("pat_growth_yoy") or row.get("profit_growth_yoy")))}</td>'
@@ -19545,7 +19920,7 @@ def _render_ipo_panel_legacy(state: PageState) -> str:
         f'<td>{badge(row.get("flag"))}</td>'
         "</tr>"
         for row in quarterly
-    ) or '<tr><td colspan="18" class="muted-cell">Quarterly monitor rows will appear after loading IPO data.</td></tr>'
+    ) or '<tr><td colspan="20" class="muted-cell">Quarterly monitor rows will appear after loading IPO data.</td></tr>'
 
     ranking_cards = "".join(action_card(row) for row in selected_ranking[:6]) or action_card({})
 
@@ -19680,12 +20055,13 @@ def _render_ipo_panel_legacy(state: PageState) -> str:
         <div class="panel-title">Quarterly Monitoring Table</div>
         <p class="status">Quarterly result proof: growth, margin trend, ROCE/ROE, debt, working capital, cash conversion, promoter/FII-DII movement.</p>
         <div class="table-wrap"><table id="ipo-quarterly-table" class="ipo-table"><thead><tr>
-          <th>{sort_header("Company", 0)}</th><th>{sort_header("Quarter", 1)}</th><th>{sort_header("Revenue YoY", 2)}</th>
-          <th>{sort_header("EBITDA YoY", 3)}</th><th>{sort_header("PAT YoY", 4)}</th><th>{sort_header("OPM trend", 5)}</th>
-          <th>{sort_header("ROCE", 6)}</th><th>{sort_header("ROE", 7)}</th><th>{sort_header("D/E", 8)}</th>
-          <th>{sort_header("Debtor days", 9)}</th><th>{sort_header("Inventory days", 10)}</th><th>{sort_header("CCC", 11)}</th>
-          <th>{sort_header("CFO/PAT", 12)}</th><th>{sort_header("FCF", 13)}</th><th>{sort_header("Promoter chg", 14)}</th>
-          <th>{sort_header("Pledge chg", 15)}</th><th>{sort_header("FII/DII chg", 16)}</th><th>{sort_header("Flag", 17)}</th>
+          <th>{sort_header("Company", 0)}</th><th>{sort_header("Quarter", 1)}</th><th>{sort_header("Quarter score", 2)}</th>
+          <th>{sort_header("Score explanation", 3)}</th><th>{sort_header("Revenue YoY", 4)}</th>
+          <th>{sort_header("EBITDA YoY", 5)}</th><th>{sort_header("PAT YoY", 6)}</th><th>{sort_header("OPM trend", 7)}</th>
+          <th>{sort_header("ROCE", 8)}</th><th>{sort_header("ROE", 9)}</th><th>{sort_header("D/E", 10)}</th>
+          <th>{sort_header("Debtor days", 11)}</th><th>{sort_header("Inventory days", 12)}</th><th>{sort_header("CCC", 13)}</th>
+          <th>{sort_header("CFO/PAT", 14)}</th><th>{sort_header("FCF", 15)}</th><th>{sort_header("Promoter chg", 16)}</th>
+          <th>{sort_header("Pledge chg", 17)}</th><th>{sort_header("FII/DII chg", 18)}</th><th>{sort_header("Flag", 19)}</th>
         </tr></thead><tbody>{quarterly_rows}</tbody></table></div>
       </section>
       <section class="panel ipo-table-panel">
@@ -26237,6 +26613,14 @@ def render_page(state: PageState) -> bytes:
       color: #14532d;
       border-color: #22c55e;
     }}
+    .ipo-upcoming-table tr.ipo-upcoming-open td {{
+      background: #e0f2fe;
+      border-top: 1px solid #7dd3fc;
+      border-bottom: 1px solid #7dd3fc;
+    }}
+    .ipo-upcoming-table tr.ipo-upcoming-open td:first-child {{
+      border-left: 4px solid #0284c7;
+    }}
     .ipo-command-panel {{
       border: 1px solid rgba(20, 184, 166, 0.28);
       border-radius: 16px;
@@ -31002,6 +31386,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if "ipo_add_sector_leaders_present" in form
                 else False
             ),
+            ipo_table_view=first(form, "ipo_table_view", "Compact"),
+            ipo_show_unavailable_columns=(
+                checked(form, "ipo_show_unavailable_columns")
+                if "ipo_show_unavailable_columns_present" in form
+                else False
+            ),
             ipo_research_json=first(form, "ipo_research_json"),
             ipo_research_html=first(form, "ipo_research_html"),
             ipo_research_message=first(form, "ipo_research_message"),
@@ -31594,6 +31984,36 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.message = (
                         f"GPT analyzed {len(rows)} {choice_text} IPO candidate(s) for long-term value investing. "
                         "Result is shown in IPO and copied to GPT output state."
+                    )
+            elif request_path == "/ipo/evaluate-all":
+                from ipo_evaluation.gpt.batch_evaluator import IpoBatchEvaluator
+                from ipo_evaluation.storage.repositories import EvaluationRepository
+
+                dashboard = build_simple_ipo_performance_dashboard(
+                    state.ipo_year,
+                    force_refresh=False,
+                )
+                state.ipo_dashboard = dashboard
+                rows = selected_ipo_rows_for_value_analysis(dashboard, limit=500)
+                batch_jsonl, skipped = build_ipo_evaluation_batch_jsonl(rows)
+                state.ipo_export_csv = batch_jsonl
+                state.ipo_export_filename = f"ipo_evaluation_batch_{state.ipo_year}.jsonl"
+                prepared = sum(1 for line in batch_jsonl.splitlines() if line.strip())
+                if prepared:
+                    batch_result = IpoBatchEvaluator().submit_jsonl(batch_jsonl)
+                    EvaluationRepository().save_batch_job(
+                        batch_result["batch_job_id"],
+                        batch_result["status"],
+                        batch_result,
+                    )
+                    state.message = (
+                        f"Submitted IPO Batch API job {batch_result['batch_job_id']} with "
+                        f"{prepared} eligible request(s); skipped {len(skipped)} row(s)."
+                    )
+                else:
+                    state.message = (
+                        "No IPO was eligible for batch evaluation. "
+                        f"Skipped {len(skipped)} row(s) at identity/data-quality gates."
                     )
             elif request_path == "/ipo/research-save":
                 dashboard = build_simple_ipo_performance_dashboard(

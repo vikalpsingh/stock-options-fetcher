@@ -14,6 +14,7 @@ import pytest
 
 import app
 import ipo_data_service
+FETCH_NSE_UPCOMING_IPOS = ipo_data_service.fetch_nse_upcoming_ipos
 from ipo_cache import load_or_generate, make_ipo_cache_key
 from ipo_data_service import (
     IPO_NO_VERIFIED_DATA_MESSAGE,
@@ -28,11 +29,13 @@ from ipo_data_service import (
     selected_ipo_rows_for_value_analysis,
 )
 from ipo_scoring_engine import filter_multibaggers_or_all, score_ipo_company
+from ipo_screener_engine import score_quarterly_results
 from ipo.symbol_resolution.symbol_resolver import (
     load_symbol_overrides,
     normalize_company_key,
     resolve_ipo_identity,
 )
+from ipo.utils.company_name_cleaner import clean_display_company_name
 from ipo.utils.ipo_price_cleaner import clean_price as clean_ipo_price
 
 
@@ -52,6 +55,24 @@ def chittorgarh_table(rows: str) -> str:
       {rows}
     </table>
     """
+
+
+def table_html(page_html: str, table_id: str = "ipo-combined-table") -> str:
+    start = page_html.index(f'id="{table_id}"')
+    end = page_html.index("</table>", start)
+    return page_html[start:end]
+
+
+def table_header_html(page_html: str, table_id: str = "ipo-combined-table") -> str:
+    table = table_html(page_html, table_id)
+    start = table.index("<thead")
+    end = table.index("</thead>", start)
+    return table[start:end]
+
+
+def header_count(page_html: str, table_id: str = "ipo-combined-table") -> int:
+    header = table_header_html(page_html, table_id)
+    return header.count("<th ") + header.count("<th>")
 
 
 @pytest.fixture(autouse=True)
@@ -134,6 +155,90 @@ def verified_live_record(**overrides):
     }
     record.update(overrides)
     return record
+
+
+def test_quarterly_results_score_rewards_strong_execution():
+    result = score_quarterly_results(
+        verified_live_record(
+            ebitda_growth_yoy=27,
+            debtor_days_change_pct=-4,
+            inventory_days_change_pct=3,
+        )
+    )
+
+    assert result.score is not None
+    assert result.score >= 80
+    assert result.rating == "STRONG"
+    assert result.coverage_pct == 100
+    assert "revenue growth" in result.explanation
+
+
+def test_quarterly_results_score_flags_deterioration():
+    result = score_quarterly_results(
+        verified_live_record(
+            latest_revenue_growth_yoy=-8,
+            ebitda_growth_yoy=-15,
+            latest_pat_growth_yoy=-20,
+            eps_growth_yoy=-18,
+            opm_trend_pct=-5,
+            roce=7,
+            cfo_pat=0.2,
+            debt_to_equity=2.5,
+            debtor_days_change_pct=35,
+        )
+    )
+
+    assert result.score is not None
+    assert result.score < 50
+    assert result.rating == "WEAK"
+    assert "PAT growth -20.0%" in result.explanation
+
+
+def test_quarterly_results_score_handles_missing_and_invalid_data():
+    missing = score_quarterly_results({"symbol": "PENDING"})
+    invalid = score_quarterly_results(None)  # type: ignore[arg-type]
+
+    assert missing.score is None
+    assert missing.rating == "DATA UNAVAILABLE"
+    assert missing.warnings
+    assert invalid.score is None
+    assert "invalid" in invalid.explanation
+
+
+def test_ipo_score_exposes_quarterly_score_and_explanation():
+    scored = score_ipo_company(
+        verified_live_record(
+            ebitda_growth_yoy=27,
+            debtor_days_change_pct=-4,
+            inventory_days_change_pct=3,
+        )
+    )
+
+    assert scored["quarterly_results_score"] >= 80
+    assert scored["quarterly_results_rating"] == "STRONG"
+    assert scored["quarterly_results_explanation"]
+
+
+def test_clean_display_company_name_removes_known_trailing_identifier_only():
+    assert clean_display_company_name("Apsis AerocomAPSISAERO", "APSISAERO") == "Apsis Aerocom"
+    assert clean_display_company_name("Indo SMC544681", "", "544681") == "Indo SMC"
+    assert clean_display_company_name("Symbolic Systems Limited", "SYS") == "Symbolic Systems Limited"
+
+
+def test_source_current_price_is_not_promoted_to_kite_ltp():
+    row = ipo_data_service._enrich_simple_ipo_decision(
+        verified_live_record(
+            company_name="Source Price IPO",
+            current_price=153,
+            ltp=None,
+            kite_ltp=None,
+            quote_verified=False,
+        )
+    )
+
+    assert row["source_current_price"] == 153
+    assert row["kite_ltp"] is None
+    assert row["market_data_status"] == "UNVERIFIED_SOURCE_PRICE"
 
 
 def simple_perf_record(index: int, ipo_type: str, gain: float, listed_year: int = 2026) -> dict:
@@ -321,6 +426,34 @@ def test_ipo_dashboard_uses_live_source_records_when_available(tmp_path, monkeyp
     assert dashboard["data_issues"] == []
     assert "1 eligible ranked row" in dashboard["research_decision"]["source_quality"]
     assert any("Chittorgarh" in note for note in dashboard["source_notes"])
+
+
+def test_fetch_nse_upcoming_ipos_preserves_subscription_close_date(monkeypatch):
+    payload = """
+    {
+      "data": [
+        {
+          "companyName": "Active NSE IPO Limited",
+          "symbol": "ACTIVEIPO",
+          "issueStartDate": "29-Jul-2026",
+          "issueEndDate": "31-Jul-2026",
+          "issueSize": "1000000"
+        }
+      ]
+    }
+    """
+    monkeypatch.setattr(ipo_data_service, "_http_get_text", lambda *args, **kwargs: payload)
+
+    result = FETCH_NSE_UPCOMING_IPOS(date(2026, 7, 31))
+
+    assert result["records"][0]["ipo_date"] == "29-Jul-2026"
+    assert result["records"][0]["ipo_close_date"] == "31-Jul-2026"
+    open_date, close_date = ipo_data_service._upcoming_ipo_subscription_window(
+        result["records"][0],
+        2026,
+    )
+    assert open_date == date(2026, 7, 29)
+    assert close_date == date(2026, 7, 31)
 
 
 def test_ipo_dashboard_does_not_auto_fallback_when_live_sources_fail(tmp_path, monkeypatch):
@@ -1359,25 +1492,257 @@ def test_render_ipo_panel_has_default_controls(tmp_path, monkeypatch):
     assert 'name="ipo_selected_key"' in html
     assert "ipo-sortable" in html
     assert "data-sort-type" in html
-    assert "Value Score" in html
-    assert "Action" in html
-    assert "Data Quality" in html
-    assert "Financial Data" in html
-    assert "Symbol Confidence" in html
-    assert "Buy Zone" in html
-    assert "Risk Alerts" in html
+    compact_table = table_html(html)
+    compact_header = table_header_html(html)
+    assert header_count(html) <= 19
+    assert "Market" in compact_table
+    assert "IPO Px" in compact_table
+    assert "LTP" in compact_table
+    assert "IPO Gain" in compact_header
+    assert "Data" in compact_header
+    assert "Decision" in compact_header
+    assert "Risk" in compact_header
+    assert "Links" in compact_header
+    assert "Value Score" not in compact_header
+    assert "Quarter Score" not in compact_header
+    assert "Score Explanation" not in compact_header
+    assert "Financial Data" not in compact_header
+    assert "Symbol Confidence" not in compact_header
+    assert "Risk Alerts" not in compact_header
     assert "Value Investor GPT Analysis" in html
     assert "g-6a031ff323688191872d730b281c71f0-next-multi-bagger-of-indian-market" in html
     assert 'option value="2026" selected' in html
     assert "/ipo/export-mainboard" not in html
     assert "/ipo/export-sme" not in html
     assert "/ipo/export-combined" in html
-    assert "Screener" in html
-    assert "Data Source" in html
+    assert "Links" in compact_header
     assert "Quarterly Monitoring Table" not in html
     assert "Company Detail Page" not in html
     assert "Data Issues" not in html
     assert "Quarterly Ranking Snapshots" not in html
+
+
+def test_ipo_compact_table_combines_market_and_keeps_only_one_price_column(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "ipo.db")
+    row = simple_perf_record(1, "sme", 35, 2026)
+    row.update(
+        {
+            "company_name": "Apsis AerocomAPSISAERO",
+            "symbol": "APSISAERO",
+            "exchange": "NSE SME",
+            "ipo_type": "SME",
+            "kite_ltp": 140,
+            "source_current_price": 141,
+            "pe_ratio": 18,
+            "latest_revenue_growth_yoy": 22,
+            "latest_pat_growth_yoy": 19,
+            "opm_pct": 16,
+            "roce": 21,
+            "lt_data_quality_score": 84,
+            "lt_final_decision": "WAIT",
+            "lt_key_risk": "Valuation expensive; full details",
+            "screener_url": "https://www.screener.in/company/APSISAERO/",
+            "source_url": "https://example.test/exchange",
+        }
+    )
+    state = app.PageState(active_tab="ipo", ipo_year=2026)
+    state.ipo_dashboard = {
+        "mode": "simple_performance",
+        "upcoming_pipeline_version": ipo_data_service.IPO_UPCOMING_PIPELINE_VERSION,
+        "year": 2026,
+        "mainboard_top20": [],
+        "sme_top20": [],
+        "combined_top40": [row],
+        "upcoming_next7": [],
+        "messages": [],
+        "summary": {},
+    }
+
+    compact = table_html(app.render_ipo_panel(state))
+    compact_header = table_header_html(app.render_ipo_panel(state))
+
+    assert header_count(app.render_ipo_panel(state)) == 19
+    assert "Apsis Aerocom<" in compact
+    assert "Apsis AerocomAPSISAERO" not in compact
+    assert "APSISAERO · NSE SME" in compact
+    assert "Source Price" not in compact
+    assert "Market Data" not in compact
+    assert "Gain from IPO in Rs" not in compact
+    assert "Python Decision" not in compact_header
+    assert "GPT Decision" not in compact_header
+    assert "Financial Data" not in compact
+    assert "Screener" in compact and "Exchange" in compact and "View Details" in compact
+    assert "Valuation expensive" in compact
+
+
+def test_ipo_detail_panel_keeps_removed_information_available(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "ipo.db")
+    row = simple_perf_record(1, "mainboard", 25, 2026)
+    row.update(
+        {
+            "listing_price": 120,
+            "issue_size": 500,
+            "six_month_return_pct": 12,
+            "one_year_return_pct": None,
+            "average_traded_value_20d": 10_000_000,
+            "pb_ratio": 3.2,
+            "ev_ebitda": 14,
+            "sales_qoq_pct": 8,
+            "pat_qoq_pct": 9,
+            "debt_to_equity": 0.4,
+            "cfo_pat": 0.9,
+            "lt_investment_score": 76,
+            "lt_python_decision": "WAIT",
+            "lt_gpt_decision": "NOT_RUN",
+            "lt_buy_zone": "NOT_CALCULABLE",
+            "lt_missing_evidence": "Quarterly; Cash Flow",
+        }
+    )
+    state = app.PageState(active_tab="ipo", ipo_year=2026)
+    state.ipo_dashboard = {
+        "mode": "simple_performance",
+        "upcoming_pipeline_version": ipo_data_service.IPO_UPCOMING_PIPELINE_VERSION,
+        "year": 2026,
+        "mainboard_top20": [],
+        "sme_top20": [],
+        "combined_top40": [row],
+        "upcoming_next7": [],
+        "messages": [],
+        "summary": {},
+    }
+
+    compact = table_html(app.render_ipo_panel(state))
+
+    assert "Listing Price" in compact
+    assert "6M %" in compact
+    assert "EV/EBITDA" in compact
+    assert "Python Decision" in compact
+    assert "Missing Evidence" in compact
+
+
+def test_ipo_view_modes_and_dynamic_empty_column_hiding(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "ipo.db")
+    rows = [simple_perf_record(index, "mainboard", 20 + index, 2026) for index in range(1, 4)]
+    for row in rows:
+        row.update(
+            {
+                "kite_ltp": 150,
+                "latest_revenue_growth_yoy": 18,
+                "latest_pat_growth_yoy": 16,
+                "opm_pct": 14,
+                "roce": 19,
+                "lt_data_quality_score": 71,
+                "lt_investment_score": 68,
+                "lt_final_decision": "WAIT",
+                "sales_qoq_pct": None,
+                "average_traded_value_20d": 25_000_000,
+                "debt_to_equity": 0.5,
+            }
+        )
+    dashboard = {
+        "mode": "simple_performance",
+        "upcoming_pipeline_version": ipo_data_service.IPO_UPCOMING_PIPELINE_VERSION,
+        "year": 2026,
+        "mainboard_top20": [],
+        "sme_top20": [],
+        "combined_top40": rows,
+        "upcoming_next7": [],
+        "messages": [],
+        "summary": {},
+    }
+
+    for view, expected in {
+        "Compact": "IPO Gain",
+        "Price": "20D Value",
+        "Fundamentals": "D/E",
+        "Research": "Invest",
+    }.items():
+        state = app.PageState(active_tab="ipo", ipo_year=2026, ipo_table_view=view)
+        state.ipo_dashboard = dashboard
+        page = app.render_ipo_panel(state)
+        rendered = table_header_html(page)
+        assert expected in rendered
+        assert 'name="ipo_selected_key"' in table_html(page)
+
+    hidden_state = app.PageState(active_tab="ipo", ipo_year=2026, ipo_table_view="Fundamentals")
+    hidden_state.ipo_dashboard = dashboard
+    hidden = table_header_html(app.render_ipo_panel(hidden_state))
+    assert "Sales QoQ" not in hidden
+    assert "Sales YoY" in hidden
+    assert "PAT YoY" in hidden
+    assert "OPM" in hidden
+    assert "ROCE" in hidden
+
+    shown_state = app.PageState(
+        active_tab="ipo",
+        ipo_year=2026,
+        ipo_table_view="Fundamentals",
+        ipo_show_unavailable_columns=True,
+    )
+    shown_state.ipo_dashboard = dashboard
+    assert "Sales QoQ" in table_header_html(app.render_ipo_panel(shown_state))
+
+
+def test_ipo_governance_pending_when_evidence_missing():
+    row = ipo_data_service._enrich_simple_ipo_decision(
+        verified_live_record(
+            promoter_holding=None,
+            promoter_pledge=None,
+            pledge_pct=None,
+            pledge_change=None,
+            promoter_holding_change=None,
+        )
+    )
+
+    assert row["governance_flag"] == "DATA PENDING"
+
+
+def test_render_ipo_panel_rebuilds_dashboard_from_older_upcoming_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "ipo.db")
+    calls: list[int] = []
+    fresh_dashboard = {
+        "mode": "simple_performance",
+        "upcoming_pipeline_version": ipo_data_service.IPO_UPCOMING_PIPELINE_VERSION,
+        "year": 2026,
+        "mainboard_top20": [],
+        "sme_top20": [],
+        "combined_top40": [],
+        "upcoming_next7": [
+            {
+                "company_name": "Recovered IPO",
+                "symbol": "RECOVERED",
+                "ipo_open_date": "2026-07-29",
+                "ipo_close_date": "2026-07-31",
+                "days_to_ipo": -2,
+                "is_open_for_application": True,
+                "application_status": "Open for application",
+                "source": "NSE upcoming IPO API",
+            }
+        ],
+        "messages": [],
+        "summary": {"upcoming_next7_count": 1},
+    }
+
+    def build_dashboard(year, today=None):
+        calls.append(year)
+        return fresh_dashboard
+
+    monkeypatch.setattr(app, "build_simple_ipo_performance_dashboard", build_dashboard)
+    state = app.PageState(active_tab="ipo", ipo_year=2026)
+    state.ipo_dashboard = {
+        "mode": "simple_performance",
+        "year": 2026,
+        "upcoming_next7": [],
+        "messages": [],
+        "summary": {"upcoming_next7_count": 0},
+    }
+
+    html = app.render_ipo_panel(state)
+
+    assert calls == [2026]
+    assert state.ipo_dashboard is fresh_dashboard
+    assert "Recovered IPO" in html
+    assert "ipo-upcoming-open" in html
 
 
 def test_simple_ipo_upcoming_adds_gmp_percent(tmp_path, monkeypatch):
@@ -1447,6 +1812,43 @@ def test_simple_ipo_upcoming_accepts_open_date_range_and_highlights_gmp(tmp_path
     assert row["status_class"] == "hot"
 
 
+def test_simple_ipo_upcoming_marks_active_subscription_window_and_keeps_it_visible(monkeypatch):
+    upcoming_rows = [
+        {
+            "company_name": "Already Open IPO",
+            "symbol": "OPENIPO",
+            "open_date": "Jul 18 - Jul 23, 2026",
+        },
+        {
+            "company_name": "Closes Today IPO",
+            "symbol": "CLOSES",
+            "ipo_open_date": "2026-07-19",
+            "ipo_close_date": "2026-07-20",
+        },
+        {
+            "company_name": "Closed IPO",
+            "symbol": "CLOSED",
+            "open_date": "2026-07-15",
+            "close_date": "2026-07-19",
+        },
+    ]
+    monkeypatch.setattr(
+        ipo_data_service,
+        "_load_research_ready_upcoming_ipos",
+        lambda today=None: (upcoming_rows, []),
+    )
+
+    rows, notes = ipo_data_service._upcoming_ipos_next_7_days(date(2026, 7, 20))
+
+    assert notes == []
+    assert [row["symbol"] for row in rows] == ["OPENIPO", "CLOSES"]
+    assert all(row["is_open_for_application"] is True for row in rows)
+    assert all(row["application_status"] == "Open for application" for row in rows)
+    assert rows[0]["ipo_open_date"] == "2026-07-18"
+    assert rows[0]["ipo_close_date"] == "2026-07-23"
+    assert rows[1]["ipo_close_date"] == "2026-07-20"
+
+
 def test_render_ipo_panel_highlights_high_gmp_upcoming_row(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "ipo.db")
     monkeypatch.setattr(
@@ -1465,7 +1867,11 @@ def test_render_ipo_panel_highlights_high_gmp_upcoming_row(tmp_path, monkeypatch
                     "company_name": "High GMP IPO",
                     "symbol": "HIGHGMP",
                     "ipo_date": "2026-07-24",
+                    "ipo_open_date": "2026-07-24",
+                    "ipo_close_date": "2026-07-28",
                     "days_to_ipo": 2,
+                    "is_open_for_application": True,
+                    "application_status": "Open for application",
                     "sector": "Manufacturing capex",
                     "ipo_type": "Mainboard",
                     "issue_size": "500 Cr",
@@ -1496,6 +1902,10 @@ def test_render_ipo_panel_highlights_high_gmp_upcoming_row(tmp_path, monkeypatch
     html = app.render_ipo_panel(state)
 
     assert "ipo-upcoming-hot" in html
+    assert 'class="ipo-upcoming-open ipo-upcoming-hot"' in html
+    assert "Light-blue rows are currently open for application" in html
+    assert "2026-07-28" in html
+    assert "Open for application" in html
     assert "+45.00%" in html
     assert "High GMP &gt;40%" in html
 

@@ -7,8 +7,9 @@ data can all use the same scoring path.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import Any, Mapping
 
 from ipo_screener_config import (
     DEFAULT_IPO_SCREENER_CONFIG,
@@ -45,6 +46,208 @@ def _pct(current: Any, base: Any) -> float | None:
     if current_num is None or base_num in {None, 0}:
         return None
     return round(((current_num - float(base_num)) / float(base_num)) * 100.0, 2)
+
+
+@dataclass(frozen=True)
+class QuarterlyResultsScore:
+    """A computed quarterly-results assessment; it is never persisted."""
+
+    score: float | None
+    rating: str
+    coverage_pct: float
+    explanation: str
+    components: dict[str, float]
+    warnings: tuple[str, ...] = ()
+
+
+def _tier_points(
+    value: float,
+    maximum: float,
+    tiers: tuple[tuple[float, float], ...],
+) -> float:
+    for threshold, fraction in tiers:
+        if value >= threshold:
+            return round(maximum * fraction, 2)
+    return 0.0
+
+
+def _quarterly_rating(score: float | None) -> str:
+    if score is None:
+        return "DATA UNAVAILABLE"
+    if score >= 80:
+        return "STRONG"
+    if score >= 65:
+        return "GOOD"
+    if score >= 50:
+        return "MIXED"
+    return "WEAK"
+
+
+def score_quarterly_results(record: Mapping[str, Any]) -> QuarterlyResultsScore:
+    """Score the latest quarterly result on a coverage-adjusted 100-point scale.
+
+    Only available metrics enter the denominator. Data coverage is returned
+    separately so a high score based on sparse inputs remains visibly qualified.
+    At least one reported growth metric is required.
+    """
+    if not isinstance(record, Mapping):
+        return QuarterlyResultsScore(
+            score=None,
+            rating="DATA UNAVAILABLE",
+            coverage_pct=0.0,
+            explanation="Quarterly score unavailable: the result record is invalid.",
+            components={},
+            warnings=("Invalid quarterly result record.",),
+        )
+
+    revenue = _num(record.get("latest_revenue_growth_yoy"), _num(record.get("revenue_growth_yoy")))
+    ebitda = _num(record.get("ebitda_growth_yoy"))
+    pat = _num(
+        record.get("latest_pat_growth_yoy"),
+        _num(record.get("pat_growth_yoy"), _num(record.get("profit_growth_yoy"))),
+    )
+    growth_values = (revenue, ebitda, pat)
+    if not any(value is not None for value in growth_values):
+        return QuarterlyResultsScore(
+            score=None,
+            rating="DATA UNAVAILABLE",
+            coverage_pct=0.0,
+            explanation="Quarterly score unavailable: revenue, EBITDA, and PAT growth are missing.",
+            components={},
+            warnings=("Latest quarterly growth data is missing.",),
+        )
+
+    earned: dict[str, float] = {}
+    available_weight = 0.0
+    positives: list[str] = []
+    concerns: list[str] = []
+
+    def add_metric(
+        name: str,
+        value: float | None,
+        weight: float,
+        tiers: tuple[tuple[float, float], ...],
+        positive_at: float,
+        concern_below: float,
+        label: str,
+        suffix: str = "%",
+    ) -> None:
+        nonlocal available_weight
+        if value is None:
+            return
+        available_weight += weight
+        earned[name] = _tier_points(value, weight, tiers)
+        if value >= positive_at:
+            positives.append(f"{label} {value:.1f}{suffix}")
+        elif value < concern_below:
+            concerns.append(f"{label} {value:.1f}{suffix}")
+
+    growth_tiers = ((25.0, 1.0), (15.0, 0.8), (5.0, 0.55), (0.0, 0.35), (-10.0, 0.15))
+    add_metric("revenue_growth", revenue, 20.0, growth_tiers, 20.0, 0.0, "revenue growth")
+    add_metric("ebitda_growth", ebitda, 15.0, growth_tiers, 20.0, 0.0, "EBITDA growth")
+    add_metric("pat_growth", pat, 20.0, growth_tiers, 20.0, 0.0, "PAT growth")
+    add_metric(
+        "eps_growth",
+        _num(record.get("eps_growth_yoy")),
+        5.0,
+        growth_tiers,
+        20.0,
+        0.0,
+        "EPS growth",
+    )
+    add_metric(
+        "margin_trend",
+        _num(record.get("opm_trend_pct")),
+        10.0,
+        ((2.0, 1.0), (0.0, 0.8), (-2.0, 0.4)),
+        0.0,
+        -2.0,
+        "OPM change",
+    )
+    add_metric(
+        "capital_efficiency",
+        _num(record.get("roce")),
+        10.0,
+        ((20.0, 1.0), (15.0, 0.75), (10.0, 0.5), (0.0, 0.25)),
+        20.0,
+        10.0,
+        "ROCE",
+    )
+    add_metric(
+        "cash_conversion",
+        _num(record.get("cfo_pat")),
+        10.0,
+        ((1.0, 1.0), (0.7, 0.8), (0.4, 0.4), (0.0, 0.2)),
+        0.7,
+        0.4,
+        "CFO/PAT",
+        "x",
+    )
+
+    debt = _num(record.get("debt_to_equity"))
+    if debt is not None:
+        available_weight += 5.0
+        earned["balance_sheet"] = (
+            5.0 if debt <= 0.5 else 3.0 if debt <= 1.0 else 1.0 if debt <= 2.0 else 0.0
+        )
+        if debt <= 0.5:
+            positives.append(f"debt/equity {debt:.2f}")
+        elif debt > 1.0:
+            concerns.append(f"debt/equity {debt:.2f}")
+
+    working_capital_values = [
+        value
+        for value in (
+            _num(record.get("debtor_days_change_pct")),
+            _num(record.get("inventory_days_change_pct")),
+        )
+        if value is not None
+    ]
+    if working_capital_values:
+        working_capital_change = sum(working_capital_values) / len(working_capital_values)
+        available_weight += 5.0
+        earned["working_capital"] = (
+            5.0
+            if working_capital_change <= 0
+            else 3.5
+            if working_capital_change <= 10
+            else 2.0
+            if working_capital_change <= 20
+            else 0.0
+        )
+        if working_capital_change > 20:
+            concerns.append(f"working-capital days up {working_capital_change:.1f}%")
+
+    if available_weight <= 0:
+        return QuarterlyResultsScore(
+            score=None,
+            rating="DATA UNAVAILABLE",
+            coverage_pct=0.0,
+            explanation="Quarterly score unavailable: no scorable metrics were supplied.",
+            components={},
+            warnings=("No scorable quarterly metrics were supplied.",),
+        )
+
+    score = round(sum(earned.values()) / available_weight * 100.0, 1)
+    coverage_pct = round(available_weight, 1)
+    rating = _quarterly_rating(score)
+    warnings: list[str] = []
+    if coverage_pct < 70:
+        warnings.append(f"Limited metric coverage ({coverage_pct:.0f}%).")
+    positive_text = ", ".join(positives[:3]) or "no standout positive metric"
+    concern_text = ", ".join(concerns[:3]) or "no major deterioration in available metrics"
+    explanation = (
+        f"{rating.title()} quarterly result ({score:.1f}/100; {coverage_pct:.0f}% coverage): "
+        f"{positive_text}; {concern_text}."
+    )
+    return QuarterlyResultsScore(
+        score=score,
+        rating=rating,
+        coverage_pct=coverage_pct,
+        explanation=explanation,
+        components=earned,
+        warnings=tuple(warnings),
+    )
 
 
 def infer_theme(record: dict[str, Any]) -> str:
@@ -383,6 +586,12 @@ def score_ipo_opportunity(
             "management_score": None,
             "sector_score": None,
             "market_performance_score": None,
+            "quarterly_results_score": None,
+            "quarterly_results_rating": "DATA UNAVAILABLE",
+            "quarterly_results_coverage_pct": 0.0,
+            "quarterly_results_explanation": (
+                "Quarterly score unavailable until the IPO record is verified for production scoring."
+            ),
             "risk_score": None,
             "flag": flag,
             "risk_flags": row.get("risk_flags") or [reason],
@@ -394,6 +603,7 @@ def score_ipo_opportunity(
             "final_recommendation": row.get("final_recommendation") or reason,
             "ai_commentary": row.get("final_recommendation") or reason,
         }
+    quarterly_result = score_quarterly_results(row)
     weights = cfg["score_weights"]
     components = {
         "sector_tailwind_score": _sector_tailwind_score(row, weights["sector_tailwind"]),
@@ -432,6 +642,12 @@ def score_ipo_opportunity(
         "management_score": round(components["governance_ownership_score"], 2),
         "sector_score": round(components["sector_tailwind_score"], 2),
         "market_performance_score": round(_valuation_comfort_score(row, 10), 2),
+        "quarterly_results_score": quarterly_result.score,
+        "quarterly_results_rating": quarterly_result.rating,
+        "quarterly_results_coverage_pct": quarterly_result.coverage_pct,
+        "quarterly_results_explanation": quarterly_result.explanation,
+        "quarterly_results_components": quarterly_result.components,
+        "quarterly_results_warnings": list(quarterly_result.warnings),
         "risk_score": round(100 - lt_score, 2),
         "buy_zone": "Buy Zone Reached" if buy_zone else None,
         "is_buy_zone": bool(buy_zone),

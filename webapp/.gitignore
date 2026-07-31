@@ -1,10 +1,20 @@
 .env
 .env.local
 node_modules/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
 .next/
 out/
+dist/
+build/
+coverage/
+logs/
+tmp/
 *.log
-__pycache__/
+*.csv
+*.parquet
 *.pyc
 
 # Legacy local application files kept outside this website repository

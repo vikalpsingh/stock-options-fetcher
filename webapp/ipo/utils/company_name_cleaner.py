@@ -45,3 +45,23 @@ def clean_ipo_company_name(raw_name: Any) -> str:
     text = re.sub(r"\s+", " ", text).strip(" -|:\t\r\n")
     text = _remove_duplicate_short_prefix(text)
     return re.sub(r"\s+", " ", text).strip(" -|:\t\r\n")
+
+
+def clean_display_company_name(company_name: Any, symbol: Any = "", bse_code: Any = "") -> str:
+    """Remove a known trailing symbol/code from a display name without guessing."""
+
+    cleaned = clean_ipo_company_name(company_name)
+    if not cleaned:
+        return ""
+    identifiers = [
+        re.sub(r"[^A-Za-z0-9]", "", str(symbol or "")).upper(),
+        re.sub(r"[^A-Za-z0-9]", "", str(bse_code or "")).upper(),
+    ]
+    normalized_name = re.sub(r"[^A-Za-z0-9]", "", cleaned).upper()
+    for identifier in identifiers:
+        if not identifier or not normalized_name.endswith(identifier):
+            continue
+        prefix = cleaned[: -len(identifier)].rstrip(" -|:")
+        if prefix and re.sub(r"[^A-Za-z0-9]", "", prefix).upper() + identifier == normalized_name:
+            return prefix
+    return cleaned
