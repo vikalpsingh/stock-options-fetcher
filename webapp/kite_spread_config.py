@@ -1,0 +1,24 @@
+"""Risk-first defaults for Kite/Zerodha stock-option spread execution."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+PAIR_LEG_TIMEOUT_SECONDS = 30
+PAIR_SCHEDULER_INTERVAL_SECONDS = 60
+PAPER_TRADING_MODE = True
+LIVE_TRADING_ENABLED = False
+DEFAULT_EXECUTION_MODE = "HEDGE_FIRST"
+ALLOW_MARKET_CONVERSION_FOR_SIBLING = False
+MAX_SLIPPAGE_PCT = 1.0
+
+SELL_LEG_OTM_PCT = 5.0
+HEDGE_LEG_OTM_PCT = 10.0
+MIN_NET_CREDIT = 1.0
+MAX_PAIR_LOSS = 50_000.0
+MIN_RETURN_ON_RISK_PCT = 3.0
+MAX_BID_ASK_SPREAD_PCT = 8.0
+BLOCK_EXPIRY_WITHIN_DAYS = 5
+
+KITE_SPREAD_OUTPUT_DIR = Path(__file__).resolve().parent / "kite_spread_outputs"

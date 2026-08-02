@@ -117,6 +117,23 @@ from ipo.symbol_resolution.symbol_resolver import clean_company_name
 from value_stock.models import UploadedPdf
 from value_stock.service import ValueStockService
 from value_stock.assessment import assess_table
+import kite_spread_config as kite_spread_cfg
+from kite_broker_adapter import KiteBrokerAdapter
+from kite_spread_gpt_research import suggest_stocks_with_openai
+from kite_option_resolver import KiteOptionResolver
+from kite_pair_execution import submit_kite_pair
+from kite_pair_scheduler import run_kite_pair_scheduler_once
+from kite_spread_engine import build_kite_spread_preview, fetch_cmp_from_kite, fetch_fresh_equity_quotes_from_kite
+from kite_spread_repository import KiteSpreadRepository
+from kite_spread_universe import KiteSpreadUniverse
+
+# Compatibility aliases for the DHAN page wiring. These point to Kite-specific
+# modules/tables only; the visible page name is DHAN, execution remains Kite.
+dhan_cfg = kite_spread_cfg
+DhanRepository = KiteSpreadRepository
+DhanStockUniverse = KiteSpreadUniverse
+DhanBrokerAdapter = KiteBrokerAdapter
+run_dhan_pair_scheduler_once = run_kite_pair_scheduler_once
 from income.covered_call import (
     CoveredCallInput,
     build_covered_call_recommendation,
@@ -159,6 +176,18 @@ SETTINGS_PATH = APP_ROOT / "app_settings.json"
 PE_SELL_SETTINGS_PATH = APP_ROOT / "pe_sell_strategy.json"
 CE_SELL_SETTINGS_PATH = APP_ROOT / "ce_sell_strategy.json"
 APP_DB_PATH = APP_ROOT / "vikalp_income.db"
+DHAN_SCHEDULER_LOCK = threading.Lock()
+DHAN_SCHEDULER_STOP = threading.Event()
+DHAN_SCHEDULER_THREAD: threading.Thread | None = None
+DHAN_SCHEDULER_STATUS: dict[str, Any] = {
+    "running": False,
+    "mode": "PAPER",
+    "last_started_at": "",
+    "last_stopped_at": "",
+    "last_run_at": "",
+    "last_result": {},
+    "last_error": "",
+}
 RISK_OUTPUT_DIR = APP_ROOT / "risk_outputs"
 OPEN_POSITIONS_PATH = APP_ROOT / "open_positions.csv"
 TRADE_JOURNAL_PATH = APP_ROOT / "trade_journal.csv"
@@ -5763,6 +5792,24 @@ class PageState:
     value_stock_decision: str = ""
     value_stock_selected_key: str = ""
     value_stock_colour_mode: str = "Latest assessment"
+    dhan_watchlist: list[dict[str, Any]] | None = None
+    dhan_pair_orders: list[dict[str, Any]] | None = None
+    dhan_opportunities: list[dict[str, Any]] | None = None
+    dhan_manual_symbol: str = ""
+    dhan_manual_company: str = ""
+    dhan_manual_bucket: str = ""
+    dhan_expiry: str = ""
+    dhan_strategy: str = "BOTH"
+    dhan_lots: int = 1
+    dhan_product_type: str = "MARGIN"
+    dhan_order_type: str = "LIMIT"
+    dhan_paper_trading: bool = True
+    dhan_spot_json: str = ""
+    dhan_contracts_json: str = ""
+    dhan_selected_index: str = ""
+    dhan_selected_symbol: str = ""
+    dhan_popup_strategy: str = ""
+    dhan_confirm_pair_order: bool = False
 
 
 def mask_secret(value: str | None) -> str:
@@ -5990,6 +6037,7 @@ def is_app_page_request(path: str) -> bool:
         "/equity",
         "/ipo",
         "/value-stock",
+        "/kite-spreads",
         "/income-growth",
         "/commodity",
         "/analytics",
@@ -18950,6 +18998,684 @@ def render_value_stock_panel(state: PageState) -> str:
     """
 
 
+def load_dhan_state(state: PageState, sync_holdings: bool = False) -> None:
+    repository = DhanRepository(APP_DB_PATH)
+    universe = DhanStockUniverse(repository)
+    universe.sync_income_growth_fno_holdings()
+    if sync_holdings:
+        universe.sync_holdings()
+    state.dhan_watchlist = universe.list_watchlist()
+    refresh_dhan_watchlist_quotes(state.dhan_watchlist)
+    state.dhan_pair_orders = repository.list_pair_orders()
+
+
+def _dhan_scheduler_stamp() -> str:
+    return datetime.now(INDIA_TIME_ZONE).isoformat(timespec="seconds")
+
+
+def dhan_scheduler_status() -> dict[str, Any]:
+    running = bool(DHAN_SCHEDULER_THREAD and DHAN_SCHEDULER_THREAD.is_alive() and not DHAN_SCHEDULER_STOP.is_set())
+    status = dict(DHAN_SCHEDULER_STATUS)
+    status["running"] = running
+    status["interval_seconds"] = dhan_cfg.PAIR_SCHEDULER_INTERVAL_SECONDS
+    return status
+
+
+def run_dhan_scheduler_now(paper_trading: bool = True) -> dict[str, Any]:
+    repository = DhanRepository(APP_DB_PATH)
+    broker = DhanBrokerAdapter(paper_trading=paper_trading)
+    with DHAN_SCHEDULER_LOCK:
+        try:
+            result = run_dhan_pair_scheduler_once(repository, broker)
+        except Exception as exc:
+            DHAN_SCHEDULER_STATUS.update(
+                {
+                    "mode": "PAPER" if paper_trading else "LIVE",
+                    "last_run_at": _dhan_scheduler_stamp(),
+                    "last_error": friendly_external_error(exc, "DHAN scheduler"),
+                }
+            )
+            raise
+        DHAN_SCHEDULER_STATUS.update(
+            {
+                "mode": "PAPER" if paper_trading else "LIVE",
+                "last_run_at": _dhan_scheduler_stamp(),
+                "last_result": dict(result or {}),
+                "last_error": "",
+            }
+        )
+        return result
+
+
+def start_dhan_scheduler(paper_trading: bool = True) -> bool:
+    global DHAN_SCHEDULER_THREAD
+    if DHAN_SCHEDULER_THREAD and DHAN_SCHEDULER_THREAD.is_alive():
+        DHAN_SCHEDULER_STATUS.update({"running": True, "mode": "PAPER" if paper_trading else "LIVE"})
+        return False
+    DHAN_SCHEDULER_STOP.clear()
+    DHAN_SCHEDULER_STATUS.update(
+        {
+            "running": True,
+            "mode": "PAPER" if paper_trading else "LIVE",
+            "last_started_at": _dhan_scheduler_stamp(),
+            "last_error": "",
+        }
+    )
+
+    def worker() -> None:
+        while not DHAN_SCHEDULER_STOP.wait(dhan_cfg.PAIR_SCHEDULER_INTERVAL_SECONDS):
+            try:
+                run_dhan_scheduler_now(paper_trading=paper_trading)
+            except Exception:
+                DHAN_SCHEDULER_STATUS["last_error"] = traceback.format_exc(limit=1)
+                logger.exception("dhan_scheduler_failed")
+
+    DHAN_SCHEDULER_THREAD = threading.Thread(target=worker, name="dhan-pair-scheduler", daemon=True)
+    DHAN_SCHEDULER_THREAD.start()
+    return True
+
+
+def stop_dhan_scheduler() -> bool:
+    was_running = bool(DHAN_SCHEDULER_THREAD and DHAN_SCHEDULER_THREAD.is_alive())
+    DHAN_SCHEDULER_STOP.set()
+    DHAN_SCHEDULER_STATUS.update({"running": False, "last_stopped_at": _dhan_scheduler_stamp()})
+    return was_running
+
+
+def _dhan_json_loads(text: str, default: Any) -> Any:
+    clean = str(text or "").strip()
+    if not clean:
+        return default
+    return json.loads(clean)
+
+
+def build_opportunities_for_watchlist(
+    watchlist: list[dict[str, Any]],
+    spot_by_symbol: dict[str, float],
+    contracts_by_symbol: dict[str, list[dict[str, Any]]],
+    expiry: str,
+    strategy: str,
+    lots: int = 1,
+    adapter: Any | None = None,
+    **_kwargs: Any,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    mode = str(strategy or "BOTH").upper()
+    selected_strategies = []
+    if mode in {"BOTH", "CE_SPREAD", "BEAR_CALL_SPREAD"}:
+        selected_strategies.append("BEAR_CALL_SPREAD")
+    if mode in {"BOTH", "PE_SPREAD", "BULL_PUT_SPREAD"}:
+        selected_strategies.append("BULL_PUT_SPREAD")
+    for item in watchlist:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        resolver = KiteOptionResolver(instruments=contracts_by_symbol.get(symbol, []))
+        for selected_strategy in selected_strategies:
+            rows.append(
+                build_kite_spread_preview(
+                    symbol=symbol,
+                    cmp=spot_by_symbol.get(symbol),
+                    strategy=selected_strategy,
+                    expiry=expiry,
+                    lots=lots,
+                    resolver=resolver,
+                    adapter=adapter,
+                    event_risk=bool(item.get("event_risk_flag")),
+                )
+            )
+    return rows
+
+
+def enrich_dhan_market_data_from_kite(
+    symbols: list[str],
+    spot_by_symbol: dict[str, float],
+    contracts_by_symbol: dict[str, list[dict[str, Any]]],
+) -> tuple[Any | None, list[str], dict[str, dict[str, float | None]]]:
+    """Best-effort live Kite data fill for explicit DHAN Evaluate clicks."""
+
+    clean_symbols = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    if not clean_symbols:
+        return None, [], {}
+    missing_spot = [symbol for symbol in clean_symbols if not spot_by_symbol.get(symbol)]
+    missing_contracts = [symbol for symbol in clean_symbols if not contracts_by_symbol.get(symbol)]
+    notes: list[str] = []
+    broker = DhanBrokerAdapter(paper_trading=True)
+    fresh_quotes = fetch_fresh_equity_quotes_from_kite(broker, clean_symbols)
+    for symbol, quote in fresh_quotes.items():
+        if quote.get("ltp"):
+            spot_by_symbol[symbol] = float(quote["ltp"] or 0)
+    notes.append(f"Fresh Kite LTP/day-change fetched for {sum(1 for symbol in clean_symbols if spot_by_symbol.get(symbol))}/{len(clean_symbols)} symbol(s), no cache.")
+    if missing_contracts:
+        try:
+            instruments = broker.get_instruments("NFO")
+        except Exception as exc:
+            notes.append(f"Kite NFO instruments unavailable: {friendly_external_error(exc, 'DHAN Kite instruments')}")
+        else:
+            wanted = set(missing_contracts)
+            grouped: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in missing_contracts}
+            for row in instruments:
+                symbol = str(row.get("name") or row.get("underlying") or "").strip().upper()
+                if symbol in wanted and str(row.get("instrument_type") or row.get("option_type") or "").upper() in {"CE", "PE"}:
+                    grouped.setdefault(symbol, []).append(dict(row))
+            for symbol, rows in grouped.items():
+                if rows:
+                    contracts_by_symbol[symbol] = rows
+            notes.append(f"Kite NFO contracts fetched for {sum(1 for symbol in missing_contracts if contracts_by_symbol.get(symbol))}/{len(missing_contracts)} symbol(s).")
+    return broker, notes, fresh_quotes
+
+
+def refresh_dhan_watchlist_quotes(watchlist: list[dict[str, Any]] | None) -> None:
+    """Add fresh HOME-style Kite CMP/day-change to DHAN stock list rows."""
+
+    if not watchlist:
+        return
+    symbols = [str(row.get("symbol") or "").strip().upper() for row in watchlist if str(row.get("symbol") or "").strip()]
+    if not symbols:
+        return
+    try:
+        broker = DhanBrokerAdapter(paper_trading=True)
+        fresh_quotes = fetch_fresh_equity_quotes_from_kite(broker, symbols)
+    except Exception:
+        return
+    for row in watchlist:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        quote = fresh_quotes.get(symbol) or {}
+        if quote.get("ltp"):
+            row["cmp"] = quote.get("ltp")
+            row["day_change_pct"] = quote.get("day_change_pct")
+            row["previous_close"] = quote.get("previous_close")
+            row["yearly_high"] = quote.get("yearly_high")
+            row["pct_to_52_high"] = quote.get("pct_to_52_high")
+            row["quote_source"] = "Fresh Kite, no cache"
+
+
+DHAN_CRITICAL_ORDER_BLOCKS = {
+    "CMP_UNAVAILABLE",
+    "CONTRACT_UNRESOLVED",
+    "OPTION_PREMIUM_UNAVAILABLE",
+    "NET_CREDIT_NON_POSITIVE",
+    "MAX_LOSS_INVALID",
+    "CE_COVERAGE_BLOCKED_NO_SHARES",
+    "CE_LOT_SIZE_UNAVAILABLE_FOR_COVERAGE_CHECK",
+}
+
+
+def dhan_pair_is_defined_risk_orderable(preview: dict[str, Any]) -> bool:
+    if str(preview.get("risk_decision") or "").upper() == "APPROVED":
+        return True
+    risk_reason = str(preview.get("risk_reason") or preview.get("reason") or "")
+    if any(code in risk_reason for code in DHAN_CRITICAL_ORDER_BLOCKS):
+        return False
+    if "CE_COVERED_LOT_LIMIT_EXCEEDED" in risk_reason or "CE_NOT_FULLY_COVERED_BY_SHARES" in risk_reason:
+        return False
+    return bool(
+        preview.get("sell_leg_tradingsymbol")
+        and preview.get("buy_leg_tradingsymbol")
+        and float(preview.get("quantity") or 0) > 0
+        and float(preview.get("sell_limit_price") or 0) > 0
+        and float(preview.get("buy_limit_price") or 0) > 0
+        and float(preview.get("max_loss") or 0) > 0
+    )
+
+
+def submit_pair_order(
+    opportunity: dict[str, Any],
+    repository: KiteSpreadRepository,
+    broker: KiteBrokerAdapter,
+    user_confirmed: bool,
+    paper_trading: bool = True,
+) -> dict[str, Any]:
+    clean_opportunity = dict(opportunity)
+    if str(clean_opportunity.get("risk_decision") or "").upper() != "APPROVED" and user_confirmed:
+        if not dhan_pair_is_defined_risk_orderable(clean_opportunity):
+            raise ValueError(f"DHAN pair is not orderable: {clean_opportunity.get('risk_reason') or clean_opportunity.get('reason')}")
+        clean_opportunity["risk_override"] = "USER_CONFIRMED_DEFINED_RISK_PAIR"
+        clean_opportunity["risk_decision_original"] = clean_opportunity.get("risk_decision")
+        clean_opportunity["risk_reason_original"] = clean_opportunity.get("risk_reason") or clean_opportunity.get("reason")
+        clean_opportunity["risk_decision"] = "APPROVED"
+        clean_opportunity["risk_reason"] = "User confirmed defined-risk paired spread override."
+        clean_opportunity["reason"] = clean_opportunity["risk_reason"]
+    return submit_kite_pair(
+        clean_opportunity,
+        repository,
+        broker,
+        user_confirmed=user_confirmed,
+        mode="PAPER" if paper_trading else "LIVE",
+        execution_mode="HEDGE_FIRST",
+    )
+
+
+def format_dhan_order_backend_log(
+    outcome: dict[str, Any],
+    repository: KiteSpreadRepository,
+    broker: KiteBrokerAdapter,
+) -> str:
+    pair_id = str(outcome.get("pair_id") or "")
+    pair_snapshot = repository.get_pair(pair_id) if pair_id else None
+    execution_log: list[dict[str, Any]] = []
+    if pair_id:
+        with repository.connect() as conn:
+            execution_log = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT action, detail, created_at FROM kite_pair_execution_log WHERE pair_id=? ORDER BY id",
+                    (pair_id,),
+                ).fetchall()
+            ]
+    broker_log = list(getattr(broker, "call_log", []) or [])
+    payload = {
+        "summary": "DHAN paired spread submitted with hedge-first execution. BUY hedge is submitted first; SELL leg is placed by the paired-order flow when safety checks allow it.",
+        "outcome": outcome,
+        "broker_mode": "paper" if getattr(broker, "paper_trading", True) else "live",
+        "kite_broker_calls": broker_log,
+        "pair_snapshot": pair_snapshot,
+        "execution_log": execution_log,
+    }
+    return "DHAN Kite order backend log\n" + json.dumps(payload, indent=2, default=str)
+
+
+def _dhan_json_number_map(text: str) -> dict[str, float]:
+    return {
+        str(key).upper(): float(value)
+        for key, value in dict(_dhan_json_loads(text, {})).items()
+    }
+
+
+def _dhan_json_contract_map(text: str) -> dict[str, list[dict[str, Any]]]:
+    return {
+        str(key).upper(): list(value or [])
+        for key, value in dict(_dhan_json_loads(text, {})).items()
+    }
+
+
+def build_dhan_opportunities_for_symbols(
+    watchlist: list[dict[str, Any]],
+    selected_symbols: list[str],
+    strategy: str,
+    state: PageState,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    clean_symbols = [str(symbol or "").strip().upper() for symbol in selected_symbols if str(symbol or "").strip()]
+    selected = [
+        row
+        for row in watchlist
+        if str(row.get("symbol") or "").strip().upper() in set(clean_symbols)
+    ]
+    spot_by_symbol = _dhan_json_number_map(state.dhan_spot_json)
+    contracts_by_symbol = _dhan_json_contract_map(state.dhan_contracts_json)
+    live_adapter, live_notes, fresh_quotes = enrich_dhan_market_data_from_kite(
+        clean_symbols,
+        spot_by_symbol,
+        contracts_by_symbol,
+    )
+    rows = build_opportunities_for_watchlist(
+        selected,
+        spot_by_symbol,
+        contracts_by_symbol,
+        expiry=state.dhan_expiry,
+        strategy=strategy,
+        lots=state.dhan_lots,
+        adapter=live_adapter,
+        product_type=state.dhan_product_type,
+        order_type=state.dhan_order_type,
+    )
+    for row in rows:
+        quote = fresh_quotes.get(str(row.get("symbol") or "").upper()) or {}
+        if quote:
+            row["day_change_pct"] = quote.get("day_change_pct")
+            row["previous_close"] = quote.get("previous_close")
+            row["quote_source"] = "Kite fresh quote, no cache"
+    return rows, live_notes
+
+
+def render_kite_spreads_panel(state: PageState) -> str:
+    if state.active_tab == "kite-spreads" and state.dhan_watchlist is None:
+        try:
+            load_dhan_state(state, sync_holdings=True)
+        except Exception as exc:
+            state.error = f"{friendly_external_error(exc, 'DHAN page')}\n\n{traceback.format_exc()}"
+            state.dhan_watchlist = []
+            state.dhan_pair_orders = []
+    panel_style = "" if state.active_tab == "kite-spreads" else ' style="display:none"'
+    watchlist = state.dhan_watchlist or []
+    opportunities = state.dhan_opportunities or []
+    pair_orders = state.dhan_pair_orders or []
+
+    def text_value(value: Any, default: str = "-") -> str:
+        return str(value if value not in {None, ""} else default)
+
+    def money(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return "-"
+
+    income_growth_by_symbol = {
+        str(item.get("symbol") or "").upper(): item
+        for item in INCOME_GROWTH_SHEET
+    }
+
+    def dhan_52w_gap(row: dict[str, Any]) -> tuple[str, str, str]:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        sheet = income_growth_by_symbol.get(symbol) or {}
+        pct_value: float | None = None
+        for key in ("pct_to_52_high", "drawdown_from_52w_high_pct", "week_52"):
+            raw = row.get(key, sheet.get(key))
+            try:
+                pct_value = float(raw)
+                break
+            except (TypeError, ValueError):
+                continue
+        if pct_value is None:
+            return "-", "", "dhan-52w-unknown"
+        try:
+            high_value = float(row.get("yearly_high") or sheet.get("high_52w") or 0)
+        except (TypeError, ValueError):
+            high_value = 0.0
+        if pct_value < 0:
+            label = f"{abs(pct_value):.2f}% below"
+            css_class = "dhan-52w-far" if pct_value <= -20 else "dhan-52w-mid" if pct_value <= -8 else "dhan-52w-near"
+        elif pct_value == 0:
+            label = "At 52W high"
+            css_class = "dhan-52w-near"
+        else:
+            label = f"{pct_value:.2f}% above"
+            css_class = "dhan-52w-near"
+        detail = f"52W high {money(high_value)}" if high_value > 0 else "Income Growth / Kite 52W reference"
+        return label, detail, css_class
+
+    watch_rows = []
+    for row in watchlist:
+        active = "YES" if int(row.get("active") or 0) else "NO"
+        row_class = ' class="current-holding"' if int(row.get("is_current_holding") or 0) else ""
+        symbol_value = html.escape(text_value(row.get("symbol")), quote=True)
+        company_name = text_value(row.get("company_name"), "")
+        coverage_note = text_value(row.get("coverage_note"), "")
+        event_risk = bool(int(row.get("event_risk_flag") or 0))
+        gap_label, gap_detail, gap_class = dhan_52w_gap(row)
+        try:
+            row_day_change = float(row.get("day_change_pct") or 0)
+        except (TypeError, ValueError):
+            row_day_change = 0.0
+        row_day_change_class = "pnl-positive" if row_day_change >= 0 else "pnl-negative"
+        watch_rows.append(
+            f"<tr{row_class}>"
+            f"<td class=\"dhan-symbol-cell\"><strong>{html.escape(text_value(row.get('symbol')))}</strong><small>{html.escape(company_name)}</small></td>"
+            f"<td>{money(row.get('cmp'))}<small class=\"{row_day_change_class}\">{html.escape(text_value(row.get('day_change_pct')))}%</small></td>"
+            f"<td class=\"dhan-52w-cell {gap_class}\"><strong>{html.escape(gap_label)}</strong><small>{html.escape(gap_detail)}</small></td>"
+            f"<td><span class=\"ipo-badge neutral\">{html.escape(text_value(row.get('stock_bucket')).replace('_', ' '))}</span></td>"
+            f"<td>{html.escape(text_value(row.get('holding_qty')))}</td>"
+            f"<td><strong>{html.escape(text_value(row.get('max_covered_lots')))}</strong><small>{html.escape(coverage_note)}</small></td>"
+            f"<td><span class=\"ipo-badge {'good' if active == 'YES' else 'neutral'}\">{html.escape(active)}</span></td>"
+            f"<td><span class=\"ipo-badge {'bad' if event_risk else 'good'}\">{'YES' if event_risk else 'NO'}</span></td>"
+            "<td class=\"dhan-action-cell\">"
+            f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-primary\" formaction=\"/kite-spreads/analyze-symbol\" name=\"dhan_analyze_symbol\" value=\"{symbol_value}\">Analyze</button>"
+            f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-pe\" formaction=\"/kite-spreads/evaluate-symbol\" name=\"dhan_eval\" value=\"{symbol_value}|BULL_PUT_SPREAD\">PE</button>"
+            f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-ce\" formaction=\"/kite-spreads/evaluate-symbol\" name=\"dhan_eval\" value=\"{symbol_value}|BEAR_CALL_SPREAD\">CE</button>"
+            f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-muted\" formaction=\"/kite-spreads/deactivate\" name=\"dhan_watchlist_id\" value=\"{html.escape(str(row.get('id') or ''), quote=True)}\">Hide</button>"
+            "</td>"
+            "</tr>"
+        )
+    if not watch_rows:
+        watch_rows.append('<tr><td colspan="9" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
+
+    opportunity_rows = []
+    for idx, row in enumerate(opportunities):
+        decision_class = "good" if row.get("risk_decision") == "APPROVED" else "bad"
+        try:
+            pop_value = float(row.get("pop_estimate") or 0)
+        except (TypeError, ValueError):
+            pop_value = 0.0
+        try:
+            max_gain_value = float(row.get("max_gain") or 0)
+        except (TypeError, ValueError):
+            max_gain_value = 0.0
+        pop_class = "dhan-good-metric" if pop_value > 80 else ""
+        gain_class = "dhan-good-metric" if max_gain_value > 10000 else ""
+        popup_label = "Open Popup"
+        opportunity_rows.append(
+            "<tr>"
+            f"<td><button type=\"submit\" class=\"mini-link button-link\" formaction=\"/kite-spreads/preview-pair\" name=\"dhan_selected_index\" value=\"{idx}\">{popup_label}</button></td>"
+            f"<td>{html.escape(text_value(row.get('symbol')))}</td>"
+            f"<td>{html.escape(text_value(row.get('strategy_type')))}</td>"
+            f"<td>{money(row.get('spot'))}<small>{html.escape(text_value(row.get('day_change_pct')))}%</small></td>"
+            f"<td>{html.escape(text_value(row.get('selected_lots')))}</td>"
+            f"<td>{html.escape(text_value(row.get('quantity')))}</td>"
+            f"<td>{money(row.get('sell_target_strike'))}<small>Resolved {money(row.get('sell_strike'))}</small></td>"
+            f"<td>{money(row.get('hedge_target_strike'))}<small>Resolved {money(row.get('hedge_strike'))}</small></td>"
+            f"<td>{money(row.get('sell_leg_premium'))}</td>"
+            f"<td>{money(row.get('buy_leg_premium'))}</td>"
+            f"<td>{money(row.get('net_credit'))}</td>"
+            f"<td class=\"{gain_class}\">{money(row.get('max_gain'))}</td>"
+            f"<td>{money(row.get('max_loss'))}</td>"
+            f"<td>{money(row.get('breakeven'))}</td>"
+            f"<td class=\"{pop_class}\">{money(row.get('pop_estimate'))}%</td>"
+            f"<td>{money(row.get('return_on_risk_pct'))}%</td>"
+            f"<td>{html.escape(text_value(row.get('event_risk')))}</td>"
+            f"<td><span class=\"ipo-badge {decision_class}\">{html.escape(text_value(row.get('risk_decision')))}</span><small>{html.escape(text_value(row.get('reason'), ''))}</small></td>"
+            "</tr>"
+        )
+    if not opportunity_rows:
+        opportunity_rows.append('<tr><td colspan="18" class="muted-cell">Use Run Analysis on any stock row to compare PE/CE pairs here. Missing live Kite data stays blocked.</td></tr>')
+
+    selected_preview = ""
+    selected_idx = int(float(state.dhan_selected_index)) if str(state.dhan_selected_index or "").isdigit() else -1
+    if 0 <= selected_idx < len(opportunities):
+        selected = opportunities[selected_idx]
+        is_approved = str(selected.get("risk_decision") or "").upper() == "APPROVED"
+        is_orderable = dhan_pair_is_defined_risk_orderable(selected)
+        review_disabled = " disabled"
+        place_button_disabled = " disabled"
+        risk_badge = "good" if is_approved else "bad"
+        modal_summary = (
+            "Risk is low enough for this engine; submit stays paper/live-confirm gated."
+            if is_approved
+            else "This is a defined-risk pair. Your acknowledgement can override score/risk warnings, but missing data or invalid credit remains blocked."
+            if is_orderable
+            else "This pair is blocked. Fix missing data, invalid credit, or coverage before order placement."
+        )
+        strategy_label = "PE Credit Spread" if selected.get("strategy_type") == "BULL_PUT_SPREAD" else "CE Credit Spread"
+        try:
+            day_change_value = float(selected.get("day_change_pct") or 0)
+        except (TypeError, ValueError):
+            day_change_value = 0.0
+        day_change_class = "pnl-positive" if day_change_value >= 0 else "pnl-negative"
+        selected_preview = f"""
+        <div class="live-modal-backdrop visible" id="dhan-pair-order-modal">
+          <div class="live-modal income-pe-order-modal-card nifty-pair-order-modal-card dhan-order-modal-card">
+            <div class="dhan-ticket-header">
+              <div>
+                <div class="leg-kicker">DHAN paired execution ticket</div>
+                <h2>{html.escape(text_value(selected.get('symbol')))} - {html.escape(strategy_label)}</h2>
+                <p class="status">5% OTM SELL + 10% OTM BUY hedge. Kite LIMIT prices use evaluated option CMP/LTP. Hedge BUY is placed first.</p>
+              </div>
+              <span class="ipo-badge {risk_badge}">{html.escape(text_value(selected.get('risk_decision')))}</span>
+            </div>
+            <input type="hidden" name="dhan_selected_index" value="{html.escape(str(selected_idx), quote=True)}">
+            <input type="hidden" name="dhan_selected_symbol" value="{html.escape(text_value(selected.get('symbol')), quote=True)}">
+            <input type="hidden" name="dhan_popup_strategy" value="{html.escape(text_value(selected.get('strategy_type')), quote=True)}">
+            <div class="dhan-ticket-grid">
+              <article class="dhan-ticket-card dhan-market-card">
+                <span>Fresh Kite CMP</span>
+                <strong>{money(selected.get('cmp'))}</strong>
+                <small class="{day_change_class}">Day change {html.escape(text_value(selected.get('day_change_pct')))}% | no cache</small>
+              </article>
+              <article class="dhan-ticket-card">
+                <span>Expiry</span>
+                <strong>{html.escape(text_value(selected.get('expiry')))}</strong>
+                <small>Lots {html.escape(text_value(selected.get('selected_lots')))} | Qty {html.escape(text_value(selected.get('quantity')))}</small>
+              </article>
+              <article class="dhan-ticket-card dhan-credit-card">
+                <span>Net credit</span>
+                <strong>{money(selected.get('net_credit'))}</strong>
+                <small>Breakeven {money(selected.get('breakeven'))}</small>
+              </article>
+              <article class="dhan-ticket-card">
+                <span>Max gain</span>
+                <strong>{money(selected.get('max_gain'))}</strong>
+                <small>LIMIT at option CMP</small>
+              </article>
+              <article class="dhan-ticket-card dhan-risk-card">
+                <span>Defined max loss</span>
+                <strong>{money(selected.get('max_loss'))}</strong>
+                <small>Known before entry</small>
+              </article>
+              <article class="dhan-ticket-card">
+                <span>Return on risk</span>
+                <strong>{money(selected.get('return_on_risk_pct'))}%</strong>
+                <small>Credit / max loss</small>
+              </article>
+              <article class="dhan-ticket-card">
+                <span>POP</span>
+                <strong>{money(selected.get('pop_estimate'))}%</strong>
+                <small>{'Approximate model' if selected.get('pop_is_approx') else 'Model estimate'}</small>
+              </article>
+              <article class="dhan-ticket-card">
+                <span>Strike grid</span>
+                <strong>{money(selected.get('strike_step'))}</strong>
+                <small>Nearest available Kite strike</small>
+              </article>
+            </div>
+            <div class="nifty-pair-sections">
+              <section class="nifty-pair-leg-section dhan-leg-card sell-leg">
+                <div class="leg-kicker">SELL 5% OTM</div>
+                <strong>{html.escape(text_value(selected.get('sell_leg_tradingsymbol')))}</strong>
+                <small>Raw target {money(selected.get('raw_sell_target_strike'))} | nearest Kite target {money(selected.get('sell_target_strike'))} | resolved {money(selected.get('sell_strike'))}</small>
+                <div class="dhan-leg-price"><span>SELL limit</span><strong>{money(selected.get('sell_limit_price'))}</strong><small>premium {money(selected.get('sell_leg_premium'))}</small></div>
+              </section>
+              <section class="nifty-pair-leg-section dhan-leg-card buy-leg">
+                <div class="leg-kicker">BUY 10% OTM HEDGE</div>
+                <strong>{html.escape(text_value(selected.get('buy_leg_tradingsymbol')))}</strong>
+                <small>Raw target {money(selected.get('raw_hedge_target_strike'))} | nearest Kite target {money(selected.get('hedge_target_strike'))} | resolved {money(selected.get('hedge_strike'))}</small>
+                <div class="dhan-leg-price"><span>BUY limit</span><strong>{money(selected.get('buy_limit_price'))}</strong><small>premium {money(selected.get('buy_leg_premium'))}</small></div>
+              </section>
+            </div>
+            <div class="income-equity-order-summary">{html.escape(modal_summary)}<br>{html.escape(text_value(selected.get('risk_reason')))}{f'<br>{html.escape(text_value(selected.get("risk_veto_advisory")))}' if selected.get('risk_veto_advisory') else ''}</div>
+            <label class="inline-check"><input id="dhan-confirm-pair-order" type="checkbox" name="dhan_confirm_pair_order" value="1" data-orderable="{'1' if is_orderable else '0'}"> I understand this paired spread order and want to submit it</label>
+            <div class="breath-circle income-pe-breath" id="dhan-pair-breath"></div>
+            <div class="breath-text" id="dhan-pair-breath-text">Tick acknowledgement to start 10s review</div>
+            <div class="countdown" id="dhan-pair-countdown">10</div>
+            <div class="modal-actions">
+              <button type="submit" class="secondary" formaction="/kite-spreads/close-popup">Cancel</button>
+              <button type="submit" formaction="/kite-spreads/evaluate-symbol">Refresh evaluation</button>
+              <button id="dhan-pair-review" type="button" class="secondary"{review_disabled}>Start 10s Review</button>
+              <button id="dhan-place-pair-order" type="submit" formaction="/kite-spreads/submit-pair" class="danger"{place_button_disabled}>GO - Place LIMIT Order</button>
+            </div>
+          </div>
+        </div>
+        """
+
+    pair_rows = []
+    for row in pair_orders:
+        pair_rows.append(
+            "<tr>"
+            f"<td>{html.escape(text_value(row.get('pair_id')))}</td>"
+            f"<td>{html.escape(text_value(row.get('symbol')))}</td>"
+            f"<td>{html.escape(text_value(row.get('strategy_type')))}</td>"
+            f"<td>{html.escape(text_value(row.get('sell_leg_status')))}</td>"
+            f"<td>{html.escape(text_value(row.get('buy_leg_status')))}</td>"
+            f"<td>{html.escape(text_value(row.get('pair_status')))}</td>"
+            f"<td>{money(row.get('net_credit_actual') or row.get('net_credit_expected'))}</td>"
+            f"<td>{html.escape(text_value(row.get('last_checked_at')))}</td>"
+            f"<td>{'Exit/hedge attention required' if row.get('pair_status') == 'EXIT_REQUIRED' else 'Monitor'}</td>"
+            "</tr>"
+        )
+    if not pair_rows:
+        pair_rows.append('<tr><td colspan="9" class="muted-cell">No DHAN pair orders submitted yet.</td></tr>')
+
+    opportunities_json = html.escape(json.dumps(opportunities, default=str), quote=True)
+    strategy_options = "".join(
+        f'<option value="{value}"{" selected" if state.dhan_strategy == value else ""}>{label}</option>'
+        for value, label in (("BOTH", "Both"), ("CE_SPREAD", "CE Spread"), ("PE_SPREAD", "PE Spread"))
+    )
+    paper_checked = " checked" if state.dhan_paper_trading else ""
+    live_checked = " checked" if not state.dhan_paper_trading else ""
+    execution_mode_label = "PAPER" if state.dhan_paper_trading else "LIVE"
+    execution_mode_class = "neutral" if state.dhan_paper_trading else "bad"
+    scheduler_status = dhan_scheduler_status()
+    scheduler_running = bool(scheduler_status.get("running"))
+    scheduler_badge_class = "good" if scheduler_running else "neutral"
+    scheduler_badge_text = "RUNNING" if scheduler_running else "STOPPED"
+    scheduler_mode = html.escape(text_value(scheduler_status.get("mode"), execution_mode_label))
+    scheduler_result = dict(scheduler_status.get("last_result") or {})
+    scheduler_summary = (
+        f"Checked {scheduler_result.get('checked', 0)} | modified {scheduler_result.get('modified', 0)} | "
+        f"failed {scheduler_result.get('failed', 0)} | exit-required {scheduler_result.get('exit_required', 0)}"
+        if scheduler_result
+        else "No scheduler run recorded yet."
+    )
+    scheduler_error = text_value(scheduler_status.get("last_error"), "")
+    return f"""
+    <form id="kite-spreads-panel" method="post" action="/kite-spreads/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <input type="hidden" name="dhan_opportunities_json" value="{opportunities_json}">
+      <input type="hidden" name="dhan_selected_symbol" value="{html.escape(state.dhan_selected_symbol, quote=True)}">
+      <input type="hidden" name="dhan_popup_strategy" value="{html.escape(state.dhan_popup_strategy, quote=True)}">
+      <input type="hidden" name="dhan_expiry" value="{html.escape(state.dhan_expiry, quote=True)}">
+      <input type="hidden" name="dhan_strategy" value="{html.escape(state.dhan_strategy, quote=True)}">
+      <input type="hidden" name="dhan_lots" value="{html.escape(str(state.dhan_lots), quote=True)}">
+      <input type="hidden" name="dhan_product_type" value="{html.escape(state.dhan_product_type, quote=True)}">
+      <input type="hidden" name="dhan_order_type" value="{html.escape(state.dhan_order_type, quote=True)}">
+      <input type="hidden" name="dhan_spot_json" value="{html.escape(state.dhan_spot_json, quote=True)}">
+      <input type="hidden" name="dhan_contracts_json" value="{html.escape(state.dhan_contracts_json, quote=True)}">
+      <section class="panel dhan-hero">
+        <div>
+          <div class="panel-title">DHAN - Income Growth F&O Paired Option Spreads</div>
+          <p class="status">Your Income Growth F&O shares are auto-loaded here. Evaluate PE SELL and CE SELL as hedged Kite paired spreads. CE-side rows are allowed only when the resolved Kite lot size is fully covered by shares. Current execution mode: <span class="ipo-badge {execution_mode_class}">{execution_mode_label}</span></p>
+          <div class="dhan-mode-toggle">
+            <label><input type="radio" name="dhan_paper_trading" value="1"{paper_checked}> Paper mode</label>
+            <label><input type="radio" name="dhan_paper_trading" value="0"{live_checked}> LIVE Kite mode</label>
+            <small>LIVE submits the BUY hedge first. The scheduler then places/manages the SELL leg for hedge-first pairs.</small>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/kite-spreads/load">Load Income Growth / Refresh</button>
+          <button type="submit" formaction="/kite-spreads/analyze-all" class="success">Run Analysis on All Stocks</button>
+          <button type="submit" formaction="/kite-spreads/gpt-refresh" class="secondary">Refresh GPT Suggestions</button>
+        </div>
+      </section>
+      {render_console(state.console_log)}
+      <section class="panel dhan-watchlist-panel">
+        <div class="panel-title">Current F&O Stock List - Select PE or CE</div>
+        <p class="status">Choose Evaluate PE or Evaluate CE for one stock. The popup reviews a 5% OTM SELL and 10% OTM BUY hedge pair before any Kite order is allowed.</p>
+        <details>
+          <summary>Advanced: add manual/GPT rows</summary>
+        <div class="compact-grid">
+          <label><span>Manual symbol</span><input name="dhan_manual_symbol" value="{html.escape(state.dhan_manual_symbol, quote=True)}" placeholder="RELIANCE"></label>
+          <label><span>Company</span><input name="dhan_manual_company" value="{html.escape(state.dhan_manual_company, quote=True)}" placeholder="Reliance Industries"></label>
+          <label><span>Bucket</span><input name="dhan_manual_bucket" value="{html.escape(state.dhan_manual_bucket, quote=True)}" placeholder="INCOME_STOCK"></label>
+          <button type="submit" formaction="/kite-spreads/add-stock">Add Stock</button>
+        </div>
+        </details>
+        <div class="table-wrap"><table class="ipo-table dhan-watchlist-table"><thead><tr><th>Symbol</th><th>CMP / Day</th><th>52W High Gap</th><th>Bucket</th><th>Shares</th><th>Max CE Lots</th><th>Active</th><th>Event Risk</th><th>Actions</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
+      </section>
+      <section class="panel dhan-opportunities-panel">
+        <div class="panel-title">Opportunity Table - Compare POP, Gain and Risk</div>
+        <p class="status">Use Run Analysis on All Stocks to refresh PE and CE pair analysis for the full active list. POP above 80% and max gain above 10,000 are highlighted green. Use Open Popup to review and place that exact pair.</p>
+        <div class="table-wrap"><table id="dhan-opportunity-table" class="ipo-table dhan-opportunity-table"><thead><tr><th>Action</th><th class="sort-header" data-sort-col="1">Symbol</th><th class="sort-header" data-sort-col="2">Strategy</th><th class="sort-header" data-sort-col="3">CMP / Day</th><th class="sort-header" data-sort-col="4">Lots</th><th class="sort-header" data-sort-col="5">Qty</th><th class="sort-header" data-sort-col="6">5% SELL Target</th><th class="sort-header" data-sort-col="7">10% BUY Target</th><th class="sort-header" data-sort-col="8">Sell Prem</th><th class="sort-header" data-sort-col="9">Hedge Prem</th><th class="sort-header" data-sort-col="10">Net Credit</th><th class="sort-header" data-sort-col="11">Max Gain</th><th class="sort-header" data-sort-col="12">Max Loss</th><th class="sort-header" data-sort-col="13">Breakeven</th><th class="sort-header" data-sort-col="14">POP</th><th class="sort-header" data-sort-col="15">RoR</th><th class="sort-header" data-sort-col="16">Event</th><th class="sort-header" data-sort-col="17">Risk Decision</th></tr></thead><tbody>{''.join(opportunity_rows)}</tbody></table></div>
+      </section>
+      {selected_preview}
+      <section class="panel dhan-monitor-panel">
+        <div class="panel-title">Pair Order Monitor</div>
+        <div class="dhan-job-status">
+          <article><span>Job Status</span><strong><span class="ipo-badge {scheduler_badge_class}">{scheduler_badge_text}</span></strong><small>{scheduler_mode} mode</small></article>
+          <article><span>Interval</span><strong>{html.escape(str(scheduler_status.get('interval_seconds') or '-'))}s</strong><small>Auto SELL-leg checks</small></article>
+          <article><span>Last Run</span><strong>{html.escape(text_value(scheduler_status.get('last_run_at')))}</strong><small>{html.escape(scheduler_summary)}</small></article>
+          <article><span>Last Start / Stop</span><strong>{html.escape(text_value(scheduler_status.get('last_started_at')))}</strong><small>Stopped: {html.escape(text_value(scheduler_status.get('last_stopped_at')))}</small></article>
+        </div>
+        {f'<div class="status error">DHAN scheduler error: {html.escape(scheduler_error)}</div>' if scheduler_error else ''}
+        <div class="actions">
+          <button type="submit" formaction="/kite-spreads/scheduler-run" class="secondary">Run Scheduler Now</button>
+          <button type="submit" formaction="/kite-spreads/scheduler-start" class="secondary">Start Scheduler</button>
+          <button type="submit" formaction="/kite-spreads/scheduler-stop" class="secondary">Stop Scheduler</button>
+          <button type="submit" formaction="/kite-spreads/load" class="secondary">Refresh Order Book</button>
+          <button type="submit" formaction="/kite-spreads/clear-pair-monitor" class="secondary danger-link" onclick="return confirm('Clear local DHAN Pair Order Monitor history? This will NOT cancel or modify any Kite orders.');">Clear Monitor</button>
+        </div>
+        <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Pair ID</th><th>Symbol</th><th>Strategy</th><th>Sell Status</th><th>Buy Status</th><th>Pair Status</th><th>Credit</th><th>Last Checked</th><th>Action</th></tr></thead><tbody>{''.join(pair_rows)}</tbody></table></div>
+      </section>
+    </form>"""
+
+
 def ceil_to_tick(value: float, tick_size: float = 0.05) -> float:
     if tick_size <= 0:
         return round(value, 2)
@@ -24096,6 +24822,7 @@ def render_page(state: PageState) -> bytes:
     equity_tab_class = "active" if state.active_tab == "equity" else ""
     ipo_tab_class = "active" if state.active_tab == "ipo" else ""
     value_stock_tab_class = "active" if state.active_tab == "value-stock" else ""
+    dhan_tab_class = "active" if state.active_tab == "kite-spreads" else ""
     nifty_income_tab_class = "active" if state.active_tab == "nifty-income" else ""
     nifty_grow_tab_class = "active" if state.active_tab == "nifty-grow" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
@@ -27158,10 +27885,29 @@ def render_page(state: PageState) -> bytes:
       cursor: pointer;
       user-select: none;
     }}
+    .ipo-table th.sort-header {{
+      cursor: pointer;
+      user-select: none;
+    }}
     .ipo-table th[data-sort-type]::after {{
       content: " ↕";
       font-size: 10px;
       opacity: 0.7;
+    }}
+    .ipo-table th.sort-header::after {{
+      content: " ↕";
+      font-size: 10px;
+      opacity: 0.7;
+    }}
+    .ipo-table th.sort-header[data-sort-dir="asc"]::after {{
+      content: " ↑";
+      color: #0f766e;
+      opacity: 1;
+    }}
+    .ipo-table th.sort-header[data-sort-dir="desc"]::after {{
+      content: " ↓";
+      color: #0f766e;
+      opacity: 1;
     }}
     .ipo-select-cell, .ipo-table th.ipo-select-cell {{
       text-align: center;
@@ -27233,6 +27979,244 @@ def render_page(state: PageState) -> bytes:
     .value-stock-table td {{
       vertical-align: top;
       font-size: 12px;
+    }}
+    .dhan-watchlist-table td {{
+      vertical-align: middle;
+    }}
+    .dhan-mode-toggle {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      padding: 10px 12px;
+      border: 1px solid #bfdbfe;
+      border-radius: 14px;
+      background: rgba(239, 246, 255, 0.78);
+    }}
+    .dhan-mode-toggle label {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      background: #ffffff;
+      color: #334155;
+      font-weight: 900;
+      font-size: 12px;
+    }}
+    .dhan-mode-toggle input {{
+      margin: 0;
+    }}
+    .dhan-mode-toggle small {{
+      color: #64748b;
+      font-weight: 800;
+    }}
+    .dhan-job-status {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
+      gap: 10px;
+      margin: 10px 0 14px;
+    }}
+    .dhan-job-status article {{
+      border: 1px solid #dbeafe;
+      border-radius: 14px;
+      padding: 10px 12px;
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(239, 246, 255, 0.82));
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+    }}
+    .dhan-job-status span {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 950;
+      text-transform: uppercase;
+    }}
+    .dhan-job-status strong {{
+      display: block;
+      margin: 5px 0 3px;
+      color: #0f172a;
+      font-size: 14px;
+      line-height: 1.2;
+    }}
+    .dhan-job-status small {{
+      display: block;
+      color: #475569;
+      font-weight: 800;
+      white-space: normal;
+      line-height: 1.25;
+    }}
+    .dhan-watchlist-table tr.current-holding td {{
+      background: linear-gradient(90deg, rgba(240, 253, 250, 0.98), rgba(255, 255, 255, 0.96));
+    }}
+    .dhan-watchlist-table tr.current-holding td:first-child {{
+      border-left: 4px solid #14b8a6;
+    }}
+    .dhan-symbol-cell strong {{
+      display: block;
+      color: #0f172a;
+      font-size: 13px;
+      letter-spacing: 0.01em;
+    }}
+    .dhan-symbol-cell small {{
+      display: block;
+      color: #64748b;
+      max-width: 170px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .dhan-52w-cell strong {{
+      display: block;
+      font-size: 12px;
+      font-weight: 950;
+    }}
+    .dhan-52w-cell small {{
+      display: block;
+      color: #64748b;
+      font-size: 10px;
+      line-height: 1.2;
+    }}
+    .dhan-52w-near strong {{ color: #166534; }}
+    .dhan-52w-mid strong {{ color: #92400e; }}
+    .dhan-52w-far strong {{ color: #991b1b; }}
+    .dhan-52w-unknown strong {{ color: #64748b; }}
+    .dhan-action-cell {{
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+      min-width: 250px;
+    }}
+    .dhan-action-btn {{
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      padding: 7px 11px;
+      min-height: 30px;
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: 0.01em;
+      cursor: pointer;
+      background: #ffffff;
+      color: #334155;
+      box-shadow: 0 5px 14px rgba(15, 23, 42, 0.06);
+    }}
+    .dhan-action-btn:hover {{
+      transform: translateY(-1px);
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.10);
+    }}
+    .dhan-action-primary {{
+      background: #0f766e;
+      color: #ffffff;
+      border-color: #0f766e;
+    }}
+    .dhan-action-pe {{
+      background: #eff6ff;
+      color: #1d4ed8;
+      border-color: #bfdbfe;
+    }}
+    .dhan-action-ce {{
+      background: #fff7ed;
+      color: #c2410c;
+      border-color: #fed7aa;
+    }}
+    .dhan-action-muted {{
+      background: #f8fafc;
+      color: #64748b;
+      border-color: #e2e8f0;
+    }}
+    .dhan-order-modal-card {{
+      width: min(980px, calc(100vw - 32px));
+      max-height: calc(100vh - 36px);
+      overflow-y: auto;
+    }}
+    .dhan-ticket-header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #dbeafe;
+      margin-bottom: 14px;
+    }}
+    .dhan-ticket-header h2 {{
+      margin: 2px 0 4px;
+      color: #0f172a;
+    }}
+    .dhan-ticket-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 12px 0 16px;
+    }}
+    .dhan-ticket-card {{
+      border: 1px solid #dbeafe;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #ffffff 0%, #eff6ff 100%);
+      padding: 12px;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+    }}
+    .dhan-ticket-card span,
+    .dhan-leg-price span {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }}
+    .dhan-ticket-card strong {{
+      display: block;
+      margin-top: 4px;
+      font-size: 20px;
+      color: #0f172a;
+    }}
+    .dhan-ticket-card small {{
+      display: block;
+      margin-top: 4px;
+      color: #475569;
+    }}
+    .dhan-credit-card {{
+      border-color: #99f6e4;
+      background: linear-gradient(135deg, #ecfdf5 0%, #f0fdfa 100%);
+    }}
+    .dhan-risk-card {{
+      border-color: #fecaca;
+      background: linear-gradient(135deg, #fff7ed 0%, #fef2f2 100%);
+    }}
+    .dhan-market-card {{
+      border-color: #bfdbfe;
+      background: linear-gradient(135deg, #eff6ff 0%, #eef2ff 100%);
+    }}
+    .dhan-leg-card {{
+      border-radius: 16px;
+      min-height: 150px;
+    }}
+    .dhan-leg-card.sell-leg {{
+      border-color: #fed7aa;
+      background: linear-gradient(135deg, #fff7ed 0%, #ffffff 100%);
+    }}
+    .dhan-leg-card.buy-leg {{
+      border-color: #bae6fd;
+      background: linear-gradient(135deg, #f0f9ff 0%, #ffffff 100%);
+    }}
+    .dhan-leg-price {{
+      margin-top: 12px;
+      padding: 10px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.75);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+    }}
+    .dhan-leg-price strong {{
+      font-size: 24px;
+    }}
+    .ipo-table td.dhan-good-metric {{
+      background: #dcfce7;
+      color: #047857;
+      font-weight: 900;
+    }}
+    .ipo-table td.dhan-good-metric small {{
+      color: #047857;
     }}
     .value-stock-table small,
     .value-stock-detail-card small {{
@@ -29494,6 +30478,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {equity_tab_class}" type="button" data-tab="equity">Equity</button>
       <button class="tab-button utility-action {ipo_tab_class}" type="button" data-tab="ipo">IPO</button>
       <button class="tab-button utility-action {value_stock_tab_class}" type="button" data-tab="value-stock">Value-Stock</button>
+      <button class="tab-button utility-action {dhan_tab_class}" type="button" data-tab="kite-spreads">DHAN</button>
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       {f'<button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>' if nifty_income_enabled else ''}
@@ -29635,6 +30620,7 @@ def render_page(state: PageState) -> bytes:
     {render_equity_panel(state)}
     {render_ipo_panel(state)}
     {render_value_stock_panel(state)}
+    {render_kite_spreads_panel(state)}
     {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
   </main>
@@ -29832,6 +30818,7 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(investingTable);
     enableTableSorting(document.getElementById('income-growth-table'));
     enableTableSorting(document.getElementById('dividend-income-table'));
+    enableTableSorting(document.getElementById('dhan-opportunity-table'));
     enableTableSorting(document.getElementById('equity-holdings-table'));
     enableTableSorting(document.getElementById('ipo-listed-table'));
     enableTableSorting(document.getElementById('ipo-mainboard-table'));
@@ -29898,6 +30885,7 @@ def render_page(state: PageState) -> bytes:
       document.getElementById('equity-panel').style.display = active === 'equity' ? '' : 'none';
       document.getElementById('ipo-panel').style.display = active === 'ipo' ? '' : 'none';
       document.getElementById('value-stock-panel').style.display = active === 'value-stock' ? '' : 'none';
+      document.getElementById('kite-spreads-panel').style.display = active === 'kite-spreads' ? '' : 'none';
       document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
       document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
       for (const item of document.querySelectorAll('.tab-button')) {{
@@ -29926,6 +30914,7 @@ def render_page(state: PageState) -> bytes:
           equity: '/equity',
           ipo: '/ipo',
           'value-stock': '/value-stock',
+          'kite-spreads': '/kite-spreads',
           'income-growth': '/income-growth',
           commodity: '/commodity',
           'order-management': '/orders',
@@ -30150,6 +31139,13 @@ def render_page(state: PageState) -> bytes:
     const niftyPairRefresh = document.getElementById('nifty-pair-refresh');
     const niftyPairReview = document.getElementById('nifty-pair-review');
     const niftyPairGo = document.getElementById('nifty-pair-go');
+    const dhanPairModal = document.getElementById('dhan-pair-order-modal');
+    const dhanPairConfirm = document.getElementById('dhan-confirm-pair-order');
+    const dhanPairReview = document.getElementById('dhan-pair-review');
+    const dhanPairGo = document.getElementById('dhan-place-pair-order');
+    const dhanPairBreath = document.getElementById('dhan-pair-breath');
+    const dhanPairBreathText = document.getElementById('dhan-pair-breath-text');
+    const dhanPairCountdown = document.getElementById('dhan-pair-countdown');
     const ceSellModal = document.getElementById('ce-sell-order-modal');
     const ceSellTitle = document.getElementById('ce-sell-order-title');
     const ceSellOption = document.getElementById('ce-sell-option');
@@ -30222,6 +31218,7 @@ def render_page(state: PageState) -> bytes:
     let positionCountdownTimer = null;
     let incomePeCountdownTimer = null;
     let niftyPairCountdownTimer = null;
+    let dhanPairCountdownTimer = null;
     let ceSellCountdownTimer = null;
     let equityOrderCountdownTimer = null;
     let equityOrderSnapshot = null;
@@ -30344,6 +31341,43 @@ def render_page(state: PageState) -> bytes:
     }}
     incomePeGo && incomePeGo.addEventListener('click', (event) => {{
       submitOrderModal(event, incomePeModal, incomePeReview, incomePeGo);
+    }});
+    function resetDhanPairConfirmation() {{
+      if (dhanPairCountdownTimer) clearInterval(dhanPairCountdownTimer);
+      dhanPairCountdownTimer = null;
+      if (dhanPairGo) dhanPairGo.disabled = true;
+      if (dhanPairReview) {{
+        const orderable = Boolean(dhanPairConfirm && dhanPairConfirm.dataset.orderable === '1');
+        dhanPairReview.disabled = !(orderable && dhanPairConfirm && dhanPairConfirm.checked);
+      }}
+      const acknowledged = Boolean(dhanPairConfirm && dhanPairConfirm.checked);
+      if (dhanPairCountdown) dhanPairCountdown.textContent = '10';
+      if (dhanPairBreathText) dhanPairBreathText.textContent = acknowledged ? 'Click Start 10s Review' : 'Tick acknowledgement to start 10s review';
+      if (dhanPairBreath) dhanPairBreath.classList.remove('active');
+    }}
+    function startDhanPairCountdown() {{
+      resetDhanPairConfirmation();
+      let remaining = 10;
+      if (dhanPairReview) dhanPairReview.disabled = true;
+      if (dhanPairBreath) dhanPairBreath.classList.add('active');
+      if (dhanPairBreathText) dhanPairBreathText.textContent = 'Breathe in';
+      if (dhanPairCountdown) dhanPairCountdown.textContent = String(remaining);
+      dhanPairCountdownTimer = setInterval(() => {{
+        remaining -= 1;
+        if (dhanPairCountdown) dhanPairCountdown.textContent = String(Math.max(remaining, 0));
+        if (dhanPairBreathText) dhanPairBreathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          clearInterval(dhanPairCountdownTimer);
+          dhanPairCountdownTimer = null;
+          if (dhanPairBreathText) dhanPairBreathText.textContent = 'Ready. Cancel or GO.';
+          if (dhanPairGo) dhanPairGo.disabled = false;
+        }}
+      }}, 1000);
+    }}
+    dhanPairConfirm && dhanPairConfirm.addEventListener('change', resetDhanPairConfirmation);
+    dhanPairReview && dhanPairReview.addEventListener('click', startDhanPairCountdown);
+    dhanPairGo && dhanPairGo.addEventListener('click', (event) => {{
+      submitOrderModal(event, dhanPairModal, dhanPairReview, dhanPairGo);
     }});
     function resetNiftyPairConfirmation() {{
       if (niftyPairCountdownTimer) clearInterval(niftyPairCountdownTimer);
@@ -31774,6 +32808,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.error = f"{friendly_external_error(exc, 'Value-Stock')}\n\n{traceback.format_exc()}"
             self.send_page(state)
             return
+        if parsed_url.path == "/kite-spreads":
+            state = PageState(active_tab="kite-spreads")
+            try:
+                load_dhan_state(state, sync_holdings=True)
+            except Exception as exc:
+                state.error = f"{friendly_external_error(exc, 'DHAN')}\n\n{traceback.format_exc()}"
+            self.send_page(state)
+            return
         if parsed_url.path == "/income":
             state = PageState(active_tab="income")
             try:
@@ -32102,6 +33144,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/ipo")
                 else "value-stock"
                 if request_path.startswith("/value-stock")
+                else "kite-spreads"
+                if request_path.startswith("/kite-spreads")
                 else "income-growth"
                 if request_path.startswith("/income-growth")
                 else "income"
@@ -32231,6 +33275,22 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             value_stock_decision=first(form, "value_stock_decision"),
             value_stock_selected_key=first(form, "value_stock_selected_key"),
             value_stock_colour_mode=first(form, "value_stock_colour_mode", "Latest assessment"),
+            dhan_manual_symbol=first(form, "dhan_manual_symbol"),
+            dhan_manual_company=first(form, "dhan_manual_company"),
+            dhan_manual_bucket=first(form, "dhan_manual_bucket"),
+            dhan_expiry=first(form, "dhan_expiry"),
+            dhan_strategy=first(form, "dhan_strategy", "BOTH"),
+            dhan_lots=int(float(first(form, "dhan_lots", "1") or 1)),
+            dhan_product_type=first(form, "dhan_product_type", "MARGIN"),
+            dhan_order_type=first(form, "dhan_order_type", "LIMIT"),
+            dhan_paper_trading=checked(form, "dhan_paper_trading", True),
+            dhan_spot_json=first(form, "dhan_spot_json"),
+            dhan_contracts_json=first(form, "dhan_contracts_json"),
+            dhan_selected_index=first(form, "dhan_selected_index"),
+            dhan_selected_symbol=first(form, "dhan_selected_symbol"),
+            dhan_popup_strategy=first(form, "dhan_popup_strategy"),
+            dhan_confirm_pair_order=checked(form, "dhan_confirm_pair_order"),
+            dhan_opportunities=_dhan_json_loads(first(form, "dhan_opportunities_json"), []),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -33160,6 +34220,199 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.ipo_quarter,
                 )
                 state.message = f"Prepared IPO snapshot export: {state.ipo_export_filename}."
+            elif request_path in {"/kite-spreads/load", "/kite-spreads/add-stock", "/kite-spreads/deactivate", "/kite-spreads/gpt-refresh"}:
+                repository = DhanRepository(APP_DB_PATH)
+                universe = DhanStockUniverse(repository)
+                if request_path == "/kite-spreads/add-stock":
+                    universe.add_manual_stock(
+                        state.dhan_manual_symbol,
+                        state.dhan_manual_company,
+                        state.dhan_manual_bucket,
+                    )
+                    state.message = f"Added {state.dhan_manual_symbol.upper()} to DHAN watchlist."
+                elif request_path == "/kite-spreads/deactivate":
+                    row_id = int(float(first(form, "dhan_watchlist_id", "0") or 0))
+                    universe.deactivate_stock(row_id)
+                    state.message = "Deactivated selected DHAN watchlist row."
+                elif request_path == "/kite-spreads/gpt-refresh":
+                    universe.sync_holdings()
+                    suggestions, gpt_error = suggest_stocks_with_openai(
+                        universe.active_watchlist(),
+                        model=state.openai_model,
+                        api_key=state.openai_api_key or env_value("OPENAI_API_KEY"),
+                    )
+                    saved = universe.save_gpt_suggestions(suggestions)
+                    state.message = (
+                        f"Saved {saved} DHAN GPT suggestion(s)."
+                        if not gpt_error
+                        else f"{gpt_error} Saved {saved} suggestion(s)."
+                    )
+                else:
+                    synced = universe.sync_holdings()
+                    state.message = f"Loaded DHAN page, seeded Income Growth F&O list, and synced {synced} Kite holding symbol(s)."
+                load_dhan_state(state)
+            elif request_path == "/kite-spreads/build-opportunities":
+                repository = DhanRepository(APP_DB_PATH)
+                universe = DhanStockUniverse(repository)
+                watchlist = universe.active_watchlist()
+                state.dhan_opportunities, live_notes = build_dhan_opportunities_for_symbols(
+                    watchlist,
+                    [str(row.get("symbol") or "") for row in watchlist],
+                    strategy=state.dhan_strategy,
+                    state=state,
+                )
+                repository.export_outputs(state.dhan_opportunities)
+                load_dhan_state(state)
+                state.message = f"Built {len(state.dhan_opportunities)} DHAN opportunity row(s). {' '.join(live_notes)}"
+            elif request_path == "/kite-spreads/analyze-all":
+                repository = DhanRepository(APP_DB_PATH)
+                universe = DhanStockUniverse(repository)
+                watchlist = universe.active_watchlist()
+                active_symbols = [str(row.get("symbol") or "").strip().upper() for row in watchlist if str(row.get("symbol") or "").strip()]
+                if not active_symbols:
+                    raise ValueError("No active DHAN stocks are available for analysis.")
+                state.dhan_opportunities, live_notes = build_dhan_opportunities_for_symbols(
+                    watchlist,
+                    active_symbols,
+                    strategy="BOTH",
+                    state=state,
+                )
+                state.dhan_selected_index = ""
+                state.dhan_selected_symbol = ""
+                state.dhan_popup_strategy = ""
+                repository.export_outputs(state.dhan_opportunities)
+                load_dhan_state(state)
+                note_text = f" {' '.join(live_notes)}" if live_notes else ""
+                state.message = f"Analyzed PE and CE DHAN pairs for {len(active_symbols)} active stock(s). Added {len(state.dhan_opportunities)} row(s) to Opportunity Table.{note_text}"
+            elif request_path == "/kite-spreads/analyze-symbol":
+                repository = DhanRepository(APP_DB_PATH)
+                universe = DhanStockUniverse(repository)
+                selected_symbol = str(first(form, "dhan_analyze_symbol") or "").strip().upper()
+                if not selected_symbol:
+                    raise ValueError("Choose one DHAN stock to analyze.")
+                watchlist = [
+                    row
+                    for row in universe.active_watchlist()
+                    if str(row.get("symbol") or "").strip().upper() == selected_symbol
+                ]
+                if not watchlist:
+                    raise ValueError(f"{selected_symbol} is not active in the DHAN stock list.")
+                state.dhan_opportunities, live_notes = build_dhan_opportunities_for_symbols(
+                    watchlist,
+                    [selected_symbol],
+                    strategy="BOTH",
+                    state=state,
+                )
+                state.dhan_selected_index = ""
+                state.dhan_selected_symbol = selected_symbol
+                state.dhan_popup_strategy = ""
+                repository.export_outputs(state.dhan_opportunities)
+                load_dhan_state(state)
+                state.message = f"Analyzed {selected_symbol} PE and CE DHAN pairs. Compare rows below. {' '.join(live_notes)}"
+            elif request_path == "/kite-spreads/evaluate-symbol":
+                repository = DhanRepository(APP_DB_PATH)
+                universe = DhanStockUniverse(repository)
+                eval_value = first(form, "dhan_eval")
+                if eval_value and "|" in eval_value:
+                    selected_symbol, selected_strategy = eval_value.split("|", 1)
+                else:
+                    selected_symbol, selected_strategy = state.dhan_selected_symbol, state.dhan_popup_strategy
+                selected_symbol = str(selected_symbol or "").strip().upper()
+                selected_strategy = str(selected_strategy or "").strip().upper()
+                if selected_strategy not in {"BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"}:
+                    raise ValueError("Choose PE or CE evaluation for one DHAN stock.")
+                if not selected_symbol:
+                    raise ValueError("Choose one DHAN stock to evaluate.")
+                watchlist = [
+                    row
+                    for row in universe.active_watchlist()
+                    if str(row.get("symbol") or "").strip().upper() == selected_symbol
+                ]
+                if not watchlist:
+                    raise ValueError(f"{selected_symbol} is not active in the DHAN stock list.")
+                state.dhan_opportunities, live_notes = build_dhan_opportunities_for_symbols(
+                    watchlist[:1],
+                    [selected_symbol],
+                    strategy=selected_strategy,
+                    state=state,
+                )
+                state.dhan_selected_index = "0" if state.dhan_opportunities else ""
+                state.dhan_selected_symbol = selected_symbol
+                state.dhan_popup_strategy = selected_strategy
+                repository.export_outputs(state.dhan_opportunities)
+                load_dhan_state(state)
+                side = "PE" if selected_strategy == "BULL_PUT_SPREAD" else "CE"
+                note_text = f" {' '.join(live_notes)}" if live_notes else ""
+                state.message = f"Evaluated {selected_symbol} {side} 5% SELL / 10% BUY DHAN pair. Review popup before placing.{note_text}"
+            elif request_path == "/kite-spreads/close-popup":
+                state.dhan_opportunities = []
+                state.dhan_selected_index = ""
+                state.dhan_selected_symbol = ""
+                state.dhan_popup_strategy = ""
+                state.dhan_confirm_pair_order = False
+                load_dhan_state(state)
+                state.message = "Closed DHAN paired-spread popup."
+            elif request_path == "/kite-spreads/preview-pair":
+                if not state.dhan_selected_index:
+                    raise ValueError("Select one DHAN opportunity row before preview.")
+                load_dhan_state(state)
+                state.message = "Review the selected DHAN pair order preview before submitting."
+            elif request_path == "/kite-spreads/submit-pair":
+                selected_idx = int(float(state.dhan_selected_index or "-1"))
+                if selected_idx < 0 or selected_idx >= len(state.dhan_opportunities or []):
+                    raise ValueError("Select one DHAN opportunity row before submitting.")
+                repository = DhanRepository(APP_DB_PATH)
+                broker = DhanBrokerAdapter(paper_trading=state.dhan_paper_trading)
+                try:
+                    outcome = submit_pair_order(
+                        (state.dhan_opportunities or [])[selected_idx],
+                        repository,
+                        broker,
+                        user_confirmed=state.dhan_confirm_pair_order,
+                        paper_trading=state.dhan_paper_trading,
+                    )
+                    state.console_log = format_dhan_order_backend_log(outcome, repository, broker)
+                    repository.export_outputs(state.dhan_opportunities)
+                    state.dhan_selected_index = ""
+                    state.dhan_selected_symbol = ""
+                    state.dhan_popup_strategy = ""
+                    state.dhan_confirm_pair_order = False
+                except Exception:
+                    state.console_log = "DHAN Kite order error log\n" + traceback.format_exc()
+                    raise
+                load_dhan_state(state)
+                state.message = f"Submitted DHAN paired spread {outcome.get('pair_id')} through Kite in {'paper' if state.dhan_paper_trading else 'live'} mode."
+            elif request_path == "/kite-spreads/scheduler-run":
+                result = run_dhan_scheduler_now(paper_trading=state.dhan_paper_trading)
+                load_dhan_state(state)
+                state.message = (
+                    f"DHAN scheduler checked {result.get('checked')} pair(s), modified {result.get('modified')}, "
+                    f"failed {result.get('failed')}, exit-required {result.get('exit_required')}."
+                )
+            elif request_path == "/kite-spreads/scheduler-start":
+                started = start_dhan_scheduler(paper_trading=state.dhan_paper_trading)
+                load_dhan_state(state)
+                state.message = "Started DHAN scheduler." if started else "DHAN scheduler is already running."
+            elif request_path == "/kite-spreads/scheduler-stop":
+                stopped = stop_dhan_scheduler()
+                load_dhan_state(state)
+                state.message = "Stopped DHAN scheduler." if stopped else "DHAN scheduler was not running."
+            elif request_path == "/kite-spreads/clear-pair-monitor":
+                repository = DhanRepository(APP_DB_PATH)
+                deleted = repository.clear_pair_monitor()
+                repository.export_outputs(state.dhan_opportunities)
+                state.dhan_selected_index = ""
+                state.dhan_selected_symbol = ""
+                state.dhan_popup_strategy = ""
+                state.dhan_confirm_pair_order = False
+                state.console_log = (
+                    "DHAN Pair Order Monitor cleared locally.\n"
+                    f"Pair order rows deleted: {deleted.get('pair_orders_deleted', 0)}\n"
+                    f"Execution log rows deleted: {deleted.get('execution_logs_deleted', 0)}\n"
+                    "No Kite orders were cancelled or modified."
+                )
+                load_dhan_state(state)
+                state.message = f"Cleared DHAN Pair Order Monitor locally: {deleted.get('pair_orders_deleted', 0)} pair row(s) removed. Kite orders were not changed."
             elif request_path in {"/value-stock/filter", "/value-stock/detail"}:
                 load_value_stock_state(state)
                 if request_path == "/value-stock/detail" and state.value_stock_detail:

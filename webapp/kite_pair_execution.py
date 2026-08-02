@@ -1,0 +1,44 @@
+"""Kite paired spread execution with hedge-first safety default."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from kite_spread_repository import KiteSpreadRepository
+
+
+def build_kite_order_payload(tradingsymbol: str, transaction_type: str, quantity: int, price: float, tag: str = "") -> dict[str, Any]:
+    return {
+        "variety": "regular",
+        "exchange": "NFO",
+        "tradingsymbol": tradingsymbol,
+        "transaction_type": transaction_type,
+        "quantity": int(quantity),
+        "product": "NRML",
+        "order_type": "LIMIT",
+        "price": round(float(price), 2),
+        "validity": "DAY",
+        "tag": tag[:20],
+    }
+
+
+def submit_kite_pair(preview: dict[str, Any], repository: KiteSpreadRepository, broker: Any, user_confirmed: bool, mode: str = "PAPER", execution_mode: str = "HEDGE_FIRST") -> dict[str, Any]:
+    if not user_confirmed:
+        raise ValueError("Explicit confirmation is required before placing a Kite spread pair.")
+    if str(preview.get("risk_decision") or "").upper() != "APPROVED":
+        raise ValueError(f"Spread is blocked: {preview.get('risk_reason') or preview.get('reason')}")
+    pair_id = repository.create_pair(preview, mode=mode, user_confirmed=True, execution_mode=execution_mode)
+    tag = pair_id[-20:]
+    buy_payload = build_kite_order_payload(preview["buy_leg_tradingsymbol"], "BUY", preview["quantity"], preview["buy_limit_price"], tag)
+    sell_payload = build_kite_order_payload(preview["sell_leg_tradingsymbol"], "SELL", preview["quantity"], preview["sell_limit_price"], tag)
+    if execution_mode == "HEDGE_FIRST":
+        buy_result = broker.place_order(buy_payload)
+        repository.update_pair(pair_id, buy_leg_order_id=buy_result["order_id"], buy_leg_status=buy_result.get("status", "OPEN"), pair_status="SUBMITTED", payload_json=json.dumps({**preview, "sell_order_payload": sell_payload, "buy_order_payload": buy_payload}, default=str))
+        repository.log(pair_id, "BUY_HEDGE_SUBMITTED", buy_result["order_id"])
+        return {"pair_id": pair_id, "buy_leg_order_id": buy_result["order_id"], "sell_leg_order_id": "", "mode": mode}
+    buy_result = broker.place_order(buy_payload)
+    sell_result = broker.place_order(sell_payload)
+    repository.update_pair(pair_id, buy_leg_order_id=buy_result["order_id"], sell_leg_order_id=sell_result["order_id"], buy_leg_status=buy_result.get("status", "OPEN"), sell_leg_status=sell_result.get("status", "OPEN"), sell_leg_placed=1, pair_status="SUBMITTED", payload_json=json.dumps({**preview, "sell_order_payload": sell_payload, "buy_order_payload": buy_payload}, default=str))
+    repository.log(pair_id, "SIMULTANEOUS_SUBMITTED", f"{buy_result['order_id']} {sell_result['order_id']}")
+    return {"pair_id": pair_id, "buy_leg_order_id": buy_result["order_id"], "sell_leg_order_id": sell_result["order_id"], "mode": mode}
