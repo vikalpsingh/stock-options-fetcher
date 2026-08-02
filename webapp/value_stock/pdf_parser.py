@@ -209,14 +209,97 @@ def company_key(name: str) -> str:
     return key or "UNKNOWN"
 
 
-def _first_non_empty_company_line(lines: list[str], filename: str) -> str:
-    ignored = ("share price |", "Summary Chart", "₹ ", "EXPORT TO EXCEL")
-    for line in lines[:12]:
-        if any(marker in line for marker in ignored):
+def _compact_spaced_toolbar_text(value: str) -> str:
+    return re.sub(r"\s+", "", re.sub(r"[^A-Za-z]+", " ", value)).upper()
+
+
+def _is_invalid_company_candidate(value: str) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return True
+    lowered = text.lower()
+    compact = _compact_spaced_toolbar_text(text)
+    if any(
+        marker in lowered
+        for marker in (
+            "share price |",
+            "summary chart",
+            "key insights - screener",
+            "current price",
+            "market cap",
+            "add ratio",
+            "read more",
+            "incorporated in",
+        )
+    ):
+        return True
+    if any(marker in compact for marker in ("EXPORTTOEXCEL", "FOLLOW", "ALERTS", "WEBSITEBSENSE")):
+        return True
+    if text.startswith("http") or re.match(r"\d{1,2}/\d{1,2}/\d{2}", text):
+        return True
+    return len(re.findall(r"[A-Za-z]", text)) < 3
+
+
+def _clean_company_name_candidate(value: str) -> str:
+    text = re.sub(r"[\ue000-\uf8ff]+", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip(" -|")
+    text = re.sub(r"\b(?:share price|about|key insights|screener)\b.*$", "", text, flags=re.I).strip(" -|")
+    return text
+
+
+def _company_from_title_line(lines: list[str]) -> str:
+    for line in lines[:8]:
+        match = re.search(
+            r"(?:\d{1,2}/\d{1,2}/\d{2,4},?\s+\d{1,2}:\d{2}\s*(?:AM|PM)?\s+)?(.+?)\s+share price\b",
+            line,
+            flags=re.I,
+        )
+        if not match:
             continue
-        if line and not line.startswith("http") and not re.match(r"\d{1,2}/\d{1,2}/\d{2}", line):
-            return line.strip()
-    return Path(filename).stem.split(" share price", 1)[0].strip() or "Unknown Company"
+        candidate = _clean_company_name_candidate(match.group(1))
+        if not _is_invalid_company_candidate(candidate):
+            return candidate
+    return ""
+
+
+def _company_from_business_profile(lines: list[str]) -> str:
+    about = _business_description(lines)
+    if not about:
+        return ""
+    suffix = r"(?:Ltd\.?|Limited)"
+    start_match = re.match(rf"([A-Z][A-Za-z0-9&.,'() /-]+?\b{suffix})\b", about)
+    if start_match:
+        candidate = _clean_company_name_candidate(start_match.group(1))
+        if not _is_invalid_company_candidate(candidate):
+            return candidate
+    embedded_match = re.search(
+        rf"\b([A-Z][A-Za-z0-9&.,'() /-]+?\b{suffix})\s+(?:is|was|has|engages|operates|manufactures|provides|offers|owns|runs)\b",
+        about,
+    )
+    if embedded_match:
+        candidate = _clean_company_name_candidate(embedded_match.group(1))
+        if not _is_invalid_company_candidate(candidate):
+            return candidate
+    return ""
+
+
+def _normalize_screener_url(url: str) -> str:
+    clean = str(url or "").strip().rstrip(".,;)")
+    match = re.match(r"(https://www\.screener\.in/company/[^/\s]+/)", clean)
+    return match.group(1) if match else clean
+
+
+def _first_non_empty_company_line(lines: list[str], filename: str) -> str:
+    for candidate in (_company_from_business_profile(lines), _company_from_title_line(lines)):
+        if candidate:
+            return candidate
+    for line in lines[:12]:
+        candidate = _clean_company_name_candidate(line)
+        if _is_invalid_company_candidate(candidate):
+            continue
+        return candidate
+    filename_candidate = _clean_company_name_candidate(Path(filename).stem.split(" share price", 1)[0])
+    return filename_candidate or "Unknown Company"
 
 
 def _source_date(lines: list[str]) -> str:
@@ -349,7 +432,7 @@ def _parse_identity(lines: list[str], filename: str) -> dict[str, str]:
         "company_name": _first_non_empty_company_line(lines, filename),
         "source_date": _source_date(lines),
         "exchange": exchange,
-        "screener_url": url_match.group(0) if url_match else "",
+        "screener_url": _normalize_screener_url(url_match.group(0)) if url_match else "",
         "sector": sector,
         "industry": industry,
         "business_description": _business_description(lines),

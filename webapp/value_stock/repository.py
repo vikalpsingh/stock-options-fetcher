@@ -236,6 +236,22 @@ class ValueStockRepository:
             return None
         return self._hydrate_detail(row)
 
+    def delete_company(self, company_key: str) -> bool:
+        key = str(company_key or "").strip()
+        if not key:
+            return False
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT company_key FROM value_stock_company WHERE company_key = ?",
+                (key,),
+            ).fetchone()
+            if not existing:
+                return False
+            conn.execute("DELETE FROM value_stock_snapshot WHERE company_key = ?", (key,))
+            conn.execute("DELETE FROM value_stock_document WHERE company_key = ?", (key,))
+            conn.execute("DELETE FROM value_stock_company WHERE company_key = ?", (key,))
+        return True
+
     def documents_missing_sector(self, limit: int = 25) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -282,6 +298,7 @@ class ValueStockRepository:
             "sector": row["sector"] or "",
             "industry": row["industry"] or "",
             "exchange": row["exchange"] or "",
+            "screener_url": row["screener_url"] or "",
             "cmp": self._metric_value(metrics, "Current Price"),
             "market_cap": self._metric_value(metrics, "Market Cap"),
             "sales_last_year": self._metric_value(metrics, "Sales last year"),

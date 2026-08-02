@@ -59,3 +59,6 @@ class ValueStockService:
 
     def get_company(self, company_key: str) -> dict[str, Any] | None:
         return self.repository.get_company(company_key)
+
+    def delete_company(self, company_key: str) -> bool:
+        return self.repository.delete_company(company_key)

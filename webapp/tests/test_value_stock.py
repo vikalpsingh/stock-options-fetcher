@@ -131,6 +131,46 @@ def test_parse_screener_pdf_text_extracts_peer_breadcrumb_sector() -> None:
     assert parsed.industry == "Pharmaceuticals"
 
 
+def test_parse_screener_pdf_text_ignores_toolbar_and_uses_business_profile_or_title() -> None:
+    text = """
+8/2/26, 9:35 PM Indo Farm Equipment Ltd share price | About Indo Farm Equip. | Key Insights - Screener
+₹ 161 6.07%
+ E X P O R T T O E X C E L  F O L L O W 
+31 Jul - close price
+A B O U T
+Incorporated in 1994, Indo Farm Equipment Limited is engaging in manufacturing Tractors, Pick & Carry Cranes.
+K E Y P O I N T S
+Market Cap ₹ 775 Cr.
+Current Price ₹ 161
+https://www.screener.in/company/INDOFARM/consolidated/ 1/11
+"""
+
+    parsed = parse_screener_pdf_text(text, "Indo Farm Equipment Ltd share price.pdf", "indo")
+
+    assert parsed.company_name == "Indo Farm Equipment Ltd"
+    assert parsed.company_key == "INDO-FARM-EQUIPMENT-LTD"
+    assert parsed.screener_url == "https://www.screener.in/company/INDOFARM/"
+
+
+def test_parse_screener_pdf_text_prefers_business_profile_company_when_it_starts_about() -> None:
+    text = """
+8/2/26, 9:35 PM Screener company page
+ E X P O R T T O E X C E L  F O L L O W 
+A B O U T
+Park Medi World Ltd is engaged in operating hospitals and healthcare services.
+K E Y P O I N T S
+Market Cap ₹ 100 Cr.
+Current Price ₹ 50
+https://www.screener.in/company/PARKHOSPS/ 1/10
+"""
+
+    parsed = parse_screener_pdf_text(text, "upload.pdf", "park")
+
+    assert parsed.company_name == "Park Medi World Ltd"
+    assert parsed.company_key == "PARK-MEDI-WORLD-LTD"
+    assert parsed.screener_url == "https://www.screener.in/company/PARKHOSPS/"
+
+
 def test_value_stock_repository_upserts_latest_snapshot(tmp_path) -> None:
     parsed = parse_screener_pdf_text(SAMPLE_TEXT, "Apsis.pdf", "abc")
     repo = ValueStockRepository(tmp_path / "value_stock.db")
@@ -175,6 +215,18 @@ def test_value_stock_repository_sorts_by_decision_and_score(tmp_path) -> None:
         "High Score Watch Ltd",
         "Corona Remedies Ltd",
     ]
+
+
+def test_value_stock_repository_delete_company_removes_comparison_row_permanently(tmp_path) -> None:
+    parsed = parse_screener_pdf_text(SAMPLE_TEXT, "Apsis.pdf", "abc")
+    repo = ValueStockRepository(tmp_path / "value_stock.db")
+    repo.upsert_parsed(parsed)
+
+    assert repo.delete_company(parsed.company_key) is True
+
+    assert repo.list_companies() == []
+    assert repo.get_company(parsed.company_key) is None
+    assert repo.delete_company(parsed.company_key) is False
 
 
 def test_score_stays_low_confidence_when_critical_data_is_missing() -> None:
@@ -222,6 +274,34 @@ def test_value_stock_panel_keeps_pdf_upload_without_screener_helper() -> None:
     assert "Save Screener page as PDF" not in html
     assert "value-stock-open-screener" not in html
     assert "Upload PDF" in html
+
+
+def test_value_stock_panel_shows_screener_link_and_delete_action() -> None:
+    html = render_value_stock_panel(
+        PageState(
+            active_tab="value-stock",
+            value_stock_rows=[
+                {
+                    "company_key": "PARK-MEDI-WORLD-LTD",
+                    "company_name": "Park Medi World Ltd",
+                    "sector": "Healthcare",
+                    "industry": "Hospitals",
+                    "exchange": "NSE",
+                    "screener_url": "https://www.screener.in/company/PARKHOSPS/",
+                    "score": 65,
+                    "decision": "WATCH",
+                    "confidence": "Medium",
+                    "freshness": "2026-08-02",
+                    "warnings": [],
+                }
+            ],
+        )
+    )
+
+    assert "Screener" in html
+    assert "https://www.screener.in/company/PARKHOSPS/" in html
+    assert 'formaction="/value-stock/delete"' in html
+    assert "Delete this Value-Stock row permanently" in html
 
 
 def test_value_stock_detail_hides_empty_statement_cards_and_shows_kpis() -> None:

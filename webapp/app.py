@@ -18797,10 +18797,17 @@ def render_value_stock_panel(state: PageState) -> str:
             "AVOID": "bad",
         }.get(decision, "watch")
         warning_text = "; ".join(str(item) for item in (row.get("warnings") or [])[:2])
+        screener_url = str(row.get("screener_url") or "").strip()
+        screener_link_html = (
+            f'<a class="mini-link" href="{html.escape(screener_url, quote=True)}" target="_blank" rel="noopener">Screener</a>'
+            if screener_url
+            else '<span class="muted-cell">-</span>'
+        )
         row_html.append(
             "<tr>"
             f"<td><button type=\"submit\" class=\"link-button\" formaction=\"/value-stock/detail\" name=\"value_stock_selected_key\" value=\"{html.escape(key, quote=True)}\">{html.escape(str(row.get('company_name') or ''))}</button>"
             f"<small>{html.escape(str(row.get('exchange') or ''))} {html.escape(str(row.get('industry') or ''))}</small></td>"
+            f"<td>{screener_link_html}</td>"
             f"<td>{html.escape(str(row.get('sector') or '-'))}</td>"
             f"<td>{fmt_value_stock_number(row.get('cmp'), 2)}</td>"
             f"<td>{fmt_value_stock_number(row.get('market_cap'), 0)}</td>"
@@ -18813,10 +18820,11 @@ def render_value_stock_panel(state: PageState) -> str:
             f"<td><span class=\"value-score\">{fmt_value_stock_number(row.get('score'), 1)}</span></td>"
             f"<td><span class=\"ipo-badge {decision_class}\">{html.escape(decision)}</span><small>{html.escape(str(row.get('confidence') or ''))}</small></td>"
             f"<td>{html.escape(str(row.get('freshness') or '-'))}{f'<small>{html.escape(warning_text)}</small>' if warning_text else ''}</td>"
+            f"<td><button type=\"submit\" class=\"mini-link button-link danger-link\" formaction=\"/value-stock/delete\" name=\"value_stock_selected_key\" value=\"{html.escape(key, quote=True)}\" onclick=\"return confirm('Delete this Value-Stock row permanently?');\">Delete</button></td>"
             "</tr>"
         )
     if not row_html:
-        row_html.append('<tr><td colspan="13" class="muted-cell">No Value-Stock PDFs uploaded yet. Upload a Screener company PDF to create the comparison table.</td></tr>')
+        row_html.append('<tr><td colspan="15" class="muted-cell">No Value-Stock PDFs uploaded yet. Upload a Screener company PDF to create the comparison table.</td></tr>')
 
     detail_html = ""
     detail = state.value_stock_detail or {}
@@ -18930,7 +18938,7 @@ def render_value_stock_panel(state: PageState) -> str:
         <div class="table-wrap value-stock-table-wrap">
           <table class="value-stock-table">
             <thead><tr>
-              <th>Company</th><th>Sector</th><th>CMP</th><th>Market Cap Cr</th><th>OPM</th><th>ROCE</th><th>ROE</th><th>D/E</th><th>P/E</th><th>EV/EBITDA</th><th>Score</th><th>Decision</th><th>Freshness</th>
+              <th>Company</th><th>Screener</th><th>Sector</th><th>CMP</th><th>Market Cap Cr</th><th>OPM</th><th>ROCE</th><th>ROE</th><th>D/E</th><th>P/E</th><th>EV/EBITDA</th><th>Score</th><th>Decision</th><th>Freshness</th><th>Action</th>
             </tr></thead>
             <tbody>{''.join(row_html)}</tbody>
           </table>
@@ -33158,6 +33166,19 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.message = f"Opened Value-Stock detail for {state.value_stock_detail.get('company_name') or state.value_stock_selected_key}."
                 else:
                     state.message = f"Loaded {len(state.value_stock_rows or [])} Value-Stock company row(s)."
+            elif request_path == "/value-stock/delete":
+                selected_key = str(state.value_stock_selected_key or "").strip()
+                if not selected_key:
+                    raise ValueError("Select a Value-Stock row to delete.")
+                deleted = ValueStockService().delete_company(selected_key)
+                state.value_stock_selected_key = ""
+                state.value_stock_detail = None
+                load_value_stock_state(state)
+                state.message = (
+                    "Deleted selected Value-Stock company permanently."
+                    if deleted
+                    else "Value-Stock company was already removed."
+                )
             elif request_path == "/value-stock/upload":
                 upload = uploaded_files.get("value_stock_pdf") or {}
                 if not upload.get("content"):
