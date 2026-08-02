@@ -1298,6 +1298,109 @@ def test_simple_ipo_top40_shows_unverified_rows_as_research_only_across_years(mo
         assert dashboard["summary"]["symbol_review_needed"] == 0
 
 
+def test_simple_ipo_2024_loads_local_fallback_company_names_when_sources_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ipo_data_service,
+        "_simple_ipo_cache_path",
+        lambda year, ipo_type: tmp_path / f"missing_{ipo_type}_{year}.csv",
+    )
+    empty_source = lambda *args, **kwargs: {"records": [], "source": "", "error": ""}
+    monkeypatch.setattr(ipo_data_service, "fetch_ipomarket_ipos", empty_source)
+    monkeypatch.setattr(ipo_data_service, "fetch_ipoguru_ipos", empty_source)
+    monkeypatch.setattr(ipo_data_service, "fetch_secondary_ipo_source", lambda *args, **kwargs: {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_chittorgarh_ipos", empty_source)
+    monkeypatch.setattr(ipo_data_service, "_upcoming_ipos_next_7_days", lambda today=None: ([], []))
+
+    dashboard = build_simple_ipo_performance_dashboard(2024, force_refresh=True, today=date(2026, 8, 2))
+    names = [row["company_name"] for row in dashboard["combined_top40"]]
+
+    assert dashboard["mainboard_all_count"] >= 5
+    assert "Premier Energies" in names
+    assert "Waaree Energies" in names
+    assert "Bajaj Housing Finance" in names
+    assert dashboard["sources"]["mainboard_mode"] == "local_history"
+
+
+def test_flattrade_year_source_parses_2024_and_2023_rows(monkeypatch):
+    html = """
+    <table>
+      <tr><th>Issuer Company</th><th>Exchange</th><th>Open</th><th>Close</th><th>Issue Price</th><th>Issue Size (Rs Cr)</th><th>Lot Size</th></tr>
+      <tr><td>Waaree Energies IPO</td><td>BSE, NSE</td><td>October 21, 2024</td><td>October 23, 2024</td><td>1503.00</td><td>4321.44</td><td>9</td></tr>
+      <tr><td>BLS E-Services IPO</td><td>BSE, NSE</td><td>January 30, 2024</td><td>February 1, 2024</td><td>135.00</td><td>310.91</td><td>108</td></tr>
+      <tr><td>IREDA IPO</td><td>BSE, NSE</td><td>November 21, 2023</td><td>November 23, 2023</td><td>32.00</td><td>2150.21</td><td>460</td></tr>
+    </table>
+    """
+    monkeypatch.setattr(ipo_data_service, "_http_get_text", lambda url: html)
+
+    rows_2024 = ipo_data_service.fetch_flattrade_ipos(2024, "mainboard")["records"]
+    rows_2023 = ipo_data_service.fetch_flattrade_ipos(2023, "mainboard")["records"]
+
+    assert [row["company_name"] for row in rows_2024] == ["Waaree Energies", "BLS E-Services"]
+    assert rows_2024[0]["ipo_price"] == 1503
+    assert rows_2024[0]["data_source"] == "FlatTrade IPO list"
+    assert [row["company_name"] for row in rows_2023] == ["IREDA"]
+
+
+def test_flattrade_rows_without_current_price_remain_visible_as_data_pending(monkeypatch):
+    html = """
+    <table>
+      <tr><th>Issuer Company</th><th>Exchange</th><th>Open</th><th>Close</th><th>Issue Price</th><th>Issue Size (Rs Cr)</th><th>Lot Size</th></tr>
+      <tr><td>IREDA IPO</td><td>BSE, NSE</td><td>November 21, 2023</td><td>November 23, 2023</td><td>32.00</td><td>2150.21</td><td>460</td></tr>
+    </table>
+    """
+    monkeypatch.setattr(ipo_data_service, "_http_get_text", lambda url: html)
+    monkeypatch.setattr(ipo_data_service, "_upcoming_ipos_next_7_days", lambda today=None: ([], []))
+
+    dashboard = build_simple_ipo_performance_dashboard(2023, force_refresh=True, today=date(2026, 8, 2))
+    row = dashboard["combined_top40"][0]
+
+    assert row["company_name"] == "IREDA"
+    assert row["current_price"] is None
+    assert row["action"] == "DATA PENDING"
+    assert dashboard["sources"]["mainboard_mode"] == "live"
+
+
+def test_cached_flattrade_rows_without_data_source_remain_visible() -> None:
+    row = ipo_data_service._simple_ipo_performance_row(
+        {
+            "company_name": "IREDA",
+            "ipo_price": 32,
+            "source_url": "https://flattrade.in/kosh/upcoming-ipo-2023/",
+        },
+        "mainboard",
+    )
+
+    assert ipo_data_service._simple_ipo_display_candidate(row) is True
+
+
+def test_ipo_year_options_include_2023():
+    assert 2023 in ipo_data_service.ipo_year_options(date(2026, 8, 2))
+
+
+def test_simple_ipo_2023_loads_local_flattrade_rows_when_sources_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ipo_data_service,
+        "_simple_ipo_cache_path",
+        lambda year, ipo_type: tmp_path / f"missing_{ipo_type}_{year}.csv",
+    )
+    empty_source = lambda *args, **kwargs: {"records": [], "source": "", "error": ""}
+    monkeypatch.setattr(ipo_data_service, "fetch_ipomarket_ipos", empty_source)
+    monkeypatch.setattr(ipo_data_service, "fetch_ipoguru_ipos", empty_source)
+    monkeypatch.setattr(ipo_data_service, "fetch_flattrade_ipos", empty_source)
+    monkeypatch.setattr(ipo_data_service, "fetch_secondary_ipo_source", lambda *args, **kwargs: {"records": [], "source": "", "error": ""})
+    monkeypatch.setattr(ipo_data_service, "fetch_chittorgarh_ipos", empty_source)
+    monkeypatch.setattr(ipo_data_service, "_upcoming_ipos_next_7_days", lambda today=None: ([], []))
+
+    dashboard = build_simple_ipo_performance_dashboard(2023, force_refresh=True, today=date(2026, 8, 2))
+    names = [row["company_name"] for row in dashboard["combined_top40"]]
+
+    assert "Tata Technologies" in names
+    assert "Indian Renewable Energy Development Agency" in names
+    assert dashboard["combined_top40"][0]["current_price"] is None
+    assert dashboard["combined_top40"][0]["action"] == "DATA PENDING"
+    assert dashboard["sources"]["mainboard_mode"] == "local_history"
+
+
 def test_simple_ipo_dashboard_keeps_positive_source_rows_visible_when_no_verified(monkeypatch):
     def fake_loader(selected_year, ipo_type, force_refresh=False):
         unverified = ipo_data_service._simple_ipo_performance_row(

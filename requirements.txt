@@ -5,3 +5,4 @@ kiteconnect
 openai
 python-dotenv
 protobuf==3.20.0
+pdfplumber

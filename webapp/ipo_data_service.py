@@ -63,9 +63,11 @@ CHITTORGARH_SME_FALLBACK_URL = "https://www.chittorgarh.com/ipo/ipo_perf_tracker
 IPOMARKET_YEAR_URL = "https://www.ipomarket.in/performance/{year}"
 IPOGURU_MAINBOARD_URL = "https://www.ipoguru.in/ipo-performance"
 IPOGURU_SME_URL = "https://www.ipoguru.in/sme-ipo-performance"
+FLATTRADE_YEAR_URL = "https://flattrade.in/kosh/upcoming-ipo-{year}/"
 IPO_DATA_SOURCE_PRIORITY = [
     "ipomarket",
     "ipoguru",
+    "flattrade",
     "economic_times",
     "hdfcsec",
     "mint",
@@ -79,6 +81,9 @@ IPO_SOURCE_URLS = {
     "ipoguru": {
         "mainboard": IPOGURU_MAINBOARD_URL,
         "sme": IPOGURU_SME_URL,
+    },
+    "flattrade": {
+        "all_by_year": FLATTRADE_YEAR_URL,
     },
     "economic_times": {
         "all": "https://economictimes.indiatimes.com/markets/ipo/recently-listed",
@@ -115,7 +120,7 @@ IPO_DEMO_COMPANY_NAMES = {
     "bharat defence systems",
 }
 IPO_DEMO_SOURCE_MARKERS = ("demo", "mock", "sample", "fallback", "seed")
-IPO_REAL_SOURCE_MARKERS = ("ipomarket", "ipoguru", "chittorgarh", "nse", "bse", "screener")
+IPO_REAL_SOURCE_MARKERS = ("ipomarket", "ipoguru", "flattrade", "chittorgarh", "nse", "bse", "screener")
 IPO_SCREENER_SYMBOL_ALIASES = {
     # Public IPO trackers sometimes show "Symbol pending" even after listing.
     # Keep only hand-verified aliases here; unknown rows fall back to Screener search.
@@ -416,7 +421,7 @@ IPO_LEGACY_MASTER_FIELDS = [
 
 def ipo_year_options(today: date | None = None) -> list[int]:
     current_year = (today or date.today()).year
-    years = {2024, 2025, 2026, current_year}
+    years = {2023, 2024, 2025, 2026, current_year}
     if current_year > 2026:
         years.update(range(2026, current_year + 2))
     return sorted(years, reverse=True)
@@ -1135,6 +1140,59 @@ def _seed_listed_ipos(year: int) -> list[dict[str, Any]]:
     ]
 
 
+def _local_historical_ipo_fallback_rows(year: int, ipo_type: str) -> list[dict[str, Any]]:
+    """Return checked local historical rows when public/cache sources are empty.
+
+    These rows are intentionally treated as source rows, not demo rows, so the
+    IPO page can still display known historical company names for older years.
+    They remain unverified/research-only after normal symbol and evidence gates.
+    """
+    if str(ipo_type or "").strip().lower() == "sme":
+        return []
+    if int(year) == 2023:
+        source_url = FLATTRADE_YEAR_URL.format(year=2023)
+        return [
+            {
+                "company_name": company,
+                "symbol": symbol,
+                "exchange": "BSE, NSE",
+                "ipo_year": 2023,
+                "ipo_type": "Mainboard",
+                "market_type": "Mainboard",
+                "listing_date": listed_on,
+                "ipo_price": issue_price,
+                "issue_price": issue_price,
+                "listing_price": listing_close,
+                "issue_size": issue_size,
+                "sector": "N/A",
+                "theme": infer_theme({"company_name": company, "sector": ""}),
+                "data_source": "FlatTrade IPO list",
+                "source": "FlatTrade IPO list",
+                "source_url": source_url,
+                "screener_url": _simple_ipo_screener_url({"company_name": company, "symbol": symbol}),
+                "last_updated_at": _now_text(),
+            }
+            for company, symbol, listed_on, issue_price, listing_close, issue_size in (
+                ("Tata Technologies", "TATATECH", "2023-11-30", 500, 1314.25, "3042.51"),
+                ("Indian Renewable Energy Development Agency", "IREDA", "2023-11-29", 32, 59.99, "2150.21"),
+                ("Gandhar Oil Refinery India", "", "2023-11-30", 169, 301.5, "500.69"),
+                ("Cello World", "CELLO", "2023-11-06", 648, 791.9, "1900.00"),
+                ("JSW Infrastructure", "JSWINFRA", "2023-10-03", 119, 157.3, "2800.00"),
+                ("Netweb Technologies India", "NETWEB", "2023-07-27", 500, 910.5, "631.00"),
+                ("ideaForge Technology", "IDEAFORGE", "2023-07-07", 672, 1294.95, "567.00"),
+                ("Mankind Pharma", "MANKIND", "2023-05-09", 1080, 1424.05, "4326.36"),
+            )
+        ]
+    rows: list[dict[str, Any]] = []
+    for row in _seed_listed_ipos(year):
+        cleaned = dict(row)
+        cleaned.pop("is_demo", None)
+        cleaned["data_source"] = "local historical IPO rows - verify with NSE/BSE/provider"
+        cleaned["source_url"] = ""
+        rows.append(cleaned)
+    return rows
+
+
 def _seed_upcoming_ipos(today: date | None = None) -> list[dict[str, Any]]:
     base = today or date.today()
     now = _now_text()
@@ -1520,7 +1578,81 @@ def _filter_source_records_for_ipo_type(
     return filtered
 
 
+def _normalize_flattrade_record(
+    raw: dict[str, str],
+    year: int,
+    source_url: str,
+) -> dict[str, Any] | None:
+    company = _clean_chittorgarh_company_name(
+        _first_present(raw, ["issuer_company", "company_name", "company", "issuer", "name"])
+    )
+    company = re.sub(r"\s+(IPO|FPO)\s*$", "", company, flags=re.I).strip()
+    if not company or _normalize_key(company) in {"company", "issuer_company", "name"}:
+        return None
+    open_date = _first_present(raw, ["open", "open_date", "ipo_open_date"])
+    close_date = _first_present(raw, ["close", "close_date", "ipo_close_date"])
+    row_year = _parse_year(open_date) or _parse_year(close_date) or _parse_year(" ".join(str(value) for value in raw.values()))
+    if row_year and row_year != int(year):
+        return None
+    if row_year is None and str(int(year)) not in " ".join(str(value) for value in raw.values()):
+        return None
+    exchange = _first_present(raw, ["exchange", "listed_on", "listing_exchange"]) or "BSE, NSE"
+    issue_price = _number(_first_present(raw, ["issue_price", "ipo_price", "price"]))
+    issue_size = _first_present(raw, ["issue_size_rs_cr", "issue_size", "issue_size_rs", "issue"])
+    market_type = "SME" if "sme" in str(exchange).lower() else "Mainboard"
+    return {
+        "company_name": company,
+        "symbol": _infer_ipo_screener_symbol({"company_name": company}),
+        "exchange": str(exchange).strip(),
+        "ipo_year": int(year),
+        "ipo_type": market_type,
+        "market_type": market_type,
+        "listing_date": "",
+        "open_date": open_date,
+        "close_date": close_date,
+        "ipo_price": issue_price,
+        "issue_price": issue_price,
+        "issue_size": issue_size or "N/A",
+        "sector": "N/A",
+        "theme": infer_theme({"company_name": company, "sector": ""}),
+        "data_source": "FlatTrade IPO list",
+        "source": "FlatTrade IPO list",
+        "source_url": source_url,
+        "screener_url": _simple_ipo_screener_url({"company_name": company}),
+        "last_updated_at": _now_text(),
+    }
+
+
+def fetch_flattrade_ipos(year: int, ipo_type: str = "mainboard") -> dict[str, Any]:
+    """Fetch historical IPO list rows from FlatTrade Kosh.
+
+    FlatTrade's yearly pages provide issue/open/close details, not current
+    performance. Rows are therefore shown as research/data-pending rows and
+    remain excluded from scoring until market and financial data are available.
+    """
+    url = FLATTRADE_YEAR_URL.format(year=int(year))
+    try:
+        html_text = _http_get_text(url)
+    except Exception as exc:
+        return {"records": [], "source": url, "source_kind": "flattrade", "tried_sources": [url], "error": f"{url}: {_clean_text(exc)}"}
+    records = [
+        record
+        for raw in _records_from_html_tables(html_text)
+        if (record := _normalize_flattrade_record(raw, year, url)) is not None
+    ]
+    records = _filter_source_records_for_ipo_type(records, ipo_type)
+    return {
+        "records": records,
+        "source": url,
+        "source_kind": "flattrade",
+        "tried_sources": [url],
+        "error": "" if records else f"{url}: no usable {int(year)} {ipo_type} rows",
+    }
+
+
 def _usable_simple_performance_source_row(row: dict[str, Any]) -> bool:
+    if str(row.get("data_source") or row.get("source") or "").strip().lower().startswith("flattrade"):
+        return bool(_clean_text(row.get("company_name"))) and _number(row.get("ipo_price") or row.get("issue_price")) is not None
     return (
         bool(_clean_text(row.get("company_name")))
         and _number(row.get("ipo_price") or row.get("issue_price")) is not None
@@ -1648,6 +1780,8 @@ def _fetch_simple_ipo_performance_by_priority(year: int, ipo_type: str) -> dict[
             result = fetch_ipomarket_ipos(year, ipo_type)
         elif source_key == "ipoguru":
             result = fetch_ipoguru_ipos(year, ipo_type)
+        elif source_key == "flattrade":
+            result = fetch_flattrade_ipos(year, ipo_type)
         elif source_key in {"economic_times", "hdfcsec", "mint"}:
             result = fetch_secondary_ipo_source(source_key, year, ipo_type)
         elif source_key == "chittorgarh":
@@ -2142,6 +2276,11 @@ def _enrich_simple_ipo_decision(row: dict[str, Any], ipo_type: str | None = None
         liquidity_score=liquidity_score,
         ipo_type=normalized_type,
     )
+    if (
+        str(enriched.get("data_source") or enriched.get("source") or "").strip().lower().startswith("flattrade")
+        and current_price is None
+    ):
+        action = "DATA PENDING"
     alerts: list[str] = []
     if is_demo_record:
         alerts.append("Demo/sample excluded")
@@ -2406,6 +2545,9 @@ def _simple_ipo_display_candidate(row: dict[str, Any]) -> bool:
     ipo_price = clean_price(row.get("ipo_price"), zero_is_missing=True)
     if current_price is not None and ipo_price is not None:
         return current_price >= ipo_price
+    source = str(row.get("data_source") or row.get("source") or row.get("source_url") or "").strip().lower()
+    if "flattrade" in source and ipo_price is not None:
+        return True
     return False
 
 
@@ -2522,6 +2664,21 @@ def _load_simple_chittorgarh_performance(
             "source": str(_simple_ipo_cache_path(year, ipo_type)),
             "source_mode": "cache_fallback",
             "last_refreshed": cached_at,
+            "messages": messages,
+        }
+    local_rows = _rank_simple_ipo_rows([
+        _simple_ipo_performance_row(row, ipo_type)
+        for row in _local_historical_ipo_fallback_rows(year, ipo_type)
+    ])
+    if local_rows:
+        messages.append(
+            f"Live/cache {ipo_type} IPO source-priority fetch returned no usable rows; showing local historical {int(year)} rows for research."
+        )
+        return {
+            "rows": local_rows,
+            "source": "local historical IPO rows",
+            "source_mode": "local_history",
+            "last_refreshed": fetched_at,
             "messages": messages,
         }
     messages.append(

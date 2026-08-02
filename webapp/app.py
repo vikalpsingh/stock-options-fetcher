@@ -32,6 +32,8 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from email.parser import BytesParser
+from email.policy import default as email_default_policy
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -112,6 +114,9 @@ from ipo.research import (
     save_ipo_research,
 )
 from ipo.symbol_resolution.symbol_resolver import clean_company_name
+from value_stock.models import UploadedPdf
+from value_stock.service import ValueStockService
+from value_stock.assessment import assess_table
 from income.covered_call import (
     CoveredCallInput,
     build_covered_call_recommendation,
@@ -5751,6 +5756,13 @@ class PageState:
     ipo_research_html: str = ""
     ipo_research_message: str = ""
     ipo_research_saved_id: str = ""
+    value_stock_rows: list[dict[str, Any]] | None = None
+    value_stock_detail: dict[str, Any] | None = None
+    value_stock_search: str = ""
+    value_stock_sector: str = ""
+    value_stock_decision: str = ""
+    value_stock_selected_key: str = ""
+    value_stock_colour_mode: str = "Latest assessment"
 
 
 def mask_secret(value: str | None) -> str:
@@ -5977,6 +5989,7 @@ def is_app_page_request(path: str) -> bool:
         "/investing",
         "/equity",
         "/ipo",
+        "/value-stock",
         "/income-growth",
         "/commodity",
         "/analytics",
@@ -6280,6 +6293,39 @@ def checked(form: dict[str, list[str]], name: str, default: bool = False) -> boo
     if name not in form:
         return default
     return first(form, name).lower() in {"1", "true", "yes", "on"}
+
+
+def parse_multipart_form(
+    body: bytes,
+    content_type: str,
+) -> tuple[dict[str, list[str]], dict[str, dict[str, Any]]]:
+    if "multipart/form-data" not in content_type.lower():
+        return parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True), {}
+    message = BytesParser(policy=email_default_policy).parsebytes(
+        (
+            f"Content-Type: {content_type}\r\n"
+            "MIME-Version: 1.0\r\n\r\n"
+        ).encode("utf-8")
+        + body
+    )
+    form: dict[str, list[str]] = {}
+    files: dict[str, dict[str, Any]] = {}
+    for part in message.iter_parts():
+        params = dict(part.get_params(header="content-disposition") or [])
+        name = str(params.get("name") or "").strip()
+        if not name:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        filename = str(params.get("filename") or "").strip()
+        if filename:
+            files[name] = {
+                "filename": Path(filename).name,
+                "content": payload,
+                "content_type": part.get_content_type() or "",
+            }
+        else:
+            form.setdefault(name, []).append(payload.decode("utf-8", errors="replace"))
+    return form, files
 
 
 def optional_float_text(value: Any) -> float | None:
@@ -18610,6 +18656,292 @@ def fmt_number(value: Any, decimals: int = 2) -> str:
         return str(value)
 
 
+def fmt_value_stock_number(value: Any, decimals: int = 2, suffix: str = "") -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+    rendered = f"{number:,.{decimals}f}"
+    if decimals == 0:
+        rendered = f"{number:,.0f}"
+    return html.escape(f"{rendered}{suffix}")
+
+
+def value_stock_status_class(status: Any) -> str:
+    return {
+        "positive": "vs-positive",
+        "warning": "vs-warning",
+        "negative": "vs-negative",
+        "neutral": "vs-neutral",
+        "unavailable": "vs-unavailable",
+    }.get(str(status or "").lower(), "vs-neutral")
+
+
+def load_value_stock_state(state: PageState) -> None:
+    service = ValueStockService()
+    try:
+        service.refresh_missing_sector_from_saved_text(limit=10)
+    except Exception as exc:
+        state.console_log = f"{state.console_log}\nValue-Stock sector refresh skipped: {friendly_external_error(exc, 'saved PDF text')}"
+    state.value_stock_rows = service.list_companies(
+        search=state.value_stock_search,
+        sector=state.value_stock_sector,
+        decision=state.value_stock_decision,
+    )
+    if state.value_stock_selected_key:
+        state.value_stock_detail = service.get_company(state.value_stock_selected_key)
+
+
+def render_value_stock_matrix(title: str, data: Any, max_rows: int = 12, colour_mode: str = "Latest assessment") -> str:
+    if not isinstance(data, dict) or not data:
+        return ""
+    period_keys: list[str] = []
+    for row in data.values():
+        if isinstance(row, dict):
+            for key in row:
+                if key not in {"unit", "values"} and key not in period_keys:
+                    period_keys.append(str(key))
+            values = row.get("values")
+            if isinstance(values, dict):
+                for key in values:
+                    if key not in period_keys:
+                        period_keys.append(str(key))
+    period_keys = period_keys[:8]
+    if not period_keys:
+        return ""
+    assessments = assess_table(data)
+    no_colours = str(colour_mode).lower().startswith("no")
+    trend_mode = str(colour_mode).lower().startswith("trend")
+    body = []
+    for idx, (label, row) in enumerate(data.items()):
+        if idx >= max_rows:
+            break
+        values = row.get("values") if isinstance(row, dict) and isinstance(row.get("values"), dict) else row
+        unit = row.get("unit", "") if isinstance(row, dict) else ""
+        cells = []
+        assessment = assessments.get(str(label), {})
+        status = assessment.get("trend_status" if trend_mode else "value_status")
+        status_class = "" if no_colours else value_stock_status_class(status)
+        title_text = str(assessment.get("reason") or "No assessment available.")
+        for period in period_keys:
+            if not isinstance(values, dict):
+                continue
+            value_html = fmt_value_stock_number(values.get(period), 2, '%' if str(label).endswith('%') else '')
+            if period == period_keys[-1] and assessment:
+                delta = assessment.get("delta_value")
+                delta_unit = str(assessment.get("delta_unit") or "")
+                delta_badge = ""
+                if isinstance(delta, (int, float)):
+                    arrow = "↑" if float(delta) > 0 else "↓"
+                    delta_text = f"{arrow}{abs(float(delta)):.2f} pp" if delta_unit == "percentage_points" else f"{arrow}{abs(float(delta)):.1f}%"
+                    delta_badge = f'<span class="value-delta {value_stock_status_class(assessment.get("trend_status"))}">{html.escape(delta_text)}</span>'
+                cells.append(
+                    f'<td class="{status_class}" title="{html.escape(title_text, quote=True)}" aria-label="{html.escape(title_text, quote=True)}">'
+                    f'<span class="value-fact">{value_html}</span>{delta_badge}</td>'
+                )
+            else:
+                cells.append(f"<td>{value_html}</td>")
+        body.append(
+            f"<tr><td>{html.escape(str(label))}{f' <small>{html.escape(str(unit))}</small>' if unit else ''}</td>{''.join(cells)}</tr>"
+        )
+    header = "".join(f"<th>{html.escape(period)}</th>" for period in period_keys)
+    rows_html = "".join(body) or f'<tr><td colspan="{len(period_keys) + 1}" class="muted-cell">No rows extracted.</td></tr>'
+    return f"""
+      <section class="value-stock-detail-card">
+        <h3>{html.escape(title)}</h3>
+        <div class="table-wrap value-stock-mini-table"><table><thead><tr><th>Metric</th>{header}</tr></thead><tbody>{rows_html}</tbody></table></div>
+      </section>
+    """
+
+
+def render_value_stock_panel(state: PageState) -> str:
+    if state.active_tab == "value-stock" and state.value_stock_rows is None:
+        try:
+            load_value_stock_state(state)
+        except Exception as exc:
+            state.error = f"{friendly_external_error(exc, 'Value-Stock')}\n\n{traceback.format_exc()}"
+            state.value_stock_rows = []
+    service = ValueStockService()
+    rows = state.value_stock_rows or []
+    sectors = service.sectors()
+    panel_style = "" if state.active_tab == "value-stock" else ' style="display:none"'
+
+    sector_options = '<option value="">All sectors</option>' + "".join(
+        f'<option value="{html.escape(sector, quote=True)}"{" selected" if sector == state.value_stock_sector else ""}>{html.escape(sector)}</option>'
+        for sector in sectors
+    )
+    decision_options = "".join(
+        f'<option value="{html.escape(value, quote=True)}"{" selected" if value == state.value_stock_decision else ""}>{html.escape(label)}</option>'
+        for value, label in (
+            ("", "All decisions"),
+            ("ACCUMULATE", "ACCUMULATE"),
+            ("WATCH", "WATCH"),
+            ("WAIT", "WAIT"),
+            ("AVOID", "AVOID"),
+        )
+    )
+    colour_options = "".join(
+        f'<option value="{html.escape(value, quote=True)}"{" selected" if value == state.value_stock_colour_mode else ""}>{html.escape(value)}</option>'
+        for value in ("Latest assessment", "Trend heatmap", "No colours")
+    )
+    row_html = []
+    for row in rows:
+        key = str(row.get("company_key") or "")
+        decision = str(row.get("decision") or "WATCH")
+        decision_class = {
+            "ACCUMULATE": "good",
+            "WATCH": "watch",
+            "WAIT": "wait",
+            "AVOID": "bad",
+        }.get(decision, "watch")
+        warning_text = "; ".join(str(item) for item in (row.get("warnings") or [])[:2])
+        row_html.append(
+            "<tr>"
+            f"<td><button type=\"submit\" class=\"link-button\" formaction=\"/value-stock/detail\" name=\"value_stock_selected_key\" value=\"{html.escape(key, quote=True)}\">{html.escape(str(row.get('company_name') or ''))}</button>"
+            f"<small>{html.escape(str(row.get('exchange') or ''))} {html.escape(str(row.get('industry') or ''))}</small></td>"
+            f"<td>{html.escape(str(row.get('sector') or '-'))}</td>"
+            f"<td>{fmt_value_stock_number(row.get('cmp'), 2)}</td>"
+            f"<td>{fmt_value_stock_number(row.get('market_cap'), 0)}</td>"
+            f"<td>{fmt_value_stock_number(row.get('opm'), 1, '%')}</td>"
+            f"<td>{fmt_value_stock_number(row.get('roce'), 1, '%')}</td>"
+            f"<td>{fmt_value_stock_number(row.get('roe'), 1, '%')}</td>"
+            f"<td>{fmt_value_stock_number(row.get('debt_equity'), 2)}</td>"
+            f"<td>{fmt_value_stock_number(row.get('pe'), 1)}</td>"
+            f"<td>{fmt_value_stock_number(row.get('ev_ebitda'), 1)}</td>"
+            f"<td><span class=\"value-score\">{fmt_value_stock_number(row.get('score'), 1)}</span></td>"
+            f"<td><span class=\"ipo-badge {decision_class}\">{html.escape(decision)}</span><small>{html.escape(str(row.get('confidence') or ''))}</small></td>"
+            f"<td>{html.escape(str(row.get('freshness') or '-'))}{f'<small>{html.escape(warning_text)}</small>' if warning_text else ''}</td>"
+            "</tr>"
+        )
+    if not row_html:
+        row_html.append('<tr><td colspan="13" class="muted-cell">No Value-Stock PDFs uploaded yet. Upload a Screener company PDF to create the comparison table.</td></tr>')
+
+    detail_html = ""
+    detail = state.value_stock_detail or {}
+    if detail:
+        score = detail.get("score") or {}
+        components = score.get("components") or {}
+        metrics = detail.get("metrics") or {}
+        def metric_value(label: str) -> Any:
+            item = metrics.get(label) or {}
+            return item.get("value") if isinstance(item, dict) else None
+        key_metric_cards = "".join(
+            f"<div><span>{html.escape(label)}</span><strong>{fmt_value_stock_number(value, decimals, suffix)}</strong></div>"
+            for label, value, decimals, suffix in (
+                ("CMP", metric_value("Current Price"), 2, ""),
+                ("Market Cap", metric_value("Market Cap"), 0, " Cr"),
+                ("P/E", metric_value("Stock P/E"), 1, ""),
+                ("ROCE", metric_value("ROCE"), 1, "%"),
+                ("Debt/Equity", metric_value("Debt to equity"), 2, ""),
+                ("Promoter", metric_value("Promoter holding"), 1, "%"),
+            )
+        )
+        explanation = "".join(f"<li>{html.escape(str(item))}</li>" for item in (score.get("explanations") or []))
+        warnings = "".join(f"<li>{html.escape(str(item))}</li>" for item in (detail.get("warnings") or []))
+        components_html = "".join(
+            f"<div><span>{html.escape(str(name).replace('_', ' ').title())}</span><strong>{fmt_value_stock_number(value, 1)}</strong></div>"
+            for name, value in components.items()
+        )
+        matrix_sections = "".join(
+            section
+            for section in (
+                render_value_stock_matrix('Annual Profit & Loss', detail.get('annual'), colour_mode=state.value_stock_colour_mode),
+                render_value_stock_matrix('Half-yearly Results', detail.get('half_yearly'), colour_mode=state.value_stock_colour_mode),
+                render_value_stock_matrix('Balance Sheet', detail.get('balance_sheet'), colour_mode=state.value_stock_colour_mode),
+                render_value_stock_matrix('Cash Flow', detail.get('cash_flow'), colour_mode=state.value_stock_colour_mode),
+                render_value_stock_matrix('Efficiency Ratios', detail.get('ratios'), colour_mode=state.value_stock_colour_mode),
+                render_value_stock_matrix('Shareholding', detail.get('shareholding'), colour_mode=state.value_stock_colour_mode),
+                render_value_stock_matrix('Operating KPIs', detail.get('operating_metrics'), colour_mode=state.value_stock_colour_mode),
+            )
+            if section
+        )
+        if not matrix_sections:
+            matrix_sections = '<section class="value-stock-detail-card value-stock-empty-card"><h3>Extracted tables</h3><p class="status">No statement tables were extracted from this PDF. Try saving the complete Screener page as PDF and upload again.</p></section>'
+        detail_html = f"""
+        <section class="panel value-stock-detail">
+          <div class="value-stock-detail-header">
+            <div>
+              <div class="panel-title">{html.escape(str(detail.get('company_name') or 'Company Detail'))}</div>
+              <p class="status">{html.escape(str(detail.get('sector') or 'Sector pending'))} · {html.escape(str(detail.get('industry') or 'Industry pending'))}</p>
+              <p class="status value-stock-business">{html.escape(str(detail.get('business_description') or 'No business profile extracted.'))}</p>
+            </div>
+            <div class="value-stock-decision">
+              <span>Decision</span>
+              <strong>{html.escape(str(score.get('decision') or 'WATCH'))}</strong>
+              <small>Score {fmt_value_stock_number(score.get('total'), 1)} / 100 - {html.escape(str(score.get('confidence') or 'Low'))} confidence</small>
+            </div>
+          </div>
+          <div class="value-stock-kpi-strip">{key_metric_cards}</div>
+          <div class="value-stock-colour-toolbar">
+            <label><span>Colour mode</span><select name="value_stock_colour_mode">{colour_options}</select></label>
+            <div class="value-stock-legend" aria-label="Value colour legend">
+              <span class="vs-positive">✓ Favourable</span>
+              <span class="vs-warning">! Caution/Mixed</span>
+              <span class="vs-negative">× Unfavourable</span>
+              <span class="vs-unavailable">– Unavailable</span>
+            </div>
+          </div>
+          <div class="summary-grid value-stock-component-grid">{components_html}</div>
+          <div class="value-stock-thesis-grid">
+            <section class="value-stock-detail-card value-stock-thesis-card">
+              <h3>Investment explanation</h3>
+              <ul>{explanation or '<li>No explanation available.</li>'}</ul>
+            </section>
+            <section class="value-stock-detail-card value-stock-source-card">
+              <h3>Source & quality</h3>
+              <p class="status">Source: {html.escape(str(detail.get('filename') or 'Uploaded PDF'))}</p>
+              <p class="status">Freshness: {html.escape(str(detail.get('source_date') or detail.get('uploaded_at') or 'No source date'))}</p>
+              {f'<p><a class="mini-link" href="{html.escape(str(detail.get("screener_url") or ""), quote=True)}" target="_blank" rel="noopener">Open source Screener page</a></p>' if detail.get("screener_url") else ''}
+              {f'<h3>Extraction warnings</h3><ul>{warnings}</ul>' if warnings else '<p class="status good-note">No extraction warnings.</p>'}
+            </section>
+          </div>
+          <div class="value-stock-detail-grid">
+            {matrix_sections}
+          </div>
+        </section>
+        """
+
+    return f"""
+    <form id="value-stock-panel" method="post" action="/value-stock/filter" enctype="multipart/form-data"{panel_style}>
+      <section class="panel value-stock-hero">
+        <div>
+          <div class="panel-title">Value-Stock</div>
+          <p class="status">Upload standard Screener-style company PDFs. The app extracts fundamentals into a local SQLite comparison database and updates the company snapshot on re-upload.</p>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/value-stock/filter" class="secondary">Apply Filters</button>
+          <button type="submit" formaction="/value-stock/upload">Upload PDF</button>
+        </div>
+      </section>
+      <section class="panel value-stock-controls">
+        <div class="compact-grid">
+          <label><span>Search</span><input name="value_stock_search" value="{html.escape(state.value_stock_search, quote=True)}" placeholder="Company or industry"></label>
+          <label><span>Sector</span><select name="value_stock_sector">{sector_options}</select></label>
+          <label><span>Decision</span><select name="value_stock_decision">{decision_options}</select></label>
+          <label><span>Detail colours</span><select name="value_stock_colour_mode">{colour_options}</select></label>
+          <label><span>Upload PDF</span><input name="value_stock_pdf" type="file" accept="application/pdf,.pdf"></label>
+        </div>
+      </section>
+      <section class="panel value-stock-table-panel">
+        <div class="panel-title">Comparison Table</div>
+        <p class="status">Colours are decision labels from the scoring engine. Missing data is kept unavailable; it is never converted to zero.</p>
+        <div class="table-wrap value-stock-table-wrap">
+          <table class="value-stock-table">
+            <thead><tr>
+              <th>Company</th><th>Sector</th><th>CMP</th><th>Market Cap Cr</th><th>OPM</th><th>ROCE</th><th>ROE</th><th>D/E</th><th>P/E</th><th>EV/EBITDA</th><th>Score</th><th>Decision</th><th>Freshness</th>
+            </tr></thead>
+            <tbody>{''.join(row_html)}</tbody>
+          </table>
+        </div>
+      </section>
+      {detail_html}
+      {render_console(state.console_log)}
+    </form>
+    """
+
+
 def ceil_to_tick(value: float, tick_size: float = 0.05) -> float:
     if tick_size <= 0:
         return round(value, 2)
@@ -19082,6 +19414,13 @@ def render_ipo_panel(state: PageState) -> str:
             if state.ipo_company_detail_message
             else ""
         )
+        value_stock_screener_url = text_value(row.get("screener_url") or identity.get("screener_url"), "")
+        value_stock_href = "/value-stock"
+        screener_pdf_link = (
+            f'<a class="button-link secondary" href="{html.escape(value_stock_screener_url, quote=True)}" target="_blank" rel="noopener">Open Screener for PDF</a>'
+            if value_stock_screener_url
+            else ""
+        )
         return f"""
         <section class="ipo-modal-backdrop">
           <div class="ipo-company-modal" role="dialog" aria-modal="true" aria-label="Company Research">
@@ -19100,6 +19439,8 @@ def render_ipo_panel(state: PageState) -> str:
               <button type="submit" formaction="/ipo/company-detail-refresh-financials" class="secondary">Refresh Financials</button>
               <button type="submit" formaction="/ipo/company-detail-save" class="secondary">Save Snapshot</button>
               <button type="submit" formaction="/ipo/company-detail-gpt" class="secondary">Generate GPT Analysis</button>
+              {screener_pdf_link}
+              <a class="button-link secondary" href="{html.escape(value_stock_href, quote=True)}">Upload PDF to Value-Stock</a>
             </div>
             <div class="ipo-modal-tabs">
               <details open><summary>Snapshot</summary>
@@ -19402,7 +19743,7 @@ def render_ipo_panel(state: PageState) -> str:
       </script>
     """
 
-    year_options = [2026, 2025, 2024]
+    year_options = [2026, 2025, 2024, 2023]
     if int(state.ipo_year) not in year_options:
         year_options.insert(0, int(state.ipo_year))
     year_options_html = "".join(
@@ -23744,6 +24085,7 @@ def render_page(state: PageState) -> bytes:
     income_growth_tab_class = "active" if state.active_tab == "income-growth" else ""
     equity_tab_class = "active" if state.active_tab == "equity" else ""
     ipo_tab_class = "active" if state.active_tab == "ipo" else ""
+    value_stock_tab_class = "active" if state.active_tab == "value-stock" else ""
     nifty_income_tab_class = "active" if state.active_tab == "nifty-income" else ""
     nifty_grow_tab_class = "active" if state.active_tab == "nifty-grow" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
@@ -26853,6 +27195,198 @@ def render_page(state: PageState) -> bytes:
     .ipo-badge.bad {{ background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }}
     .ipo-badge.blue {{ background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }}
     .ipo-badge.neutral {{ background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; }}
+    .ipo-badge.watch {{ background: #e0f2fe; color: #075985; border: 1px solid #7dd3fc; }}
+    .ipo-badge.wait {{ background: #fef3c7; color: #92400e; border: 1px solid #fbbf24; }}
+    .value-stock-hero {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      border-left: 5px solid #0f766e;
+      background: linear-gradient(135deg, rgba(240, 253, 250, 0.98), rgba(239, 246, 255, 0.85));
+    }}
+    .value-stock-controls .compact-grid {{
+      align-items: end;
+    }}
+    .value-stock-table-wrap {{
+      max-height: 560px;
+    }}
+    .value-stock-table th {{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #eef7f8;
+      color: #284462;
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    .value-stock-table td {{
+      vertical-align: top;
+      font-size: 12px;
+    }}
+    .value-stock-table small,
+    .value-stock-detail-card small {{
+      display: block;
+      color: var(--muted);
+      margin-top: 3px;
+      font-size: 11px;
+    }}
+    .value-score {{
+      font-weight: 950;
+      color: #0f766e;
+    }}
+    .value-stock-detail {{
+      border-left: 5px solid #2563eb;
+      background: linear-gradient(135deg, rgba(239, 246, 255, 0.92), rgba(255, 255, 255, 0.95));
+    }}
+    .value-stock-detail-header {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(180px, 260px);
+      gap: 14px;
+      align-items: start;
+    }}
+    .value-stock-decision {{
+      border: 1px solid rgba(37, 99, 235, 0.18);
+      border-radius: 14px;
+      padding: 14px;
+      background: #ffffff;
+    }}
+    .value-stock-decision span,
+    .value-stock-component-grid span,
+    .value-stock-kpi-strip span {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .value-stock-decision strong {{
+      display: block;
+      color: #1d4ed8;
+      font-size: 24px;
+      margin: 4px 0;
+    }}
+    .value-stock-component-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(140px, 1fr));
+      margin: 14px 0;
+      gap: 10px;
+    }}
+    .value-stock-kpi-strip {{
+      display: grid;
+      grid-template-columns: repeat(6, minmax(110px, 1fr));
+      gap: 10px;
+      margin: 14px 0 8px;
+    }}
+    .value-stock-kpi-strip div {{
+      border: 1px solid rgba(14, 116, 144, 0.18);
+      border-radius: 14px;
+      padding: 12px;
+      background: linear-gradient(135deg, rgba(236, 254, 255, 0.94), rgba(255, 255, 255, 0.96));
+    }}
+    .value-stock-kpi-strip strong {{
+      color: #0f766e;
+      font-size: 18px;
+    }}
+    .value-stock-component-grid div,
+    .value-stock-detail-card {{
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.9);
+    }}
+    .value-stock-component-grid strong {{
+      font-size: 17px;
+      color: #172554;
+    }}
+    .value-stock-business {{
+      max-width: 920px;
+    }}
+    .value-stock-thesis-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr);
+      gap: 12px;
+      margin: 12px 0;
+    }}
+    .value-stock-thesis-card ul,
+    .value-stock-source-card ul {{
+      margin: 8px 0 0;
+      padding-left: 18px;
+      color: #334155;
+      line-height: 1.45;
+    }}
+    .value-stock-detail-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }}
+    .value-stock-mini-table {{
+      max-height: 320px;
+    }}
+    .value-stock-mini-table table {{
+      font-size: 12px;
+    }}
+    .value-stock-colour-toolbar {{
+      display: grid;
+      grid-template-columns: minmax(180px, 260px) 1fr;
+      gap: 12px;
+      align-items: end;
+      margin: 10px 0;
+    }}
+    .value-stock-legend {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+    }}
+    .value-stock-legend span,
+    .value-delta {{
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-weight: 900;
+      line-height: 1.2;
+    }}
+    .value-fact {{
+      display: inline-block;
+      font-weight: 850;
+      margin-right: 5px;
+    }}
+    .value-delta {{
+      margin-top: 3px;
+      font-size: 11px;
+    }}
+    td.vs-positive,
+    .vs-positive {{
+      background: #dcfce7;
+      color: #14532d;
+      border-color: #86efac;
+    }}
+    td.vs-warning,
+    .vs-warning {{
+      background: #fef3c7;
+      color: #78350f;
+      border-color: #fbbf24;
+    }}
+    td.vs-negative,
+    .vs-negative {{
+      background: #fee2e2;
+      color: #7f1d1d;
+      border-color: #fecaca;
+    }}
+    td.vs-neutral,
+    .vs-neutral {{
+      background: #eff6ff;
+      color: #1e3a8a;
+      border-color: #bfdbfe;
+    }}
+    td.vs-unavailable,
+    .vs-unavailable {{
+      background: #f1f5f9;
+      color: #334155;
+      border-color: #cbd5e1;
+    }}
     .ipo-upcoming-table tr.ipo-upcoming-hot td {{
       background: #ecfdf5;
       border-top: 1px solid #86efac;
@@ -28866,6 +29400,18 @@ def render_page(state: PageState) -> bytes:
       .ipo-summary-panel .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .ipo-section-head {{ flex-direction: column; }}
       .ipo-health-panel .summary-grid.compact {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .value-stock-hero {{
+        align-items: flex-start;
+        flex-direction: column;
+      }}
+      .value-stock-detail-header,
+      .value-stock-component-grid,
+      .value-stock-kpi-strip,
+      .value-stock-thesis-grid,
+      .value-stock-colour-toolbar,
+      .value-stock-detail-grid {{
+        grid-template-columns: 1fr;
+      }}
       .position-summary-strip {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .position-summary-chip {{ align-items: flex-start; flex-direction: column; gap: 4px; }}
       .position-settings-grid,
@@ -28937,6 +29483,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {investing_tab_class}" type="button" data-tab="investing">Investing</button>
       <button class="tab-button utility-action {equity_tab_class}" type="button" data-tab="equity">Equity</button>
       <button class="tab-button utility-action {ipo_tab_class}" type="button" data-tab="ipo">IPO</button>
+      <button class="tab-button utility-action {value_stock_tab_class}" type="button" data-tab="value-stock">Value-Stock</button>
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       {f'<button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>' if nifty_income_enabled else ''}
@@ -29077,6 +29624,7 @@ def render_page(state: PageState) -> bytes:
     {render_investing_panel(state)}
     {render_equity_panel(state)}
     {render_ipo_panel(state)}
+    {render_value_stock_panel(state)}
     {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
   </main>
@@ -29339,6 +29887,7 @@ def render_page(state: PageState) -> bytes:
       document.getElementById('investing-panel').style.display = active === 'investing' ? '' : 'none';
       document.getElementById('equity-panel').style.display = active === 'equity' ? '' : 'none';
       document.getElementById('ipo-panel').style.display = active === 'ipo' ? '' : 'none';
+      document.getElementById('value-stock-panel').style.display = active === 'value-stock' ? '' : 'none';
       document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
       document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
       for (const item of document.querySelectorAll('.tab-button')) {{
@@ -29366,6 +29915,7 @@ def render_page(state: PageState) -> bytes:
           investing: '/investing',
           equity: '/equity',
           ipo: '/ipo',
+          'value-stock': '/value-stock',
           'income-growth': '/income-growth',
           commodity: '/commodity',
           'order-management': '/orders',
@@ -29463,6 +30013,8 @@ def render_page(state: PageState) -> bytes:
       '/investing/load': 'Refreshing investing portfolio...',
       '/equity/load': 'Loading equity holdings...',
       '/commodity/refresh': 'Refreshing ETF quotes and averages...',
+      '/value-stock/upload': 'Extracting and saving Value-Stock PDF...',
+      '/value-stock/filter': 'Refreshing Value-Stock comparison...',
       '/ce-scan/load': 'Recalculating covered CALL candidates...',
       '/gpt/generate': 'Waiting for OpenAI analysis...',
       '/income-growth/gpt': 'Waiting for OpenAI validation...',
@@ -31204,6 +31756,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/ipo":
             self.send_page(PageState(active_tab="ipo"))
             return
+        if parsed_url.path == "/value-stock":
+            state = PageState(active_tab="value-stock")
+            try:
+                load_value_stock_state(state)
+            except Exception as exc:
+                state.error = f"{friendly_external_error(exc, 'Value-Stock')}\n\n{traceback.format_exc()}"
+            self.send_page(state)
+            return
         if parsed_url.path == "/income":
             state = PageState(active_tab="income")
             try:
@@ -31493,8 +32053,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         request_path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8")
-        form = parse_qs(body, keep_blank_values=True)
+        raw_body = self.rfile.read(length)
+        form, uploaded_files = parse_multipart_form(
+            raw_body,
+            self.headers.get("Content-Type", ""),
+        )
         if request_path == "/login":
             username = first(form, "username")
             password = first(form, "password")
@@ -31527,6 +32090,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/commodity")
                 else "ipo"
                 if request_path.startswith("/ipo")
+                else "value-stock"
+                if request_path.startswith("/value-stock")
                 else "income-growth"
                 if request_path.startswith("/income-growth")
                 else "income"
@@ -31651,6 +32216,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             ipo_research_html=first(form, "ipo_research_html"),
             ipo_research_message=first(form, "ipo_research_message"),
             ipo_research_saved_id=first(form, "ipo_research_saved_id"),
+            value_stock_search=first(form, "value_stock_search"),
+            value_stock_sector=first(form, "value_stock_sector"),
+            value_stock_decision=first(form, "value_stock_decision"),
+            value_stock_selected_key=first(form, "value_stock_selected_key"),
+            value_stock_colour_mode=first(form, "value_stock_colour_mode", "Latest assessment"),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -32580,6 +33150,31 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.ipo_quarter,
                 )
                 state.message = f"Prepared IPO snapshot export: {state.ipo_export_filename}."
+            elif request_path in {"/value-stock/filter", "/value-stock/detail"}:
+                load_value_stock_state(state)
+                if request_path == "/value-stock/detail" and state.value_stock_detail:
+                    state.message = f"Opened Value-Stock detail for {state.value_stock_detail.get('company_name') or state.value_stock_selected_key}."
+                else:
+                    state.message = f"Loaded {len(state.value_stock_rows or [])} Value-Stock company row(s)."
+            elif request_path == "/value-stock/upload":
+                upload = uploaded_files.get("value_stock_pdf") or {}
+                if not upload.get("content"):
+                    raise ValueError("Choose a Screener company PDF before uploading.")
+                outcome = ValueStockService().upload_pdf(
+                    UploadedPdf(
+                        filename=str(upload.get("filename") or "upload.pdf"),
+                        content=bytes(upload.get("content") or b""),
+                        content_type=str(upload.get("content_type") or "application/pdf"),
+                    )
+                )
+                state.value_stock_selected_key = str(outcome.get("company_key") or "")
+                load_value_stock_state(state)
+                warning_count = len(outcome.get("warnings") or [])
+                state.message = (
+                    f"Saved Value-Stock data for {outcome.get('company_name')}. "
+                    f"Score {outcome.get('score')}; decision {outcome.get('decision')}. "
+                    f"{warning_count} extraction warning(s)."
+                )
             elif request_path == "/analytics/load":
                 state.analytics_data, state.console_log = call_with_console(
                     option_analytics_for_symbol,
