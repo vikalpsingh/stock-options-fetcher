@@ -1466,6 +1466,37 @@ def test_simple_ipo_upcoming_filters_next_7_days(tmp_path, monkeypatch):
     dashboard = build_simple_ipo_performance_dashboard(2026, force_refresh=True, today=date(2026, 7, 20))
 
     assert [row["symbol"] for row in dashboard["upcoming_next7"]] == ["TODAY", "SEVEN"]
+    assert [row["market_type"] for row in dashboard["upcoming_next7"]] == ["N/A", "N/A"]
+
+
+def test_simple_ipo_upcoming_preserves_board_when_source_provides_it(monkeypatch):
+    upcoming_rows = [
+        {
+            "company_name": "SME Board IPO",
+            "symbol": "SMEIPO",
+            "ipo_date": "2026-07-20",
+            "ipo_close_date": "2026-07-22",
+            "market_type": "SME",
+            "sector": "Industrials",
+        },
+        {
+            "company_name": "Main Board IPO",
+            "symbol": "MAINIPO",
+            "ipo_date": "2026-07-21",
+            "ipo_close_date": "2026-07-23",
+            "segment": "Mainboard",
+            "sector": "Healthcare",
+        },
+    ]
+    monkeypatch.setattr(
+        ipo_data_service,
+        "_load_research_ready_upcoming_ipos",
+        lambda today=None: (upcoming_rows, []),
+    )
+
+    rows, _ = ipo_data_service._upcoming_ipos_next_7_days(date(2026, 7, 20))
+
+    assert [row["market_type"] for row in rows] == ["SME", "Mainboard"]
 
 
 def test_ipo_value_investor_prompt_uses_selected_rows_and_screener_links():
@@ -1525,6 +1556,7 @@ def test_render_ipo_panel_has_default_controls(tmp_path, monkeypatch):
                     "symbol": "UPIPO",
                     "ipo_date": "2026-07-22",
                     "sector": "EMS",
+                    "market_type": "SME",
                     "issue_size": "500 Cr",
                     "price_band": "100-110",
                     "gmp": "N/A",
@@ -1583,6 +1615,9 @@ def test_render_ipo_panel_has_default_controls(tmp_path, monkeypatch):
     assert "Useful parser warning" in html
     assert "Upcoming IPOs - Next 7 Days" in html
     assert html.index("Upcoming IPOs - Next 7 Days") < html.index("Top 40 IPO Performers")
+    assert html.index("Useful parser warning") > html.index("Exports")
+    assert "Board" in html
+    assert "SME" in html
     assert "GMP %" in html
     assert "Days" in html
     assert 'id="ipo-upcoming-table"' in html

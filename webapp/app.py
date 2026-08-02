@@ -19780,9 +19780,11 @@ def render_ipo_panel(state: PageState) -> str:
             row_classes.append("ipo-upcoming-hot")
         class_attr = f' class="{" ".join(row_classes)}"' if row_classes else ""
         application_style = "blue" if item.get("is_open_for_application") is True else "neutral"
+        board_value = text_value(item.get("market_type") or item.get("ipo_market_type") or item.get("board"), "-")
         return f"""
         <tr{class_attr}>
           <td><a class="ipo-company-link" href="{html.escape(text_value(item.get("screener_url"), "https://www.screener.in/"), quote=True)}" target="_blank" rel="noopener">{html.escape(clean_company_display(item.get("company_name")))}</a><br><small>{html.escape(text_value(item.get("symbol") or item.get("ipo_type")))}</small></td>
+          <td>{badge(board_value, board_value)}</td>
           <td>{html.escape(text_value(item.get("ipo_open_date") or item.get("ipo_date")))}</td>
           <td>{html.escape(text_value(item.get("ipo_close_date")))}</td>
           <td>{html.escape(text_value(item.get("days_to_ipo")))}</td>
@@ -19800,12 +19802,12 @@ def render_ipo_panel(state: PageState) -> str:
 
     upcoming_rows_html = "".join(upcoming_row_html(item) for item in upcoming_next7)
     if not upcoming_rows_html:
-        upcoming_rows_html = '<tr><td colspan="13" class="muted-cell">No upcoming IPOs in the next 7 days from verified sources.</td></tr>'
+        upcoming_rows_html = '<tr><td colspan="14" class="muted-cell">No upcoming IPOs in the next 7 days from verified sources.</td></tr>'
     upcoming_html = f"""
         <div class="table-wrap compact">
           <table id="ipo-upcoming-table" class="ipo-table ipo-upcoming-table">
             <thead><tr>
-              <th>Company</th><th>Open Date</th><th>Close Date</th><th>Days</th><th>Sector</th><th>Type</th><th>Issue</th><th>Price Band</th><th>GMP</th><th>GMP %</th><th>GMP Status</th><th>Application</th><th>Source</th>
+              <th>Company</th><th>Board</th><th>Open Date</th><th>Close Date</th><th>Days</th><th>Sector</th><th>Type</th><th>Issue</th><th>Price Band</th><th>GMP</th><th>GMP %</th><th>GMP Status</th><th>Application</th><th>Source</th>
             </tr></thead>
             <tbody>{upcoming_rows_html}</tbody>
           </table>
@@ -20055,11 +20057,10 @@ def render_ipo_panel(state: PageState) -> str:
       </section>
       <section class="panel ipo-upcoming-panel">
         <div class="panel-title">Upcoming IPOs - Next 7 Days</div>
-        <p class="status">Light-blue rows are currently open for application: today falls on or between the IPO open and close dates. Dates are evaluated inclusively.</p>
+        <p class="status">Light-blue rows are currently open for application: today falls on or between the IPO open and close dates. Dates are evaluated inclusively. Board shows Mainboard or SME when the source provides or implies it.</p>
         {upcoming_html}
       </section>
       <section class="panel ipo-summary-panel compact-top-performers"><div class="summary-grid">{summary_cards_html}</div></section>
-      {messages_html}
       <section class="panel ipo-long-term-evaluation-panel">
         <div class="panel-title">Long-Term Evaluation</div>
         <p class="status">Python verifies identity and evidence, calculates data quality, investment score, hard blocks, valuation and liquidity, then prevents GPT from upgrading the permitted decision.</p>
@@ -20082,6 +20083,7 @@ def render_ipo_panel(state: PageState) -> str:
         </div>
       </section>
       {export_panel}
+      {messages_html}
       {sortable_script}
     </form>"""
 

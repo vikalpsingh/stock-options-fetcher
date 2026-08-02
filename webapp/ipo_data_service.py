@@ -2951,6 +2951,40 @@ def _enrich_upcoming_ipo_row(
     Screener search link instead of dropping the row.
     """
 
+    def upcoming_market_type() -> str:
+        explicit_value = _first_present(
+            row,
+            [
+                "market_type",
+                "ipo_market_type",
+                "board",
+                "segment",
+                "category",
+                "exchange",
+                "ipo_type",
+                "issue_type",
+                "source",
+                "source_url",
+            ],
+        )
+        explicit_text = _clean_text(explicit_value)
+        searchable = " ".join(
+            _clean_text(value)
+            for value in (
+                explicit_text,
+                row.get("company_name"),
+                row.get("raw_company_name"),
+                row.get("ipo_name"),
+                row.get("name"),
+            )
+            if value
+        ).lower()
+        if "sme" in searchable:
+            return "SME"
+        if "mainboard" in searchable or "main board" in searchable:
+            return "Mainboard"
+        return "N/A"
+
     raw_company = _clean_text(
         row.get("raw_company_name")
         or row.get("company_name")
@@ -3000,6 +3034,7 @@ def _enrich_upcoming_ipo_row(
         "is_open_for_application": is_open_for_application,
         "application_status": application_status,
         "sector": _clean_text(row.get("sector") or row.get("theme") or row.get("industry") or "N/A"),
+        "market_type": upcoming_market_type(),
         "ipo_type": _clean_text(row.get("ipo_type") or row.get("market_type") or row.get("issue_type") or "N/A"),
         "issue_size": _clean_text(row.get("issue_size") or row.get("issue") or row.get("offer_size") or "N/A"),
         "price_band": _clean_text(price_band_value or "N/A"),
@@ -3367,6 +3402,14 @@ def fetch_nse_upcoming_ipos(today: date | None = None) -> dict[str, Any]:
                     or row.get("endDate")
                 ),
                 "sector": _clean_text(row.get("sector") or row.get("industry") or "N/A"),
+                "market_type": _ipo_market_type_from_text(
+                    row.get("marketType")
+                    or row.get("issueType")
+                    or row.get("segment")
+                    or row.get("category")
+                    or row.get("series"),
+                    "N/A",
+                ),
                 "issue_size": _clean_text(row.get("issueSize") or row.get("issueSizeInCr") or "N/A"),
                 "price_band": _clean_text(row.get("priceBand") or row.get("priceRange") or "N/A"),
                 "gmp": "N/A",
@@ -3424,6 +3467,10 @@ def fetch_ipowatch_upcoming_ipos(today: date | None = None) -> dict[str, Any]:
                 "symbol": symbol,
                 "ipo_date": ipo_date_value or "N/A",
                 "sector": _first_present(raw, ["sector", "industry"]) or "N/A",
+                "market_type": _ipo_market_type_from_text(
+                    _first_present(raw, ["market_type", "ipo_type", "board", "segment", "category", "issue_type"]),
+                    "N/A",
+                ),
                 "issue_size": _first_present(raw, ["issue_size", "offer_size", "size"]) or "N/A",
                 "price_band": price_band,
                 "gmp": gmp,
