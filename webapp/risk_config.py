@@ -27,6 +27,31 @@ BLOCK_ORDER_IF_STOPLOSS_MISSING = True
 OPTION_CAPITAL_DEPLOYED = 1_000_000.0
 
 
+# Option liquidity depth gates ---------------------------------------------
+
+# Buy orders = sum of order count from top 5 bid depth.
+LIQUIDITY_AMBER_MIN_BUY_ORDERS = 100
+
+# Sell orders = sum of order count from top 5 ask depth.
+LIQUIDITY_AMBER_MIN_SELL_ORDERS = 100
+
+# Trade activity = actual number_of_trades if available; otherwise Kite volume proxy.
+LIQUIDITY_AMBER_MIN_TRADE_ACTIVITY = 100
+
+# Buy orders = sum of order count from top 5 bid depth.
+LIQUIDITY_GREEN_MIN_BUY_ORDERS = 1000
+
+# Sell orders = sum of order count from top 5 ask depth.
+LIQUIDITY_GREEN_MIN_SELL_ORDERS = 1000
+
+# Trade activity = actual number_of_trades if available; otherwise Kite volume proxy.
+LIQUIDITY_GREEN_MIN_TRADE_ACTIVITY = 1000
+
+BLOCK_RED_LIQUIDITY = True
+ALLOW_AMBER_LIQUIDITY = True
+ALLOW_GREEN_LIQUIDITY = True
+
+
 # Covered Call / CE sell settings -----------------------------------------
 
 # Book covered CALL profit after this percent of premium has decayed.
@@ -115,6 +140,31 @@ EXIT_BEFORE_EXPIRY_DAYS = 4
 
 # Do not open new income trades inside this many days to expiry.
 BLOCK_NEW_TRADES_IF_DAYS_TO_EXPIRY_LESS_THAN = 5
+
+
+# Kite/DHAN paired spread expiry-comparison settings -----------------------
+
+# Minimum expected credit/gain required before a paired spread is useful.
+# Below this amount, the app evaluates next-month expiry instead of forcing a
+# low-premium current-month trade.
+MIN_PAIR_MAX_GAIN_INR = 5_000
+
+# Trigger level for automatic next-month comparison when current-month spread
+# premium is not meaningful enough for the risk being taken.
+AUTO_CHECK_NEXT_EXPIRY_IF_GAIN_BELOW = 5_000
+
+# Allow the DHAN spread evaluator to compare the current monthly expiry with
+# next monthly expiry when the current-month max gain is below threshold.
+ALLOW_NEXT_MONTH_ROLLOVER_ANALYSIS = True
+
+# Minimum return on defined max risk required for a spread recommendation.
+MIN_RETURN_ON_RISK_PCT = 8
+
+# Maximum acceptable defined loss for one paired stock-option spread.
+MAX_ACCEPTABLE_PAIR_LOSS_INR = 50_000
+
+# Minimum probability of profit required before recommending a spread.
+MIN_POP_FOR_SPREAD = 70
 
 
 # Assignment and bucket controls ------------------------------------------

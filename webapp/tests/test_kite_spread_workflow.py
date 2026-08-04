@@ -4,11 +4,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import app
+import risk_config
 from kite_broker_adapter import KiteBrokerAdapter
+from kite_spread_evaluator import evaluate_spread_with_expiry_comparison
 from kite_option_resolver import KiteOptionResolver, next_otm_strike
 from kite_pair_execution import submit_kite_pair
 from kite_pair_scheduler import run_kite_pair_scheduler_once
 from kite_spread_engine import build_kite_spread_preview, fetch_cmp_from_kite, fetch_fresh_equity_quotes_from_kite
+from kite_option_liquidity import analyze_pair_liquidity
 from kite_spread_income_universe import INCOME_GROWTH_FNO_HOLDINGS
 from kite_spread_repository import KiteSpreadRepository
 from kite_spread_universe import KiteSpreadUniverse
@@ -52,7 +55,10 @@ class MockKiteAdapter:
                 "last_price": ltp,
                 "volume": 1000,
                 "oi": 5000,
-                "depth": {"buy": [{"price": ltp - 0.1}], "sell": [{"price": ltp + 0.1}]},
+                "depth": {
+                    "buy": [{"price": ltp - 0.1, "orders": 250, "quantity": 500} for _ in range(5)],
+                    "sell": [{"price": ltp + 0.1, "orders": 250, "quantity": 500} for _ in range(5)],
+                },
             }
         return out
 
@@ -91,6 +97,126 @@ def instruments() -> list[dict]:
     ]
 
 
+def spread_inst(expiry: str, strike: int, opt: str, price: float, symbol: str = "RELIANCE") -> dict:
+    return {
+        "tradingsymbol": f"{symbol}{expiry[5:7]}{expiry[8:10]}{strike}{opt}",
+        "name": symbol,
+        "expiry": expiry,
+        "instrument_type": opt,
+        "strike": strike,
+        "last_price": price,
+        "lot_size": 250,
+        "volume": 1000,
+        "oi": 5000,
+        "depth": {"buy": [{"price": max(price - 0.1, 0.05)}], "sell": [{"price": price + 0.1}]},
+    }
+
+
+def comparison_chain(current_sell: float = 12, current_buy: float = 5, next_sell: float = 30, next_buy: float = 5) -> list[dict]:
+    return [
+        spread_inst("2026-08-27", 1050, "CE", current_sell),
+        spread_inst("2026-08-27", 1100, "CE", current_buy),
+        spread_inst("2026-09-24", 1050, "CE", next_sell),
+        spread_inst("2026-09-24", 1100, "CE", next_buy),
+        spread_inst("2026-08-27", 950, "PE", current_sell),
+        spread_inst("2026-08-27", 900, "PE", current_buy),
+        spread_inst("2026-09-24", 950, "PE", next_sell),
+        spread_inst("2026-09-24", 900, "PE", next_buy),
+    ]
+
+
+def expiry_comparison(**kwargs):
+    return evaluate_spread_with_expiry_comparison(
+        symbol="RELIANCE",
+        strategy_type=kwargs.get("strategy", "BEAR_CALL_SPREAD"),
+        spot=1000,
+        selected_lots=1,
+        current_month_expiry="2026-08-27",
+        next_month_expiry="2026-09-24",
+        option_chain_data=kwargs.get("chain", comparison_chain()),
+        kite_adapter=None,
+        risk_engine=AllowRisk(),
+        market_data={"today": datetime(2026, 8, 4).date()},
+        technical_data={},
+        event_data=kwargs.get("event_data", {}),
+    )
+
+
+def depth_quote(orders: int, activity: int, *, number_of_trades: int | None = None, ltp: float = 10.0) -> dict:
+    quote = {
+        "last_price": ltp,
+        "volume": activity,
+        "oi": 5000,
+        "depth": {
+            "buy": [{"price": ltp - 0.05, "orders": orders // 5, "quantity": 1000} for _ in range(5)],
+            "sell": [{"price": ltp + 0.05, "orders": orders // 5, "quantity": 1000} for _ in range(5)],
+        },
+    }
+    if number_of_trades is not None:
+        quote["number_of_trades"] = number_of_trades
+    return quote
+
+
+def test_pair_liquidity_green_when_both_legs_have_strong_depth():
+    result = analyze_pair_liquidity("SELL", depth_quote(1500, 1500), "BUY", depth_quote(1200, 1200))
+
+    assert result["pair_liquidity_condition"] == "GREEN"
+    assert result["liquidity_order_allowed"] is True
+
+
+def test_pair_liquidity_amber_when_both_legs_are_acceptable_below_green():
+    result = analyze_pair_liquidity("SELL", depth_quote(500, 500), "BUY", depth_quote(300, 300))
+
+    assert result["pair_liquidity_condition"] == "AMBER"
+    assert result["liquidity_order_allowed"] is True
+
+
+def test_pair_liquidity_red_when_one_leg_buy_orders_below_threshold():
+    bad = depth_quote(50, 500)
+    result = analyze_pair_liquidity("SELL", bad, "BUY", depth_quote(500, 500))
+
+    assert result["pair_liquidity_condition"] == "RED"
+    assert result["liquidity_order_allowed"] is False
+
+
+def test_pair_liquidity_red_when_one_leg_sell_orders_below_threshold():
+    bad = depth_quote(500, 500)
+    for row in bad["depth"]["sell"]:
+        row["orders"] = 10
+    result = analyze_pair_liquidity("SELL", depth_quote(500, 500), "BUY", bad)
+
+    assert result["pair_liquidity_condition"] == "RED"
+    assert result["liquidity_order_allowed"] is False
+
+
+def test_pair_liquidity_red_when_trade_activity_below_threshold():
+    result = analyze_pair_liquidity("SELL", depth_quote(500, 99), "BUY", depth_quote(500, 500))
+
+    assert result["pair_liquidity_condition"] == "RED"
+    assert result["liquidity_order_allowed"] is False
+
+
+def test_pair_liquidity_amber_when_one_leg_green_one_amber():
+    result = analyze_pair_liquidity("SELL", depth_quote(1500, 1500), "BUY", depth_quote(500, 500))
+
+    assert result["pair_liquidity_condition"] == "AMBER"
+    assert result["liquidity_order_allowed"] is True
+
+
+def test_liquidity_uses_volume_proxy_when_number_of_trades_missing():
+    result = analyze_pair_liquidity("SELL", depth_quote(500, 500), "BUY", depth_quote(500, 500))
+
+    assert result["sell_leg_liquidity"]["trade_count_source"] == "VOLUME_PROXY"
+    assert result["sell_leg_liquidity"]["trade_activity_count"] == 500
+
+
+def test_liquidity_uses_actual_number_of_trades_when_available():
+    result = analyze_pair_liquidity("SELL", depth_quote(500, 500, number_of_trades=700), "BUY", depth_quote(500, 500))
+
+    assert result["sell_leg_liquidity"]["trade_count_source"] == "ACTUAL_TRADE_COUNT"
+    assert result["sell_leg_liquidity"]["trade_activity_count"] == 700
+
+
 def test_cmp_fetch_uses_nse_symbol_format():
     broker = MockKiteAdapter()
 
@@ -109,8 +235,11 @@ def test_nfo_instrument_resolver_finds_correct_option_contract():
 
 def test_next_50_otm_strike_rounding_for_dhan():
     assert next_otm_strike(1198.26, "CE", 50) == 1200
-    assert next_otm_strike(1255.32, "CE", 50) == 1300
-    assert next_otm_strike(1084.14, "PE", 50) == 1050
+    assert next_otm_strike(1005, "CE", 50) == 1000
+    assert next_otm_strike(1060, "CE", 50) == 1050
+    assert next_otm_strike(1084.14, "PE", 50) == 1100
+    assert next_otm_strike(1080, "PE", 50) == 1050
+    assert next_otm_strike(1080.01, "CE", 50) == 1100
 
 
 def test_ce_spread_uses_5pct_sell_and_10pct_hedge_and_metrics():
@@ -146,7 +275,78 @@ def test_pe_spread_uses_5pct_sell_and_10pct_hedge_and_metrics():
     assert preview["breakeven"] == 943
 
 
-def test_bajajfinance_ce_hedge_uses_next_available_1300_for_10pct_target():
+def test_expiry_comparison_prefers_current_when_gain_above_threshold():
+    result = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=40, next_buy=5))
+
+    assert result["recommended_expiry"] == "CURRENT_MONTH"
+    assert result["current_month"]["max_gain"] == 6250
+
+
+def test_expiry_comparison_moves_to_next_when_current_gain_low_and_next_acceptable():
+    result = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=30, next_buy=5))
+
+    assert result["recommended_expiry"] == "NEXT_MONTH"
+    assert result["current_month"]["max_gain"] == 1750
+    assert result["next_month"]["max_gain"] == 6250
+    assert result["recommended_preview"]["expiry"] == "2026-09-24"
+
+
+def test_expiry_comparison_marks_no_trade_when_both_gains_low():
+    result = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=13, next_buy=5))
+
+    assert result["recommended_expiry"] == "NO_TRADE"
+    assert "max gain below" in result["recommendation_reason"]
+
+
+def test_expiry_comparison_does_not_recommend_next_when_event_risk_exists():
+    result = expiry_comparison(
+        chain=comparison_chain(current_sell=12, current_buy=5, next_sell=30, next_buy=5),
+        event_data={"next": {"event_risk": True}},
+    )
+
+    assert result["recommended_expiry"] == "NO_TRADE"
+    assert "event risk" in result["recommendation_reason"]
+
+
+def test_expiry_comparison_does_not_recommend_next_when_pop_below_threshold(monkeypatch):
+    monkeypatch.setattr(risk_config, "MIN_POP_FOR_SPREAD", 80)
+
+    result = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=30, next_buy=5))
+
+    assert result["recommended_expiry"] == "NO_TRADE"
+    assert "POP below" in result["recommendation_reason"]
+
+
+def test_expiry_comparison_does_not_recommend_next_when_max_loss_too_high(monkeypatch):
+    monkeypatch.setattr(risk_config, "MAX_ACCEPTABLE_PAIR_LOSS_INR", 5000)
+
+    result = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=30, next_buy=5))
+
+    assert result["recommended_expiry"] == "NO_TRADE"
+    assert "max loss above" in result["recommendation_reason"]
+
+
+def test_expiry_comparison_ce_math_is_correct():
+    result = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5))
+    current = result["current_month"]
+
+    assert current["net_credit"] == 25
+    assert current["max_gain"] == 6250
+    assert current["max_loss"] == 6250
+    assert current["breakeven"] == 1075
+
+
+def test_expiry_comparison_pe_math_is_correct():
+    result = expiry_comparison(strategy="BULL_PUT_SPREAD", chain=comparison_chain(current_sell=30, current_buy=5))
+    current = result["current_month"]
+
+    assert current["net_credit"] == 25
+    assert current["max_gain"] == 6250
+    assert current["max_loss"] == 6250
+    assert current["breakeven"] == 925
+
+
+def test_bajajfinance_ce_hedge_uses_nearest_available_1250_for_10pct_target():
     local_instruments = [
         {"tradingsymbol": "BAJFINANCE26AUG1200CE", "name": "BAJFINANCE", "expiry": "2026-08-27", "instrument_type": "CE", "strike": 1200, "last_price": 9.8, "lot_size": 750},
         {"tradingsymbol": "BAJFINANCE26AUG1250CE", "name": "BAJFINANCE", "expiry": "2026-08-27", "instrument_type": "CE", "strike": 1250, "last_price": 3.1, "lot_size": 750},
@@ -165,9 +365,9 @@ def test_bajajfinance_ce_hedge_uses_next_available_1300_for_10pct_target():
     )
 
     assert preview["raw_hedge_target_strike"] == 1255.32
-    assert preview["buy_leg_tradingsymbol"] == "BAJFINANCE26AUG1300CE"
-    assert preview["hedge_target_strike"] == 1300
-    assert preview["hedge_strike"] == 1300
+    assert preview["buy_leg_tradingsymbol"] == "BAJFINANCE26AUG1250CE"
+    assert preview["hedge_target_strike"] == 1250
+    assert preview["hedge_strike"] == 1250
 
 
 def test_spread_blocked_when_contract_unresolved():
@@ -224,6 +424,7 @@ def test_dhan_page_seeds_income_growth_fno_holdings(tmp_path, monkeypatch):
     assert "DHAN - Income Growth F&O Paired Option Spreads" in html
     for holding in INCOME_GROWTH_FNO_HOLDINGS:
         assert holding.symbol in html
+    assert "NUVAMA" not in html
     assert "BAJFINANCE" in html
     assert "2310" in html
     assert "max covered CE lots: 1" in html or "Max CE Lots" in html
@@ -248,7 +449,7 @@ def test_dhan_stock_rows_have_simple_pe_ce_evaluation_actions(tmp_path, monkeypa
 
     assert "Current F&O Stock List - Select PE or CE" in html
     assert "Run Analysis" in html
-    assert "/kite-spreads/analyze-symbol" in html
+    assert "/kite-spreads/open-symbol" in html
     assert "Run Analysis on All Stocks" in html
     assert "/kite-spreads/analyze-all" in html
     assert "Evaluate PE" in html
@@ -289,7 +490,7 @@ def test_fresh_kite_quote_includes_52_week_high_gap():
 
 def test_dhan_selected_opportunity_renders_modal_execution_review(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
-    preview = approved_preview()
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=50, next_buy=5))["recommended_preview"]
 
     html = app.render_kite_spreads_panel(
         app.PageState(
@@ -319,11 +520,181 @@ def test_dhan_selected_opportunity_renders_modal_execution_review(tmp_path, monk
     assert "sell_order_payload" not in html
 
 
-def test_dhan_opportunity_table_highlights_pop_and_gain_and_opens_popup(tmp_path, monkeypatch):
+def test_dhan_popup_uses_recommended_expiry_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=30, next_buy=5))["recommended_preview"]
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(active_tab="kite-spreads", dhan_opportunities=[preview], dhan_selected_index="0")
+    )
+
+    assert "Comparison: Current, Next, and Mixed Expiry" in html
+    assert "Selected expiry: <strong>NEXT_MONTH</strong>" in html
+    assert 'name="dhan_selected_expiry_choice" value="NEXT_MONTH" data-expiry-preview-action="/kite-spreads/preview-pair" checked' in html
+    assert 'name="dhan_selected_expiry_choice" value="CURRENT_MONTH" data-expiry-preview-action="/kite-spreads/preview-pair"' in html
+    assert 'name="dhan_selected_expiry_choice" value="NEXT_SELL_CURRENT_BUY" data-expiry-preview-action="/kite-spreads/preview-pair"' in html
+    assert "SELL next month + BUY current hedge" in html
+
+
+def test_dhan_popup_allows_acknowledged_soft_no_trade_pair_to_start_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=13, next_buy=5))["recommended_preview"]
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(active_tab="kite-spreads", dhan_opportunities=[preview], dhan_selected_index="0")
+    )
+
+    assert 'id="dhan-pair-order-modal"' in html
+    assert "Selected expiry: <strong>NO_TRADE</strong>" in html
+    assert 'data-orderable="1"' in html
+    assert 'data-auto-clear="0"' in html
+    assert 'id="dhan-pair-review" type="button" class="secondary" disabled' in html
+    assert 'id="dhan-place-pair-order" type="submit" formaction="/kite-spreads/submit-pair" class="danger" disabled' in html
+
+
+def test_dhan_quality_clear_enables_review_without_acknowledgement(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = expiry_comparison(chain=comparison_chain(current_sell=50, current_buy=5, next_sell=55, next_buy=5))["recommended_preview"]
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "RETURN_ON_RISK_TOO_LOW"
+    preview["reason"] = preview["risk_reason"]
+    preview["pop_estimate"] = 80
+    preview["max_gain"] = 12000
+    preview["current_month_preview"]["risk_decision"] = "BLOCKED"
+    preview["current_month_preview"]["risk_reason"] = "RETURN_ON_RISK_TOO_LOW"
+    preview["current_month_preview"]["reason"] = "RETURN_ON_RISK_TOO_LOW"
+    preview["current_month_preview"]["pop_estimate"] = 80
+    preview["current_month_preview"]["max_gain"] = 12000
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(active_tab="kite-spreads", dhan_opportunities=[preview], dhan_selected_index="0")
+    )
+
+    assert app.dhan_pair_quality_auto_clears(preview)
+    assert 'data-auto-clear="1"' in html
+    assert "Quality-clear available" in html
+    assert 'id="dhan-pair-review" type="button" class="secondary">' in html
+
+
+def test_dhan_red_liquidity_allows_paper_popup_flow_but_blocks_live(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
     preview = approved_preview()
+    preview["pair_liquidity_condition"] = "RED"
+    preview["liquidity_order_allowed"] = False
+    preview["liquidity_reason"] = "Poor liquidity — order blocked."
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "LIQUIDITY_RED_ORDER_BLOCKED"
+    preview["reason"] = preview["risk_reason"]
+
+    paper_html = app.render_kite_spreads_panel(
+        app.PageState(active_tab="kite-spreads", dhan_opportunities=[preview], dhan_selected_index="0", dhan_confirm_pair_order=True)
+    )
+    live_html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_opportunities=[preview],
+            dhan_selected_index="0",
+            dhan_confirm_pair_order=True,
+            dhan_paper_trading=False,
+        )
+    )
+
+    assert "Liquidity Condition" in paper_html
+    assert "Paper mode: RED liquidity is shown for execution-flow testing; live order would be blocked." in paper_html
+    assert 'data-orderable="1"' in paper_html
+    assert 'id="dhan-pair-review" type="button" class="secondary">' in paper_html
+    assert "Place Order disabled because liquidity condition is RED." in live_html
+    assert 'data-orderable="0"' in live_html
+    assert app.dhan_pair_is_defined_risk_orderable(preview, allow_red_liquidity=True)
+    assert not app.dhan_pair_is_defined_risk_orderable(preview, allow_red_liquidity=False)
+
+
+def test_dhan_amber_liquidity_allows_acknowledged_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = approved_preview()
+    preview["pair_liquidity_condition"] = "AMBER"
+    preview["liquidity_order_allowed"] = True
+    preview["liquidity_reason"] = "Acceptable liquidity — order allowed with caution."
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(active_tab="kite-spreads", dhan_opportunities=[preview], dhan_selected_index="0", dhan_confirm_pair_order=True)
+    )
+
+    assert "Liquidity is acceptable but not strong. Use limit order and verify slippage." in html
+    assert 'data-orderable="1"' in html
+    assert 'id="dhan-pair-review" type="button" class="secondary">' in html
+
+
+def test_red_liquidity_blocks_live_submit_but_allows_paper_flow(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    broker = MockKiteAdapter()
+    preview = approved_preview()
+    preview["pair_liquidity_condition"] = "RED"
+    preview["liquidity_order_allowed"] = False
+    preview["liquidity_reason"] = "Poor liquidity — order blocked."
+
+    try:
+        submit_kite_pair(preview, repo, broker, user_confirmed=True, mode="LIVE")
+    except ValueError as exc:
+        assert "LIQUIDITY_RED_ORDER_BLOCKED" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("RED liquidity must block live submission")
+    assert broker.placed == []
+
+    paper_broker = MockKiteAdapter()
+    outcome = submit_kite_pair(preview, repo, paper_broker, user_confirmed=True, mode="PAPER")
+    assert outcome["mode"] == "PAPER"
+    assert outcome["buy_leg_order_id"]
+    assert len(paper_broker.placed) == 1
+    assert paper_broker.placed[0]["transaction_type"] == "BUY"
+
+
+def test_dhan_popup_allows_manual_expiry_override_for_each_approved_expiry(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    current_approved = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=35, next_buy=5))["recommended_preview"]
+    next_approved = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=35, next_buy=5))["recommended_preview"]
+
+    current_html = app.render_kite_spreads_panel(app.PageState(active_tab="kite-spreads", dhan_opportunities=[current_approved], dhan_selected_index="0"))
+    next_html = app.render_kite_spreads_panel(app.PageState(active_tab="kite-spreads", dhan_opportunities=[next_approved], dhan_selected_index="0"))
+
+    assert 'value="CURRENT_MONTH" data-expiry-preview-action="/kite-spreads/preview-pair" checked' in current_html
+    assert 'value="NEXT_MONTH"' in current_html
+    assert 'value="NEXT_MONTH" disabled' not in current_html
+    assert 'value="NEXT_MONTH" data-expiry-preview-action="/kite-spreads/preview-pair" checked' in next_html
+    assert 'value="CURRENT_MONTH"' in next_html
+
+
+def test_dhan_best_selection_prefers_gain_3000_and_loss_40000_quality_row():
+    high_pop_low_gain = {
+        "recommended_expiry": "CURRENT_MONTH",
+        "pop_estimate": 95,
+        "max_gain": 2500,
+        "max_loss": 15000,
+        "return_on_risk_pct": 16,
+    }
+    lower_pop_quality = {
+        "recommended_expiry": "CURRENT_MONTH",
+        "pop_estimate": 80,
+        "max_gain": 3200,
+        "max_loss": 39000,
+        "return_on_risk_pct": 8.2,
+    }
+    assert app.best_dhan_opportunity_index(
+        [high_pop_low_gain, lower_pop_quality],
+        min_gain=app.DHAN_SELECTION_MIN_GAIN_INR,
+        max_loss=app.DHAN_SELECTION_MAX_LOSS_INR,
+    ) == "1"
+
+
+def test_dhan_opportunity_table_highlights_pop_and_gain_and_opens_popup(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=50, next_buy=5))["recommended_preview"]
     preview["pop_estimate"] = 85
-    preview["max_gain"] = 12000
+    preview["max_gain"] = 12500
+    preview["max_loss"] = 35000
+    preview["current_month"]["pop"] = 85
+    preview["current_month"]["max_gain"] = 12500
+    preview["current_month"]["max_loss"] = 35000
 
     html = app.render_kite_spreads_panel(
         app.PageState(
@@ -335,23 +706,46 @@ def test_dhan_opportunity_table_highlights_pop_and_gain_and_opens_popup(tmp_path
 
     assert "Opportunity Table - Compare POP, Gain and Risk" in html
     assert 'id="dhan-opportunity-table"' in html
-    assert 'class="sort-header" data-sort-col="14">POP' in html
-    assert 'class="sort-header" data-sort-col="11">Max Gain' in html
-    assert 'class="sort-header" data-sort-col="17">Risk Decision' in html
+    assert "dhan-opportunities-panel dhan-best-pair-section" in html
+    assert "Best pair ready: green rows satisfy POP, max gain, max loss, liquidity, and order-shape checks." in html
+    assert 'formaction="/kite-spreads/preview-pair" name="dhan_selected_index" value="0">RELIANCE</button>' in html
+    assert 'class="sort-header" data-sort-col="7">Current POP' in html
+    assert 'class="sort-header" data-sort-col="5">Current Gain' in html
+    assert 'class="sort-header" data-sort-col="14">Recommended' in html
+    assert 'class="sort-header" data-sort-col="29">Best Pick' in html
+    assert 'class="dhan-best-pick-cell"><strong>BEST PICK</strong>' in html
+    assert 'class="dhan-best-pick-row"' in html
     assert 'formaction="/kite-spreads/preview-pair"' in html
     assert "Open Popup" in html
-    assert html.count("dhan-good-metric") >= 2
-    assert "85.00%" in html
-    assert "12000.00" in html
+    assert "CURRENT_MONTH" in html
+    assert "12500.00" in html
     assert 'formaction="/kite-spreads/clear-pair-monitor"' in html
     assert "Clear Monitor" in html
 
 
+def test_dhan_opportunity_data_expires_after_ten_minutes_in_render(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    old_stamp = (app.datetime.now(app.INDIA_TIME_ZONE) - app.timedelta(minutes=11)).isoformat(timespec="seconds")
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=50, next_buy=5))["recommended_preview"]
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_opportunities=[preview],
+            dhan_opportunities_generated_at=old_stamp,
+        )
+    )
+
+    assert "Analysis is older than 10 minutes" in html
+    assert "RELIANCE</button>" in html
+    assert "Recalculate Opportunity Table" in html
+
+
 def test_dhan_checkbox_can_unlock_defined_risk_warning_pair(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
-    preview = approved_preview()
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=50, next_buy=5))["recommended_preview"]
     preview["risk_decision"] = "BLOCKED"
-    preview["risk_reason"] = "RETURN_ON_RISK_TOO_LOW; MAX_LOSS_TOO_HIGH"
+    preview["risk_reason"] = "RETURN_ON_RISK_TOO_LOW"
     preview["reason"] = preview["risk_reason"]
 
     html = app.render_kite_spreads_panel(
@@ -388,6 +782,49 @@ def test_dhan_submit_overrides_warning_only_defined_risk_pair(tmp_path):
     pair = repo.get_pair(result["pair_id"])
     assert result["buy_leg_order_id"] == "KITE-1"
     assert "USER_CONFIRMED_DEFINED_RISK_PAIR" in pair["payload_json"]
+
+
+def test_dhan_apply_expiry_choice_uses_requested_approved_preview():
+    current_preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=35, next_buy=5))["recommended_preview"]
+    next_preview = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=35, next_buy=5))["recommended_preview"]
+
+    current_choice = app.apply_dhan_expiry_choice(current_preview, "CURRENT_MONTH")
+    next_choice = app.apply_dhan_expiry_choice(next_preview, "NEXT_MONTH")
+
+    assert current_choice["expiry"] == "2026-08-27"
+    assert next_choice["expiry"] == "2026-09-24"
+
+
+def test_dhan_apply_mixed_expiry_choice_uses_next_sell_and_current_buy():
+    preview = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=35, next_buy=5))["recommended_preview"]
+
+    mixed_choice = app.apply_dhan_expiry_choice(preview, "NEXT_SELL_CURRENT_BUY")
+
+    assert mixed_choice["selected_expiry_choice"] == "NEXT_SELL_CURRENT_BUY"
+    assert mixed_choice["sell_expiry"] == "2026-09-24"
+    assert mixed_choice["buy_expiry"] == "2026-08-27"
+    assert mixed_choice["sell_leg_tradingsymbol"] == "RELIANCE09241050CE"
+    assert mixed_choice["buy_leg_tradingsymbol"] == "RELIANCE08271100CE"
+    assert mixed_choice["risk_decision"] == "BLOCKED"
+    assert "CALENDAR_HEDGE_EXPIRES_BEFORE_SHORT" in mixed_choice["risk_reason"]
+
+
+def test_dhan_mixed_expiry_choice_is_not_orderable_as_defined_risk_vertical():
+    preview = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=35, next_buy=5))["recommended_preview"]
+    mixed_choice = app.apply_dhan_expiry_choice(preview, "NEXT_SELL_CURRENT_BUY")
+
+    assert not app.dhan_pair_is_defined_risk_orderable(mixed_choice)
+
+
+def test_dhan_apply_expiry_choice_blocks_unapproved_selected_expiry():
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=35, next_buy=5), event_data={"next": {"event_risk": True}})["recommended_preview"]
+
+    try:
+        app.apply_dhan_expiry_choice(preview, "NEXT_MONTH")
+    except ValueError as exc:
+        assert "liquidity, event, and risk checks" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("Manual override should be blocked when both expiries are not approved")
 
 
 def test_dhan_order_backend_log_includes_outcome_pair_and_execution_rows(tmp_path):
@@ -468,6 +905,45 @@ def test_dhan_pair_monitor_can_be_cleared_locally(tmp_path):
     assert deleted["pair_orders_deleted"] == 1
     assert deleted["execution_logs_deleted"] >= 2
     assert repo.list_pair_orders() == []
+
+
+def test_dhan_export_outputs_include_expiry_comparison_files(tmp_path, monkeypatch):
+    monkeypatch.setattr("kite_spread_config.KITE_SPREAD_OUTPUT_DIR", tmp_path / "outputs")
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    candidate = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=30, next_buy=5))["recommended_preview"]
+
+    repo.export_outputs([candidate])
+
+    candidates_csv = (tmp_path / "outputs" / "kite_spread_candidates.csv").read_text(encoding="utf-8")
+    comparison_csv = (tmp_path / "outputs" / "kite_spread_expiry_comparison.csv").read_text(encoding="utf-8")
+    assert "current_month_expiry" in candidates_csv
+    assert "next_month_max_gain" in candidates_csv
+    assert "recommended_expiry" in candidates_csv
+    assert "expiry_type" in comparison_csv
+    assert "CURRENT_MONTH" in comparison_csv
+    assert "NEXT_MONTH" in comparison_csv
+
+
+def test_dhan_opportunity_table_is_saved_and_reloaded_from_app_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    monkeypatch.setattr(app, "refresh_dhan_watchlist_quotes", lambda rows: None)
+    repo = KiteSpreadRepository(tmp_path / "app.db")
+    candidate = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=50, next_buy=5))["recommended_preview"]
+    stamp = app.dhan_opportunity_stamp()
+
+    saved = repo.save_opportunities([candidate], stamp, "DHAN")
+    loaded, loaded_stamp = repo.list_opportunities("DHAN")
+    state = app.PageState(active_tab="kite-spreads")
+    app.load_dhan_state(state)
+    html = app.render_kite_spreads_panel(state)
+
+    assert saved == 1
+    assert loaded_stamp == stamp
+    assert loaded[0]["symbol"] == "RELIANCE"
+    assert state.dhan_opportunities
+    assert state.dhan_opportunities_generated_at == stamp
+    assert "RELIANCE</button>" in html
+    assert "Recalculate Opportunity Table" in html
 
 
 def test_dhan_submit_does_not_override_missing_contract_pair(tmp_path):
@@ -552,36 +1028,16 @@ def test_ce_spread_is_blocked_when_income_growth_shares_do_not_cover_lot_size():
     assert "CE_NOT_FULLY_COVERED_BY_SHARES_130_LT_150" in preview["risk_reason"]
 
 
-def test_nuvama_blocks_ce_but_can_still_be_evaluated_for_pe():
-    ce_preview = build_kite_spread_preview(
-        "NUVAMA",
-        1000,
-        "BEAR_CALL_SPREAD",
-        "2026-08-27",
-        1,
-        KiteOptionResolver(instruments=[
-            {"tradingsymbol": "NUVAMA26AUG1050CE", "name": "NUVAMA", "expiry": "2026-08-27", "instrument_type": "CE", "strike": 1050, "last_price": 12, "lot_size": 75},
-            {"tradingsymbol": "NUVAMA26AUG1100CE", "name": "NUVAMA", "expiry": "2026-08-27", "instrument_type": "CE", "strike": 1100, "last_price": 5, "lot_size": 75},
-        ]),
-        None,
-        AllowRisk(),
-    )
-    pe_preview = build_kite_spread_preview(
-        "NUVAMA",
-        1000,
-        "BULL_PUT_SPREAD",
-        "2026-08-27",
-        1,
-        KiteOptionResolver(instruments=[
-            {"tradingsymbol": "NUVAMA26AUG950PE", "name": "NUVAMA", "expiry": "2026-08-27", "instrument_type": "PE", "strike": 950, "last_price": 12, "lot_size": 75},
-            {"tradingsymbol": "NUVAMA26AUG900PE", "name": "NUVAMA", "expiry": "2026-08-27", "instrument_type": "PE", "strike": 900, "last_price": 5, "lot_size": 75},
-        ]),
-        None,
-        AllowRisk(),
-    )
+def test_nuvama_is_excluded_from_dhan_even_if_already_in_watchlist(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    universe = KiteSpreadUniverse(repo)
+    repo.upsert_watchlist("NUVAMA", "NUVAMA", "INCOME_GROWTH", is_current_holding=False, holding_qty=0, fno_enabled=True)
+    universe.sync_income_growth_fno_holdings()
 
-    assert "CE_COVERAGE_BLOCKED_NO_SHARES" in ce_preview["risk_reason"]
-    assert "CE_COVERAGE_BLOCKED_NO_SHARES" not in pe_preview["risk_reason"]
+    symbols = [row["symbol"] for row in universe.list_watchlist()]
+
+    assert "NUVAMA" not in symbols
+    assert "BAJFINANCE" in symbols
 
 
 def test_gpt_suggestions_are_saved_into_db(tmp_path):

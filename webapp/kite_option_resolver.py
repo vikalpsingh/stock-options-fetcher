@@ -24,11 +24,21 @@ def strike_step_for_spot(spot: float) -> int:
 
 
 def next_otm_strike(value: float, option_type: str, step: int = 50) -> float:
+    """Round to the nearest usable stock-option strike grid.
+
+    DHAN/DHAN-IT uses a softer 50-point grid rule for stock options:
+    stay on the lower rounded strike when the remainder is 30 points or less,
+    and move to the next 50-point strike only when the remainder is above 30.
+    This avoids pushing 5%/10% targets too far away from the actual CMP.
+    """
+
     clean_step = max(int(step or 50), 1)
     clean_value = _to_float(value)
-    if str(option_type or "").upper() == "CE":
-        return float(math.ceil(clean_value / clean_step) * clean_step)
-    return float(math.floor(clean_value / clean_step) * clean_step)
+    lower = math.floor(clean_value / clean_step) * clean_step
+    remainder = clean_value - lower
+    if remainder > 30:
+        return float(lower + clean_step)
+    return float(lower)
 
 
 def _parse_expiry(value: Any) -> date | None:

@@ -26,6 +26,12 @@ def build_kite_order_payload(tradingsymbol: str, transaction_type: str, quantity
 def submit_kite_pair(preview: dict[str, Any], repository: KiteSpreadRepository, broker: Any, user_confirmed: bool, mode: str = "PAPER", execution_mode: str = "HEDGE_FIRST") -> dict[str, Any]:
     if not user_confirmed:
         raise ValueError("Explicit confirmation is required before placing a Kite spread pair.")
+    if str(mode or "").upper() != "PAPER" and (
+        str(preview.get("pair_liquidity_condition") or "").upper() == "RED"
+        or preview.get("liquidity_order_allowed") is False
+    ):
+        repository.log("", "LIQUIDITY_RED_ORDER_BLOCKED", str(preview.get("liquidity_reason") or "RED liquidity blocked order"))
+        raise ValueError("LIQUIDITY_RED_ORDER_BLOCKED: Place Order disabled because liquidity condition is RED.")
     if str(preview.get("risk_decision") or "").upper() != "APPROVED":
         raise ValueError(f"Spread is blocked: {preview.get('risk_reason') or preview.get('reason')}")
     pair_id = repository.create_pair(preview, mode=mode, user_confirmed=True, execution_mode=execution_mode)

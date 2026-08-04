@@ -97,6 +97,18 @@ class KiteSpreadRepository:
                     detail TEXT,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS kite_spread_opportunities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    screen_name TEXT NOT NULL DEFAULT 'DHAN',
+                    row_index INTEGER NOT NULL,
+                    symbol TEXT,
+                    strategy_type TEXT,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    generated_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -214,6 +226,61 @@ class KiteSpreadRepository:
     def list_pair_orders(self, include_closed: bool = True) -> list[dict[str, Any]]:
         return self.list_pairs(include_closed=include_closed)
 
+    def save_opportunities(self, opportunities: list[dict[str, Any]], generated_at: str = "", screen_name: str = "DHAN") -> int:
+        stamp = generated_at or now_text()
+        now = now_text()
+        clean_screen = str(screen_name or "DHAN").strip().upper()
+        with self.connect() as conn:
+            conn.execute("DELETE FROM kite_spread_opportunities WHERE screen_name=?", (clean_screen,))
+            for idx, row in enumerate(opportunities):
+                conn.execute(
+                    """
+                    INSERT INTO kite_spread_opportunities(
+                        screen_name, row_index, symbol, strategy_type, payload_json,
+                        generated_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_screen,
+                        idx,
+                        str(row.get("symbol") or "").strip().upper(),
+                        str(row.get("strategy_type") or ""),
+                        json.dumps(row, default=str),
+                        stamp,
+                        now,
+                        now,
+                    ),
+                )
+        return len(opportunities)
+
+    def list_opportunities(self, screen_name: str = "DHAN") -> tuple[list[dict[str, Any]], str]:
+        clean_screen = str(screen_name or "DHAN").strip().upper()
+        with self.connect() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT payload_json, generated_at
+                    FROM kite_spread_opportunities
+                    WHERE screen_name=?
+                    ORDER BY row_index, id
+                    """,
+                    (clean_screen,),
+                ).fetchall()
+            ]
+        opportunities: list[dict[str, Any]] = []
+        generated_at = ""
+        for row in rows:
+            if not generated_at:
+                generated_at = str(row.get("generated_at") or "")
+            try:
+                parsed = json.loads(str(row.get("payload_json") or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                opportunities.append(parsed)
+        return opportunities, generated_at
+
     def clear_pair_monitor(self) -> dict[str, int]:
         with self.connect() as conn:
             pair_count = int(conn.execute("SELECT COUNT(*) FROM kite_pair_orders").fetchone()[0])
@@ -233,6 +300,7 @@ class KiteSpreadRepository:
             self._write_csv(out / "kite_spread_candidates.csv", candidates)
             self._write_csv(out / "kite_spread_preview.csv", candidates)
             self._write_csv(out / "kite_spread_rejections.csv", [row for row in candidates if row.get("risk_decision") == "BLOCKED"])
+            self._write_csv(out / "kite_spread_expiry_comparison.csv", self._expiry_comparison_rows(candidates))
         self._write_csv(out / "kite_pair_orders.csv", self.list_pairs())
         with self.connect() as conn:
             logs = [dict(row) for row in conn.execute("SELECT * FROM kite_pair_execution_log ORDER BY id DESC LIMIT 500").fetchall()]
@@ -245,3 +313,34 @@ class KiteSpreadRepository:
             writer = csv.DictWriter(handle, fieldnames=headers)
             writer.writeheader()
             writer.writerows(flat)
+
+    def _expiry_comparison_rows(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        timestamp = now_text()
+        for candidate in candidates:
+            for expiry_type, month_key in (("CURRENT_MONTH", "current_month"), ("NEXT_MONTH", "next_month")):
+                month = candidate.get(month_key)
+                if not isinstance(month, dict) or not month.get("expiry"):
+                    continue
+                rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "symbol": candidate.get("symbol"),
+                        "strategy_type": candidate.get("strategy_type"),
+                        "expiry_type": expiry_type,
+                        "expiry": month.get("expiry"),
+                        "dte": month.get("dte"),
+                        "sell_leg": month.get("sell_leg_tradingsymbol"),
+                        "buy_leg": month.get("buy_leg_tradingsymbol"),
+                        "net_credit": month.get("net_credit"),
+                        "max_gain": month.get("max_gain"),
+                        "max_loss": month.get("max_loss"),
+                        "breakeven": month.get("breakeven"),
+                        "pop": month.get("pop"),
+                        "return_on_risk_pct": month.get("return_on_risk_pct"),
+                        "margin_required": month.get("margin_required"),
+                        "risk_decision": month.get("risk_decision"),
+                        "risk_reason": month.get("risk_reason"),
+                    }
+                )
+        return rows

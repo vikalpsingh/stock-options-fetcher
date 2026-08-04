@@ -37,10 +37,11 @@ INCOME_GROWTH_FNO_HOLDINGS: tuple[IncomeGrowthFnoHolding, ...] = (
     IncomeGrowthFnoHolding("CAMS", 410, 1, "CE only if Kite lot size is fully covered."),
     IncomeGrowthFnoHolding("CDSL", 410, 1, "CE only if Kite lot size is fully covered."),
     IncomeGrowthFnoHolding("MAZDOCK", 475, 1),
-    IncomeGrowthFnoHolding("NUVAMA", 0, 0, "No covered CALL allowed."),
     IncomeGrowthFnoHolding("NTPC", 927, 1, "CE only if Kite lot size is fully covered."),
     IncomeGrowthFnoHolding("WAAREEENER", 130, 1, "CE only if Kite lot size is fully covered."),
 )
+
+DHAN_EXCLUDED_NON_FNO_SYMBOLS = {"NUVAMA"}
 
 INCOME_GROWTH_FNO_BY_SYMBOL: dict[str, IncomeGrowthFnoHolding] = {
     item.symbol: item for item in INCOME_GROWTH_FNO_HOLDINGS

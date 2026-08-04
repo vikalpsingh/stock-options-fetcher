@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from kite_spread_income_universe import annotate_income_growth_row, seed_income_growth_fno_watchlist
+from kite_spread_income_universe import DHAN_EXCLUDED_NON_FNO_SYMBOLS, annotate_income_growth_row, seed_income_growth_fno_watchlist
 from kite_spread_repository import KiteSpreadRepository
 
 
@@ -68,7 +68,11 @@ class KiteSpreadUniverse:
         return saved
 
     def list_watchlist(self, active_only: bool = False) -> list[dict[str, Any]]:
-        return [annotate_income_growth_row(row) for row in self.repository.list_watchlist(active_only=active_only)]
+        return [
+            annotate_income_growth_row(row)
+            for row in self.repository.list_watchlist(active_only=active_only)
+            if str(row.get("symbol") or "").upper().strip() not in DHAN_EXCLUDED_NON_FNO_SYMBOLS
+        ]
 
     def active_watchlist(self) -> list[dict[str, Any]]:
         return self.list_watchlist(active_only=True)

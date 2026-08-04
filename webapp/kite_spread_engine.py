@@ -8,6 +8,7 @@ from typing import Any
 import kite_spread_config as spread_cfg
 from kite_spread_income_universe import ce_coverage_reason
 from kite_option_resolver import KiteOptionResolver
+from kite_option_liquidity import analyze_pair_liquidity
 from risk_engine import RiskVetoEngine
 
 
@@ -109,13 +110,24 @@ def build_kite_spread_preview(symbol: str, cmp: float | None, strategy: str, exp
     sell_ts = str(sell.get("tradingsymbol") or "")
     buy_ts = str(buy.get("tradingsymbol") or "")
     quotes = {}
+    quote_fetch_attempted = False
     if adapter and sell_ts and buy_ts:
         try:
+            quote_fetch_attempted = True
             quotes = adapter.get_quote([f"NFO:{sell_ts}", f"NFO:{buy_ts}"])
         except Exception:
             quotes = {}
-    sell_q = _quote_metrics(quotes.get(f"NFO:{sell_ts}") or sell)
-    buy_q = _quote_metrics(quotes.get(f"NFO:{buy_ts}") or buy)
+    sell_quote = quotes.get(f"NFO:{sell_ts}") or {}
+    buy_quote = quotes.get(f"NFO:{buy_ts}") or {}
+    sell_q = _quote_metrics(sell_quote or sell)
+    buy_q = _quote_metrics(buy_quote or buy)
+    pair_liquidity = analyze_pair_liquidity(
+        sell_ts,
+        sell_quote,
+        buy_ts,
+        buy_quote,
+        allow_fallback=not quote_fetch_attempted,
+    )
     sell_premium, buy_premium = sell_q["ltp"], buy_q["ltp"]
     if sell_premium <= 0 or buy_premium <= 0:
         reasons.append("OPTION_PREMIUM_UNAVAILABLE")
@@ -146,6 +158,8 @@ def build_kite_spread_preview(symbol: str, cmp: float | None, strategy: str, exp
         reasons.append("RETURN_ON_RISK_TOO_LOW")
     if event_risk:
         reasons.append("EVENT_RISK")
+    if not pair_liquidity.get("liquidity_order_allowed", True):
+        reasons.append("LIQUIDITY_RED_ORDER_BLOCKED")
     option_type = "CE" if strategy == "BEAR_CALL_SPREAD" else "PE"
     coverage_reason = ce_coverage_reason(symbol, lots, lot_size) if option_type == "CE" else ""
     if coverage_reason:
@@ -175,7 +189,7 @@ def build_kite_spread_preview(symbol: str, cmp: float | None, strategy: str, exp
         "buy_limit_price": round(buy_premium, 2), "net_credit": round(net_credit, 2),
         "spread_width": spread_width, "max_gain": round(max_gain, 2), "max_loss": round(max_loss, 2),
         "breakeven": round(breakeven, 2), "return_on_risk_pct": round(ror, 2), "pop_estimate": pop,
-        "pop_is_approx": approx, "margin_required": 0, "liquidity_view": "OK" if not any(r in reasons for r in ("LOW_LIQUIDITY", "WIDE_BID_ASK", "MISSING_OI")) else "WEAK",
+        "pop_is_approx": approx, "margin_required": 0, "liquidity_view": "OK" if pair_liquidity.get("pair_liquidity_condition") in {"AMBER", "GREEN"} and not any(r in reasons for r in ("LOW_LIQUIDITY", "WIDE_BID_ASK", "MISSING_OI")) else "WEAK",
         "event_risk": "YES" if event_risk else "NO", "risk_decision": "BLOCKED" if reasons else "APPROVED",
         "risk_reason": "; ".join(reasons) if reasons else "Spread risk checks passed.", "risk_engine": risk,
         "risk_veto_advisory": risk_veto_advisory,
@@ -186,6 +200,21 @@ def build_kite_spread_preview(symbol: str, cmp: float | None, strategy: str, exp
         "raw_hedge_target_strike": round(raw_hedge_target_strike, 2),
         "reason": "; ".join(reasons) if reasons else "Spread risk checks passed.",
         "sell_leg": sell, "buy_leg": buy,
+        "sell_leg_liquidity": pair_liquidity.get("sell_leg_liquidity") or {},
+        "hedge_leg_liquidity": pair_liquidity.get("hedge_leg_liquidity") or {},
+        "pair_liquidity_condition": pair_liquidity.get("pair_liquidity_condition"),
+        "liquidity_order_allowed": pair_liquidity.get("liquidity_order_allowed"),
+        "liquidity_reason": pair_liquidity.get("liquidity_reason"),
+        "sell_leg_buy_orders": (pair_liquidity.get("sell_leg_liquidity") or {}).get("top_5_buy_order_count"),
+        "sell_leg_sell_orders": (pair_liquidity.get("sell_leg_liquidity") or {}).get("top_5_sell_order_count"),
+        "sell_leg_trade_activity": (pair_liquidity.get("sell_leg_liquidity") or {}).get("trade_activity_count"),
+        "sell_leg_trade_count_source": (pair_liquidity.get("sell_leg_liquidity") or {}).get("trade_count_source"),
+        "sell_leg_liquidity_condition": (pair_liquidity.get("sell_leg_liquidity") or {}).get("liquidity_condition"),
+        "hedge_leg_buy_orders": (pair_liquidity.get("hedge_leg_liquidity") or {}).get("top_5_buy_order_count"),
+        "hedge_leg_sell_orders": (pair_liquidity.get("hedge_leg_liquidity") or {}).get("top_5_sell_order_count"),
+        "hedge_leg_trade_activity": (pair_liquidity.get("hedge_leg_liquidity") or {}).get("trade_activity_count"),
+        "hedge_leg_trade_count_source": (pair_liquidity.get("hedge_leg_liquidity") or {}).get("trade_count_source"),
+        "hedge_leg_liquidity_condition": (pair_liquidity.get("hedge_leg_liquidity") or {}).get("liquidity_condition"),
         "order_payload": {
             "mode": "PAPER_DEFAULT",
             "sequence": "BUY hedge first, then SELL after hedge completion",
