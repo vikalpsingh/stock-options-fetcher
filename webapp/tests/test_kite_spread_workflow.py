@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import app
+import kite_option_liquidity
 import risk_config
 from kite_broker_adapter import KiteBrokerAdapter
 from kite_spread_evaluator import evaluate_spread_with_expiry_comparison
@@ -12,7 +13,7 @@ from kite_option_resolver import KiteOptionResolver, next_otm_strike
 from kite_pair_execution import submit_kite_pair
 from kite_pair_scheduler import run_kite_pair_scheduler_once
 from kite_spread_engine import build_kite_spread_preview, fetch_cmp_from_kite, fetch_fresh_equity_quotes_from_kite
-from kite_option_liquidity import analyze_pair_liquidity
+from kite_option_liquidity import analyze_option_liquidity, analyze_pair_liquidity
 from kite_spread_income_universe import INCOME_GROWTH_FNO_HOLDINGS
 from kite_spread_repository import KiteSpreadRepository
 from kite_spread_universe import KiteSpreadUniverse
@@ -172,22 +173,48 @@ def test_pair_liquidity_amber_when_both_legs_are_acceptable_below_green():
     assert result["liquidity_order_allowed"] is True
 
 
-def test_pair_liquidity_red_when_one_leg_buy_orders_below_threshold():
-    bad = depth_quote(50, 500)
+def test_pair_liquidity_red_when_overall_orders_below_threshold():
+    bad = depth_quote(500, 500)
+    for row in bad["depth"]["buy"]:
+        row["orders"] = 2
+    for row in bad["depth"]["sell"]:
+        row["orders"] = 0
     result = analyze_pair_liquidity("SELL", bad, "BUY", depth_quote(500, 500))
 
     assert result["pair_liquidity_condition"] == "RED"
     assert result["liquidity_order_allowed"] is False
 
 
-def test_pair_liquidity_red_when_one_leg_sell_orders_below_threshold():
+def test_pair_liquidity_accepts_one_sided_depth_when_overall_orders_meet_threshold():
     bad = depth_quote(500, 500)
+    for row in bad["depth"]["buy"]:
+        row["orders"] = 0
     for row in bad["depth"]["sell"]:
-        row["orders"] = 10
+        row["orders"] = 4
     result = analyze_pair_liquidity("SELL", depth_quote(500, 500), "BUY", bad)
 
-    assert result["pair_liquidity_condition"] == "RED"
-    assert result["liquidity_order_allowed"] is False
+    assert result["hedge_leg_liquidity"]["overall_order_count"] == 20
+    assert result["pair_liquidity_condition"] == "AMBER"
+    assert result["liquidity_order_allowed"] is True
+
+
+def test_pair_liquidity_accepts_minimum_20_overall_orders():
+    result = analyze_pair_liquidity("SELL", depth_quote(10, 500), "BUY", depth_quote(10, 500))
+
+    assert result["sell_leg_liquidity"]["overall_order_count"] == 20
+    assert result["pair_liquidity_condition"] == "AMBER"
+    assert result["liquidity_order_allowed"] is True
+
+
+def test_option_liquidity_after_hours_missing_depth_is_advisory(monkeypatch):
+    monkeypatch.setattr(kite_option_liquidity, "is_nfo_market_open", lambda now=None: False)
+    quote = {"last_price": 50.0, "volume": 0, "oi": 1000, "depth": {"buy": [], "sell": []}}
+
+    result = analyze_option_liquidity("NAUKRI26AUGCE", quote)
+
+    assert result["liquidity_condition"] == "AMBER"
+    assert result["order_allowed"] is True
+    assert "Market is closed" in result["liquidity_reason"]
 
 
 def test_pair_liquidity_red_when_trade_activity_below_threshold():
@@ -479,8 +506,7 @@ def test_dhan_page_seeds_income_growth_fno_holdings(tmp_path, monkeypatch):
         assert holding.symbol in html
     assert "NUVAMA" not in html
     assert "BAJFINANCE" in html
-    assert "2310" in html
-    assert "max covered CE lots: 1" in html or "Max CE Lots" in html
+    assert "Max CE Lots" not in html
 
 
 def test_dhan_page_exposes_paper_and_live_execution_modes(tmp_path, monkeypatch):
@@ -501,6 +527,7 @@ def test_dhan_stock_rows_have_simple_pe_ce_evaluation_actions(tmp_path, monkeypa
     html = app.render_kite_spreads_panel(app.PageState(active_tab="kite-spreads"))
 
     assert "Current F&O Stock List - Select PE or CE" in html
+    assert "dhan-watchlist-scroll" in html
     assert "Run Analysis" in html
     assert "/kite-spreads/open-symbol" in html
     assert "Run Analysis on All Stocks" in html
@@ -534,6 +561,70 @@ def test_dhan_stock_rows_show_52_week_high_gap(tmp_path, monkeypatch):
     assert "dhan-52w-far" in html
 
 
+def test_dhan_parent_stock_table_shows_latest_fno_sheet_evaluation_details():
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_watchlist=[
+                {
+                    "id": 1,
+                    "symbol": "ALKEM",
+                    "company_name": "Alkem Labs",
+                    "active": 1,
+                    "cmp": 5620,
+                    "day_change_pct": 1.2,
+                    "stock_bucket": "FNO_SHEET_TOP10",
+                    "holding_qty": 0,
+                    "max_covered_lots": 0,
+                }
+            ],
+            dhan_pair_orders=[],
+            dhan_holding_positions=[],
+            dhan_fno_top10_run={
+                "top10": [
+                    {
+                        "rank": 1,
+                        "symbol": "ALKEM",
+                        "source_tab": "CE_WHEEL_SHORTLIST",
+                        "dhan_strategy": "BEAR_CALL_SPREAD",
+                        "spot_price_sheet": 5597.5,
+                        "cmp_kite": 5620,
+                        "sheet_strike": 6000,
+                        "sheet_premium": 49.4,
+                        "sheet_total_premium": 6175,
+                        "otm_pct": 7,
+                        "expiry": "2026-08-25",
+                        "itm_risk_pct": 7,
+                        "liquidity_tag": "High",
+                        "pair_liquidity_condition": "AMBER",
+                        "wheel_score": 90,
+                        "sheet_score": 97,
+                        "dhan_evaluation_score": 95,
+                        "final_score": 87.5,
+                        "max_gain": 6200,
+                        "max_loss": 31300,
+                        "pop_estimate": 72.5,
+                        "return_on_risk_pct": 19.81,
+                        "live_status": "LIVE_BLOCKED",
+                        "live_risk_decision": "NO_TRADE",
+                        "risk_reason": "liquidity weak",
+                    }
+                ]
+            },
+        )
+    )
+
+    assert "Strike / Premium" in html
+    assert "Live Status / Risk Reason" in html
+    assert "6000.00" in html
+    assert "49.40 prem" in html
+    assert "Final <strong>87.50</strong>" in html
+    assert "6200.00" in html
+    assert "72.50%" in html
+    assert "LIVE_BLOCKED" in html
+    assert "liquidity weak" in html
+
+
 def test_dhan_configure_stocks_and_dma_zone_recommend_actions():
     html = app.render_kite_spreads_panel(
         app.PageState(
@@ -548,7 +639,7 @@ def test_dhan_configure_stocks_and_dma_zone_recommend_actions():
                     "cmp": 90,
                     "dma_50": 100,
                     "dma_200": 110,
-                    "stock_bucket": "MANUAL",
+                    "stock_bucket": "INCOME_GROWTH_FNO",
                     "holding_qty": 0,
                     "max_covered_lots": 0,
                 },
@@ -587,9 +678,16 @@ def test_dhan_configure_stocks_and_dma_zone_recommend_actions():
     assert 'name="dhan_fno_sheet" type="file"' in html
     assert 'formaction="/kite-spreads/fno-sheet-analyze"' in html
     assert 'formaction="/kite-spreads/fno-sheet-add-selected"' in html
+    assert 'formaction="/kite-spreads/fno-sheet-remove-selected"' in html
+    assert "Remove Selected Top 10 from DHAN Watchlist" in html
     assert 'formaction="/kite-spreads/fno-sheet-evaluate-top10"' in html
     assert 'formaction="/kite-spreads/add-stock"' in html
+    assert 'formaction="/kite-spreads/deactivate-non-igf"' in html
+    assert "Remove All Except IGF Base Holdings" in html
     assert 'formaction="/kite-spreads/deactivate" name="dhan_watchlist_id" value="1"' in html
+    assert "Stock / Remove" in html
+    assert ">IGF</span>" in html
+    assert "INCOME_GROWTH_FNO" not in html
     assert "DMA Zone" in html
     assert "BUY ZONE" in html
     assert "SELL ZONE" in html
@@ -1388,6 +1486,7 @@ def test_dhan_current_position_table_clubs_open_option_buckets():
     assert rows[0]["dma_zone"] == "SELL ZONE"
     assert "Current Kite Option Holdings / Pair Status" in html
     assert "CMP / DMA Zone" in html
+    assert html.index("<th>Action</th>") < html.index("<th>SELL Option Holdings</th>")
     assert "SELL ZONE" in html
     assert "OTM 5.00% | POP 70.00% approx" in html
     assert "SHORT CE UNHEDGED" in html

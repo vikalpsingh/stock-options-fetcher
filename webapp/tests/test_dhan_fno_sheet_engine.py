@@ -3,7 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
 
-from dhan_fno_sheet_importer import EXPECTED_COLUMNS, parse_fno_opportunities_xlsx
+from dhan_fno_sheet_importer import EXPECTED_COLUMNS, clean_number, parse_fno_opportunities_xlsx
 from dhan_fno_sheet_scoring import DhanFnoSheetScoringEngine
 from dhan_fno_top10_engine import generate_dhan_top10_from_fno_sheet
 from kite_spread_repository import KiteSpreadRepository
@@ -155,13 +155,39 @@ def test_missing_tabs_do_not_crash():
     assert "PE_WHEEL_SHORTLIST" in parsed["missing_tabs"]
 
 
+def test_case_insensitive_sheet_name_match_works():
+    data = make_xlsx({" ce_wheel_shortlist ": [row("CASE")]})
+    parsed = parse_fno_opportunities_xlsx(data, selected_tabs=["CE_WHEEL_SHORTLIST"])
+
+    assert parsed["ce_rows_read"] == 1
+    assert parsed["candidates"][0]["symbol"] == "CASE"
+    assert " ce_wheel_shortlist " in parsed["available_sheets"]
+
+
+def test_numeric_cleaner_handles_currency_percent_commas_and_blanks():
+    assert clean_number("₹5,200") == 5200
+    assert clean_number("7%") == 7
+    assert clean_number("5,200") == 5200
+    assert clean_number("") == 0
+    assert clean_number("HIGH") == 0
+
+
+def test_missing_optional_columns_and_missing_premium_still_show_candidate():
+    data = make_xlsx({"CE_WHEEL_SHORTLIST": [{"Stock": "MISS", "Wheel Score": 88}]})
+    result = generate_dhan_top10_from_fno_sheet(data, live_validator=passing_live)
+
+    assert result["debug"]["rows_with_symbol"] == 1
+    assert result["top10"][0]["symbol"] == "MISS"
+    assert result["top10"][0]["sheet_data_status"] == "SHEET_DATA_MISSING"
+
+
 def test_filters_low_wheel_and_high_itm_and_low_liquidity():
     engine = DhanFnoSheetScoringEngine()
     scored, rejected = engine.filter_and_score(
         [row("LOW", wheel=60), row("ITM", itm=15), row("LIQ", liquidity="Low")]
     )
-    assert scored == []
-    reason_text = " ".join(" ".join(item.get("reason_codes", [])) for item in rejected)
+    assert len(scored) == 3
+    reason_text = " ".join(" ".join(item.get("reason_codes", [])) for item in scored + rejected)
     assert "WHEEL_SCORE_BELOW_MIN" in reason_text
     assert "ITM_RISK_ABOVE_MAX" in reason_text
     assert "LIQUIDITY_NOT_ALLOWED" in reason_text
@@ -208,13 +234,81 @@ def test_generates_overall_top10_from_ce_and_pe():
     assert {item["source_tab"] for item in result["top10"]} == {"CE_WHEEL_SHORTLIST", "PE_WHEEL_SHORTLIST"}
 
 
+def test_strict_filters_zero_rows_trigger_fallback_top10():
+    rows = [row(f"LOW{i}", wheel=40 + i, liquidity="Low", total=1000, itm=20) for i in range(12)]
+    result = generate_dhan_top10_from_fno_sheet(make_xlsx({"CE_WHEEL_SHORTLIST": rows}), live_validator=passing_live)
+
+    assert result["debug"]["strict_pass_rows"] == 0
+    assert result["debug"]["fallback_used"] is True
+    assert len(result["top10"]) == 10
+
+
+def test_live_validation_failure_does_not_remove_sheet_candidate():
+    def broken_live(candidate: dict) -> dict:
+        raise RuntimeError("kite unavailable")
+
+    result = generate_dhan_top10_from_fno_sheet(make_xlsx({"CE_WHEEL_SHORTLIST": [row("KITEFAIL")]}), live_validator=broken_live)
+
+    assert result["top10"][0]["symbol"] == "KITEFAIL"
+    assert result["top10"][0]["live_status"] == "LIVE_DATA_MISSING"
+    assert result["top10"][0]["add_to_watchlist_allowed"] is True
+
+
+def test_top10_empty_only_when_no_symbols_exist():
+    result = generate_dhan_top10_from_fno_sheet(make_xlsx({"CE_WHEEL_SHORTLIST": [{"Wheel Score": 99}]}))
+
+    assert result["status"] == "NO_VALID_SYMBOLS"
+    assert result["top10"] == []
+
+
+def test_expected_daily_sheet_top10_strategy_set():
+    expected = {
+        ("ALKEM", "BEAR_CALL_SPREAD"),
+        ("ZYDUSLIFE", "BEAR_CALL_SPREAD"),
+        ("DELHIVERY", "BEAR_CALL_SPREAD"),
+        ("LUPIN", "BEAR_CALL_SPREAD"),
+        ("PATANJALI", "BEAR_CALL_SPREAD"),
+        ("LAURUSLABS", "BULL_PUT_SPREAD"),
+        ("BRITANNIA", "BULL_PUT_SPREAD"),
+        ("FORTIS", "BEAR_CALL_SPREAD"),
+        ("CUMMINSIND", "BEAR_CALL_SPREAD"),
+        ("GLENMARK", "BEAR_CALL_SPREAD"),
+    }
+    ce_rows = [
+        row("ALKEM", wheel=90, total=6175, otm=7, itm=7, rsi=49.7, rel=0.51),
+        row("ZYDUSLIFE", wheel=99, total=5220, otm=8, itm=4, rsi=44.3, rel=16.93),
+        row("DELHIVERY", wheel=91, total=5188, otm=14, itm=4, rsi=45.7, rel=-0.65),
+        row("LUPIN", wheel=96, total=5674, otm=8, itm=3, rsi=48.3, rel=5.3, liquidity="Medium"),
+        row("PATANJALI", wheel=97, total=3195, otm=10, itm=4, rsi=37.8, rel=-23.64),
+        row("FORTIS", wheel=92, total=2945, otm=11, itm=3, rsi=48.9, rel=-2.18),
+        row("CUMMINSIND", wheel=87, total=4360, otm=11, itm=5, rsi=45.1, rel=3.88),
+        row("GLENMARK", wheel=87, total=3412, otm=10, itm=5, rsi=57.1, rel=-0.68),
+        row("APOLLOHOSP", wheel=93, total=2788, otm=8, itm=3, rsi=57.7, rel=10.38),
+        row("HINDALCO", wheel=92, total=3675, otm=11, itm=4, rsi=65.7, rel=-2.34),
+    ]
+    pe_rows = [
+        row("BRITANNIA", tab="PE", wheel=97, total=2794, otm=7, itm=4, rsi=65.5, rel=0.17),
+        row("LAURUSLABS", tab="PE", wheel=81, total=5695, otm=9, itm=8, rsi=80.1, rel=44.33),
+        row("BIOCON", tab="PE", wheel=81, total=3000, otm=10, itm=5, rsi=53.0, rel=8.79),
+        row("DIVISLAB", tab="PE", wheel=85, total=3565, otm=8, itm=7, rsi=73.2, rel=23.05),
+    ]
+    result = generate_dhan_top10_from_fno_sheet(
+        make_xlsx({"CE_WHEEL_SHORTLIST": ce_rows, "PE_WHEEL_SHORTLIST": pe_rows}),
+        live_validator=passing_live,
+    )
+
+    assert {(item["symbol"], item["dhan_strategy"]) for item in result["top10"]} == expected
+
+
 def test_rejects_red_liquidity_after_live_validation():
     def red_live(candidate: dict) -> dict:
         return {**passing_live(candidate), "pair_liquidity_condition": "RED"}
 
     result = generate_dhan_top10_from_fno_sheet(make_xlsx({"CE_WHEEL_SHORTLIST": [row("RED")]}), live_validator=red_live)
-    assert result["top10"] == []
-    assert "LIVE_RED_LIQUIDITY" in result["rejected"][0]["reason_codes"]
+    assert result["top10"][0]["symbol"] == "RED"
+    assert result["top10"][0]["live_status"] == "LIVE_BLOCKED"
+    assert result["top10"][0]["order_allowed"] is False
+    assert "LIVE_RED_LIQUIDITY" in result["top10"][0]["risk_reason"]
 
 
 def test_rejects_when_live_max_gain_below_5000():
@@ -222,8 +316,10 @@ def test_rejects_when_live_max_gain_below_5000():
         return {**passing_live(candidate), "max_gain": 3000}
 
     result = generate_dhan_top10_from_fno_sheet(make_xlsx({"CE_WHEEL_SHORTLIST": [row("LOWGAIN")]}), live_validator=low_gain)
-    assert result["top10"] == []
-    assert "LIVE_MAX_GAIN_BELOW_MIN" in result["rejected"][0]["reason_codes"]
+    assert result["top10"][0]["symbol"] == "LOWGAIN"
+    assert result["top10"][0]["live_status"] == "LIVE_BLOCKED"
+    assert result["top10"][0]["add_to_watchlist_allowed"] is True
+    assert "LIVE_MAX_GAIN_BELOW_MIN" in result["top10"][0]["risk_reason"]
 
 
 def test_repository_saves_run_and_adds_selected_to_watchlist(tmp_path):
@@ -252,3 +348,38 @@ def test_repository_does_not_duplicate_existing_fno_sheet_watchlist(tmp_path):
     assert first["added"] == 1
     assert second["updated"] == 1
     assert len(rows) == 1
+
+
+def test_repository_removes_selected_fno_sheet_watchlist_without_touching_manual_row(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    repo.upsert_watchlist("ADDME", "Manual ADDME", "MANUAL")
+    result = generate_dhan_top10_from_fno_sheet(make_xlsx({"CE_WHEEL_SHORTLIST": [row("ADDME")]}), live_validator=passing_live)
+    repo.save_dhan_fno_top10_run(result)
+    candidate_id = repo.latest_dhan_fno_top10_run()["top10"][0]["candidate_id"]
+    repo.add_dhan_fno_top10_to_watchlist([candidate_id])
+
+    outcome = repo.remove_dhan_fno_top10_from_watchlist([candidate_id])
+    rows = [item for item in repo.list_watchlist(active_only=False) if item["symbol"] == "ADDME"]
+    manual = next(item for item in rows if item["source"] == "MANUAL")
+    sheet = next(item for item in rows if item["source"] == "FNO_SHEET")
+    latest = repo.latest_dhan_fno_top10_run()
+
+    assert outcome == {"removed": 1, "skipped": 0, "missing": 0}
+    assert manual["active"] == 1
+    assert sheet["active"] == 0
+    assert latest["top10"][0]["selected_for_watchlist"] == 0
+
+
+def test_repository_deactivates_non_igf_watchlist_rows_and_skips_protected_symbols(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    repo.upsert_watchlist("BASE", "Base Holding", "INCOME_GROWTH_FNO")
+    repo.upsert_watchlist("REMOVE", "Sheet Row", "FNO_SHEET")
+    repo.upsert_watchlist("LOCKED", "Open Position Row", "MANUAL")
+
+    outcome = repo.deactivate_watchlist_except_sources({"INCOME_GROWTH_FNO"}, protected_symbols={"LOCKED"})
+    rows = {item["symbol"]: item for item in repo.list_watchlist(active_only=False)}
+
+    assert outcome == {"removed": 1, "kept": 1, "skipped_protected": 1}
+    assert rows["BASE"]["active"] == 1
+    assert rows["LOCKED"]["active"] == 1
+    assert rows["REMOVE"]["active"] == 0

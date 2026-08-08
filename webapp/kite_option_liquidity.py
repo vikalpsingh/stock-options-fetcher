@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import risk_config
 
@@ -17,13 +19,23 @@ def _num(value: Any) -> float:
 def _sum_depth(depth_rows: Any, field: str) -> float:
     if not isinstance(depth_rows, list):
         return 0.0
-    return sum(_num((row or {}).get(field)) for row in depth_rows[:5] if isinstance(row, dict))
+    return sum(_num((row or {}).get(field)) for row in depth_rows if isinstance(row, dict))
 
 
 def _best_depth_price(depth_rows: Any) -> float:
     if not isinstance(depth_rows, list) or not depth_rows:
         return 0.0
     return _num((depth_rows[0] or {}).get("price"))
+
+
+def is_nfo_market_open(now: datetime | None = None) -> bool:
+    """Return True during regular NSE/NFO market hours in India."""
+
+    current = now or datetime.now(ZoneInfo("Asia/Kolkata"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+    current = current.astimezone(ZoneInfo("Asia/Kolkata"))
+    return current.weekday() < 5 and time(9, 15) <= current.time() <= time(15, 30)
 
 
 def analyze_option_liquidity(tradingsymbol: str, quote: dict[str, Any] | None) -> dict[str, Any]:
@@ -38,6 +50,7 @@ def analyze_option_liquidity(tradingsymbol: str, quote: dict[str, Any] | None) -
     best_ask = _best_depth_price(sell_depth) or _num(clean_quote.get("best_ask") or clean_quote.get("ask"))
     buy_orders = _sum_depth(buy_depth, "orders")
     sell_orders = _sum_depth(sell_depth, "orders")
+    total_orders = buy_orders + sell_orders
     buy_qty = _sum_depth(buy_depth, "quantity") or _num(clean_quote.get("buy_quantity"))
     sell_qty = _sum_depth(sell_depth, "quantity") or _num(clean_quote.get("sell_quantity"))
     volume = _num(clean_quote.get("volume"))
@@ -47,12 +60,12 @@ def analyze_option_liquidity(tradingsymbol: str, quote: dict[str, Any] | None) -
     trade_count_source = "ACTUAL_TRADE_COUNT" if has_actual_trade_count else "VOLUME_PROXY"
     spread = max(best_ask - best_bid, 0.0) if best_bid and best_ask else 0.0
     spread_pct = (spread / last_price * 100) if last_price else 0.0
+    market_open = is_nfo_market_open()
 
     red_reasons: list[str] = []
-    if buy_orders < risk_config.LIQUIDITY_AMBER_MIN_BUY_ORDERS:
-        red_reasons.append(f"top 5 buy order count {buy_orders:.0f} below {risk_config.LIQUIDITY_AMBER_MIN_BUY_ORDERS}")
-    if sell_orders < risk_config.LIQUIDITY_AMBER_MIN_SELL_ORDERS:
-        red_reasons.append(f"top 5 sell order count {sell_orders:.0f} below {risk_config.LIQUIDITY_AMBER_MIN_SELL_ORDERS}")
+    min_total_orders = int(getattr(risk_config, "LIQUIDITY_AMBER_MIN_TOTAL_ORDERS", 20) or 20)
+    if total_orders < min_total_orders:
+        red_reasons.append(f"overall depth order count {total_orders:.0f} below {min_total_orders}")
     if trade_activity < risk_config.LIQUIDITY_AMBER_MIN_TRADE_ACTIVITY:
         red_reasons.append(f"trade activity {trade_activity:.0f} below {risk_config.LIQUIDITY_AMBER_MIN_TRADE_ACTIVITY}")
     if best_bid <= 0:
@@ -61,6 +74,37 @@ def analyze_option_liquidity(tradingsymbol: str, quote: dict[str, Any] | None) -
         red_reasons.append("best ask unavailable")
     if last_price <= 0:
         red_reasons.append("LTP unavailable")
+
+    after_hours_depth_unavailable = not market_open and (
+        best_bid <= 0
+        or best_ask <= 0
+        or (buy_orders <= 0 and sell_orders <= 0)
+    )
+    if red_reasons and after_hours_depth_unavailable and last_price > 0:
+        condition = "AMBER"
+        reason = (
+            "Market is closed; Kite depth/orders can be stale or unavailable. "
+            "Liquidity block bypassed after hours; verify live depth during market hours before LIVE order."
+        )
+        return {
+            "tradingsymbol": tradingsymbol,
+            "best_bid": round(best_bid, 2),
+            "best_ask": round(best_ask, 2),
+            "bid_ask_spread": round(spread, 2),
+            "bid_ask_spread_pct": round(spread_pct, 2),
+            "volume": int(volume),
+            "oi": int(oi),
+            "top_5_buy_order_count": int(buy_orders),
+            "top_5_sell_order_count": int(sell_orders),
+            "overall_order_count": int(total_orders),
+            "top_5_buy_quantity": int(buy_qty),
+            "top_5_sell_quantity": int(sell_qty),
+            "trade_activity_count": int(trade_activity),
+            "trade_count_source": trade_count_source,
+            "liquidity_condition": condition,
+            "liquidity_reason": reason,
+            "order_allowed": True,
+        }
 
     if red_reasons:
         condition = "RED"
@@ -71,10 +115,10 @@ def analyze_option_liquidity(tradingsymbol: str, quote: dict[str, Any] | None) -
         and trade_activity >= risk_config.LIQUIDITY_GREEN_MIN_TRADE_ACTIVITY
     ):
         condition = "GREEN"
-        reason = "Strong liquidity from top 5 depth orders and trade activity."
+        reason = "Strong liquidity from available depth orders and trade activity."
     else:
         condition = "AMBER"
-        reason = "Acceptable liquidity from top 5 depth orders and trade activity."
+        reason = "Acceptable liquidity from available depth orders and trade activity."
 
     return {
         "tradingsymbol": tradingsymbol,
@@ -86,6 +130,7 @@ def analyze_option_liquidity(tradingsymbol: str, quote: dict[str, Any] | None) -
         "oi": int(oi),
         "top_5_buy_order_count": int(buy_orders),
         "top_5_sell_order_count": int(sell_orders),
+        "overall_order_count": int(total_orders),
         "top_5_buy_quantity": int(buy_qty),
         "top_5_sell_quantity": int(sell_qty),
         "trade_activity_count": int(trade_activity),
@@ -107,6 +152,7 @@ def fallback_option_liquidity(tradingsymbol: str, reason: str = "Live Kite depth
         "oi": 0,
         "top_5_buy_order_count": 0,
         "top_5_sell_order_count": 0,
+        "overall_order_count": 0,
         "top_5_buy_quantity": 0,
         "top_5_sell_quantity": 0,
         "trade_activity_count": 0,

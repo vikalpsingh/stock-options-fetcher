@@ -29,11 +29,15 @@ OPTION_CAPITAL_DEPLOYED = 1_000_000.0
 
 # Option liquidity depth gates ---------------------------------------------
 
-# Buy orders = sum of order count from top 5 bid depth.
-LIQUIDITY_AMBER_MIN_BUY_ORDERS = 100
+# Overall orders = total order count from available bid + ask depth.
+LIQUIDITY_AMBER_MIN_TOTAL_ORDERS = 20
 
-# Sell orders = sum of order count from top 5 ask depth.
-LIQUIDITY_AMBER_MIN_SELL_ORDERS = 100
+# Legacy per-side fields are kept for compatibility; the active gate uses
+# LIQUIDITY_AMBER_MIN_TOTAL_ORDERS so far-OTM/monthly options are not blocked
+# only because one side of depth is sparse.
+LIQUIDITY_AMBER_MIN_BUY_ORDERS = 20
+
+LIQUIDITY_AMBER_MIN_SELL_ORDERS = 20
 
 # Trade activity = actual number_of_trades if available; otherwise Kite volume proxy.
 LIQUIDITY_AMBER_MIN_TRADE_ACTIVITY = 100

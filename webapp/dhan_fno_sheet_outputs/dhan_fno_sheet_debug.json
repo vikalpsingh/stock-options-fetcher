@@ -1,13 +1,4 @@
 {
-  "status": "OK",
-  "message": "Generated sheet-based DHAN candidates with live validation status.",
-  "generated_at": "2026-08-08T23:34:20+05:30",
-  "source_file_name": "FNO_Opportunities_Report_29_apr_26.xlsx",
-  "ce_rows_read": 244,
-  "pe_rows_read": 179,
-  "rows_after_basic_filter": 150,
-  "rows_after_sheet_score": 135,
-  "rows_after_live_validation": 40,
   "debug": {
     "available_sheets": [
       "CE_OPPORTUNITIES",

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
@@ -123,6 +123,32 @@ COLUMN_TO_FIELD = {
     "Block/Bulk Activity": "block_bulk_activity",
 }
 
+COLUMN_ALIASES = {
+    "symbol": ("Stock", "Symbol", "Trading Symbol", "stock", "symbol"),
+    "spot_price": ("Spot Price", "Spot", "CMP", "Last Price", "Underlying Price"),
+    "strike": ("Strike", "Strike Price"),
+    "premium": ("Premium", "Option Premium", "LTP", "Price"),
+    "lot_size": ("Lot Size", "Lot"),
+    "total_premium": ("Total Premium", "Premium Value", "Total Value"),
+    "otm_pct": ("% OTM", "OTM %", "OTM Percent"),
+    "expiry": ("Expiry", "Expiry Date"),
+    "days_to_expiry": ("Days to Expiry", "DTE"),
+    "itm_risk_pct": ("ITM Risk %", "ITM Risk", "Risk %"),
+    "premium_yield_pct": ("Premium Yield %", "Yield %"),
+    "monthly_yield_pct": ("Monthly Yield %",),
+    "move_cover": ("Move Cover",),
+    "liquidity_tag": ("Liquidity Tag", "Liquidity"),
+    "wheel_score": ("Wheel Score", "Score"),
+    "wheel_action": ("Wheel Action", "Action"),
+    "safety_band": ("Safety Band", "Safety"),
+    "volatility_tag": ("Volatility Tag", "Volatility"),
+    "rsi_14": ("RSI 14", "RSI"),
+    "relative_strength_3m": ("Rel Str vs Nifty 3M", "Relative Strength", "RS 3M"),
+    "dip_signal": ("Dip Signal",),
+    "insider_activity": ("Insider Activity",),
+    "block_bulk_activity": ("Block/Bulk Activity",),
+}
+
 NS = {
     "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
@@ -146,15 +172,24 @@ def _clean_header(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
-def _to_number(value: Any) -> float:
-    text = str(value or "").strip().replace(",", "")
-    if not text or text in {"-", "NA", "N/A"}:
+def _header_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def clean_number(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"-", "na", "n/a", "nan", "none"}:
         return 0.0
-    text = text.rstrip("%")
+    text = text.replace("₹", "").replace("Rs.", "").replace("Rs", "")
+    text = text.replace(",", "").replace("%", "").strip()
     try:
         return float(text)
     except ValueError:
         return 0.0
+
+
+def _to_number(value: Any) -> float:
+    return clean_number(value)
 
 
 def _normalize_expiry(value: Any) -> str:
@@ -223,8 +258,16 @@ def _workbook_sheet_paths(zf: ZipFile) -> dict[str, str]:
     return out
 
 
-def _normalize_row(raw: dict[str, Any], source_tab: str, row_number: int) -> dict[str, Any] | None:
-    symbol = str(raw.get("Stock") or "").strip().upper()
+def _match_sheet_name(sheet_paths: dict[str, str], requested: str) -> tuple[str | None, str | None]:
+    requested_key = _header_key(requested)
+    for actual, path in sheet_paths.items():
+        if _header_key(actual) == requested_key:
+            return actual, path
+    return None, None
+
+
+def _normalize_row(raw: dict[str, Any], source_tab: str, row_number: int, warnings: list[str] | None = None) -> dict[str, Any] | None:
+    symbol = str(raw.get("symbol") or "").strip().upper()
     if not symbol:
         return None
     candidate: dict[str, Any] = {
@@ -233,8 +276,8 @@ def _normalize_row(raw: dict[str, Any], source_tab: str, row_number: int) -> dic
         "dhan_strategy": SOURCE_TO_STRATEGY[source_tab],
         "source_row_number": row_number,
     }
-    for column, field in COLUMN_TO_FIELD.items():
-        value = raw.get(column, "")
+    for field in COLUMN_ALIASES:
+        value = raw.get(field, "")
         if field == "symbol":
             continue
         if field == "expiry":
@@ -243,11 +286,19 @@ def _normalize_row(raw: dict[str, Any], source_tab: str, row_number: int) -> dic
             candidate[field] = _to_number(value)
         else:
             candidate[field] = str(value or "").strip()
+    missing_core = [field for field in ("strike", "premium", "lot_size") if not candidate.get(field)]
+    if missing_core:
+        candidate["sheet_data_status"] = "SHEET_DATA_MISSING"
+        candidate["sheet_data_missing_fields"] = missing_core
+        if warnings is not None:
+            warnings.append(f"{symbol} row {row_number}: missing {', '.join(missing_core)}")
+    else:
+        candidate["sheet_data_status"] = "SHEET_READY"
     return candidate
 
 
 def parse_fno_opportunities_xlsx(
-    content: bytes,
+    content: bytes | BinaryIO,
     *,
     selected_tabs: list[str] | tuple[str, ...] | None = None,
     source_file_name: str = "",
@@ -257,34 +308,73 @@ def parse_fno_opportunities_xlsx(
     tabs = tuple(tab for tab in (selected_tabs or SUPPORTED_SHEETS) if tab in SUPPORTED_SHEETS)
     candidates: list[dict[str, Any]] = []
     rows_read = {"CE_WHEEL_SHORTLIST": 0, "PE_WHEEL_SHORTLIST": 0}
+    rows_seen = {"CE_WHEEL_SHORTLIST": 0, "PE_WHEEL_SHORTLIST": 0}
     missing_tabs: list[str] = []
-    with ZipFile(Path(source_file_name) if isinstance(content, Path) else __import__("io").BytesIO(content)) as zf:
+    warnings: list[str] = []
+    debug: dict[str, Any] = {
+        "available_sheets": [],
+        "selected_tabs": list(tabs),
+        "ce_tab_found": False,
+        "pe_tab_found": False,
+        "ce_rows_read": 0,
+        "pe_rows_read": 0,
+        "total_rows_read": 0,
+        "original_columns": {},
+        "normalized_columns": {},
+        "rows_dropped": [],
+    }
+    if hasattr(content, "seek"):
+        content.seek(0)  # type: ignore[union-attr]
+        payload: Any = content
+    else:
+        payload = Path(source_file_name) if isinstance(content, Path) else __import__("io").BytesIO(content)
+    with ZipFile(payload) as zf:
         shared_strings = _read_shared_strings(zf)
         sheet_paths = _workbook_sheet_paths(zf)
+        debug["available_sheets"] = list(sheet_paths)
         for tab in tabs:
-            sheet_path = sheet_paths.get(tab)
+            actual_sheet, sheet_path = _match_sheet_name(sheet_paths, tab)
             if not sheet_path:
                 missing_tabs.append(tab)
                 continue
+            debug["ce_tab_found" if tab == "CE_WHEEL_SHORTLIST" else "pe_tab_found"] = True
             rows = _read_sheet_rows(zf, sheet_path, shared_strings)
             if not rows:
                 continue
             headers = [_clean_header(value) for value in rows[0]]
-            header_index = {header: idx for idx, header in enumerate(headers) if header}
+            debug["original_columns"][tab] = headers
+            header_index = {_header_key(header): idx for idx, header in enumerate(headers) if header}
+            field_index: dict[str, int] = {}
+            for field, aliases in COLUMN_ALIASES.items():
+                for alias in aliases:
+                    key = _header_key(alias)
+                    if key in header_index:
+                        field_index[field] = header_index[key]
+                        break
+            debug["normalized_columns"][tab] = sorted(field_index)
             for excel_row_number, row in enumerate(rows[1:], start=2):
-                raw = {
-                    column: row[header_index[column]] if column in header_index and header_index[column] < len(row) else ""
-                    for column in EXPECTED_COLUMNS
-                }
-                candidate = _normalize_row(raw, tab, excel_row_number)
+                rows_seen[tab] += 1
+                raw = {field: row[idx] if idx < len(row) else "" for field, idx in field_index.items()}
+                candidate = _normalize_row(raw, tab, excel_row_number, warnings)
                 if candidate:
+                    candidate["actual_sheet_name"] = actual_sheet or tab
+                    candidate["source_file_name"] = source_file_name
                     candidates.append(candidate)
                     rows_read[tab] += 1
+                else:
+                    debug["rows_dropped"].append({"source_tab": tab, "row_number": excel_row_number, "reason": "BLANK_SYMBOL"})
+    debug["ce_rows_read"] = rows_read["CE_WHEEL_SHORTLIST"]
+    debug["pe_rows_read"] = rows_read["PE_WHEEL_SHORTLIST"]
+    debug["total_rows_read"] = rows_read["CE_WHEEL_SHORTLIST"] + rows_read["PE_WHEEL_SHORTLIST"]
     return {
         "source_file_name": source_file_name,
         "candidates": candidates,
         "ce_rows_read": rows_read["CE_WHEEL_SHORTLIST"],
         "pe_rows_read": rows_read["PE_WHEEL_SHORTLIST"],
+        "ce_rows_seen": rows_seen["CE_WHEEL_SHORTLIST"],
+        "pe_rows_seen": rows_seen["PE_WHEEL_SHORTLIST"],
+        "available_sheets": debug["available_sheets"],
         "missing_tabs": missing_tabs,
+        "warnings": warnings,
+        "debug": debug,
     }
-

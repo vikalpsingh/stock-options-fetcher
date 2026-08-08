@@ -782,7 +782,7 @@ def test_monitor_blocks_sell_when_refreshed_liquidity_turns_red(tmp_path):
     broker = MockBroker()
     result = submit_dhan_it_pair(approved_preview(), repo, broker, user_confirmed=True, mode="PAPER")
     broker.orders = [{"order_id": "MOCK-1", "status": "COMPLETE"}]
-    broker.quotes = {"TCS08271050CE": depth_quote(50, 500)}
+    broker.quotes = {"TCS08271050CE": depth_quote(4, 500)}
 
     monitor_result = run_dhan_it_pair_monitor_once(repo, broker)
     pair_after_check = repo.get_pair(result["pair_id"])

@@ -19721,6 +19721,10 @@ def render_pair_liquidity_section(selected: dict[str, Any], paper_mode: bool = F
         condition = str(value or "").upper()
         return "good" if condition == "GREEN" else "neutral" if condition == "AMBER" else "bad"
 
+    def compact_bucket_label(value: Any) -> str:
+        label = text_value(value, "MANUAL_FNO")
+        return "IGF" if label.upper() == "INCOME_GROWTH_FNO" else label
+
     def condition_class(value: Any) -> str:
         condition = str(value or "").upper()
         return "good" if condition == "GREEN" else "neutral" if condition == "AMBER" else "bad"
@@ -20370,11 +20374,11 @@ def render_dhan_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             f"<tr{row_class}>"
             f"<td><strong>{html.escape(symbol)}</strong><small>{html.escape(option_type)} bucket</small></td>"
             f"<td class=\"dhan-cmp-zone-cell\">{cmp_cell}</td>"
+            f"<td class=\"dhan-pair-action-cell\">{button}</td>"
             f"<td>{option_chips(row.get('sell_options'), 'SELL', option_type)}</td>"
             f"<td>{option_chips(row.get('buy_options'), 'BUY', option_type)}</td>"
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(pair_status)}</span></td>"
             f"<td class=\"dhan-pair-suggestion-cell\">{html.escape(text_value(row.get('suggestion')))}</td>"
-            f"<td class=\"dhan-pair-action-cell\">{button}</td>"
             "</tr>"
         )
     if not rendered_rows:
@@ -20384,7 +20388,7 @@ def render_dhan_holding_positions(rows: list[dict[str, Any]] | None) -> str:
         '<div class="panel-title">Current Kite Option Holdings / Pair Status</div>'
         '<p class="status">Shows only current open option positions for active DHAN stocks. SELL legs are red, BUY hedges are green, and multiple lots/legs are clubbed by stock + CE/PE bucket. DMA zone: below 50/200 DMA = BUY zone, above 50/200 DMA = SELL zone, between them = neutral.</p>'
         '<div class="table-wrap"><table class="ipo-table dhan-it-position-table">'
-        '<thead><tr><th>Stock</th><th>CMP / DMA Zone</th><th>SELL Option Holdings</th><th>BUY Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th><th>Action</th></tr></thead>'
+        '<thead><tr><th>Stock</th><th>CMP / DMA Zone</th><th>Action</th><th>SELL Option Holdings</th><th>BUY Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th></tr></thead>'
         f'<tbody>{"".join(rendered_rows)}</tbody></table></div></section>'
     )
 
@@ -20685,9 +20689,19 @@ def render_kite_spreads_panel(state: PageState) -> str:
         condition = str(value or "").upper()
         return "good" if condition == "GREEN" else "neutral" if condition == "AMBER" else "bad"
 
+    def compact_bucket_label(value: Any) -> str:
+        label = text_value(value, "MANUAL_FNO")
+        return "IGF" if label.upper() == "INCOME_GROWTH_FNO" else label
+
     income_growth_by_symbol = {
         str(item.get("symbol") or "").upper(): item
         for item in INCOME_GROWTH_SHEET
+    }
+    fno_run = state.dhan_fno_top10_run or {}
+    fno_top10_by_symbol = {
+        str(item.get("symbol") or "").strip().upper(): item
+        for item in fno_run.get("top10") or []
+        if str(item.get("symbol") or "").strip()
     }
 
     def dhan_52w_gap(row: dict[str, Any]) -> tuple[str, str, str]:
@@ -20724,6 +20738,8 @@ def render_kite_spreads_panel(state: PageState) -> str:
         active = "YES" if int(row.get("active") or 0) else "NO"
         if active != "YES":
             continue
+        row_symbol = str(row.get("symbol") or "").strip().upper()
+        fno_detail = fno_top10_by_symbol.get(row_symbol) or {}
         row_class = ' class="current-holding"' if int(row.get("is_current_holding") or 0) else ""
         symbol_value = html.escape(text_value(row.get("symbol")), quote=True)
         company_name = text_value(row.get("company_name"), "")
@@ -20738,13 +20754,23 @@ def render_kite_spreads_panel(state: PageState) -> str:
         dma_ctx = dhan_stock_dma_context(str(row.get("symbol") or ""), row)
         zone_class = str(dma_ctx.get("dma_zone_class") or "neutral")
         preferred_action = str(dma_ctx.get("preferred_action") or "")
+        if str(row.get("source") or "").upper() == "FNO_SHEET":
+            gpt_view = str(row.get("gpt_view") or "").upper()
+            if gpt_view == "PE_SELL":
+                preferred_action = "PE"
+            elif gpt_view == "CE_SELL":
+                preferred_action = "CE"
+        fno_strategy_badge = "CE" if fno_detail.get("dhan_strategy") == "BEAR_CALL_SPREAD" else "PE" if fno_detail.get("dhan_strategy") == "BULL_PUT_SPREAD" else "-"
+        fno_live_status = str(fno_detail.get("live_status") or "").upper()
+        fno_live_class = "bad" if fno_live_status in {"LIVE_BLOCKED", "LIVE_DATA_MISSING", "BLOCKED"} else "good" if fno_live_status else "neutral"
+        fno_liquidity_class = liquidity_badge_class(fno_detail.get("pair_liquidity_condition"))
+        fno_reason = text_value(fno_detail.get("risk_reason") or fno_detail.get("sheet_reason"), "")
         pe_button_class = "dhan-action-btn dhan-action-pe"
         ce_button_class = "dhan-action-btn dhan-action-ce"
         if preferred_action == "PE":
             pe_button_class += " dhan-action-recommended"
         elif preferred_action == "CE":
             ce_button_class += " dhan-action-recommended"
-        row_symbol = str(row.get("symbol") or "").strip().upper()
         remove_disabled = " disabled" if row_symbol in protected_dhan_symbols else ""
         remove_title = (
             " title=\"Open option position exists; use Current Kite Option Holdings / Pair Status before removing.\""
@@ -20757,11 +20783,14 @@ def render_kite_spreads_panel(state: PageState) -> str:
             f"<td>{money(row.get('cmp'))}<small class=\"{row_day_change_class}\">{html.escape(text_value(row.get('day_change_pct')))}%</small></td>"
             f"<td class=\"dhan-cmp-zone-cell\"><span class=\"ipo-badge {html.escape(zone_class)}\">{html.escape(text_value(dma_ctx.get('dma_zone')))}</span><small>50 DMA {money(dma_ctx.get('dma_50'))} | 200 DMA {money(dma_ctx.get('dma_200'))}</small><small>{html.escape(text_value(dma_ctx.get('dma_zone_reason'), ''))}</small></td>"
             f"<td class=\"dhan-52w-cell {gap_class}\"><strong>{html.escape(gap_label)}</strong><small>{html.escape(gap_detail)}</small></td>"
-            f"<td><span class=\"ipo-badge neutral\">{html.escape(text_value(row.get('stock_bucket')).replace('_', ' '))}</span></td>"
-            f"<td>{html.escape(text_value(row.get('holding_qty')))}</td>"
-            f"<td><strong>{html.escape(text_value(row.get('max_covered_lots')))}</strong><small>{html.escape(coverage_note)}</small></td>"
-            f"<td><span class=\"ipo-badge {'good' if active == 'YES' else 'neutral'}\">{html.escape(active)}</span></td>"
-            f"<td><span class=\"ipo-badge {'bad' if event_risk else 'good'}\">{'YES' if event_risk else 'NO'}</span></td>"
+            f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('spot_price_sheet'))}<small>Kite {money(fno_detail.get('cmp_kite'))}</small></td>"
+            f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('sheet_strike'))}<small>{money(fno_detail.get('sheet_premium'))} prem | {money(fno_detail.get('sheet_total_premium'))} total</small></td>"
+            f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('otm_pct'))}%<small>ITM {money(fno_detail.get('itm_risk_pct'))}% | Exp {html.escape(text_value(fno_detail.get('expiry')))}</small></td>"
+            f"<td class=\"dhan-fno-parent-cell\"><span class=\"ipo-badge {fno_liquidity_class}\">{html.escape(text_value(fno_detail.get('liquidity_tag')))}</span><small>Live {html.escape(text_value(fno_detail.get('pair_liquidity_condition')))}</small></td>"
+            f"<td class=\"dhan-fno-parent-cell\">Wheel {money(fno_detail.get('wheel_score'))}<small>Sheet {money(fno_detail.get('sheet_score'))} | Eval {money(fno_detail.get('dhan_evaluation_score'))} | Final <strong>{money(fno_detail.get('final_score'))}</strong></small></td>"
+            f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('max_gain'))}<small>Loss {money(fno_detail.get('max_loss'))}</small></td>"
+            f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('pop_estimate'))}%<small>RoR {money(fno_detail.get('return_on_risk_pct'))}%</small></td>"
+            f"<td class=\"dhan-fno-parent-cell dhan-fno-risk-reason\"><span class=\"ipo-badge {fno_live_class}\">{html.escape(text_value(fno_detail.get('live_status')))}</span><small>{html.escape(text_value(fno_detail.get('live_risk_decision') or fno_detail.get('risk_decision')))}</small><small>{html.escape(fno_reason)}</small></td>"
             "<td class=\"dhan-action-cell\">"
             f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-primary\" formaction=\"/kite-spreads/open-symbol\" name=\"dhan_open_symbol\" value=\"{symbol_value}\">Analyze</button>"
             f"<button type=\"submit\" class=\"{pe_button_class}\" formaction=\"/kite-spreads/evaluate-symbol\" name=\"dhan_eval\" value=\"{symbol_value}|BULL_PUT_SPREAD\">PE</button>"
@@ -20771,7 +20800,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
             "</tr>"
         )
     if not watch_rows:
-        watch_rows.append('<tr><td colspan="10" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
+        watch_rows.append('<tr><td colspan="13" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
 
     active_config_rows = []
     for row in watchlist:
@@ -20781,34 +20810,37 @@ def render_kite_spreads_panel(state: PageState) -> str:
         is_protected = row_symbol in protected_dhan_symbols
         config_dma = dhan_stock_dma_context(row_symbol, row)
         config_zone_class = str(config_dma.get("dma_zone_class") or "neutral")
-        remove_cell = (
-            '<span class="ipo-badge warn">Locked: open position</span>'
+        remove_control = (
+            '<span class="ipo-badge warn" title="Locked: open position">Locked: open position</span>'
             if is_protected
             else f'<button type="submit" class="danger-link" formaction="/kite-spreads/deactivate" name="dhan_watchlist_id" value="{html.escape(str(row.get("id") or ""), quote=True)}">Remove</button>'
         )
+        bucket_label = compact_bucket_label(row.get("stock_bucket"))
         active_config_rows.append(
             "<tr>"
-            f"<td><strong>{html.escape(text_value(row.get('symbol')))}</strong><small>{html.escape(text_value(row.get('company_name'), ''))}</small></td>"
+            f"<td><div class=\"dhan-config-stock-cell\"><span><strong>{html.escape(text_value(row.get('symbol')))}</strong><small>{html.escape(text_value(row.get('company_name'), ''))}</small></span>{remove_control}</div></td>"
             f"<td>{money(row.get('cmp'))}<small>{html.escape(text_value(row.get('day_change_pct'), ''))}%</small></td>"
             f"<td><span class=\"ipo-badge {html.escape(config_zone_class)}\">{html.escape(text_value(config_dma.get('dma_zone'), 'DATA PENDING'))}</span><small>50 DMA {money(config_dma.get('dma_50'))} | 200 DMA {money(config_dma.get('dma_200'))}</small></td>"
-            f"<td>{html.escape(text_value(row.get('stock_bucket'), 'MANUAL_FNO'))}</td>"
+            f"<td><span class=\"ipo-badge neutral\">{html.escape(bucket_label)}</span></td>"
             f"<td>{html.escape(text_value(row.get('holding_qty'), '0'))}</td>"
-            f"<td>{remove_cell}</td>"
             "</tr>"
         )
     fno_run = state.dhan_fno_top10_run or {}
+    fno_debug = ((fno_run.get("top10") or [{}])[0].get("run_debug") if fno_run.get("top10") else {}) or {}
+    fno_run_message = ((fno_run.get("top10") or [{}])[0].get("run_message") if fno_run.get("top10") else "") or ""
     fno_top10_rows = []
     for row in fno_run.get("top10") or []:
         row_class = "dhan-fno-ce-row" if row.get("source_tab") == "CE_WHEEL_SHORTLIST" else "dhan-fno-pe-row"
-        if str(row.get("risk_decision") or "").upper() == "BLOCKED":
+        if str(row.get("live_status") or row.get("risk_decision") or "").upper() in {"LIVE_BLOCKED", "LIVE_DATA_MISSING", "BLOCKED"}:
             row_class += " dhan-fno-blocked-row"
         checked_attr = "" if row.get("selected_for_watchlist") else " checked"
+        strategy_badge = "CE" if row.get("dhan_strategy") == "BEAR_CALL_SPREAD" else "PE"
         fno_top10_rows.append(
             f"<tr class=\"{row_class}\">"
             f"<td><input type=\"checkbox\" name=\"dhan_fno_candidate_id\" value=\"{html.escape(str(row.get('candidate_id') or ''), quote=True)}\"{checked_attr}></td>"
             f"<td>{html.escape(text_value(row.get('rank')))}</td>"
             f"<td><strong>{html.escape(text_value(row.get('symbol')))}</strong><small>{html.escape(text_value(row.get('trader_comment'), ''))}</small></td>"
-            f"<td>{html.escape(text_value(row.get('source_tab')))}<small>{html.escape(text_value(row.get('dhan_strategy')))}</small></td>"
+            f"<td>{html.escape(text_value(row.get('source_tab')))}<small><span class=\"ipo-badge good\">{strategy_badge}</span> {html.escape(text_value(row.get('dhan_strategy')))}</small></td>"
             f"<td>{money(row.get('spot_price_sheet'))}<small>Kite {money(row.get('cmp_kite'))}</small></td>"
             f"<td>{money(row.get('sheet_strike'))}<small>{money(row.get('sheet_premium'))} prem</small></td>"
             f"<td>{money(row.get('sheet_total_premium'))}</td>"
@@ -20817,21 +20849,37 @@ def render_kite_spreads_panel(state: PageState) -> str:
             f"<td>{money(row.get('itm_risk_pct'))}%</td>"
             f"<td>{html.escape(text_value(row.get('liquidity_tag')))}<small>Live {html.escape(text_value(row.get('pair_liquidity_condition')))}</small></td>"
             f"<td>{money(row.get('wheel_score'))}</td>"
-            f"<td>{money(row.get('sheet_score'))}</td>"
+            f"<td>{money(row.get('sheet_score'))}<small>{html.escape(text_value(row.get('sheet_decision')))}</small></td>"
             f"<td>{money(row.get('dhan_evaluation_score'))}</td>"
             f"<td><strong>{money(row.get('final_score'))}</strong></td>"
             f"<td>{money(row.get('max_gain'))}<small>Loss {money(row.get('max_loss'))}</small></td>"
             f"<td>{money(row.get('pop_estimate'))}%<small>RoR {money(row.get('return_on_risk_pct'))}%</small></td>"
-            f"<td>{html.escape(text_value(row.get('risk_reason'), ''))}</td>"
+            f"<td>{html.escape(text_value(row.get('live_status')))}<small>{html.escape(text_value(row.get('live_risk_decision') or row.get('risk_decision')))}</small></td>"
+            f"<td>{html.escape(text_value(row.get('risk_reason') or row.get('sheet_reason'), ''))}</td>"
             "</tr>"
         )
     fno_summary = (
         f"Latest sheet: {html.escape(text_value(fno_run.get('source_file_name')))} | "
         f"CE {html.escape(text_value(fno_run.get('ce_rows_read'), '0'))} / PE {html.escape(text_value(fno_run.get('pe_rows_read'), '0'))} rows | "
+        f"Rows with symbols {html.escape(text_value(fno_debug.get('rows_with_symbol'), text_value(fno_run.get('rows_after_basic_filter'), '0')))} | "
+        f"Scored {html.escape(text_value(fno_debug.get('rows_scored'), text_value(fno_run.get('rows_after_basic_filter'), '0')))} | "
+        f"Fallback {'YES' if fno_debug.get('fallback_used') else 'NO'} | "
+        f"Live approved {html.escape(text_value(fno_debug.get('live_approved_count'), '0'))} / blocked {html.escape(text_value(fno_debug.get('live_blocked_count'), '0'))} | "
         f"Top rows {len(fno_run.get('top10') or [])}"
         if fno_run
         else "Upload and analyze a daily F&O Opportunities workbook to produce candidates."
     )
+    fno_parse_cards = ""
+    if fno_run:
+        sheets_text = ", ".join(str(item) for item in (fno_debug.get("available_sheets") or []))
+        fno_parse_cards = (
+            '<div class="dhan-ticket-summary dhan-fno-summary-cards">'
+            f'<article><span>Sheet Parse Summary</span><strong>{html.escape(text_value(fno_debug.get("total_rows_read"), text_value((fno_run.get("ce_rows_read") or 0) + (fno_run.get("pe_rows_read") or 0))))}</strong><small>CE {html.escape(text_value(fno_run.get("ce_rows_read"), "0"))} | PE {html.escape(text_value(fno_run.get("pe_rows_read"), "0"))}</small></article>'
+            f'<article><span>Sheet Candidates</span><strong>{html.escape(text_value(fno_debug.get("top10_count"), str(len(fno_run.get("top10") or []))))}</strong><small>{html.escape(fno_run_message or "Sheet-based Top candidates remain visible even if live validation blocks.")}</small></article>'
+            f'<article><span>Live DHAN Validation</span><strong>{html.escape(text_value(fno_debug.get("live_approved_count"), "0"))} OK</strong><small>{html.escape(text_value(fno_debug.get("live_blocked_count"), "0"))} blocked/data missing</small></article>'
+            f'<article><span>Available sheets</span><strong>{html.escape(text_value(len(fno_debug.get("available_sheets") or [])))}</strong><small>{html.escape(sheets_text or "No sheet list stored")}</small></article>'
+            '</div>'
+        )
     fno_ce_checked = " checked" if state.dhan_fno_include_ce else ""
     fno_pe_checked = " checked" if state.dhan_fno_include_pe else ""
     fno_prime_checked = " checked" if state.dhan_fno_only_prime_selective else ""
@@ -20848,6 +20896,9 @@ def render_kite_spreads_panel(state: PageState) -> str:
                 <p class="status">Add or remove stocks shown in the Current F&amp;O Stock List. Rows with open option positions are locked until the position is repaired or closed.</p>
               </div>
               <button type="submit" class="secondary" formaction="/kite-spreads/configure-close">Close</button>
+            </div>
+            <div class="actions dhan-config-cleanup-actions">
+              <button type="submit" class="secondary" formaction="/kite-spreads/deactivate-non-igf">Remove All Except IGF Base Holdings</button>
             </div>
             <div class="compact-grid dhan-config-add-grid">
               <label><span>Symbol</span><input name="dhan_manual_symbol" value="{html.escape(state.dhan_manual_symbol, quote=True)}" placeholder="RELIANCE"></label>
@@ -20873,19 +20924,21 @@ def render_kite_spreads_panel(state: PageState) -> str:
               <div class="actions">
                 <button type="submit" formaction="/kite-spreads/fno-sheet-analyze">Analyze F&amp;O Sheet</button>
                 <button type="submit" formaction="/kite-spreads/fno-sheet-add-selected" class="success">Add Selected Top 10 to DHAN Watchlist</button>
+                <button type="submit" formaction="/kite-spreads/fno-sheet-remove-selected" class="secondary">Remove Selected Top 10 from DHAN Watchlist</button>
                 <button type="submit" formaction="/kite-spreads/fno-sheet-evaluate-top10" class="secondary">Evaluate Top 10 Now</button>
               </div>
+              {fno_parse_cards}
               <div class="table-wrap">
                 <table class="ipo-table dhan-fno-top10-table">
-                  <thead><tr><th>Select</th><th>Rank</th><th>Stock</th><th>Strategy Source</th><th>Spot</th><th>Strike/Premium</th><th>Total Premium</th><th>% OTM</th><th>Expiry</th><th>ITM Risk</th><th>Liquidity</th><th>Wheel</th><th>Sheet</th><th>DHAN Eval</th><th>Final</th><th>Gain/Loss</th><th>POP/RoR</th><th>Risk Reason</th></tr></thead>
-                  <tbody>{''.join(fno_top10_rows) or '<tr><td colspan="18" class="muted-cell">No DHAN Sheet Top 10 Candidates yet. Upload and analyze an .xlsx file.</td></tr>'}</tbody>
+                  <thead><tr><th>Select</th><th>Rank</th><th>Stock</th><th>Strategy Source</th><th>Spot</th><th>Strike/Premium</th><th>Total Premium</th><th>% OTM</th><th>Expiry</th><th>ITM Risk</th><th>Liquidity</th><th>Wheel</th><th>Sheet</th><th>DHAN Eval</th><th>Final</th><th>Gain/Loss</th><th>POP/RoR</th><th>Live Status</th><th>Risk Reason</th></tr></thead>
+                  <tbody>{''.join(fno_top10_rows) or '<tr><td colspan="19" class="muted-cell">No DHAN Sheet Top 10 Candidates yet. Upload and analyze an .xlsx file.</td></tr>'}</tbody>
                 </table>
               </div>
             </section>
             <div class="table-wrap">
               <table class="ipo-table dhan-config-table">
-                <thead><tr><th>Stock</th><th>CMP / Day</th><th>DMA Details</th><th>Bucket</th><th>Shares</th><th>Action</th></tr></thead>
-                <tbody>{''.join(active_config_rows) or '<tr><td colspan="6" class="muted-cell">No active DHAN stocks configured.</td></tr>'}</tbody>
+                <thead><tr><th>Stock / Remove</th><th>CMP / Day</th><th>DMA Details</th><th>Bucket</th><th>Shares</th></tr></thead>
+                <tbody>{''.join(active_config_rows) or '<tr><td colspan="5" class="muted-cell">No active DHAN stocks configured.</td></tr>'}</tbody>
               </table>
             </div>
           </div>
@@ -21316,7 +21369,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
       <section class="panel dhan-watchlist-panel">
         <div class="panel-title">Current F&O Stock List - Select PE or CE</div>
         <p class="status">Choose Evaluate PE or Evaluate CE for one stock. The popup reviews a 5% OTM SELL and 10% OTM BUY hedge pair before any Kite order is allowed.</p>
-        <div class="table-wrap"><table class="ipo-table dhan-watchlist-table"><thead><tr><th>Symbol</th><th>CMP / Day</th><th>DMA Zone</th><th>52W High Gap</th><th>Bucket</th><th>Shares</th><th>Max CE Lots</th><th>Active</th><th>Event Risk</th><th>Actions</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
+        <div class="table-wrap dhan-watchlist-scroll"><table class="ipo-table dhan-watchlist-table"><thead><tr><th>Symbol</th><th>CMP / Day</th><th>DMA Zone</th><th>52W High Gap</th><th>Spot</th><th>Strike / Premium</th><th>OTM / Expiry</th><th>Liquidity</th><th>Scores</th><th>Gain / Loss</th><th>POP / RoR</th><th>Live Status / Risk Reason</th><th>Actions</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
       </section>
       <section class="panel dhan-opportunities-panel{best_pair_section_class}">
         <div class="panel-title">Opportunity Table - Compare POP, Gain and Risk</div>
@@ -30824,7 +30877,41 @@ def render_page(state: PageState) -> bytes:
       font-size: 12px;
     }}
     .dhan-watchlist-table td {{
-      vertical-align: middle;
+      vertical-align: top;
+      font-size: 12px;
+      line-height: 1.25;
+    }}
+    .dhan-watchlist-table th {{
+      white-space: nowrap;
+    }}
+    .dhan-watchlist-scroll {{
+      max-height: 560px;
+      overflow-y: auto;
+      overflow-x: auto;
+      border: 1px solid #dbeafe;
+      border-radius: 14px;
+    }}
+    .dhan-watchlist-scroll .dhan-watchlist-table th {{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }}
+    .dhan-fno-parent-cell {{
+      min-width: 112px;
+      white-space: normal;
+    }}
+    .dhan-fno-parent-cell small {{
+      display: block;
+      margin-top: 3px;
+      color: #475569;
+      font-size: 10.5px;
+      font-weight: 750;
+      line-height: 1.25;
+    }}
+    .dhan-fno-risk-reason {{
+      min-width: 220px;
+      max-width: 300px;
+      word-break: break-word;
     }}
     .dhan-mode-toggle {{
       display: flex;
@@ -31049,6 +31136,23 @@ def render_page(state: PageState) -> bytes:
     .dhan-config-table td:first-child strong {{
       display: block;
       color: #0f766e;
+    }}
+    .dhan-config-stock-cell {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 210px;
+    }}
+    .dhan-config-stock-cell .danger-link {{
+      flex: 0 0 auto;
+      margin-top: 0;
+      padding: 4px 8px;
+      font-size: 11px;
+    }}
+    .dhan-config-cleanup-actions {{
+      justify-content: flex-end;
+      margin: 8px 0 12px;
     }}
     .dhan-config-table td small {{
       display: block;
@@ -31475,26 +31579,39 @@ def render_page(state: PageState) -> bytes:
     .dhan-it-position-table td {{
       vertical-align: top;
     }}
+    .dhan-it-position-table {{
+      table-layout: auto;
+    }}
+    .dhan-it-position-table th:nth-child(1),
+    .dhan-it-position-table td:nth-child(1) {{
+      min-width: 86px;
+      max-width: 110px;
+    }}
+    .dhan-it-position-table th:nth-child(2),
+    .dhan-it-position-table td:nth-child(2) {{
+      min-width: 138px;
+      max-width: 178px;
+    }}
     .dhan-it-position-table .dhan-pair-suggestion-cell {{
-      min-width: 220px;
-      max-width: 320px;
+      min-width: 170px;
+      max-width: 240px;
       white-space: normal;
       overflow-wrap: anywhere;
-      line-height: 1.35;
+      line-height: 1.25;
       color: #0f172a;
-      font-size: 12px;
+      font-size: 11.5px;
     }}
     .dhan-it-position-table .dhan-pair-action-cell {{
-      width: 92px;
-      min-width: 92px;
-      max-width: 110px;
+      width: 76px;
+      min-width: 76px;
+      max-width: 90px;
       text-align: center;
       white-space: nowrap;
     }}
     .dhan-it-position-table .dhan-pair-action-cell .dhan-action-btn {{
-      padding: 6px 9px;
+      padding: 6px 8px;
       min-height: 28px;
-      font-size: 10.5px;
+      font-size: 10px;
       box-shadow: none;
     }}
     .dhan-it-position-table tr.dhan-repair-pending-row td {{
@@ -31506,18 +31623,19 @@ def render_page(state: PageState) -> bytes:
       display: block;
       margin-top: 3px;
       color: #64748b;
-      max-width: 220px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      max-width: 180px;
+      overflow-wrap: anywhere;
+      white-space: normal;
+      line-height: 1.2;
     }}
     .dhan-it-option-chip {{
       border-radius: 12px;
-      padding: 7px 9px;
+      padding: 6px 8px;
       margin: 2px 0 5px;
       border: 1px solid #e2e8f0;
       box-shadow: 0 5px 14px rgba(15, 23, 42, 0.05);
-      min-width: 190px;
+      min-width: 150px;
+      max-width: 190px;
     }}
     .dhan-it-option-chip span {{
       display: block;
@@ -31527,7 +31645,7 @@ def render_page(state: PageState) -> bytes:
     }}
     .dhan-it-option-chip strong {{
       display: block;
-      font-size: 19px;
+      font-size: 17px;
       line-height: 1;
       margin: 2px 0 3px;
     }}
@@ -37853,8 +37971,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 "/kite-spreads/configure-close",
                 "/kite-spreads/add-stock",
                 "/kite-spreads/deactivate",
+                "/kite-spreads/deactivate-non-igf",
                 "/kite-spreads/fno-sheet-analyze",
                 "/kite-spreads/fno-sheet-add-selected",
+                "/kite-spreads/fno-sheet-remove-selected",
                 "/kite-spreads/fno-sheet-evaluate-top10",
                 "/kite-spreads/gpt-refresh",
             }:
@@ -37891,6 +38011,18 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     universe.deactivate_stock(row_id)
                     state.dhan_show_config = True
                     state.message = "Deactivated selected DHAN watchlist row."
+                elif request_path == "/kite-spreads/deactivate-non-igf":
+                    holding_rows = load_dhan_holding_position_rows(universe.list_watchlist())
+                    protected_symbols = dhan_symbols_with_open_option_positions(holding_rows)
+                    result = repository.deactivate_watchlist_except_sources(
+                        {"INCOME_GROWTH_FNO"},
+                        protected_symbols=protected_symbols,
+                    )
+                    state.dhan_show_config = True
+                    state.message = (
+                        f"Removed {result.get('removed', 0)} non-IGF DHAN watchlist row(s). "
+                        f"Kept {result.get('kept', 0)} IGF base row(s); skipped {result.get('skipped_protected', 0)} row(s) with open option positions."
+                    )
                 elif request_path == "/kite-spreads/fno-sheet-analyze":
                     upload = uploaded_files.get("dhan_fno_sheet") or {}
                     if not upload.get("content"):
@@ -37927,6 +38059,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.dhan_show_config = True
                     state.message = (
                         f"Added {result.get('added', 0)} and updated {result.get('updated', 0)} F&O sheet candidate(s) in DHAN watchlist."
+                    )
+                elif request_path == "/kite-spreads/fno-sheet-remove-selected":
+                    candidate_ids = [int(float(item)) for item in form.get("dhan_fno_candidate_id", []) if str(item or "").strip()]
+                    result = repository.remove_dhan_fno_top10_from_watchlist(candidate_ids)
+                    state.dhan_show_config = True
+                    state.message = (
+                        f"Removed {result.get('removed', 0)} selected F&O sheet candidate(s) from DHAN watchlist. "
+                        f"Skipped {result.get('skipped', 0)} and missing {result.get('missing', 0)}."
                     )
                 elif request_path == "/kite-spreads/fno-sheet-evaluate-top10":
                     latest = repository.latest_dhan_fno_top10_run()

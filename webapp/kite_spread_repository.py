@@ -193,6 +193,40 @@ class KiteSpreadRepository:
             cur = conn.execute("UPDATE kite_spread_watchlist SET active=0, updated_at=? WHERE id=?", (now_text(), int(row_id)))
         return cur.rowcount > 0
 
+    def deactivate_watchlist_except_sources(
+        self,
+        keep_sources: set[str],
+        protected_symbols: set[str] | None = None,
+    ) -> dict[str, int]:
+        normalized_sources = {str(item or "").strip().upper() for item in keep_sources}
+        normalized_symbols = {str(item or "").strip().upper() for item in (protected_symbols or set())}
+        removed = 0
+        kept = 0
+        skipped_protected = 0
+        stamp = now_text()
+        with self.connect() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT id, symbol, source FROM kite_spread_watchlist WHERE active=1"
+                ).fetchall()
+            ]
+            for row in rows:
+                symbol = str(row.get("symbol") or "").strip().upper()
+                source = str(row.get("source") or "").strip().upper()
+                if source in normalized_sources:
+                    kept += 1
+                    continue
+                if symbol in normalized_symbols:
+                    skipped_protected += 1
+                    continue
+                cur = conn.execute(
+                    "UPDATE kite_spread_watchlist SET active=0, updated_at=? WHERE id=?",
+                    (stamp, int(row["id"])),
+                )
+                removed += int(cur.rowcount or 0)
+        return {"removed": removed, "kept": kept, "skipped_protected": skipped_protected}
+
     def list_watchlist(self, active_only: bool = False) -> list[dict[str, Any]]:
         query = "SELECT * FROM kite_spread_watchlist"
         if active_only:
@@ -330,6 +364,50 @@ class KiteSpreadRepository:
                 updated += 1 if existed else 0
                 added += 0 if existed else 1
         return {"added": added, "updated": updated, "missing": missing}
+
+    def remove_dhan_fno_top10_from_watchlist(self, candidate_ids: list[int]) -> dict[str, int]:
+        if not candidate_ids:
+            return {"removed": 0, "skipped": 0, "missing": 0}
+        removed = 0
+        skipped = 0
+        missing = 0
+        clean_ids = [int(item) for item in candidate_ids]
+        with self.connect() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM dhan_fno_top10_candidates WHERE id IN ({','.join('?' for _ in clean_ids)})",
+                    clean_ids,
+                ).fetchall()
+            ]
+            by_id = {int(row["id"]): row for row in rows}
+            for candidate_id in clean_ids:
+                row = by_id.get(candidate_id)
+                if not row:
+                    missing += 1
+                    continue
+                payload = json.loads(row.get("payload_json") or "{}")
+                symbol = str(row.get("symbol") or payload.get("symbol") or "").strip().upper()
+                if not symbol:
+                    missing += 1
+                    continue
+                cur = conn.execute(
+                    """
+                    UPDATE kite_spread_watchlist
+                    SET active=0, updated_at=?
+                    WHERE symbol=? AND source='FNO_SHEET' AND active=1
+                    """,
+                    (now_text(), symbol),
+                )
+                conn.execute(
+                    "UPDATE dhan_fno_top10_candidates SET selected_for_watchlist=0 WHERE id=?",
+                    (candidate_id,),
+                )
+                if cur.rowcount > 0:
+                    removed += int(cur.rowcount)
+                else:
+                    skipped += 1
+        return {"removed": removed, "skipped": skipped, "missing": missing}
 
     def create_pair(self, preview: dict[str, Any], mode: str = "PAPER", user_confirmed: bool = True, execution_mode: str = "HEDGE_FIRST") -> str:
         pair_id = str(preview.get("pair_id") or f"KSP-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}")
