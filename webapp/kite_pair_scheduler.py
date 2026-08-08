@@ -36,6 +36,8 @@ def run_kite_pair_scheduler_once(repository: KiteSpreadRepository, broker: Any, 
         sell_status = status(by_id.get(sell_id), pair.get("sell_leg_status") or "PENDING")
         payload = json.loads(pair.get("payload_json") or "{}")
         if buy_status in FAILED:
+            if sell_id and sell_status not in COMPLETE:
+                broker.cancel_order("regular", sell_id)
             repository.update_pair(pair_id, buy_leg_status=buy_status, sell_leg_status=sell_status, pair_status="FAILED", last_checked_at=current.isoformat(timespec="seconds"))
             failed += 1
             continue
@@ -45,6 +47,20 @@ def run_kite_pair_scheduler_once(repository: KiteSpreadRepository, broker: Any, 
             continue
         execution_mode = str(pair.get("execution_mode") or "HEDGE_FIRST")
         if execution_mode == "HEDGE_FIRST":
+            if buy_status in COMPLETE and sell_id and sell_status not in COMPLETE and not pair.get("sell_leg_modified_at"):
+                target_price = round(float(payload.get("sell_cmp_limit_price") or payload.get("sell_limit_price") or payload.get("sell_leg_premium") or 0), 2)
+                broker.modify_order("regular", sell_id, {"order_type": "LIMIT", "price": target_price})
+                repository.update_pair(
+                    pair_id,
+                    buy_leg_status=buy_status,
+                    sell_leg_status=sell_status,
+                    sell_leg_modified_at=current.isoformat(timespec="seconds"),
+                    pair_status="HEDGE_FILLED_SELL_REPRICED",
+                    last_checked_at=current.isoformat(timespec="seconds"),
+                )
+                repository.log(pair_id, "SELL_REPRICED_TO_CMP_AFTER_HEDGE", f"{sell_id} @ {target_price}")
+                modified += 1
+                continue
             if buy_status in COMPLETE and not int(pair.get("sell_leg_placed") or 0):
                 sell_payload = payload.get("sell_order_payload") or build_kite_order_payload(pair["sell_leg_tradingsymbol"], "SELL", int(pair["quantity"]), float(payload.get("sell_limit_price") or payload.get("sell_leg_premium") or 0), pair_id[-20:])
                 result = broker.place_order(sell_payload)
@@ -55,6 +71,8 @@ def run_kite_pair_scheduler_once(repository: KiteSpreadRepository, broker: Any, 
             if buy_status not in COMPLETE and (current - datetime.fromisoformat(pair["created_at"])).total_seconds() >= spread_cfg.PAIR_LEG_TIMEOUT_SECONDS:
                 if buy_id:
                     broker.cancel_order("regular", buy_id)
+                if sell_id and sell_status not in COMPLETE:
+                    broker.cancel_order("regular", sell_id)
                 repository.update_pair(pair_id, pair_status="FAILED", buy_leg_status=buy_status, sell_leg_status=sell_status, last_checked_at=current.isoformat(timespec="seconds"))
                 failed += 1
                 continue

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from kite_pair_execution import build_kite_order_payload
+import risk_config
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "dhan_it_outputs"
@@ -159,12 +160,34 @@ class DhanItPairRepository:
 def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepository, broker: Any, user_confirmed: bool, mode: str = "PAPER") -> dict[str, Any]:
     if not user_confirmed:
         raise ValueError("Explicit confirmation is required before placing a DHAN-IT paired spread.")
-    if str(mode or "").upper() != "PAPER" and (
-        str(preview.get("pair_liquidity_condition") or "").upper() == "RED"
-        or preview.get("liquidity_order_allowed") is False
-    ):
+    if str(preview.get("pair_liquidity_condition") or "").upper() == "RED" or preview.get("liquidity_order_allowed") is False:
         repository.log("", "LIQUIDITY_RED_ORDER_BLOCKED", str(preview.get("liquidity_reason") or "RED liquidity blocked order"))
-        raise ValueError("LIQUIDITY_RED_ORDER_BLOCKED: Place Order disabled because liquidity condition is RED.")
+        raise ValueError("LIQUIDITY_RED_ORDER_BLOCKED: DHAN-IT blocks RED liquidity in both Paper and Live mode.")
+    quote_stamp = str(preview.get("option_quote_generated_at") or "").strip()
+    if quote_stamp:
+        try:
+            generated_at = datetime.fromisoformat(quote_stamp.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc)).total_seconds()
+        except ValueError:
+            age = float("inf")
+        if age > float(getattr(risk_config, "DHAN_IT_QUOTE_TTL_SECONDS", 30)):
+            repository.log("", "QUOTE_STALE_ORDER_BLOCKED", f"Quote age {age:.0f}s")
+            raise ValueError("QUOTE_STALE_ORDER_BLOCKED: refresh DHAN-IT liquidity before submitting.")
+    hard_reasons: list[str] = []
+    if float(preview.get("pop_estimate") or 0) < float(getattr(risk_config, "DHAN_IT_MIN_POP", 70.0)):
+        hard_reasons.append("POP below DHAN-IT minimum")
+    if float(preview.get("return_on_risk_pct") or 0) < float(getattr(risk_config, "DHAN_IT_MIN_RETURN_ON_RISK_PCT", 8.0)):
+        hard_reasons.append("return on risk below DHAN-IT minimum")
+    if float(preview.get("max_loss") or 0) > float(getattr(risk_config, "DHAN_IT_MAX_ACCEPTABLE_PAIR_LOSS_INR", 40_000)):
+        hard_reasons.append("max loss above configured limit")
+    if str(preview.get("event_risk") or "").upper() == "YES":
+        hard_reasons.append("event risk")
+    if str(preview.get("dma_status") or "").upper() == "RED":
+        hard_reasons.append("DMA/technical gate RED")
+    if hard_reasons:
+        reason = "; ".join(hard_reasons)
+        repository.log("", "DHAN_IT_RISK_REWARD_BLOCKED", reason)
+        raise ValueError(f"DHAN_IT_RISK_REWARD_BLOCKED: {reason}")
     if str(preview.get("risk_decision") or "").upper() != "APPROVED":
         raise ValueError(f"DHAN-IT spread is blocked: {preview.get('risk_reason') or preview.get('reason')}")
     pair_id = repository.create_pair(preview, mode=mode, user_confirmed=True, execution_mode="HEDGE_FIRST")

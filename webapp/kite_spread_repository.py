@@ -109,6 +109,35 @@ class KiteSpreadRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS dhan_fno_sheet_import_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_file_name TEXT,
+                    generated_at TEXT,
+                    ce_rows_read INTEGER NOT NULL DEFAULT 0,
+                    pe_rows_read INTEGER NOT NULL DEFAULT 0,
+                    rows_after_basic_filter INTEGER NOT NULL DEFAULT 0,
+                    rows_after_sheet_score INTEGER NOT NULL DEFAULT 0,
+                    rows_after_live_validation INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS dhan_fno_top10_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    rank INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    source_tab TEXT,
+                    dhan_strategy TEXT,
+                    sheet_score REAL,
+                    dhan_evaluation_score REAL,
+                    final_score REAL,
+                    recommended_expiry TEXT,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    selected_for_watchlist INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES dhan_fno_sheet_import_runs(id)
+                );
                 """
             )
 
@@ -171,6 +200,136 @@ class KiteSpreadRepository:
         query += " ORDER BY is_current_holding DESC, active DESC, source, symbol"
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(query).fetchall()]
+
+    def save_dhan_fno_top10_run(self, result: dict[str, Any]) -> int:
+        stamp = now_text()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO dhan_fno_sheet_import_runs(
+                    source_file_name, generated_at, ce_rows_read, pe_rows_read,
+                    rows_after_basic_filter, rows_after_sheet_score,
+                    rows_after_live_validation, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.get("source_file_name") or "",
+                    result.get("generated_at") or stamp,
+                    int(result.get("ce_rows_read") or 0),
+                    int(result.get("pe_rows_read") or 0),
+                    int(result.get("rows_after_basic_filter") or 0),
+                    int(result.get("rows_after_sheet_score") or 0),
+                    int(result.get("rows_after_live_validation") or 0),
+                    stamp,
+                ),
+            )
+            run_id = int(cur.lastrowid)
+            for row in result.get("top10") or []:
+                conn.execute(
+                    """
+                    INSERT INTO dhan_fno_top10_candidates(
+                        run_id, rank, symbol, source_tab, dhan_strategy, sheet_score,
+                        dhan_evaluation_score, final_score, recommended_expiry,
+                        payload_json, selected_for_watchlist, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    """,
+                    (
+                        run_id,
+                        int(row.get("rank") or 0),
+                        str(row.get("symbol") or "").upper(),
+                        row.get("source_tab") or "",
+                        row.get("dhan_strategy") or "",
+                        float(row.get("sheet_score") or row.get("final_sheet_score") or 0),
+                        float(row.get("dhan_evaluation_score") or 0),
+                        float(row.get("final_score") or 0),
+                        row.get("recommended_expiry") or "",
+                        json.dumps(row, default=str),
+                        stamp,
+                    ),
+                )
+        return run_id
+
+    def latest_dhan_fno_top10_run(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            run = conn.execute("SELECT * FROM dhan_fno_sheet_import_runs ORDER BY id DESC LIMIT 1").fetchone()
+            if not run:
+                return {}
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM dhan_fno_top10_candidates WHERE run_id=? ORDER BY rank, id",
+                    (int(run["id"]),),
+                ).fetchall()
+            ]
+        candidates = []
+        for row in rows:
+            payload = json.loads(row.get("payload_json") or "{}")
+            payload["candidate_id"] = row["id"]
+            payload["selected_for_watchlist"] = row["selected_for_watchlist"]
+            candidates.append(payload)
+        out = dict(run)
+        out["top10"] = candidates
+        return out
+
+    def add_dhan_fno_top10_to_watchlist(self, candidate_ids: list[int]) -> dict[str, int]:
+        if not candidate_ids:
+            return {"added": 0, "updated": 0, "missing": 0}
+        added = 0
+        updated = 0
+        missing = 0
+        with self.connect() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM dhan_fno_top10_candidates WHERE id IN ({','.join('?' for _ in candidate_ids)})",
+                    [int(item) for item in candidate_ids],
+                ).fetchall()
+            ]
+            by_id = {int(row["id"]): row for row in rows}
+            for candidate_id in candidate_ids:
+                row = by_id.get(int(candidate_id))
+                if not row:
+                    missing += 1
+                    continue
+                payload = json.loads(row.get("payload_json") or "{}")
+                symbol = str(row.get("symbol") or payload.get("symbol") or "").upper()
+                existed = conn.execute(
+                    "SELECT 1 FROM kite_spread_watchlist WHERE symbol=? AND source='FNO_SHEET'",
+                    (symbol,),
+                ).fetchone()
+                reason = (
+                    f"{payload.get('trader_comment') or 'F&O sheet Top 10 candidate'} "
+                    f"| source {payload.get('source_file_name') or ''} | score {payload.get('final_score') or row.get('final_score')}"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO kite_spread_watchlist(
+                        symbol, company_name, source, is_current_holding, holding_qty,
+                        fno_enabled, active, gpt_view, gpt_reason, event_risk_flag,
+                        result_event_date, sector_event_flag, created_at, updated_at, last_gpt_review_date
+                    ) VALUES (?, ?, 'FNO_SHEET', 0, 0, 1, 1, ?, ?, ?, '', 0, ?, ?, '')
+                    ON CONFLICT(symbol, source) DO UPDATE SET
+                        company_name=excluded.company_name,
+                        active=1,
+                        gpt_view=excluded.gpt_view,
+                        gpt_reason=excluded.gpt_reason,
+                        event_risk_flag=excluded.event_risk_flag,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        symbol,
+                        payload.get("company_name") or symbol,
+                        "CE_SELL" if row.get("dhan_strategy") == "BEAR_CALL_SPREAD" else "PE_SELL",
+                        reason,
+                        1 if payload.get("event_risk_flag") else 0,
+                        now_text(),
+                        now_text(),
+                    ),
+                )
+                conn.execute("UPDATE dhan_fno_top10_candidates SET selected_for_watchlist=1 WHERE id=?", (int(candidate_id),))
+                updated += 1 if existed else 0
+                added += 0 if existed else 1
+        return {"added": added, "updated": updated, "missing": missing}
 
     def create_pair(self, preview: dict[str, Any], mode: str = "PAPER", user_confirmed: bool = True, execution_mode: str = "HEDGE_FIRST") -> str:
         pair_id = str(preview.get("pair_id") or f"KSP-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}")

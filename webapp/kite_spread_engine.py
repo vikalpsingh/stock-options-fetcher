@@ -86,12 +86,36 @@ def _pop_estimate(strategy: str, spot: float, sell_strike: float, vix: float = 1
     return round(pop, 1), True
 
 
-def build_kite_spread_preview(symbol: str, cmp: float | None, strategy: str, expiry: str, lots: int, resolver: KiteOptionResolver, adapter: Any | None = None, risk_engine: Any | None = None, event_risk: bool = False, as_of_date: date | None = None) -> dict[str, Any]:
+def build_kite_spread_preview(
+    symbol: str,
+    cmp: float | None,
+    strategy: str,
+    expiry: str,
+    lots: int,
+    resolver: KiteOptionResolver,
+    adapter: Any | None = None,
+    risk_engine: Any | None = None,
+    event_risk: bool = False,
+    as_of_date: date | None = None,
+    sell_otm_pct: float | None = None,
+    hedge_otm_pct: float | None = None,
+) -> dict[str, Any]:
     reasons: list[str] = []
     if not cmp:
         reasons.append("CMP_UNAVAILABLE")
         cmp = 0.0
-    resolved = resolver.resolve_spread_legs(symbol, cmp, expiry, strategy) if cmp else {"error": "CONTRACT_UNRESOLVED"}
+    resolved = (
+        resolver.resolve_spread_legs(
+            symbol,
+            cmp,
+            expiry,
+            strategy,
+            sell_otm_pct=sell_otm_pct,
+            hedge_otm_pct=hedge_otm_pct,
+        )
+        if cmp
+        else {"error": "CONTRACT_UNRESOLVED"}
+    )
     if resolved.get("error"):
         reasons.append("CONTRACT_UNRESOLVED")
         sell = buy = {}
@@ -198,6 +222,8 @@ def build_kite_spread_preview(symbol: str, cmp: float | None, strategy: str, exp
         "hedge_target_strike": hedge_target_strike,
         "raw_sell_target_strike": round(raw_sell_target_strike, 2),
         "raw_hedge_target_strike": round(raw_hedge_target_strike, 2),
+        "sell_otm_pct": sell_otm_pct if sell_otm_pct is not None else 5.0,
+        "hedge_otm_pct": hedge_otm_pct if hedge_otm_pct is not None else 10.0,
         "reason": "; ".join(reasons) if reasons else "Spread risk checks passed.",
         "sell_leg": sell, "buy_leg": buy,
         "sell_leg_liquidity": pair_liquidity.get("sell_leg_liquidity") or {},

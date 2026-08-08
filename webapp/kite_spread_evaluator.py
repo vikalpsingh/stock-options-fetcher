@@ -107,18 +107,37 @@ def _expiry_event_risk(event_data: dict[str, Any] | None, expiry_type: str) -> b
     return bool(typed)
 
 
-def _approved(month: dict[str, Any]) -> tuple[bool, list[str]]:
+def _thresholds(technical_data: dict[str, Any] | None) -> dict[str, float]:
+    data = technical_data or {}
+
+    def configured(key: str, default: float) -> float:
+        try:
+            return float(data.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    return {
+        "min_pair_max_gain": configured("min_pair_max_gain", risk_config.MIN_PAIR_MAX_GAIN_INR),
+        "auto_check_gain_below": configured("auto_check_gain_below", risk_config.AUTO_CHECK_NEXT_EXPIRY_IF_GAIN_BELOW),
+        "min_pop": configured("min_pop", risk_config.MIN_POP_FOR_SPREAD),
+        "min_return_on_risk_pct": configured("min_return_on_risk_pct", risk_config.MIN_RETURN_ON_RISK_PCT),
+        "max_acceptable_pair_loss": configured("max_acceptable_pair_loss", risk_config.MAX_ACCEPTABLE_PAIR_LOSS_INR),
+    }
+
+
+def _approved(month: dict[str, Any], thresholds: dict[str, float] | None = None) -> tuple[bool, list[str]]:
+    limits = thresholds or _thresholds(None)
     reasons: list[str] = []
     if str(month.get("risk_decision") or "").upper() != "APPROVED":
         reasons.append("risk engine did not approve")
-    if _num(month.get("max_gain")) < risk_config.MIN_PAIR_MAX_GAIN_INR:
-        reasons.append(f"max gain below ₹{risk_config.MIN_PAIR_MAX_GAIN_INR:,.0f}")
-    if _num(month.get("pop")) < risk_config.MIN_POP_FOR_SPREAD:
-        reasons.append(f"POP below {risk_config.MIN_POP_FOR_SPREAD}%")
-    if _num(month.get("return_on_risk_pct")) < risk_config.MIN_RETURN_ON_RISK_PCT:
-        reasons.append(f"return on risk below {risk_config.MIN_RETURN_ON_RISK_PCT}%")
-    if _num(month.get("max_loss")) > risk_config.MAX_ACCEPTABLE_PAIR_LOSS_INR:
-        reasons.append(f"max loss above ₹{risk_config.MAX_ACCEPTABLE_PAIR_LOSS_INR:,.0f}")
+    if _num(month.get("max_gain")) < limits["min_pair_max_gain"]:
+        reasons.append(f"max gain below ₹{limits['min_pair_max_gain']:,.0f}")
+    if _num(month.get("pop")) < limits["min_pop"]:
+        reasons.append(f"POP below {limits['min_pop']}%")
+    if _num(month.get("return_on_risk_pct")) < limits["min_return_on_risk_pct"]:
+        reasons.append(f"return on risk below {limits['min_return_on_risk_pct']}%")
+    if _num(month.get("max_loss")) > limits["max_acceptable_pair_loss"]:
+        reasons.append(f"max loss above ₹{limits['max_acceptable_pair_loss']:,.0f}")
     if str(month.get("event_risk") or "").upper() == "YES":
         reasons.append("event risk")
     if str(month.get("liquidity") or "").upper() != "OK":
@@ -297,6 +316,9 @@ def evaluate_spread_with_expiry_comparison(
     technical_data: dict[str, Any] | None,
     event_data: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    limits = _thresholds(technical_data)
+    sell_otm_pct = (technical_data or {}).get("sell_otm_pct")
+    hedge_otm_pct = (technical_data or {}).get("hedge_otm_pct")
     resolver = KiteOptionResolver(
         instruments=list(option_chain_data or []) if isinstance(option_chain_data, list) else list((option_chain_data or {}).get("instruments") or []),
         today=(market_data or {}).get("today"),
@@ -315,9 +337,11 @@ def evaluate_spread_with_expiry_comparison(
         risk_engine,
         event_risk=current_event,
         as_of_date=(market_data or {}).get("today"),
+        sell_otm_pct=float(sell_otm_pct) if sell_otm_pct not in {None, ""} else None,
+        hedge_otm_pct=float(hedge_otm_pct) if hedge_otm_pct not in {None, ""} else None,
     )
     current_month = _month_from_preview(current_preview, current_expiry, today=(market_data or {}).get("today"))
-    current_ok, current_reasons = _approved(current_month)
+    current_ok, current_reasons = _approved(current_month, limits)
 
     next_preview: dict[str, Any] | None = None
     next_month: dict[str, Any] = _empty_month(next_expiry)
@@ -337,12 +361,14 @@ def evaluate_spread_with_expiry_comparison(
             risk_engine,
             event_risk=next_event,
             as_of_date=(market_data or {}).get("today"),
+            sell_otm_pct=float(sell_otm_pct) if sell_otm_pct not in {None, ""} else None,
+            hedge_otm_pct=float(hedge_otm_pct) if hedge_otm_pct not in {None, ""} else None,
         )
         next_month = _month_from_preview(next_preview, next_expiry, today=(market_data or {}).get("today"))
-    next_ok, next_reasons = _approved(next_month)
+    next_ok, next_reasons = _approved(next_month, limits)
 
-    should_recommend_next = _num(current_month.get("max_gain")) < risk_config.AUTO_CHECK_NEXT_EXPIRY_IF_GAIN_BELOW
-    if current_ok and _num(current_month.get("max_gain")) >= risk_config.MIN_PAIR_MAX_GAIN_INR:
+    should_recommend_next = _num(current_month.get("max_gain")) < limits["auto_check_gain_below"]
+    if current_ok and _num(current_month.get("max_gain")) >= limits["min_pair_max_gain"]:
         recommended = "CURRENT_MONTH"
         reason = "Current month meets max gain, POP, return-on-risk, liquidity, event, and max-loss checks."
     elif should_check_next and should_recommend_next and next_ok:

@@ -159,20 +159,73 @@ class KiteOptionResolver:
         otm = [row for row in contracts if _to_float(row.get("strike")) <= target_strike]
         return max(otm, key=lambda row: _to_float(row.get("strike"))) if otm else self.nearest_contract_after_excluding(underlying, expiry, option_type, target_strike, excluded)
 
-    def resolve_spread_legs(self, symbol: str, spot: float, expiry: str | date | None, strategy: str) -> dict[str, Any]:
+    def hedge_contract_beyond_sell(
+        self,
+        underlying: str,
+        expiry: str | date,
+        option_type: str,
+        target_strike: float,
+        sell_strike: float,
+        excluded_strikes: set[float] | None = None,
+    ) -> dict[str, Any] | None:
+        """Resolve the hedge leg near the raw target while preserving spread width.
+
+        The sell leg may use the softer 50-point rounded target requested for DHAN,
+        but the hedge must not collapse to the next tiny strike gap. For CE spreads
+        the hedge has to stay above the sell strike; for PE spreads it has to stay
+        below the sell strike. Within those safe candidates, choose the contract
+        closest to the raw 10% target so liquid intermediate strikes such as 520
+        are preferred over a too-close 505 hedge.
+        """
+
+        opt = str(option_type or "").upper()
+        excluded = excluded_strikes or set()
+        contracts = [
+            row
+            for row in self.option_contracts(underlying, option_type, expiry)
+            if _to_float(row.get("strike")) not in excluded
+        ]
+        if not contracts:
+            return None
+        if opt == "CE":
+            candidates = [row for row in contracts if _to_float(row.get("strike")) > sell_strike]
+        else:
+            candidates = [row for row in contracts if _to_float(row.get("strike")) < sell_strike]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda row: abs(_to_float(row.get("strike")) - target_strike))
+
+    def resolve_spread_legs(
+        self,
+        symbol: str,
+        spot: float,
+        expiry: str | date | None,
+        strategy: str,
+        sell_otm_pct: float | None = None,
+        hedge_otm_pct: float | None = None,
+    ) -> dict[str, Any]:
         strategy_type = str(strategy or "").upper()
         option_type = "CE" if strategy_type == "BEAR_CALL_SPREAD" else "PE"
         selected_expiry = self.selected_expiry(symbol, expiry)
         if selected_expiry is None:
             return {"error": "CONTRACT_UNRESOLVED"}
         strike_step = strike_step_for_spot(spot)
-        raw_sell_target = spot * (1.05 if option_type == "CE" else 0.95)
-        raw_hedge_target = spot * (1.10 if option_type == "CE" else 0.90)
+        sell_pct = max(float(sell_otm_pct) if sell_otm_pct is not None else 5.0, 0.1)
+        hedge_pct = max(float(hedge_otm_pct) if hedge_otm_pct is not None else 10.0, sell_pct + 0.1)
+        raw_sell_target = spot * (1 + sell_pct / 100) if option_type == "CE" else spot * (1 - sell_pct / 100)
+        raw_hedge_target = spot * (1 + hedge_pct / 100) if option_type == "CE" else spot * (1 - hedge_pct / 100)
         sell_target = next_otm_strike(raw_sell_target, option_type, strike_step)
         hedge_target = next_otm_strike(raw_hedge_target, option_type, strike_step)
         sell = self.otm_contract_after_excluding(symbol, selected_expiry, option_type, sell_target)
         sell_strike_for_exclusion = {_to_float(sell.get("strike"))} if sell else set()
-        hedge = self.otm_contract_after_excluding(symbol, selected_expiry, option_type, hedge_target, sell_strike_for_exclusion)
+        hedge = self.hedge_contract_beyond_sell(
+            symbol,
+            selected_expiry,
+            option_type,
+            raw_hedge_target,
+            _to_float(sell.get("strike")) if sell else hedge_target,
+            sell_strike_for_exclusion,
+        ) if sell else None
         if sell and hedge:
             sell_strike = _to_float(sell.get("strike"))
             hedge_strike = _to_float(hedge.get("strike"))

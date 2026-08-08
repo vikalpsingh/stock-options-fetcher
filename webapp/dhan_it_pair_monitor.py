@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from dhan_it_pair_execution import DhanItPairRepository
+from kite_option_liquidity import analyze_option_liquidity
 from kite_pair_execution import build_kite_order_payload
 
 COMPLETE = {"COMPLETE"}
@@ -19,6 +20,18 @@ def _orders_by_id(orders: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 def _status(row: dict[str, Any] | None, fallback: str) -> str:
     return str((row or {}).get("status") or fallback).upper()
+
+
+def _fresh_quote_for_symbol(broker: Any, tradingsymbol: str) -> dict[str, Any] | None:
+    if hasattr(broker, "quote"):
+        quotes = broker.quote([f"NFO:{tradingsymbol}"])
+        return (quotes or {}).get(f"NFO:{tradingsymbol}") or (quotes or {}).get(tradingsymbol)
+    if hasattr(broker, "get_quote"):
+        quotes = broker.get_quote([f"NFO:{tradingsymbol}"])
+        return (quotes or {}).get(f"NFO:{tradingsymbol}") or (quotes or {}).get(tradingsymbol)
+    if hasattr(broker, "quotes") and isinstance(getattr(broker, "quotes"), dict):
+        return broker.quotes.get(tradingsymbol) or broker.quotes.get(f"NFO:{tradingsymbol}")
+    return None
 
 
 def run_dhan_it_pair_monitor_once(repository: DhanItPairRepository, broker: Any, now: datetime | None = None) -> dict[str, int]:
@@ -38,6 +51,20 @@ def run_dhan_it_pair_monitor_once(repository: DhanItPairRepository, broker: Any,
             failed += 1
             continue
         if buy_status in COMPLETE and not int(pair.get("sell_leg_placed") or 0):
+            sell_quote = _fresh_quote_for_symbol(broker, pair["sell_leg_tradingsymbol"])
+            sell_liquidity = analyze_option_liquidity(pair["sell_leg_tradingsymbol"], sell_quote)
+            if str(sell_liquidity.get("liquidity_condition") or "").upper() == "RED":
+                repository.update_pair(
+                    pair_id,
+                    buy_leg_status=buy_status,
+                    sell_leg_status="BLOCKED_LIQUIDITY",
+                    pair_status="HEDGE_FILLED_SELL_BLOCKED_LIQUIDITY",
+                    last_checked_at=current.isoformat(timespec="seconds"),
+                    payload_json=json.dumps({**payload, "sell_leg_liquidity_recheck": sell_liquidity}, default=str),
+                )
+                repository.log(pair_id, "SELL_BLOCKED_LIQUIDITY_AFTER_HEDGE", sell_liquidity.get("liquidity_reason", "RED liquidity"))
+                failed += 1
+                continue
             sell_payload = payload.get("sell_order_payload") or build_kite_order_payload(pair["sell_leg_tradingsymbol"], "SELL", int(pair["quantity"]), float(payload.get("sell_limit_price") or 0), pair_id[-20:])
             result = broker.place_order(sell_payload)
             repository.update_pair(pair_id, sell_leg_order_id=result["order_id"], sell_leg_status=result.get("status", "OPEN"), sell_leg_placed=1, pair_status="HEDGE_FILLED_WAITING_SELL", last_checked_at=current.isoformat(timespec="seconds"))

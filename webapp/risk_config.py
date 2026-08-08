@@ -166,6 +166,39 @@ MAX_ACCEPTABLE_PAIR_LOSS_INR = 50_000
 # Minimum probability of profit required before recommending a spread.
 MIN_POP_FOR_SPREAD = 70
 
+# DHAN-IT call-spread 50/200 DMA watch settings ---------------------------
+
+# Need a full 200 completed daily closes before the DMA gate is trusted.
+DHAN_IT_MIN_DMA_HISTORY_SESSIONS = 200
+
+# A stock this far below 50 DMA can bounce sharply; allow review but require
+# explicit confirmation instead of treating it as a clean green setup.
+DHAN_IT_REBOUND_RISK_BELOW_50DMA_PCT = 8.0
+
+# DHAN-IT sell-on-rise Bear Call Spread signal settings --------------------
+DHAN_IT_WATCH_RISE_PCT = 3.0
+DHAN_IT_RESISTANCE_PROXIMITY_PCT = 1.0
+DHAN_IT_MIN_REJECTION_CONDITIONS = 2
+DHAN_IT_UPPER_WICK_MIN_PCT = 40.0
+DHAN_IT_SHORT_CE_DELTA_MIN = 0.15
+DHAN_IT_SHORT_CE_DELTA_MAX = 0.22
+DHAN_IT_HEDGE_CE_DELTA_MIN = 0.05
+DHAN_IT_HEDGE_CE_DELTA_MAX = 0.10
+DHAN_IT_SHORT_MIN_ATR_DISTANCE = 1.0
+DHAN_IT_SHORT_PREFERRED_ATR_DISTANCE = 1.5
+DHAN_IT_MIN_POP = 70.0
+DHAN_IT_MIN_RETURN_ON_RISK_PCT = 8.0
+DHAN_IT_MIN_PAIR_MAX_GAIN_INR = 2_000
+DHAN_IT_MAX_ACCEPTABLE_PAIR_LOSS_INR = 40_000
+DHAN_IT_QUALITY_OVERRIDE_MIN_POP = 70.0
+DHAN_IT_QUALITY_OVERRIDE_MIN_GAIN_INR = 3_000
+DHAN_IT_QUALITY_OVERRIDE_MAX_LOSS_INR = 30_000
+DHAN_IT_NEAR_CMP_SHIFT_PCT = 1.0
+DHAN_IT_MIN_CREDIT_TO_WIDTH_PCT = 8.0
+DHAN_IT_MAX_LOSS_PCT_OF_CAPITAL = 0.30
+DHAN_IT_QUOTE_TTL_SECONDS = 30
+DHAN_IT_OPPORTUNITY_TTL_MINUTES = 10
+
 
 # Assignment and bucket controls ------------------------------------------
 

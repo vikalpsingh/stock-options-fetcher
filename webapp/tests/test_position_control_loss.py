@@ -157,7 +157,7 @@ def test_control_loss_builds_buy_order_at_ten_percent_below_hard_stop():
     assert orders[0]["tag"] == "CTRL_LOSS"
 
 
-def test_missing_close_guard_builds_sell_order_for_long_buy_position():
+def test_missing_close_guard_skips_sell_order_for_long_buy_position_when_stop_enabled():
     position = {
         "exchange": "NFO",
         "tradingsymbol": "NIFTY26JUL22200PE",
@@ -170,6 +170,29 @@ def test_missing_close_guard_builds_sell_order_for_long_buy_position():
         app, "refresh_option_positions_with_live_ltp", return_value=[position]
     ), patch.object(app, "open_option_close_orders_by_symbol_side", return_value={}):
         orders, evaluations = app.build_missing_option_close_orders(kite=None, discount_percent=20)
+
+    assert orders == []
+    assert evaluations[0]["action"] == "SKIP_OPTION_SELL_STOP_ENABLED"
+    assert evaluations[0]["close_side"] == "SELL"
+
+
+def test_missing_close_guard_builds_sell_order_for_long_buy_position_when_stop_disabled():
+    position = {
+        "exchange": "NFO",
+        "tradingsymbol": "NIFTY26JUL22200PE",
+        "quantity": 65,
+        "product": "NRML",
+        "average_price": 18.45,
+        "ltp": 18.20,
+    }
+    with patch.object(app, "open_option_positions", return_value=[position]), patch.object(
+        app, "refresh_option_positions_with_live_ltp", return_value=[position]
+    ), patch.object(app, "open_option_close_orders_by_symbol_side", return_value={}):
+        orders, evaluations = app.build_missing_option_close_orders(
+            kite=None,
+            discount_percent=20,
+            stop_option_sell=False,
+        )
 
     assert evaluations[0]["action"] == "PLACE_SELL_CLOSE"
     assert orders[0]["tradingsymbol"] == "NIFTY26JUL22200PE"
@@ -206,3 +229,88 @@ def test_missing_close_guard_skips_long_position_with_existing_sell_close_order(
     assert orders == []
     assert evaluations[0]["action"] == "SKIP_EXISTING_CLOSE_ORDER"
     assert evaluations[0]["close_side"] == "SELL"
+
+
+def test_execute_position_orders_blocks_sell_when_stop_enabled():
+    orders = [
+        {
+            "tradingsymbol": "NIFTY26JUL22200PE",
+            "transaction_type": "SELL",
+            "quantity": 65,
+        }
+    ]
+
+    try:
+        app.execute_position_buy_orders(
+            orders,
+            {0},
+            dry_run=True,
+            keep_existing_orders=True,
+            stop_option_sell=True,
+        )
+    except PermissionError as exc:
+        assert "STOP OPTION SELL is enabled" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("SELL close order should be blocked while STOP OPTION SELL is enabled")
+
+
+def test_positions_panel_shows_stop_option_sell_enabled_by_default():
+    html = app.render_positions_panel(app.PageState(active_tab="positions"))
+
+    assert 'name="position_stop_option_sell" value="1" checked' in html
+    assert "STOP OPTION SELL: ON" in html
+    assert "Scheduled Default Close Orders" in html
+
+
+def test_positions_panel_renders_large_colored_buy_and_sell_quantities():
+    html = app.render_positions_panel(
+        app.PageState(
+            active_tab="positions",
+            positions_rows=[
+                {
+                    "symbol": "HAVELLS26AUG1300CE",
+                    "quantity": 520,
+                    "product": "NRML",
+                },
+                {
+                    "symbol": "BAJFINANCE26AUG1200CE",
+                    "quantity": -750,
+                    "product": "NRML",
+                },
+            ],
+            positions_summary={"count": 2},
+        )
+    )
+
+    assert "HAVELLS26AUG1300CE" in html
+    assert 'position-qty-badge position-qty-buy">BUY Qty 520</span>' in html
+    assert 'position-qty-badge position-qty-sell">SELL Qty 750</span>' in html
+
+
+def test_positions_active_analytics_prioritizes_otm_pop_margin_iv_pcr_after_pnl():
+    html = app.render_positions_panel(
+        app.PageState(
+            active_tab="positions",
+            positions_rows=[
+                {
+                    "symbol": "HAVELLS26AUG1300CE",
+                    "quantity": -520,
+                    "pnl": -100,
+                    "otm_distance": 4.5,
+                    "sell_pop": 82,
+                    "deployed": 50000,
+                    "iv_percent": 24,
+                    "pcr": 0.9,
+                }
+            ],
+            positions_summary={"count": 1},
+        )
+    )
+
+    header = html[html.index("<th>Position</th>") : html.index("</tr></thead>", html.index("<th>Position</th>"))]
+    assert header.index("<th>P&L</th>") < header.index("<th>OTM</th>")
+    assert header.index("<th>OTM</th>") < header.index("<th>POP</th>")
+    assert header.index("<th>POP</th>") < header.index("<th>Margin</th>")
+    assert header.index("<th>Margin</th>") < header.index("<th>IV</th>")
+    assert header.index("<th>IV</th>") < header.index("<th>PCR</th>")
+    assert header.index("<th>PCR</th>") < header.index("<th>Captured</th>")

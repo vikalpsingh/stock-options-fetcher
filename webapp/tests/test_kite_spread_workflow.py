@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -370,6 +371,58 @@ def test_bajajfinance_ce_hedge_uses_nearest_available_1250_for_10pct_target():
     assert preview["hedge_strike"] == 1250
 
 
+def test_ce_hedge_uses_raw_10pct_target_instead_of_tiny_next_strike_gap():
+    local_instruments = [
+        {"tradingsymbol": "DELHIVERY26AUG500CE", "name": "DELHIVERY", "expiry": "2026-08-27", "instrument_type": "CE", "strike": 500, "last_price": 6.9, "lot_size": 2075},
+        {"tradingsymbol": "DELHIVERY26AUG505CE", "name": "DELHIVERY", "expiry": "2026-08-27", "instrument_type": "CE", "strike": 505, "last_price": 5.8, "lot_size": 2075},
+        {"tradingsymbol": "DELHIVERY26AUG520CE", "name": "DELHIVERY", "expiry": "2026-08-27", "instrument_type": "CE", "strike": 520, "last_price": 2.0, "lot_size": 2075},
+    ]
+
+    preview = build_kite_spread_preview(
+        "DELHIVERY",
+        473.3,
+        "BEAR_CALL_SPREAD",
+        "2026-08-27",
+        1,
+        KiteOptionResolver(instruments=local_instruments),
+        None,
+        AllowRisk(),
+    )
+
+    assert preview["raw_sell_target_strike"] == 496.97
+    assert preview["raw_hedge_target_strike"] == 520.63
+    assert preview["sell_leg_tradingsymbol"] == "DELHIVERY26AUG500CE"
+    assert preview["buy_leg_tradingsymbol"] == "DELHIVERY26AUG520CE"
+    assert preview["hedge_strike"] > preview["sell_strike"]
+    assert preview["net_credit"] == 4.9
+
+
+def test_pe_hedge_uses_raw_10pct_target_and_stays_below_sell_strike():
+    local_instruments = [
+        {"tradingsymbol": "DELHIVERY26AUG450PE", "name": "DELHIVERY", "expiry": "2026-08-27", "instrument_type": "PE", "strike": 450, "last_price": 6.9, "lot_size": 2075},
+        {"tradingsymbol": "DELHIVERY26AUG445PE", "name": "DELHIVERY", "expiry": "2026-08-27", "instrument_type": "PE", "strike": 445, "last_price": 5.8, "lot_size": 2075},
+        {"tradingsymbol": "DELHIVERY26AUG425PE", "name": "DELHIVERY", "expiry": "2026-08-27", "instrument_type": "PE", "strike": 425, "last_price": 2.0, "lot_size": 2075},
+    ]
+
+    preview = build_kite_spread_preview(
+        "DELHIVERY",
+        473.3,
+        "BULL_PUT_SPREAD",
+        "2026-08-27",
+        1,
+        KiteOptionResolver(instruments=local_instruments),
+        None,
+        AllowRisk(),
+    )
+
+    assert preview["raw_sell_target_strike"] == 449.63
+    assert preview["raw_hedge_target_strike"] == 425.97
+    assert preview["sell_leg_tradingsymbol"] == "DELHIVERY26AUG450PE"
+    assert preview["buy_leg_tradingsymbol"] == "DELHIVERY26AUG425PE"
+    assert preview["hedge_strike"] < preview["sell_strike"]
+    assert preview["net_credit"] == 4.9
+
+
 def test_spread_blocked_when_contract_unresolved():
     preview = build_kite_spread_preview("RELIANCE", 1000, "BEAR_CALL_SPREAD", "2026-08-27", 1, KiteOptionResolver(instruments=[]), MockKiteAdapter(), AllowRisk())
 
@@ -481,6 +534,123 @@ def test_dhan_stock_rows_show_52_week_high_gap(tmp_path, monkeypatch):
     assert "dhan-52w-far" in html
 
 
+def test_dhan_configure_stocks_and_dma_zone_recommend_actions():
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_show_config=True,
+            dhan_watchlist=[
+                {
+                    "id": 1,
+                    "symbol": "BUYME",
+                    "company_name": "Buy Zone Ltd",
+                    "active": 1,
+                    "cmp": 90,
+                    "dma_50": 100,
+                    "dma_200": 110,
+                    "stock_bucket": "MANUAL",
+                    "holding_qty": 0,
+                    "max_covered_lots": 0,
+                },
+                {
+                    "id": 2,
+                    "symbol": "SELLME",
+                    "company_name": "Sell Zone Ltd",
+                    "active": 1,
+                    "cmp": 120,
+                    "dma_50": 100,
+                    "dma_200": 110,
+                    "stock_bucket": "MANUAL",
+                    "holding_qty": 0,
+                    "max_covered_lots": 0,
+                },
+                {
+                    "id": 3,
+                    "symbol": "HIDDEN",
+                    "company_name": "Hidden Ltd",
+                    "active": 0,
+                    "cmp": 100,
+                    "dma_50": 100,
+                    "dma_200": 100,
+                },
+            ],
+            dhan_pair_orders=[],
+            dhan_holding_positions=[],
+        )
+    )
+
+    assert "Configure DHAN Stocks" in html
+    assert 'id="dhan-config-modal"' in html
+    assert 'formaction="/kite-spreads/configure-open"' in html
+    assert 'formaction="/kite-spreads/configure-close"' in html
+    assert "Upload F&amp;O Opportunities Sheet" in html
+    assert 'name="dhan_fno_sheet" type="file"' in html
+    assert 'formaction="/kite-spreads/fno-sheet-analyze"' in html
+    assert 'formaction="/kite-spreads/fno-sheet-add-selected"' in html
+    assert 'formaction="/kite-spreads/fno-sheet-evaluate-top10"' in html
+    assert 'formaction="/kite-spreads/add-stock"' in html
+    assert 'formaction="/kite-spreads/deactivate" name="dhan_watchlist_id" value="1"' in html
+    assert "DMA Zone" in html
+    assert "BUY ZONE" in html
+    assert "SELL ZONE" in html
+    assert "HIDDEN" not in html
+    assert 'value="BUYME|BULL_PUT_SPREAD">PE</button>' in html
+    assert 'class="dhan-action-btn dhan-action-pe dhan-action-recommended"' in html
+    assert 'value="SELLME|BEAR_CALL_SPREAD">CE</button>' in html
+    assert 'class="dhan-action-btn dhan-action-ce dhan-action-recommended"' in html
+
+
+def test_dhan_configure_stocks_modal_locks_remove_for_open_positions():
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_show_config=True,
+            dhan_watchlist=[
+                {
+                    "id": 1,
+                    "symbol": "LOCKME",
+                    "company_name": "Locked Ltd",
+                    "active": 1,
+                    "cmp": 100,
+                    "dma_50": 95,
+                    "dma_200": 90,
+                    "stock_bucket": "MANUAL",
+                    "holding_qty": 0,
+                    "max_covered_lots": 0,
+                },
+            ],
+            dhan_pair_orders=[],
+            dhan_holding_positions=[
+                {
+                    "symbol": "LOCKME",
+                    "option_type": "CE",
+                    "sell_qty_abs": 250,
+                    "buy_qty_abs": 0,
+                    "pair_status": "SHORT CE UNHEDGED",
+                }
+            ],
+        )
+    )
+
+    assert "Locked: open position" in html
+    assert 'formaction="/kite-spreads/deactivate" name="dhan_watchlist_id" value="1">Remove</button>' not in html
+    assert 'formaction="/kite-spreads/deactivate" name="dhan_watchlist_id" value="1" disabled' in html
+
+
+def test_dhan_configure_stocks_modal_hidden_until_requested():
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_watchlist=[],
+            dhan_pair_orders=[],
+            dhan_holding_positions=[],
+        )
+    )
+
+    assert 'formaction="/kite-spreads/configure-open"' in html
+    assert 'id="dhan-config-modal"' not in html
+
+
 def test_fresh_kite_quote_includes_52_week_high_gap():
     quotes = fetch_fresh_equity_quotes_from_kite(MockKiteAdapter(), ["RELIANCE"])
 
@@ -572,8 +742,151 @@ def test_dhan_quality_clear_enables_review_without_acknowledgement(tmp_path, mon
 
     assert app.dhan_pair_quality_auto_clears(preview)
     assert 'data-auto-clear="1"' in html
-    assert "Quality-clear available" in html
+    assert "Basic clear available" in html
     assert 'id="dhan-pair-review" type="button" class="secondary">' in html
+
+
+def test_dhan_basic_pop_gain_clear_allows_blocked_pair_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = approved_preview()
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "return on risk below 8.0%, liquidity weak"
+    preview["reason"] = preview["risk_reason"]
+    preview["pop_estimate"] = 81.5
+    preview["max_gain"] = 5962.5
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_watchlist=[],
+            dhan_pair_orders=[],
+            dhan_holding_positions=[],
+            dhan_opportunities=[preview],
+            dhan_selected_index="0",
+        )
+    )
+
+    assert app.dhan_pair_simple_quality_clears(preview)
+    assert "BASIC CLEAR" in html
+    assert "Basic clear available" in html
+    assert 'data-orderable="1"' in html
+    assert 'data-auto-clear="1"' in html
+    assert 'id="dhan-pair-review" type="button" class="secondary">' in html
+
+
+def test_dhan_acknowledgement_pop_ror_clear_requires_checkbox(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = approved_preview()
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "CALENDAR_HEDGE_EXPIRES_BEFORE_SHORT; RETURN_ON_RISK_WARNING"
+    preview["reason"] = preview["risk_reason"]
+    preview["pop_estimate"] = 71.5
+    preview["return_on_risk_pct"] = 10.5
+    preview["max_gain"] = 4200
+
+    unchecked_html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_watchlist=[],
+            dhan_pair_orders=[],
+            dhan_holding_positions=[],
+            dhan_opportunities=[preview],
+            dhan_selected_index="0",
+        )
+    )
+    checked_html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_watchlist=[],
+            dhan_pair_orders=[],
+            dhan_holding_positions=[],
+            dhan_opportunities=[preview],
+            dhan_selected_index="0",
+            dhan_confirm_pair_order=True,
+        )
+    )
+
+    assert app.dhan_pair_acknowledgement_quality_clears(preview)
+    assert not app.dhan_pair_simple_quality_clears(preview)
+    assert "ACK CLEAR" in unchecked_html
+    assert "Acknowledgement clear available" in unchecked_html
+    assert 'data-orderable="1"' in unchecked_html
+    assert 'data-auto-clear="0"' in unchecked_html
+    assert 'id="dhan-pair-review" type="button" class="secondary" disabled' in unchecked_html
+    assert 'id="dhan-pair-review" type="button" class="secondary">' in checked_html
+
+
+def test_dhan_popup_blocks_new_pair_when_same_side_position_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = approved_preview()
+    preview["pop_estimate"] = 81.5
+    preview["max_gain"] = 5962.5
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_watchlist=[],
+            dhan_pair_orders=[],
+            dhan_holding_positions=[
+                {
+                    "symbol": "RELIANCE",
+                    "option_type": "CE",
+                    "sell_qty_abs": 250,
+                    "buy_qty_abs": 0,
+                    "pair_status": "SHORT CE UNHEDGED",
+                }
+            ],
+            dhan_opportunities=[preview],
+            dhan_selected_index="0",
+            dhan_confirm_pair_order=True,
+        )
+    )
+
+    assert app.dhan_existing_option_position_for_pair(preview, [{"symbol": "RELIANCE", "option_type": "CE", "sell_qty_abs": 250}])
+    assert "OPEN POSITION" in html
+    assert "use Repair from Current Kite Option Holdings / Pair Status" in html
+    assert 'data-orderable="0"' in html
+    assert 'id="dhan-pair-review" type="button" class="secondary" disabled' in html
+
+
+def test_dhan_submit_allows_basic_pop_gain_clear_with_confirmation(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    broker = MockKiteAdapter()
+    preview = approved_preview()
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "return on risk below 8.0%, liquidity weak"
+    preview["reason"] = preview["risk_reason"]
+    preview["pop_estimate"] = 81.5
+    preview["max_gain"] = 5962.5
+
+    result = app.submit_pair_order(preview, repo, broker, user_confirmed=True, paper_trading=True)
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert result["buy_leg_order_id"] == "KITE-1"
+    assert pair["risk_decision"] == "APPROVED"
+    assert "Basic clear" in payload["risk_reason"]
+
+
+def test_dhan_submit_allows_acknowledged_pop_ror_clear(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    broker = MockKiteAdapter()
+    preview = approved_preview()
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "CALENDAR_HEDGE_EXPIRES_BEFORE_SHORT; RETURN_ON_RISK_WARNING"
+    preview["reason"] = preview["risk_reason"]
+    preview["pop_estimate"] = 71.5
+    preview["return_on_risk_pct"] = 10.5
+    preview["max_gain"] = 4200
+
+    result = app.submit_pair_order(preview, repo, broker, user_confirmed=True, paper_trading=True)
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert result["buy_leg_order_id"] == "KITE-1"
+    assert pair["risk_decision"] == "APPROVED"
+    assert payload["risk_override"] == "DHAN_ACK_POP_ROR_CLEAR"
+    assert "Acknowledgement clear" in payload["risk_reason"]
 
 
 def test_dhan_red_liquidity_allows_paper_popup_flow_but_blocks_live(tmp_path, monkeypatch):
@@ -645,8 +958,10 @@ def test_red_liquidity_blocks_live_submit_but_allows_paper_flow(tmp_path):
     outcome = submit_kite_pair(preview, repo, paper_broker, user_confirmed=True, mode="PAPER")
     assert outcome["mode"] == "PAPER"
     assert outcome["buy_leg_order_id"]
-    assert len(paper_broker.placed) == 1
+    assert len(paper_broker.placed) == 2
     assert paper_broker.placed[0]["transaction_type"] == "BUY"
+    assert paper_broker.placed[1]["transaction_type"] == "SELL"
+    assert paper_broker.placed[1]["price"] == 13.2
 
 
 def test_dhan_popup_allows_manual_expiry_override_for_each_approved_expiry(tmp_path, monkeypatch):
@@ -853,8 +1168,8 @@ def test_dhan_live_submit_records_live_hedge_first_pair_without_paper_mode(tmp_p
     assert pair["mode"] == "LIVE"
     assert pair["execution_mode"] == "HEDGE_FIRST"
     assert result["buy_leg_order_id"] == "KITE-1"
-    assert result["sell_leg_order_id"] == ""
-    assert pair["sell_leg_placed"] == 0
+    assert result["sell_leg_order_id"] == "KITE-2"
+    assert pair["sell_leg_placed"] == 1
 
 
 def test_dhan_console_log_renders_near_top_before_tables(tmp_path, monkeypatch):
@@ -1054,6 +1369,118 @@ def approved_preview() -> dict:
     return build_kite_spread_preview("RELIANCE", 1000, "BEAR_CALL_SPREAD", "2026-08-27", 1, KiteOptionResolver(instruments=instruments()), MockKiteAdapter(), AllowRisk())
 
 
+def test_dhan_current_position_table_clubs_open_option_buckets():
+    positions = [
+        {"tradingsymbol": "RELIANCE26AUG1050CE", "name": "RELIANCE", "instrument_type": "CE", "quantity": -250, "average_price": 20, "last_price": 18, "pnl": 500},
+        {"tradingsymbol": "RELIANCE26AUG1100CE", "name": "RELIANCE", "instrument_type": "CE", "quantity": -250, "average_price": 8, "last_price": 7, "pnl": 250},
+        {"tradingsymbol": "RELIANCE26AUG1200CE", "name": "RELIANCE", "instrument_type": "CE", "quantity": 250, "average_price": 3, "last_price": 4, "pnl": -250},
+    ]
+    rows = app.analyze_dhan_holding_positions(
+        positions,
+        [{"symbol": "RELIANCE", "active": 1, "cmp": 1000, "dma_50": 950, "dma_200": 900}],
+    )
+    html = app.render_dhan_holding_positions(rows)
+
+    assert rows[0]["sell_qty_abs"] == 500
+    assert rows[0]["buy_qty_abs"] == 250
+    assert rows[0]["repair_qty"] == 250
+    assert rows[0]["pair_status"] == "SHORT CE UNHEDGED"
+    assert rows[0]["dma_zone"] == "SELL ZONE"
+    assert "Current Kite Option Holdings / Pair Status" in html
+    assert "CMP / DMA Zone" in html
+    assert "SELL ZONE" in html
+    assert "OTM 5.00% | POP 70.00% approx" in html
+    assert "SHORT CE UNHEDGED" in html
+    assert 'formaction="/kite-spreads/repair-preview" name="dhan_repair" value="RELIANCE|CE|BUY_HEDGE"' in html
+
+
+def test_dhan_current_position_table_marks_pending_repair_order_amber():
+    positions = [
+        {"tradingsymbol": "RELIANCE26AUG1050CE", "name": "RELIANCE", "instrument_type": "CE", "quantity": -250},
+    ]
+    orders = [
+        {
+            "order_id": "KITE-99",
+            "tradingsymbol": "RELIANCE26AUG1100CE",
+            "name": "RELIANCE",
+            "transaction_type": "BUY",
+            "status": "OPEN",
+            "pending_quantity": 250,
+            "price": 5.5,
+        }
+    ]
+    rows = app.analyze_dhan_holding_positions(
+        positions,
+        [{"symbol": "RELIANCE", "active": 1, "cmp": 1000, "dma_50": 1050, "dma_200": 1100}],
+        orders,
+    )
+    html = app.render_dhan_holding_positions(rows)
+
+    assert rows[0]["pair_status"] == "CE REPAIR ORDER PLACED"
+    assert rows[0]["action"] == "ORDER_PLACED"
+    assert rows[0]["dma_zone"] == "BUY ZONE"
+    assert "KITE-99" in rows[0]["suggestion"]
+    assert "BUY ZONE" in html
+    assert 'class="dhan-repair-pending-row"' in html
+    assert '<span class="ipo-badge warn">CE REPAIR ORDER PLACED</span>' in html
+    assert "Order Placed" in html
+    assert 'formaction="/kite-spreads/repair-preview"' not in html
+
+
+def test_dhan_repair_popup_and_submit_single_missing_hedge_order():
+    opportunity = expiry_comparison()
+    holding_row = {
+        "symbol": "RELIANCE",
+        "option_type": "CE",
+        "sell_qty_abs": 500,
+        "buy_qty_abs": 250,
+        "pair_status": "SHORT CE UNHEDGED",
+    }
+    selected = app.apply_dhan_repair_expiry_choice(opportunity, "BUY_HEDGE")
+    preview = app.build_dhan_repair_preview_from_opportunity(selected, holding_row, "BUY_HEDGE")
+
+    assert preview["transaction_type"] == "BUY"
+    assert preview["quantity"] == 250
+    assert preview["selected_expiry_choice"] == "CURRENT_MONTH"
+
+    html = app.render_dhan_repair_modal(
+        app.PageState(active_tab="kite-spreads", dhan_repair_preview=preview, dhan_paper_trading=True)
+    )
+    assert "DHAN Repair Order - RELIANCE" in html
+    assert "BUY CE HEDGE" in html
+    assert 'id="dhan-repair-countdown">10</div>' in html
+    assert 'formaction="/kite-spreads/repair-submit" disabled>Place Order</button>' in html
+
+    broker = MockKiteAdapter()
+    outcome = app.submit_dhan_repair_order(preview, broker, user_confirmed=True, mode="PAPER")
+
+    assert outcome["order_id"] == "KITE-1"
+    assert len(broker.placed) == 1
+    assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[0]["quantity"] == 250
+
+
+def test_dhan_repair_sell_leg_defaults_next_month_and_can_choose_current():
+    opportunity = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=30, next_buy=5))
+    holding_row = {
+        "symbol": "RELIANCE",
+        "option_type": "CE",
+        "sell_qty_abs": 250,
+        "buy_qty_abs": 500,
+        "pair_status": "BUY CE HEDGE ONLY",
+    }
+
+    default_next = app.apply_dhan_repair_expiry_choice(opportunity, "SELL_LEG")
+    current = app.apply_dhan_repair_expiry_choice(opportunity, "SELL_LEG", "CURRENT_MONTH")
+    next_preview = app.build_dhan_repair_preview_from_opportunity(default_next, holding_row, "SELL_LEG")
+
+    assert default_next["selected_expiry_choice"] == "NEXT_MONTH"
+    assert current["selected_expiry_choice"] == "CURRENT_MONTH"
+    assert next_preview["transaction_type"] == "SELL"
+    assert next_preview["quantity"] == 250
+    assert next_preview["limit_price"] == 30
+
+
 def test_paper_mode_does_not_call_real_kite_place_order(tmp_path):
     repo = KiteSpreadRepository(tmp_path / "kite.db")
     broker = KiteBrokerAdapter(kite=None, paper_trading=True)
@@ -1061,7 +1488,8 @@ def test_paper_mode_does_not_call_real_kite_place_order(tmp_path):
     result = submit_kite_pair(approved_preview(), repo, broker, user_confirmed=True, mode="PAPER")
 
     assert result["buy_leg_order_id"].startswith("PAPER-KITE")
-    assert len(broker.call_log) == 1
+    assert result["sell_leg_order_id"].startswith("PAPER-KITE")
+    assert len(broker.call_log) == 2
 
 
 def test_live_order_requires_explicit_confirmation(tmp_path):
@@ -1076,15 +1504,22 @@ def test_live_order_requires_explicit_confirmation(tmp_path):
         raise AssertionError("Live order should require explicit confirmation")
 
 
-def test_hedge_first_does_not_place_sell_until_buy_complete(tmp_path):
+def test_hedge_first_places_buy_and_parks_sell_above_cmp(tmp_path):
     repo = KiteSpreadRepository(tmp_path / "kite.db")
     broker = MockKiteAdapter()
 
     result = submit_kite_pair(approved_preview(), repo, broker, user_confirmed=True, mode="PAPER", execution_mode="HEDGE_FIRST")
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
 
-    assert result["sell_leg_order_id"] == ""
-    assert len(broker.placed) == 1
+    assert result["sell_leg_order_id"] == "KITE-2"
+    assert len(broker.placed) == 2
     assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[0]["price"] == 5.0
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.placed[1]["price"] == 13.2
+    assert payload["sell_cmp_limit_price"] == 12.0
+    assert payload["sell_initial_limit_price"] == 13.2
 
 
 def test_rejected_hedge_prevents_sell_leg_placement(tmp_path):
@@ -1096,20 +1531,29 @@ def test_rejected_hedge_prevents_sell_leg_placement(tmp_path):
     summary = run_kite_pair_scheduler_once(repo, broker)
 
     assert summary["failed"] == 1
-    assert len(broker.placed) == 1
+    assert len(broker.placed) == 2
+    assert broker.cancelled == [("regular", result["sell_leg_order_id"])]
 
 
-def test_scheduler_places_sell_after_hedge_complete_without_duplicates(tmp_path):
+def test_scheduler_reprices_parked_sell_to_cmp_after_hedge_complete_without_duplicates(tmp_path):
     repo = KiteSpreadRepository(tmp_path / "kite.db")
     broker = MockKiteAdapter()
     result = submit_kite_pair(approved_preview(), repo, broker, user_confirmed=True, mode="PAPER")
-    broker.orders = [{"order_id": result["buy_leg_order_id"], "status": "COMPLETE"}]
+    broker.orders = [
+        {"order_id": result["buy_leg_order_id"], "status": "COMPLETE"},
+        {"order_id": result["sell_leg_order_id"], "status": "OPEN"},
+    ]
 
-    run_kite_pair_scheduler_once(repo, broker)
-    run_kite_pair_scheduler_once(repo, broker)
+    first = run_kite_pair_scheduler_once(repo, broker)
+    second = run_kite_pair_scheduler_once(repo, broker)
+    pair = repo.get_pair(result["pair_id"])
 
     assert len(broker.placed) == 2
     assert broker.placed[1]["transaction_type"] == "SELL"
+    assert first["modified"] == 1
+    assert second["modified"] == 0
+    assert broker.modified == [("regular", result["sell_leg_order_id"], {"order_type": "LIMIT", "price": 12.0})]
+    assert pair["pair_status"] == "HEDGE_FILLED_SELL_REPRICED"
 
 
 def test_simultaneous_mode_modifies_sibling_when_one_leg_complete(tmp_path):
