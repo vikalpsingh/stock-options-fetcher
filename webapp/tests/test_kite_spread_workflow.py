@@ -528,6 +528,7 @@ def test_dhan_stock_rows_have_simple_pe_ce_evaluation_actions(tmp_path, monkeypa
 
     assert "Current F&O Stock List - Select PE or CE" in html
     assert "dhan-watchlist-scroll" in html
+    assert html.index("<th>Actions</th>") < html.index("<th>52W High Gap</th>")
     assert "Run Analysis" in html
     assert "/kite-spreads/open-symbol" in html
     assert "Run Analysis on All Stocks" in html
@@ -614,8 +615,11 @@ def test_dhan_parent_stock_table_shows_latest_fno_sheet_evaluation_details():
         )
     )
 
+    assert "Rank / Trade" in html
     assert "Strike / Premium" in html
     assert "Live Status / Risk Reason" in html
+    assert "#1" in html
+    assert "CE SELL" in html
     assert "6000.00" in html
     assert "49.40 prem" in html
     assert "Final <strong>87.50</strong>" in html

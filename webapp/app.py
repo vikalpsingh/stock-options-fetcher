@@ -20782,7 +20782,14 @@ def render_kite_spreads_panel(state: PageState) -> str:
             f"<td class=\"dhan-symbol-cell\"><button type=\"submit\" class=\"mini-link button-link\" formaction=\"/kite-spreads/open-symbol\" name=\"dhan_open_symbol\" value=\"{symbol_value}\"><strong>{html.escape(text_value(row.get('symbol')))}</strong></button><small>{html.escape(company_name)}</small></td>"
             f"<td>{money(row.get('cmp'))}<small class=\"{row_day_change_class}\">{html.escape(text_value(row.get('day_change_pct')))}%</small></td>"
             f"<td class=\"dhan-cmp-zone-cell\"><span class=\"ipo-badge {html.escape(zone_class)}\">{html.escape(text_value(dma_ctx.get('dma_zone')))}</span><small>50 DMA {money(dma_ctx.get('dma_50'))} | 200 DMA {money(dma_ctx.get('dma_200'))}</small><small>{html.escape(text_value(dma_ctx.get('dma_zone_reason'), ''))}</small></td>"
+            "<td class=\"dhan-action-cell\">"
+            f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-primary\" formaction=\"/kite-spreads/open-symbol\" name=\"dhan_open_symbol\" value=\"{symbol_value}\">Analyze</button>"
+            f"<button type=\"submit\" class=\"{pe_button_class}\" formaction=\"/kite-spreads/evaluate-symbol\" name=\"dhan_eval\" value=\"{symbol_value}|BULL_PUT_SPREAD\">PE</button>"
+            f"<button type=\"submit\" class=\"{ce_button_class}\" formaction=\"/kite-spreads/evaluate-symbol\" name=\"dhan_eval\" value=\"{symbol_value}|BEAR_CALL_SPREAD\">CE</button>"
+            f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-muted\" formaction=\"/kite-spreads/deactivate\" name=\"dhan_watchlist_id\" value=\"{html.escape(str(row.get('id') or ''), quote=True)}\"{remove_disabled}{remove_title}>Hide</button>"
+            "</td>"
             f"<td class=\"dhan-52w-cell {gap_class}\"><strong>{html.escape(gap_label)}</strong><small>{html.escape(gap_detail)}</small></td>"
+            f"<td class=\"dhan-fno-parent-cell\"><strong>#{html.escape(text_value(fno_detail.get('rank')))}</strong><small><span class=\"ipo-badge good\">{html.escape(fno_strategy_badge)} SELL</span></small></td>"
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('spot_price_sheet'))}<small>Kite {money(fno_detail.get('cmp_kite'))}</small></td>"
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('sheet_strike'))}<small>{money(fno_detail.get('sheet_premium'))} prem | {money(fno_detail.get('sheet_total_premium'))} total</small></td>"
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('otm_pct'))}%<small>ITM {money(fno_detail.get('itm_risk_pct'))}% | Exp {html.escape(text_value(fno_detail.get('expiry')))}</small></td>"
@@ -20791,16 +20798,10 @@ def render_kite_spreads_panel(state: PageState) -> str:
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('max_gain'))}<small>Loss {money(fno_detail.get('max_loss'))}</small></td>"
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('pop_estimate'))}%<small>RoR {money(fno_detail.get('return_on_risk_pct'))}%</small></td>"
             f"<td class=\"dhan-fno-parent-cell dhan-fno-risk-reason\"><span class=\"ipo-badge {fno_live_class}\">{html.escape(text_value(fno_detail.get('live_status')))}</span><small>{html.escape(text_value(fno_detail.get('live_risk_decision') or fno_detail.get('risk_decision')))}</small><small>{html.escape(fno_reason)}</small></td>"
-            "<td class=\"dhan-action-cell\">"
-            f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-primary\" formaction=\"/kite-spreads/open-symbol\" name=\"dhan_open_symbol\" value=\"{symbol_value}\">Analyze</button>"
-            f"<button type=\"submit\" class=\"{pe_button_class}\" formaction=\"/kite-spreads/evaluate-symbol\" name=\"dhan_eval\" value=\"{symbol_value}|BULL_PUT_SPREAD\">PE</button>"
-            f"<button type=\"submit\" class=\"{ce_button_class}\" formaction=\"/kite-spreads/evaluate-symbol\" name=\"dhan_eval\" value=\"{symbol_value}|BEAR_CALL_SPREAD\">CE</button>"
-            f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-muted\" formaction=\"/kite-spreads/deactivate\" name=\"dhan_watchlist_id\" value=\"{html.escape(str(row.get('id') or ''), quote=True)}\"{remove_disabled}{remove_title}>Hide</button>"
-            "</td>"
             "</tr>"
         )
     if not watch_rows:
-        watch_rows.append('<tr><td colspan="13" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
+        watch_rows.append('<tr><td colspan="14" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
 
     active_config_rows = []
     for row in watchlist:
@@ -21369,7 +21370,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
       <section class="panel dhan-watchlist-panel">
         <div class="panel-title">Current F&O Stock List - Select PE or CE</div>
         <p class="status">Choose Evaluate PE or Evaluate CE for one stock. The popup reviews a 5% OTM SELL and 10% OTM BUY hedge pair before any Kite order is allowed.</p>
-        <div class="table-wrap dhan-watchlist-scroll"><table class="ipo-table dhan-watchlist-table"><thead><tr><th>Symbol</th><th>CMP / Day</th><th>DMA Zone</th><th>52W High Gap</th><th>Spot</th><th>Strike / Premium</th><th>OTM / Expiry</th><th>Liquidity</th><th>Scores</th><th>Gain / Loss</th><th>POP / RoR</th><th>Live Status / Risk Reason</th><th>Actions</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
+        <div class="table-wrap dhan-watchlist-scroll"><table class="ipo-table dhan-watchlist-table"><thead><tr><th>Symbol</th><th>CMP / Day</th><th>DMA Zone</th><th>Actions</th><th>52W High Gap</th><th>Rank / Trade</th><th>Spot</th><th>Strike / Premium</th><th>OTM / Expiry</th><th>Liquidity</th><th>Scores</th><th>Gain / Loss</th><th>POP / RoR</th><th>Live Status / Risk Reason</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
       </section>
       <section class="panel dhan-opportunities-panel{best_pair_section_class}">
         <div class="panel-title">Opportunity Table - Compare POP, Gain and Risk</div>
