@@ -1659,6 +1659,41 @@ def test_scheduler_reprices_parked_sell_to_cmp_after_hedge_complete_without_dupl
     assert pair["pair_status"] == "HEDGE_FILLED_SELL_REPRICED"
 
 
+def test_dhan_pair_order_registers_monitor_and_reprices_sell_after_buy_fill(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    broker = MockKiteAdapter()
+    preview = approved_preview()
+
+    result = app.submit_pair_order(preview, repo, broker, user_confirmed=True, paper_trading=True)
+    monitor_rows = repo.list_pair_orders(include_closed=False)
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert len(monitor_rows) == 1
+    assert monitor_rows[0]["pair_id"] == result["pair_id"]
+    assert pair["pair_status"] == "SUBMITTED_WAITING_HEDGE"
+    assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[0]["order_type"] == "LIMIT"
+    assert broker.placed[0]["price"] == preview["buy_limit_price"]
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.placed[1]["order_type"] == "LIMIT"
+    assert broker.placed[1]["price"] == round(preview["sell_limit_price"] * 1.10, 2)
+    assert payload["sell_reprice_after_hedge"] is True
+
+    broker.orders = [
+        {"order_id": result["buy_leg_order_id"], "status": "COMPLETE"},
+        {"order_id": result["sell_leg_order_id"], "status": "OPEN"},
+    ]
+    summary = run_kite_pair_scheduler_once(repo, broker)
+    pair_after_scheduler = repo.get_pair(result["pair_id"])
+
+    assert summary["modified"] == 1
+    assert broker.modified == [
+        ("regular", result["sell_leg_order_id"], {"order_type": "LIMIT", "price": preview["sell_limit_price"]})
+    ]
+    assert pair_after_scheduler["pair_status"] == "HEDGE_FILLED_SELL_REPRICED"
+
+
 def test_simultaneous_mode_modifies_sibling_when_one_leg_complete(tmp_path):
     repo = KiteSpreadRepository(tmp_path / "kite.db")
     broker = MockKiteAdapter()

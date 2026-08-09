@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +20,7 @@ class AllowRisk:
 class MockBroker:
     def __init__(self):
         self.placed = []
+        self.modified = []
         self.orders = []
         self.quotes = {}
 
@@ -28,6 +30,10 @@ class MockBroker:
 
     def get_orders(self):
         return self.orders
+
+    def modify_order(self, variety, order_id, payload):
+        self.modified.append((variety, order_id, payload))
+        return {"order_id": order_id}
 
     def get_quote(self, instruments):
         keys = instruments if isinstance(instruments, list) else [instruments]
@@ -747,40 +753,54 @@ def test_dhan_it_opportunity_data_expires_after_ten_minutes_in_render():
     assert 'formaction="/dhan-it/preview" name="dhan_it_selected_index" value="0">TCS</button>' not in html
 
 
-def test_paper_submit_records_buy_hedge_only_first(tmp_path):
+def test_paper_submit_places_buy_and_parks_sell_above_cmp(tmp_path):
     repo = DhanItPairRepository(tmp_path / "dhan_it.db")
     broker = MockBroker()
+    preview = approved_preview()
     result = submit_dhan_it_pair(approved_preview(), repo, broker, user_confirmed=True, mode="PAPER")
     pair = repo.get_pair(result["pair_id"])
-    assert len(broker.placed) == 1
+    payload = json.loads(pair["payload_json"])
+
+    assert len(broker.placed) == 2
     assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[0]["price"] == preview["buy_limit_price"]
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.placed[1]["price"] == round(preview["sell_limit_price"] * 1.10, 2)
     assert pair["buy_leg_order_id"] == "MOCK-1"
-    assert not pair["sell_leg_order_id"]
-    assert pair["pair_status"] == "SUBMITTED"
+    assert pair["sell_leg_order_id"] == "MOCK-2"
+    assert pair["sell_leg_placed"] == 1
+    assert pair["pair_status"] == "SUBMITTED_WAITING_HEDGE"
+    assert payload["sell_reprice_after_hedge"] is True
 
 
-def test_monitor_places_sell_only_after_buy_hedge_completes(tmp_path):
+def test_monitor_reprices_parked_sell_after_buy_hedge_completes(tmp_path):
     repo = DhanItPairRepository(tmp_path / "dhan_it.db")
     broker = MockBroker()
-    result = submit_dhan_it_pair(approved_preview(), repo, broker, user_confirmed=True, mode="PAPER")
+    preview = approved_preview()
+    result = submit_dhan_it_pair(preview, repo, broker, user_confirmed=True, mode="PAPER")
     run_dhan_it_pair_monitor_once(repo, broker)
     pair_before_fill = repo.get_pair(result["pair_id"])
-    assert len(broker.placed) == 1
-    assert pair_before_fill["sell_leg_placed"] == 0
-    broker.orders = [{"order_id": "MOCK-1", "status": "COMPLETE"}]
+    assert len(broker.placed) == 2
+    assert pair_before_fill["sell_leg_placed"] == 1
+    broker.orders = [{"order_id": "MOCK-1", "status": "COMPLETE"}, {"order_id": "MOCK-2", "status": "OPEN"}]
     monitor_result = run_dhan_it_pair_monitor_once(repo, broker)
     pair_after_fill = repo.get_pair(result["pair_id"])
-    assert monitor_result["placed"] == 1
+    payload_after_fill = json.loads(pair_after_fill["payload_json"])
+
+    assert monitor_result["modified"] == 1
+    assert monitor_result["placed"] == 0
     assert len(broker.placed) == 2
-    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.modified == [("regular", "MOCK-2", {"order_type": "LIMIT", "price": preview["sell_limit_price"]})]
     assert pair_after_fill["sell_leg_placed"] == 1
-    assert pair_after_fill["pair_status"] == "HEDGE_FILLED_WAITING_SELL"
+    assert pair_after_fill["pair_status"] == "HEDGE_FILLED_SELL_REPRICED"
+    assert payload_after_fill["sell_repriced_after_hedge_at"]
 
 
 def test_monitor_blocks_sell_when_refreshed_liquidity_turns_red(tmp_path):
     repo = DhanItPairRepository(tmp_path / "dhan_it.db")
     broker = MockBroker()
     result = submit_dhan_it_pair(approved_preview(), repo, broker, user_confirmed=True, mode="PAPER")
+    repo.update_pair(result["pair_id"], sell_leg_order_id="", sell_leg_placed=0, sell_leg_status="PENDING")
     broker.orders = [{"order_id": "MOCK-1", "status": "COMPLETE"}]
     broker.quotes = {"TCS08271050CE": depth_quote(4, 500)}
 
@@ -788,7 +808,7 @@ def test_monitor_blocks_sell_when_refreshed_liquidity_turns_red(tmp_path):
     pair_after_check = repo.get_pair(result["pair_id"])
 
     assert monitor_result["failed"] == 1
-    assert len(broker.placed) == 1
+    assert len(broker.placed) == 2
     assert pair_after_check["sell_leg_placed"] == 0
     assert pair_after_check["pair_status"] == "HEDGE_FILLED_SELL_BLOCKED_LIQUIDITY"
 
@@ -799,6 +819,34 @@ def test_existing_dhan_and_new_dhan_it_panels_render_without_loading_live_data()
     assert 'id="kite-spreads-panel"' in dhan_html
     assert "DHAN-IT" in dhan_it_html
     assert "DHAN-IT Call Spread Watch" in dhan_it_html
+
+
+def test_dhan_it_pair_monitor_has_dhan_scheduler_controls_and_five_minute_interval():
+    app.DHAN_IT_SCHEDULER_STATUS.update(
+        {
+            "running": False,
+            "mode": "PAPER",
+            "last_started_at": "2026-08-09T09:15:00+05:30",
+            "last_stopped_at": "",
+            "last_run_at": "2026-08-09T09:20:00+05:30",
+            "last_result": {"checked": 2, "modified": 1, "placed": 0, "failed": 0, "exit_required": 0},
+            "last_error": "",
+        }
+    )
+
+    html = app.render_dhan_it_panel(app.PageState(active_tab="dhan-it", dhan_it_rows=dhan_it_universe_rows()))
+
+    assert "Pair Order Monitor" in html
+    assert "Job Status" in html
+    assert "300s" in html
+    assert "Checked 2 | modified 1 | placed 0 | failed 0 | exit-required 0" in html
+    assert 'formaction="/dhan-it/monitor-run"' in html
+    assert 'formaction="/dhan-it/scheduler-start"' in html
+    assert 'formaction="/dhan-it/scheduler-stop"' in html
+    assert 'formaction="/dhan-it/load"' in html
+    assert 'formaction="/dhan-it/clear-pair-monitor"' in html
+    assert "Clear Monitor" in html
+    app.DHAN_IT_SCHEDULER_STATUS.update({"mode": "PAPER", "last_result": {}, "last_run_at": "", "last_error": ""})
 
 
 def test_dhan_it_stock_list_marks_watch_rise_when_day_change_above_three_pct():

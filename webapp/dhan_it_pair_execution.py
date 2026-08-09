@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from kite_pair_execution import build_kite_order_payload
+from kite_pair_execution import build_kite_order_payload, dhan_initial_sell_limit_price
 import risk_config
 
 
@@ -130,6 +130,15 @@ class DhanItPairRepository:
         with self.connect() as conn:
             conn.execute("INSERT INTO dhan_it_execution_log(pair_id, action, detail, created_at) VALUES (?, ?, ?, ?)", (pair_id, action, detail, now_text()))
 
+    def clear_pair_monitor(self) -> dict[str, int]:
+        with self.connect() as conn:
+            order_cur = conn.execute("DELETE FROM dhan_it_pair_orders")
+            log_cur = conn.execute("DELETE FROM dhan_it_execution_log")
+        return {
+            "pair_orders_deleted": int(order_cur.rowcount or 0),
+            "execution_logs_deleted": int(log_cur.rowcount or 0),
+        }
+
     def export_outputs(self, candidates: list[dict[str, Any]] | None = None) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         if candidates is not None:
@@ -193,8 +202,31 @@ def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepositor
     pair_id = repository.create_pair(preview, mode=mode, user_confirmed=True, execution_mode="HEDGE_FIRST")
     tag = pair_id[-20:]
     buy_payload = build_kite_order_payload(preview["buy_leg_tradingsymbol"], "BUY", preview["quantity"], preview["buy_limit_price"], tag)
-    sell_payload = build_kite_order_payload(preview["sell_leg_tradingsymbol"], "SELL", preview["quantity"], preview["sell_limit_price"], tag)
+    sell_cmp_limit_price = round(float(preview["sell_limit_price"]), 2)
+    sell_initial_limit_price = dhan_initial_sell_limit_price(sell_cmp_limit_price)
+    sell_payload = build_kite_order_payload(preview["sell_leg_tradingsymbol"], "SELL", preview["quantity"], sell_initial_limit_price, tag)
     buy_result = broker.place_order(buy_payload)
-    repository.update_pair(pair_id, buy_leg_order_id=buy_result["order_id"], buy_leg_status=buy_result.get("status", "OPEN"), pair_status="SUBMITTED", payload_json=json.dumps({**preview, "buy_order_payload": buy_payload, "sell_order_payload": sell_payload}, default=str))
+    sell_result = broker.place_order(sell_payload)
+    repository.update_pair(
+        pair_id,
+        buy_leg_order_id=buy_result["order_id"],
+        sell_leg_order_id=sell_result["order_id"],
+        buy_leg_status=buy_result.get("status", "OPEN"),
+        sell_leg_status=sell_result.get("status", "OPEN"),
+        sell_leg_placed=1,
+        pair_status="SUBMITTED_WAITING_HEDGE",
+        payload_json=json.dumps(
+            {
+                **preview,
+                "buy_order_payload": buy_payload,
+                "sell_order_payload": sell_payload,
+                "sell_cmp_limit_price": sell_cmp_limit_price,
+                "sell_initial_limit_price": sell_initial_limit_price,
+                "sell_reprice_after_hedge": True,
+            },
+            default=str,
+        ),
+    )
     repository.log(pair_id, "BUY_HEDGE_SUBMITTED", buy_result["order_id"])
-    return {"pair_id": pair_id, "buy_leg_order_id": buy_result["order_id"], "sell_leg_order_id": "", "mode": mode}
+    repository.log(pair_id, "SELL_PARKED_ABOVE_CMP", f"{sell_result['order_id']} @ {sell_initial_limit_price}; reprice to {sell_cmp_limit_price} after hedge fill")
+    return {"pair_id": pair_id, "buy_leg_order_id": buy_result["order_id"], "sell_leg_order_id": sell_result["order_id"], "mode": mode}

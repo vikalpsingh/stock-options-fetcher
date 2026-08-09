@@ -37,7 +37,7 @@ def _fresh_quote_for_symbol(broker: Any, tradingsymbol: str) -> dict[str, Any] |
 def run_dhan_it_pair_monitor_once(repository: DhanItPairRepository, broker: Any, now: datetime | None = None) -> dict[str, int]:
     current = now or datetime.now(timezone.utc)
     by_id = _orders_by_id(broker.get_orders())
-    checked = placed = failed = exit_required = both = 0
+    checked = placed = modified = failed = exit_required = both = 0
     for pair in repository.list_pairs(include_closed=False):
         checked += 1
         pair_id = pair["pair_id"]
@@ -49,6 +49,26 @@ def run_dhan_it_pair_monitor_once(repository: DhanItPairRepository, broker: Any,
         if buy_status in FAILED or sell_status in FAILED:
             repository.update_pair(pair_id, buy_leg_status=buy_status, sell_leg_status=sell_status, pair_status="FAILED", last_checked_at=current.isoformat(timespec="seconds"))
             failed += 1
+            continue
+        if (
+            buy_status in COMPLETE
+            and sell_id
+            and int(pair.get("sell_leg_placed") or 0)
+            and sell_status not in COMPLETE
+            and not payload.get("sell_repriced_after_hedge_at")
+        ):
+            target_price = round(float(payload.get("sell_cmp_limit_price") or payload.get("sell_limit_price") or payload.get("sell_leg_premium") or 0), 2)
+            broker.modify_order("regular", sell_id, {"order_type": "LIMIT", "price": target_price})
+            repository.update_pair(
+                pair_id,
+                buy_leg_status=buy_status,
+                sell_leg_status=sell_status,
+                pair_status="HEDGE_FILLED_SELL_REPRICED",
+                last_checked_at=current.isoformat(timespec="seconds"),
+                payload_json=json.dumps({**payload, "sell_repriced_after_hedge_at": current.isoformat(timespec="seconds")}, default=str),
+            )
+            repository.log(pair_id, "SELL_REPRICED_TO_CMP_AFTER_HEDGE", f"{sell_id} @ {target_price}")
+            modified += 1
             continue
         if buy_status in COMPLETE and not int(pair.get("sell_leg_placed") or 0):
             sell_quote = _fresh_quote_for_symbol(broker, pair["sell_leg_tradingsymbol"])
@@ -79,4 +99,4 @@ def run_dhan_it_pair_monitor_once(repository: DhanItPairRepository, broker: Any,
             repository.update_pair(pair_id, pair_status="EXIT_REQUIRED", last_checked_at=current.isoformat(timespec="seconds"))
             exit_required += 1
     repository.export_outputs()
-    return {"checked": checked, "placed": placed, "failed": failed, "exit_required": exit_required, "both_filled": both}
+    return {"checked": checked, "placed": placed, "modified": modified, "failed": failed, "exit_required": exit_required, "both_filled": both}

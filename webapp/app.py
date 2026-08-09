@@ -203,6 +203,19 @@ DHAN_SCHEDULER_STATUS: dict[str, Any] = {
     "last_result": {},
     "last_error": "",
 }
+DHAN_IT_PAIR_SCHEDULER_INTERVAL_SECONDS = 5 * 60
+DHAN_IT_SCHEDULER_LOCK = threading.Lock()
+DHAN_IT_SCHEDULER_STOP = threading.Event()
+DHAN_IT_SCHEDULER_THREAD: threading.Thread | None = None
+DHAN_IT_SCHEDULER_STATUS: dict[str, Any] = {
+    "running": False,
+    "mode": "PAPER",
+    "last_started_at": "",
+    "last_stopped_at": "",
+    "last_run_at": "",
+    "last_result": {},
+    "last_error": "",
+}
 RISK_OUTPUT_DIR = APP_ROOT / "risk_outputs"
 OPEN_POSITIONS_PATH = APP_ROOT / "open_positions.csv"
 TRADE_JOURNAL_PATH = APP_ROOT / "trade_journal.csv"
@@ -19294,6 +19307,75 @@ def stop_dhan_scheduler() -> bool:
     return was_running
 
 
+def dhan_it_scheduler_status() -> dict[str, Any]:
+    running = bool(DHAN_IT_SCHEDULER_THREAD and DHAN_IT_SCHEDULER_THREAD.is_alive() and not DHAN_IT_SCHEDULER_STOP.is_set())
+    status = dict(DHAN_IT_SCHEDULER_STATUS)
+    status["running"] = running
+    status["interval_seconds"] = DHAN_IT_PAIR_SCHEDULER_INTERVAL_SECONDS
+    return status
+
+
+def run_dhan_it_scheduler_now(paper_trading: bool = True) -> dict[str, Any]:
+    repository = DhanItPairRepository(APP_DB_PATH)
+    broker = DhanBrokerAdapter(paper_trading=paper_trading)
+    with DHAN_IT_SCHEDULER_LOCK:
+        try:
+            result = run_dhan_it_pair_monitor_once(repository, broker)
+        except Exception as exc:
+            DHAN_IT_SCHEDULER_STATUS.update(
+                {
+                    "mode": "PAPER" if paper_trading else "LIVE",
+                    "last_run_at": _dhan_scheduler_stamp(),
+                    "last_error": friendly_external_error(exc, "DHAN-IT scheduler"),
+                }
+            )
+            raise
+        DHAN_IT_SCHEDULER_STATUS.update(
+            {
+                "mode": "PAPER" if paper_trading else "LIVE",
+                "last_run_at": _dhan_scheduler_stamp(),
+                "last_result": dict(result or {}),
+                "last_error": "",
+            }
+        )
+        return result
+
+
+def start_dhan_it_scheduler(paper_trading: bool = True) -> bool:
+    global DHAN_IT_SCHEDULER_THREAD
+    if DHAN_IT_SCHEDULER_THREAD and DHAN_IT_SCHEDULER_THREAD.is_alive():
+        DHAN_IT_SCHEDULER_STATUS.update({"running": True, "mode": "PAPER" if paper_trading else "LIVE"})
+        return False
+    DHAN_IT_SCHEDULER_STOP.clear()
+    DHAN_IT_SCHEDULER_STATUS.update(
+        {
+            "running": True,
+            "mode": "PAPER" if paper_trading else "LIVE",
+            "last_started_at": _dhan_scheduler_stamp(),
+            "last_error": "",
+        }
+    )
+
+    def worker() -> None:
+        while not DHAN_IT_SCHEDULER_STOP.wait(DHAN_IT_PAIR_SCHEDULER_INTERVAL_SECONDS):
+            try:
+                run_dhan_it_scheduler_now(paper_trading=paper_trading)
+            except Exception:
+                DHAN_IT_SCHEDULER_STATUS["last_error"] = traceback.format_exc(limit=1)
+                logger.exception("dhan_it_scheduler_failed")
+
+    DHAN_IT_SCHEDULER_THREAD = threading.Thread(target=worker, name="dhan-it-pair-scheduler", daemon=True)
+    DHAN_IT_SCHEDULER_THREAD.start()
+    return True
+
+
+def stop_dhan_it_scheduler() -> bool:
+    was_running = bool(DHAN_IT_SCHEDULER_THREAD and DHAN_IT_SCHEDULER_THREAD.is_alive())
+    DHAN_IT_SCHEDULER_STOP.set()
+    DHAN_IT_SCHEDULER_STATUS.update({"running": False, "last_stopped_at": _dhan_scheduler_stamp()})
+    return was_running
+
+
 def _dhan_json_loads(text: str, default: Any) -> Any:
     clean = str(text or "").strip()
     if not clean:
@@ -22511,6 +22593,20 @@ def render_dhan_it_panel(state: PageState) -> str:
     freshness_note = dhan_freshness_label(state.dhan_it_opportunities_generated_at) if state.dhan_it_opportunities else "Run evaluation to load fresh Kite opportunity data."
     trade_mode = "PAPER" if state.dhan_it_paper_trading else "LIVE"
     live_option_label = "Live"
+    it_scheduler_status = dhan_it_scheduler_status()
+    it_scheduler_running = bool(it_scheduler_status.get("running"))
+    it_scheduler_badge_class = "good" if it_scheduler_running else "neutral"
+    it_scheduler_badge_text = "RUNNING" if it_scheduler_running else "STOPPED"
+    it_scheduler_mode = html.escape(text_value(it_scheduler_status.get("mode"), trade_mode))
+    it_scheduler_result = dict(it_scheduler_status.get("last_result") or {})
+    it_scheduler_summary = (
+        f"Checked {it_scheduler_result.get('checked', 0)} | modified {it_scheduler_result.get('modified', 0)} | "
+        f"placed {it_scheduler_result.get('placed', 0)} | failed {it_scheduler_result.get('failed', 0)} | "
+        f"exit-required {it_scheduler_result.get('exit_required', 0)}"
+        if it_scheduler_result
+        else "No scheduler run recorded yet."
+    )
+    it_scheduler_error = text_value(it_scheduler_status.get("last_error"), "")
     return f"""
     <form id="dhan-it-panel" method="post" action="/dhan-it/load"{panel_style}>
       {env_hidden_fields_for_render()}
@@ -22539,7 +22635,24 @@ def render_dhan_it_panel(state: PageState) -> str:
       <section class="panel"><div class="panel-title">Opportunity Table</div><p class="status">Click stock name or Place Order to open the popup. {html.escape(freshness_note)}</p><div class="table-wrap"><table id="dhan-it-opportunity-table" class="ipo-table"><thead><tr><th>Select</th><th class="sort-header" data-sort-col="1">Symbol</th><th class="sort-header" data-sort-col="2">Strategy</th><th class="sort-header" data-sort-col="3">CMP</th><th class="sort-header" data-sort-col="4">Expiry</th><th class="sort-header" data-sort-col="5">Sell Leg</th><th class="sort-header" data-sort-col="6">Buy Hedge Leg</th><th class="sort-header" data-sort-col="7">Sell Strike</th><th class="sort-header" data-sort-col="8">Hedge Strike</th><th class="sort-header" data-sort-col="9">Sell Premium</th><th class="sort-header" data-sort-col="10">Hedge Premium</th><th class="sort-header" data-sort-col="11">Net Credit</th><th class="sort-header" data-sort-col="12">Max Gain</th><th class="sort-header" data-sort-col="13">Max Loss</th><th class="sort-header" data-sort-col="14">Breakeven</th><th class="sort-header" data-sort-col="15">POP</th><th class="sort-header" data-sort-col="16">RoR</th><th class="sort-header" data-sort-col="17">Margin</th><th class="sort-header" data-sort-col="18">Liquidity</th><th class="sort-header" data-sort-col="19">Event Risk</th><th class="sort-header" data-sort-col="20">Risk Decision</th><th class="sort-header" data-sort-col="21">Reason</th><th class="sort-header" data-sort-col="22">Sell Buy Orders</th><th class="sort-header" data-sort-col="23">Sell Sell Orders</th><th class="sort-header" data-sort-col="24">Sell Trade Activity</th><th class="sort-header" data-sort-col="25">Sell Trade Source</th><th class="sort-header" data-sort-col="26">Sell Liquidity</th><th class="sort-header" data-sort-col="27">Hedge Buy Orders</th><th class="sort-header" data-sort-col="28">Hedge Sell Orders</th><th class="sort-header" data-sort-col="29">Hedge Trade Activity</th><th class="sort-header" data-sort-col="30">Hedge Trade Source</th><th class="sort-header" data-sort-col="31">Hedge Liquidity</th><th class="sort-header" data-sort-col="32">Pair Liquidity</th><th class="sort-header" data-sort-col="33">Liquidity Order Allowed</th><th>Action</th></tr></thead><tbody>{''.join(opportunity_rows)}</tbody></table></div></section>
       <section class="panel"><div class="panel-title">Compare POP, Gain and Risk</div><p class="status">Click the stock name to open the DHAN-IT execution popup. Best Pick turns green when that expiry has POP 80%+, max gain 10,000+, max loss 40,000 or lower, liquidity is not RED, and the legs are available for the selected lot size.</p><div class="table-wrap"><table id="dhan-it-comparison-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Symbol</th><th class="sort-header" data-sort-col="1">Strategy</th><th class="sort-header" data-sort-col="2">Expiry Type</th><th class="sort-header" data-sort-col="3">Expiry Date</th><th class="sort-header" data-sort-col="4">DTE</th><th class="sort-header" data-sort-col="5">Sell Leg</th><th class="sort-header" data-sort-col="6">Buy Hedge Leg</th><th class="sort-header" data-sort-col="7">Net Credit</th><th class="sort-header" data-sort-col="8">Max Gain</th><th class="sort-header" data-sort-col="9">Max Loss</th><th class="sort-header" data-sort-col="10">POP</th><th class="sort-header" data-sort-col="11">RoR</th><th class="sort-header" data-sort-col="12">Breakeven</th><th class="sort-header" data-sort-col="13">Margin</th><th class="sort-header" data-sort-col="14">Event Risk</th><th class="sort-header" data-sort-col="15">Liquidity</th><th class="sort-header" data-sort-col="16">Risk Decision</th><th class="sort-header" data-sort-col="17">Recommendation</th><th class="sort-header" data-sort-col="18">Best Pick</th></tr></thead><tbody>{''.join(comparison_rows)}</tbody></table></div></section>
       {selected_preview}
-      <section class="panel"><div class="panel-title">Pair Order Monitor</div><div class="actions"><button type="submit" formaction="/dhan-it/monitor-run" class="secondary">Run Now</button><button type="submit" formaction="/dhan-it/load" class="secondary">Refresh</button></div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Pair ID</th><th>Symbol</th><th>Strategy</th><th>Expiry</th><th>Sell Leg</th><th>Buy Hedge Leg</th><th>Sell Status</th><th>Hedge Status</th><th>Pair Status</th><th>Expected Credit</th><th>Actual Credit</th><th>Max Gain</th><th>Max Loss</th><th>Breakeven</th><th>Last Checked</th><th>Recommended Action</th></tr></thead><tbody>{''.join(pair_rows)}</tbody></table></div></section>
+      <section class="panel dhan-monitor-panel">
+        <div class="panel-title">Pair Order Monitor</div>
+        <div class="dhan-job-status">
+          <article><span>Job Status</span><strong><span class="ipo-badge {it_scheduler_badge_class}">{it_scheduler_badge_text}</span></strong><small>{it_scheduler_mode} mode</small></article>
+          <article><span>Interval</span><strong>{html.escape(str(it_scheduler_status.get('interval_seconds') or '-'))}s</strong><small>Auto SELL-leg checks</small></article>
+          <article><span>Last Run</span><strong>{html.escape(text_value(it_scheduler_status.get('last_run_at')))}</strong><small>{html.escape(it_scheduler_summary)}</small></article>
+          <article><span>Last Start / Stop</span><strong>{html.escape(text_value(it_scheduler_status.get('last_started_at')))}</strong><small>Stopped: {html.escape(text_value(it_scheduler_status.get('last_stopped_at')))}</small></article>
+        </div>
+        {f'<div class="status error">DHAN-IT scheduler error: {html.escape(it_scheduler_error)}</div>' if it_scheduler_error else ''}
+        <div class="actions">
+          <button type="submit" formaction="/dhan-it/monitor-run" class="secondary">Run Scheduler Now</button>
+          <button type="submit" formaction="/dhan-it/scheduler-start" class="secondary">Start Scheduler</button>
+          <button type="submit" formaction="/dhan-it/scheduler-stop" class="secondary">Stop Scheduler</button>
+          <button type="submit" formaction="/dhan-it/load" class="secondary">Refresh Order Book</button>
+          <button type="submit" formaction="/dhan-it/clear-pair-monitor" class="secondary danger-link" onclick="return confirm('Clear local DHAN-IT Pair Order Monitor history? This will NOT cancel or modify any Kite orders.');">Clear Monitor</button>
+        </div>
+        <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Pair ID</th><th>Symbol</th><th>Strategy</th><th>Expiry</th><th>Sell Leg</th><th>Buy Hedge Leg</th><th>Sell Status</th><th>Hedge Status</th><th>Pair Status</th><th>Expected Credit</th><th>Actual Credit</th><th>Max Gain</th><th>Max Loss</th><th>Breakeven</th><th>Last Checked</th><th>Recommended Action</th></tr></thead><tbody>{''.join(pair_rows)}</tbody></table></div>
+      </section>
     </form>"""
 
 
@@ -38679,16 +38792,36 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 load_dhan_it_state(state)
                 state.message = f"Submitted DHAN-IT paired spread {outcome.get('pair_id')} in {submit_mode.lower()} mode. Monitor will place SELL after BUY hedge is complete."
             elif request_path == "/dhan-it/monitor-run":
-                repository = DhanItPairRepository(APP_DB_PATH)
-                result = run_dhan_it_pair_monitor_once(
-                    repository,
-                    DhanBrokerAdapter(paper_trading=state.dhan_it_paper_trading),
-                )
+                result = run_dhan_it_scheduler_now(paper_trading=state.dhan_it_paper_trading)
                 load_dhan_it_state(state)
                 state.message = (
-                    f"DHAN-IT monitor checked {result.get('checked')} pair(s), placed {result.get('placed')} SELL leg(s), "
+                    f"DHAN-IT scheduler checked {result.get('checked')} pair(s), modified {result.get('modified', 0)}, placed {result.get('placed')} SELL leg(s), "
                     f"failed {result.get('failed')}, exit-required {result.get('exit_required')}, both-filled {result.get('both_filled')}."
                 )
+            elif request_path == "/dhan-it/scheduler-start":
+                started = start_dhan_it_scheduler(paper_trading=state.dhan_it_paper_trading)
+                load_dhan_it_state(state)
+                state.message = "Started DHAN-IT scheduler." if started else "DHAN-IT scheduler is already running."
+            elif request_path == "/dhan-it/scheduler-stop":
+                stopped = stop_dhan_it_scheduler()
+                load_dhan_it_state(state)
+                state.message = "Stopped DHAN-IT scheduler." if stopped else "DHAN-IT scheduler was not running."
+            elif request_path == "/dhan-it/clear-pair-monitor":
+                repository = DhanItPairRepository(APP_DB_PATH)
+                deleted = repository.clear_pair_monitor()
+                repository.export_outputs(state.dhan_it_opportunities)
+                state.dhan_it_selected_index = ""
+                state.dhan_it_confirm_order = False
+                state.dhan_it_repair_preview = None
+                state.dhan_it_confirm_repair_order = False
+                state.console_log = (
+                    "DHAN-IT Pair Order Monitor cleared locally.\n"
+                    f"Pair order rows deleted: {deleted.get('pair_orders_deleted', 0)}\n"
+                    f"Execution log rows deleted: {deleted.get('execution_logs_deleted', 0)}\n"
+                    "No Kite orders were cancelled or modified."
+                )
+                load_dhan_it_state(state)
+                state.message = f"Cleared DHAN-IT Pair Order Monitor locally: {deleted.get('pair_orders_deleted', 0)} pair row(s) removed. Kite orders were not changed."
             elif request_path in {"/value-stock/filter", "/value-stock/detail"}:
                 load_value_stock_state(state)
                 if request_path == "/value-stock/detail" and state.value_stock_detail:
