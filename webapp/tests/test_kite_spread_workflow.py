@@ -528,17 +528,45 @@ def test_dhan_stock_rows_have_simple_pe_ce_evaluation_actions(tmp_path, monkeypa
 
     assert "Current F&O Stock List - Select PE or CE" in html
     assert "dhan-watchlist-scroll" in html
-    assert html.index("<th>Actions</th>") < html.index("<th>52W High Gap</th>")
+    assert 'id="dhan-watchlist-table"' in html
+    assert '<th class="sort-header" data-sort-col="0">Select</th>' in html
+    assert '<th class="sort-header" data-sort-col="2">CMP / Day</th>' in html
+    assert html.index('data-sort-col="4">Actions</th>') < html.index('data-sort-col="5">52W High Gap</th>')
     assert "Run Analysis" in html
+    assert "Select All" in html
+    assert "Clear Selection" in html
+    assert "Run Analysis for Selected Actions" in html
+    assert "Run Analysis for All" in html
+    assert "/kite-spreads/analyze-selected-actions" in html
+    assert 'name="dhan_analyze_all_actions" value="1"' in html
+    assert 'name="dhan_watch_action"' in html
+    assert "Analysis results are saved locally and remain visible after refresh until you recalculate." in html
     assert "/kite-spreads/open-symbol" in html
     assert "Run Analysis on All Stocks" in html
     assert "/kite-spreads/analyze-all" in html
+    assert "https://www.screener.in/company/BAJFINANCE/" in html
+    assert "Open Screener" in html
     assert "Evaluate PE" in html
     assert "Evaluate CE" in html
     assert "/kite-spreads/evaluate-symbol" in html
     assert "BAJFINANCE|BULL_PUT_SPREAD" in html
     assert "BAJFINANCE|BEAR_CALL_SPREAD" in html
     assert "Market Setup for Popup Evaluation" not in html
+
+
+def test_dhan_watch_action_strategy_prefers_fno_sheet_strategy_then_dma_zone():
+    assert app.dhan_watch_action_strategy(
+        {"symbol": "ALKEM", "cmp": 100, "dma_50": 90, "dma_200": 80},
+        {"dhan_strategy": "BULL_PUT_SPREAD"},
+    ) == "BULL_PUT_SPREAD"
+    assert app.dhan_watch_action_strategy(
+        {"symbol": "SELLME", "cmp": 120, "dma_50": 100, "dma_200": 90},
+        {},
+    ) == "BEAR_CALL_SPREAD"
+    assert app.dhan_watch_action_strategy(
+        {"symbol": "BUYME", "cmp": 80, "dma_50": 100, "dma_200": 90},
+        {},
+    ) == "BULL_PUT_SPREAD"
 
 
 def test_dhan_stock_rows_show_fresh_cmp_when_available(tmp_path, monkeypatch):
@@ -548,8 +576,21 @@ def test_dhan_stock_rows_show_fresh_cmp_when_available(tmp_path, monkeypatch):
     html = app.render_kite_spreads_panel(app.PageState(active_tab="kite-spreads"))
 
     assert "CMP / Day" in html
+    assert "dhan-cmp-day-cell" in html
     assert "1141.20" in html
     assert "8.32%" in html
+
+
+def test_dhan_opportunities_sort_by_max_gain_descending():
+    rows = app.sort_dhan_opportunities_by_max_gain(
+        [
+            {"symbol": "LOW", "max_gain": 2000, "pop_estimate": 95, "return_on_risk_pct": 30},
+            {"symbol": "HIGH", "max_gain": 12000, "pop_estimate": 72, "return_on_risk_pct": 8},
+            {"symbol": "MID", "max_gain": 8000, "pop_estimate": 80, "return_on_risk_pct": 14},
+        ]
+    )
+
+    assert [row["symbol"] for row in rows] == ["HIGH", "MID", "LOW"]
 
 
 def test_dhan_stock_rows_show_52_week_high_gap(tmp_path, monkeypatch):
@@ -1485,11 +1526,15 @@ def test_dhan_current_position_table_clubs_open_option_buckets():
 
     assert rows[0]["sell_qty_abs"] == 500
     assert rows[0]["buy_qty_abs"] == 250
+    assert rows[0]["option_pnl"] == 500
     assert rows[0]["repair_qty"] == 250
     assert rows[0]["pair_status"] == "SHORT CE UNHEDGED"
     assert rows[0]["dma_zone"] == "SELL ZONE"
     assert "Current Kite Option Holdings / Pair Status" in html
     assert "CMP / DMA Zone" in html
+    assert "dhan-it-position-table" in html
+    assert "<th>P&amp;L</th>" in html or "<th>P&L</th>" in html
+    assert "500.00" in html
     assert html.index("<th>Action</th>") < html.index("<th>SELL Option Holdings</th>")
     assert "SELL ZONE" in html
     assert "OTM 5.00% | POP 70.00% approx" in html

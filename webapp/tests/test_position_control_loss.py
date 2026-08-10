@@ -254,12 +254,95 @@ def test_execute_position_orders_blocks_sell_when_stop_enabled():
         raise AssertionError("SELL close order should be blocked while STOP OPTION SELL is enabled")
 
 
-def test_positions_panel_shows_stop_option_sell_enabled_by_default():
+def test_positions_panel_shows_stop_option_sell_enabled_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "SETTINGS_PATH", tmp_path / "app_settings.json")
+
     html = app.render_positions_panel(app.PageState(active_tab="positions"))
 
     assert 'name="position_stop_option_sell" value="1" checked' in html
+    assert 'name="position_stop_option_sell_present" value="1"' in html
     assert "STOP OPTION SELL: ON" in html
+    assert 'formaction="/positions/save-option-sell-flag"' in html
+    assert "Save Option Sell Close Flag" in html
     assert "Scheduled Default Close Orders" in html
+    assert "Intraday Missing Close-Order Guard" in html
+    assert 'formaction="/positions/intraday-guard-run"' in html
+    assert 'formaction="/positions/intraday-guard-start"' in html
+    assert 'formaction="/positions/intraday-guard-stop"' in html
+    assert 'formaction="/positions/intraday-guard-clear"' in html
+
+
+def test_position_stop_option_sell_setting_persists_off_for_page_state(tmp_path, monkeypatch):
+    settings_path = tmp_path / "app_settings.json"
+    monkeypatch.setattr(app, "SETTINGS_PATH", settings_path)
+
+    assert app.position_stop_option_sell_setting() is True
+
+    app.save_app_settings({"position_stop_option_sell": False})
+
+    assert app.position_stop_option_sell_setting() is False
+    html = app.render_positions_panel(app.PageState(active_tab="positions"))
+    assert 'name="position_stop_option_sell" value="1" checked' not in html
+    assert "OPTION SELL CLOSE: ENABLED" in html
+    assert 'formaction="/positions/save-option-sell-flag"' in html
+    assert "<span>STOP OPTION SELL</span><strong>OFF</strong>" in html
+
+
+def test_intraday_missing_close_guard_uses_saved_stop_option_sell_setting(
+    tmp_path,
+    monkeypatch,
+):
+    settings_path = tmp_path / "app_settings.json"
+    monkeypatch.setattr(app, "SETTINGS_PATH", settings_path)
+    app.save_app_settings({"position_stop_option_sell": False})
+
+    captured: dict[str, bool] = {}
+    default_order = {
+        "tradingsymbol": "NIFTY26JUL22200PE",
+        "transaction_type": "SELL",
+        "quantity": 65,
+        "price": 22.15,
+    }
+
+    def fake_build_missing_option_close_orders(kite, discount_percent, stop_option_sell=True):
+        captured["build_stop_option_sell"] = stop_option_sell
+        return [default_order], [{"action": "PLACE_SELL_CLOSE"}]
+
+    def fake_execute_position_buy_orders(
+        orders,
+        selected_indexes,
+        dry_run,
+        keep_existing_orders,
+        stop_option_sell=True,
+    ):
+        captured["execute_stop_option_sell"] = stop_option_sell
+        return orders, [{"status": "LIVE_SENT", "tradingsymbol": orders[0]["tradingsymbol"]}]
+
+    fake_kite = object()
+    with patch.object(app, "load_kite_profiles", return_value={}), patch.object(
+        app, "apply_kite_profile_to_env"
+    ), patch.object(app, "kite_setup_issue", return_value=""), patch.object(
+        app.kite_buy_positions, "kite_client", return_value=fake_kite
+    ), patch.object(
+        app, "verify_scheduled_position_market_open", return_value=(True, "Market open.")
+    ), patch.object(
+        app, "build_intraday_loss_limit_close_orders", return_value=([], [])
+    ), patch.object(
+        app, "build_intraday_pe_risk_exit_orders", return_value=([], [])
+    ), patch.object(
+        app, "build_missing_option_close_orders", side_effect=fake_build_missing_option_close_orders
+    ), patch.object(
+        app, "execute_position_buy_orders", side_effect=fake_execute_position_buy_orders
+    ):
+        result = app.run_intraday_position_close_job(
+            now=datetime(2026, 8, 10, 10, 0, tzinfo=app.INDIA_TIME_ZONE),
+            force=True,
+        )
+
+    assert result is not None
+    assert result["status"] == "PLACED"
+    assert captured["build_stop_option_sell"] is False
+    assert captured["execute_stop_option_sell"] is False
 
 
 def test_positions_panel_renders_large_colored_buy_and_sell_quantities():

@@ -298,9 +298,9 @@ def test_dhan_it_holding_position_analyzer_scopes_to_it_symbols_and_suggests_pai
             {"tradingsymbol": "RELIANCE", "quantity": 50, "average_price": 1000, "last_price": 1100},
         ],
         positions=[
-            {"tradingsymbol": "TCS26AUG4000CE", "name": "TCS", "instrument_type": "CE", "quantity": -175},
-            {"tradingsymbol": "TCS26AUG4200CE", "name": "TCS", "instrument_type": "CE", "quantity": 175},
-            {"tradingsymbol": "INFY26AUG1700CE", "name": "INFY", "instrument_type": "CE", "quantity": -400},
+            {"tradingsymbol": "TCS26AUG4000CE", "name": "TCS", "instrument_type": "CE", "quantity": -175, "pnl": 1200},
+            {"tradingsymbol": "TCS26AUG4200CE", "name": "TCS", "instrument_type": "CE", "quantity": 175, "pnl": -300},
+            {"tradingsymbol": "INFY26AUG1700CE", "name": "INFY", "instrument_type": "CE", "quantity": -400, "pnl": -2500},
             {"tradingsymbol": "RELIANCE26AUG3000CE", "name": "RELIANCE", "instrument_type": "CE", "quantity": -250},
         ],
     )
@@ -308,9 +308,11 @@ def test_dhan_it_holding_position_analyzer_scopes_to_it_symbols_and_suggests_pai
 
     assert set(by_symbol) == {"TCS", "INFY", "HCLTECH", "TECHM"}
     assert by_symbol["TCS"]["pair_status"] == "PAIR ACTIVE"
+    assert by_symbol["TCS"]["option_pnl"] == 900
     assert by_symbol["TCS"]["sell_options"][0]["strike"] == "4000"
     assert by_symbol["TCS"]["buy_options"][0]["strike"] == "4200"
     assert by_symbol["INFY"]["pair_status"] == "SHORT CE UNHEDGED"
+    assert by_symbol["INFY"]["option_pnl"] == -2500
     assert by_symbol["INFY"]["sell_qty_abs"] == 400
     assert by_symbol["INFY"]["buy_qty_abs"] == 0
     assert by_symbol["HCLTECH"]["pair_status"] == "NO CE PAIR"
@@ -364,6 +366,7 @@ def test_dhan_it_holding_position_table_renders_below_call_watch():
     assert "Holding Qty" not in html
     assert "SELL CE Option Holdings" in html
     assert "BUY CE Hedge Holdings" in html
+    assert "<th>P&L</th>" in html
     assert 'formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol" value="INFY"' in html
 
 

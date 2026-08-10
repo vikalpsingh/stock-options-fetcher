@@ -1426,6 +1426,11 @@ def position_close_discount_percent_setting() -> float:
     return discount if 0 <= discount < 100 else DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT
 
 
+def position_stop_option_sell_setting() -> bool:
+    value = load_app_settings().get("position_stop_option_sell", True)
+    return profile_flag(value, True)
+
+
 def intraday_hard_stop_start_dte_setting() -> int:
     value = load_app_settings().get(
         "intraday_hard_stop_start_dte",
@@ -5728,7 +5733,7 @@ class PageState:
     position_keep_existing_orders: bool = False
     position_max_orders: str = ""
     position_live_confirmed: bool = False
-    position_stop_option_sell: bool = True
+    position_stop_option_sell: bool = field(default_factory=position_stop_option_sell_setting)
     gpt_url: str = DEFAULT_GPT_SHARE_URL
     gpt_conversation: str = ""
     gpt_csv_text: str = ""
@@ -17308,11 +17313,12 @@ def run_scheduled_position_close_job(
             )
             orders = build_position_buy_orders(state)
             selected = set(range(len(orders)))
-            submitted_orders, results = execute_position_buy_orders(
+            submitted_orders, results = execute_position_orders_for_scheduler(
                 orders,
                 selected,
                 False,
                 False,
+                position_stop_option_sell_setting(),
             )
             live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
             error_count = sum(1 for result in results if result.get("status") == "ERROR")
@@ -17362,6 +17368,49 @@ def save_intraday_position_close_schedule_state(**updates: Any) -> dict[str, Any
     state.update(updates)
     save_app_settings({"intraday_position_close_scheduler": state})
     return state
+
+
+def build_missing_option_close_orders_for_scheduler(
+    kite: Any,
+    discount_percent: float,
+    stop_option_sell: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        return build_missing_option_close_orders(
+            kite,
+            discount_percent,
+            stop_option_sell=stop_option_sell,
+        )
+    except TypeError as exc:
+        if "stop_option_sell" not in str(exc):
+            raise
+        return build_missing_option_close_orders(kite, discount_percent)
+
+
+def execute_position_orders_for_scheduler(
+    orders: list[dict[str, Any]],
+    selected_indexes: set[int],
+    dry_run: bool,
+    keep_existing_orders: bool,
+    stop_option_sell: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        return execute_position_buy_orders(
+            orders,
+            selected_indexes,
+            dry_run,
+            keep_existing_orders,
+            stop_option_sell,
+        )
+    except TypeError as exc:
+        if "positional" not in str(exc) and "argument" not in str(exc):
+            raise
+        return execute_position_buy_orders(
+            orders,
+            selected_indexes,
+            dry_run,
+            keep_existing_orders,
+        )
 
 
 def scheduled_job_definitions() -> dict[str, dict[str, Any]]:
@@ -17756,6 +17805,7 @@ def run_intraday_position_close_job(
                 position_dry_run=False,
                 position_discount_percent=position_close_discount_percent_setting(),
                 position_keep_existing_orders=True,
+                position_stop_option_sell=position_stop_option_sell_setting(),
             )
             loss_limit_orders, loss_limit_evaluations = build_intraday_loss_limit_close_orders(
                 kite,
@@ -17787,10 +17837,10 @@ def run_intraday_position_close_job(
                 if str(order.get("tradingsymbol") or "").upper() not in loss_limit_symbols
             ]
             default_orders: list[dict[str, Any]] = []
-            default_orders, close_order_evaluations = build_missing_option_close_orders(
+            default_orders, close_order_evaluations = build_missing_option_close_orders_for_scheduler(
                 kite,
                 state.position_discount_percent,
-                stop_option_sell=True,
+                state.position_stop_option_sell,
             )
             default_orders = [
                 order for order in default_orders
@@ -17867,30 +17917,32 @@ def run_intraday_position_close_job(
             submitted_orders: list[dict[str, Any]] = []
             results: list[dict[str, Any]] = []
             if loss_limit_orders:
-                loss_submitted, loss_results = execute_position_buy_orders(
+                loss_submitted, loss_results = execute_position_orders_for_scheduler(
                     loss_limit_orders,
                     set(range(len(loss_limit_orders))),
                     False,
                     False,
+                    state.position_stop_option_sell,
                 )
                 submitted_orders.extend(loss_submitted)
                 results.extend(loss_results)
             if risk_orders:
-                risk_submitted, risk_results = execute_position_buy_orders(
+                risk_submitted, risk_results = execute_position_orders_for_scheduler(
                     risk_orders,
                     set(range(len(risk_orders))),
                     False,
                     True,
+                    state.position_stop_option_sell,
                 )
                 submitted_orders.extend(risk_submitted)
                 results.extend(risk_results)
             if default_orders:
-                default_submitted, default_results = execute_position_buy_orders(
+                default_submitted, default_results = execute_position_orders_for_scheduler(
                     default_orders,
                     set(range(len(default_orders))),
                     False,
                     True,
-                    stop_option_sell=True,
+                    state.position_stop_option_sell,
                 )
                 submitted_orders.extend(default_submitted)
                 results.extend(default_results)
@@ -19539,6 +19591,26 @@ def dhan_stock_dma_context(symbol: str, row: dict[str, Any] | None = None) -> di
     }
 
 
+def dhan_watch_action_strategy(row: dict[str, Any], fno_detail: dict[str, Any] | None = None) -> str:
+    fno_strategy = str((fno_detail or {}).get("dhan_strategy") or "").upper()
+    if fno_strategy in {"BEAR_CALL_SPREAD", "BULL_PUT_SPREAD"}:
+        return fno_strategy
+    preferred_action = str(
+        dhan_stock_dma_context(str(row.get("symbol") or ""), row).get("preferred_action") or ""
+    )
+    if str(row.get("source") or "").upper() == "FNO_SHEET":
+        gpt_view = str(row.get("gpt_view") or "").upper()
+        if gpt_view == "PE_SELL":
+            preferred_action = "PE"
+        elif gpt_view == "CE_SELL":
+            preferred_action = "CE"
+    if preferred_action == "PE":
+        return "BULL_PUT_SPREAD"
+    if preferred_action == "CE":
+        return "BEAR_CALL_SPREAD"
+    return "BOTH"
+
+
 DHAN_CRITICAL_ORDER_BLOCKS = {
     "CMP_UNAVAILABLE",
     "CONTRACT_UNRESOLVED",
@@ -19963,6 +20035,18 @@ def filter_dhan_opportunities_for_table(opportunities: list[dict[str, Any]]) -> 
     return [row for row in opportunities if dhan_opportunity_passes_gain_loss_filter(row)]
 
 
+def sort_dhan_opportunities_by_max_gain(opportunities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        opportunities,
+        key=lambda row: (
+            _dhan_metric_float(row.get("max_gain")),
+            _dhan_metric_float(row.get("pop_estimate")),
+            _dhan_metric_float(row.get("return_on_risk_pct")),
+        ),
+        reverse=True,
+    )
+
+
 def dhan_month_passes_selection_threshold(month: dict[str, Any], min_gain: float, max_loss: float) -> bool:
     return (
         str(month.get("risk_decision") or "").upper() == "APPROVED"
@@ -20283,6 +20367,7 @@ def analyze_dhan_holding_positions(
                 "buy_options": [],
                 "sell_qty_abs": 0,
                 "buy_qty_abs": 0,
+                "option_pnl": 0.0,
             },
         )
         analytics = option_otm_pop(symbol, option_type, parts.get("strike") or position.get("strike"))
@@ -20303,6 +20388,7 @@ def analyze_dhan_holding_positions(
         else:
             bucket["buy_options"].append(chip)
             bucket["buy_qty_abs"] += quantity
+        bucket["option_pnl"] = _dhan_metric_float(bucket.get("option_pnl")) + _dhan_metric_float(position.get("pnl"))
     pending_orders_by_bucket_side: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for order in orders or []:
         tradingsymbol = str(order.get("tradingsymbol") or "").strip().upper()
@@ -20403,6 +20489,14 @@ def render_dhan_holding_positions(rows: list[dict[str, Any]] | None) -> str:
         except (TypeError, ValueError):
             return "-"
 
+    def pnl_class(value: Any) -> str:
+        pnl_value = _dhan_metric_float(value)
+        if pnl_value > 0:
+            return "pnl-positive"
+        if pnl_value < 0:
+            return "pnl-negative"
+        return ""
+
     def option_chips(options: Any, side: str, option_type: str) -> str:
         option_rows = options if isinstance(options, list) else []
         css_side = "sell" if side == "SELL" else "buy"
@@ -20457,6 +20551,7 @@ def render_dhan_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             f"<td><strong>{html.escape(symbol)}</strong><small>{html.escape(option_type)} bucket</small></td>"
             f"<td class=\"dhan-cmp-zone-cell\">{cmp_cell}</td>"
             f"<td class=\"dhan-pair-action-cell\">{button}</td>"
+            f"<td class=\"dhan-position-pnl-cell {pnl_class(row.get('option_pnl'))}\">{money(row.get('option_pnl'))}</td>"
             f"<td>{option_chips(row.get('sell_options'), 'SELL', option_type)}</td>"
             f"<td>{option_chips(row.get('buy_options'), 'BUY', option_type)}</td>"
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(pair_status)}</span></td>"
@@ -20464,13 +20559,13 @@ def render_dhan_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             "</tr>"
         )
     if not rendered_rows:
-        rendered_rows.append('<tr><td colspan="7" class="muted-cell">No current DHAN option positions found for active Income Growth F&O stocks.</td></tr>')
+        rendered_rows.append('<tr><td colspan="8" class="muted-cell">No current DHAN option positions found for active Income Growth F&O stocks.</td></tr>')
     return (
         '<section class="panel dhan-it-position-panel">'
         '<div class="panel-title">Current Kite Option Holdings / Pair Status</div>'
         '<p class="status">Shows only current open option positions for active DHAN stocks. SELL legs are red, BUY hedges are green, and multiple lots/legs are clubbed by stock + CE/PE bucket. DMA zone: below 50/200 DMA = BUY zone, above 50/200 DMA = SELL zone, between them = neutral.</p>'
         '<div class="table-wrap"><table class="ipo-table dhan-it-position-table">'
-        '<thead><tr><th>Stock</th><th>CMP / DMA Zone</th><th>Action</th><th>SELL Option Holdings</th><th>BUY Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th></tr></thead>'
+        '<thead><tr><th>Stock</th><th>CMP / DMA Zone</th><th>Action</th><th>P&L</th><th>SELL Option Holdings</th><th>BUY Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th></tr></thead>'
         f'<tbody>{"".join(rendered_rows)}</tbody></table></div></section>'
     )
 
@@ -20853,6 +20948,15 @@ def render_kite_spreads_panel(state: PageState) -> str:
             pe_button_class += " dhan-action-recommended"
         elif preferred_action == "CE":
             ce_button_class += " dhan-action-recommended"
+        selected_strategy = dhan_watch_action_strategy(row, fno_detail)
+        selected_action_label = (
+            "PE"
+            if selected_strategy == "BULL_PUT_SPREAD"
+            else "CE"
+            if selected_strategy == "BEAR_CALL_SPREAD"
+            else "BOTH"
+        )
+        screener_url = screener_link_for_code(f"NSE:{row_symbol}") if row_symbol else "https://www.screener.in/"
         remove_disabled = " disabled" if row_symbol in protected_dhan_symbols else ""
         remove_title = (
             " title=\"Open option position exists; use Current Kite Option Holdings / Pair Status before removing.\""
@@ -20861,8 +20965,9 @@ def render_kite_spreads_panel(state: PageState) -> str:
         )
         watch_rows.append(
             f"<tr{row_class}>"
-            f"<td class=\"dhan-symbol-cell\"><button type=\"submit\" class=\"mini-link button-link\" formaction=\"/kite-spreads/open-symbol\" name=\"dhan_open_symbol\" value=\"{symbol_value}\"><strong>{html.escape(text_value(row.get('symbol')))}</strong></button><small>{html.escape(company_name)}</small></td>"
-            f"<td>{money(row.get('cmp'))}<small class=\"{row_day_change_class}\">{html.escape(text_value(row.get('day_change_pct')))}%</small></td>"
+            f"<td class=\"dhan-watch-select-cell\"><label class=\"dhan-row-select\"><input type=\"checkbox\" name=\"dhan_watch_action\" value=\"{symbol_value}|{html.escape(selected_strategy, quote=True)}\"><span>{html.escape(selected_action_label)}</span></label></td>"
+            f"<td class=\"dhan-symbol-cell\"><a class=\"dhan-symbol-screener-link\" href=\"{html.escape(screener_url, quote=True)}\" target=\"_blank\" rel=\"noopener\"><strong>{html.escape(text_value(row.get('symbol')))}</strong></a><small>{html.escape(company_name)}</small><small><a class=\"mini-link\" href=\"{html.escape(screener_url, quote=True)}\" target=\"_blank\" rel=\"noopener\">Open Screener</a></small></td>"
+            f"<td class=\"dhan-cmp-day-cell\"><strong>{money(row.get('cmp'))}</strong><small class=\"{row_day_change_class}\">{html.escape(text_value(row.get('day_change_pct')))}%</small></td>"
             f"<td class=\"dhan-cmp-zone-cell\"><span class=\"ipo-badge {html.escape(zone_class)}\">{html.escape(text_value(dma_ctx.get('dma_zone')))}</span><small>50 DMA {money(dma_ctx.get('dma_50'))} | 200 DMA {money(dma_ctx.get('dma_200'))}</small><small>{html.escape(text_value(dma_ctx.get('dma_zone_reason'), ''))}</small></td>"
             "<td class=\"dhan-action-cell\">"
             f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-primary\" formaction=\"/kite-spreads/open-symbol\" name=\"dhan_open_symbol\" value=\"{symbol_value}\">Analyze</button>"
@@ -20883,7 +20988,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
             "</tr>"
         )
     if not watch_rows:
-        watch_rows.append('<tr><td colspan="14" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
+        watch_rows.append('<tr><td colspan="15" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
 
     active_config_rows = []
     for row in watchlist:
@@ -21451,8 +21556,14 @@ def render_kite_spreads_panel(state: PageState) -> str:
       {render_dhan_repair_modal(state)}
       <section class="panel dhan-watchlist-panel">
         <div class="panel-title">Current F&O Stock List - Select PE or CE</div>
-        <p class="status">Choose Evaluate PE or Evaluate CE for one stock. The popup reviews a 5% OTM SELL and 10% OTM BUY hedge pair before any Kite order is allowed.</p>
-        <div class="table-wrap dhan-watchlist-scroll"><table class="ipo-table dhan-watchlist-table"><thead><tr><th>Symbol</th><th>CMP / Day</th><th>DMA Zone</th><th>Actions</th><th>52W High Gap</th><th>Rank / Trade</th><th>Spot</th><th>Strike / Premium</th><th>OTM / Expiry</th><th>Liquidity</th><th>Scores</th><th>Gain / Loss</th><th>POP / RoR</th><th>Live Status / Risk Reason</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
+        <p class="status">Choose Evaluate PE or Evaluate CE for one stock, or tick selected actions and run focused analysis. Stock names open Screener for business-quality review; app action buttons stay inside DHAN. Analysis results are saved locally and remain visible after refresh until you recalculate.</p>
+        <div class="actions">
+          <button type="button" id="dhan-select-all-actions" class="secondary">Select All</button>
+          <button type="button" id="dhan-clear-all-actions" class="secondary">Clear Selection</button>
+          <button type="submit" formaction="/kite-spreads/analyze-selected-actions" class="success">Run Analysis for Selected Actions</button>
+          <button type="submit" formaction="/kite-spreads/analyze-selected-actions" name="dhan_analyze_all_actions" value="1" class="success">Run Analysis for All</button>
+        </div>
+        <div class="table-wrap dhan-watchlist-scroll"><table id="dhan-watchlist-table" class="ipo-table dhan-watchlist-table"><thead><tr><th class="sort-header" data-sort-col="0">Select</th><th class="sort-header" data-sort-col="1">Symbol</th><th class="sort-header" data-sort-col="2">CMP / Day</th><th class="sort-header" data-sort-col="3">DMA Zone</th><th class="sort-header" data-sort-col="4">Actions</th><th class="sort-header" data-sort-col="5">52W High Gap</th><th class="sort-header" data-sort-col="6">Rank / Trade</th><th class="sort-header" data-sort-col="7">Spot</th><th class="sort-header" data-sort-col="8">Strike / Premium</th><th class="sort-header" data-sort-col="9">OTM / Expiry</th><th class="sort-header" data-sort-col="10">Liquidity</th><th class="sort-header" data-sort-col="11">Scores</th><th class="sort-header" data-sort-col="12">Gain / Loss</th><th class="sort-header" data-sort-col="13">POP / RoR</th><th class="sort-header" data-sort-col="14">Live Status / Risk Reason</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
       </section>
       <section class="panel dhan-opportunities-panel{best_pair_section_class}">
         <div class="panel-title">Opportunity Table - Compare POP, Gain and Risk</div>
@@ -21593,6 +21704,7 @@ def analyze_dhan_it_holding_positions(
                 buy_positions.append(position)
         sell_qty_abs = sum(abs(int(float(item.get("quantity") or 0))) for item in sell_positions)
         buy_qty_abs = sum(abs(int(float(item.get("quantity") or 0))) for item in buy_positions)
+        option_pnl = sum(_dhan_metric_float(item.get("pnl")) for item in [*sell_positions, *buy_positions])
         has_sell = bool(sell_positions)
         has_buy = bool(buy_positions)
         if has_sell and has_buy:
@@ -21622,6 +21734,7 @@ def analyze_dhan_it_holding_positions(
                 "buy_count": len(buy_positions),
                 "sell_qty_abs": sell_qty_abs,
                 "buy_qty_abs": buy_qty_abs,
+                "option_pnl": option_pnl,
                 "sell_options": [option_chip(item) for item in sell_positions],
                 "buy_options": [option_chip(item) for item in buy_positions],
                 "sell_symbols": ", ".join(str(item.get("tradingsymbol") or "") for item in sell_positions[:2]),
@@ -21672,6 +21785,14 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             return f"{float(value):.2f}"
         except (TypeError, ValueError):
             return "-"
+
+    def pnl_class(value: Any) -> str:
+        pnl_value = _dhan_metric_float(value)
+        if pnl_value > 0:
+            return "pnl-positive"
+        if pnl_value < 0:
+            return "pnl-negative"
+        return ""
 
     def option_chips(options: Any, side: str, fallback_symbol_text: str, fallback_qty: Any) -> str:
         option_rows = options if isinstance(options, list) else []
@@ -21728,6 +21849,7 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
         rendered_rows.append(
             "<tr>"
             f"<td><strong>{html.escape(symbol)}</strong></td>"
+            f"<td class=\"dhan-position-pnl-cell {pnl_class(row.get('option_pnl'))}\">{money(row.get('option_pnl'))}</td>"
             f"<td>{option_chips(row.get('sell_options'), 'SELL', str(row.get('sell_symbols') or ''), row.get('sell_qty_abs'))}</td>"
             f"<td>{option_chips(row.get('buy_options'), 'BUY', str(row.get('buy_symbols') or ''), row.get('buy_qty_abs'))}</td>"
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(pair_status)}</span></td>"
@@ -21736,13 +21858,13 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             "</tr>"
         )
     if not rendered_rows:
-        rendered_rows.append('<tr><td colspan="6" class="muted-cell">No DHAN-IT Kite option-position data loaded.</td></tr>')
+        rendered_rows.append('<tr><td colspan="7" class="muted-cell">No DHAN-IT Kite option-position data loaded.</td></tr>')
     return (
         '<section class="panel dhan-it-position-panel">'
         '<div class="panel-title">Current Kite Option Holdings / CE Pair Status</div>'
         '<p class="status">Scope locked to TCS, INFY, HCLTECH and TECHM. Equity holdings are intentionally hidden here; SELL CE is red and BUY hedge CE is green.</p>'
         '<div class="table-wrap"><table class="ipo-table dhan-it-position-table">'
-        '<thead><tr><th>Stock</th><th>SELL CE Option Holdings</th><th>BUY CE Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th><th>Action</th></tr></thead>'
+        '<thead><tr><th>Stock</th><th>P&L</th><th>SELL CE Option Holdings</th><th>BUY CE Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th><th>Action</th></tr></thead>'
         f'<tbody>{"".join(rendered_rows)}</tbody></table></div></section>'
     )
 
@@ -25474,16 +25596,22 @@ def render_position_close_schedule_panel() -> str:
     schedule = position_close_schedule_state()
     intraday = intraday_position_close_schedule_state()
     discount_percent = position_close_discount_percent_setting()
+    stop_option_sell = position_stop_option_sell_setting()
     results = schedule.get("results") if isinstance(schedule.get("results"), list) else []
     intraday_results = intraday.get("results") if isinstance(intraday.get("results"), list) else []
     status = str(schedule.get("status") or "WAITING").upper()
-    intraday_status = str(intraday.get("status") or "WAITING").upper()
+    intraday_enabled = bool(intraday.get("enabled", True))
+    intraday_status = (
+        "STOPPED"
+        if not intraday_enabled
+        else str(intraday.get("status") or "WAITING").upper()
+    )
     color = "green" if status == "PLACED" else "yellow" if status in {"WAITING", "NO_ORDERS", "MARKET_CLOSED"} else "red"
     intraday_color = (
         "green"
         if intraday_status in {"PLACED", "ALL_COVERED"}
         else "yellow"
-        if intraday_status in {"WAITING", "MARKET_CLOSED"}
+        if intraday_status in {"WAITING", "MARKET_CLOSED", "DTE_GATED"}
         else "red"
     )
     result_rows = "".join(
@@ -25533,10 +25661,13 @@ def render_position_close_schedule_panel() -> str:
         f"{details}"
         '<hr><div class="panel-title">Intraday Missing Close-Order Guard</div>'
         '<div class="position-summary-strip">'
-        '<div class="position-summary-chip"><span>Schedule</span><strong>Every 15 min | 09:30-15:15</strong></div>'
+        f'<div class="position-summary-chip"><span>Job status</span><strong>{"RUNNING" if intraday_enabled else "STOPPED"}</strong></div>'
+        f'<div class="position-summary-chip"><span>Interval</span><strong>{int(intraday.get("interval_minutes") or INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES) * 60}s</strong></div>'
+        '<div class="position-summary-chip"><span>Window</span><strong>09:30-15:15</strong></div>'
         f'<div class="position-summary-chip"><span>Runs today</span><strong>{html.escape(str(intraday.get("run_count_today") or 0))}</strong></div>'
         f'<div class="position-summary-chip {strength_class(intraday_color)}"><span>Last status</span><strong>{html.escape(intraday_status)}</strong></div>'
         f'<div class="position-summary-chip"><span>Last run</span><strong>{html.escape(str(intraday.get("last_run_at") or "Not run yet"))}</strong></div>'
+        f'<div class="position-summary-chip {strength_class("red" if stop_option_sell else "green")}"><span>STOP OPTION SELL</span><strong>{"ON" if stop_option_sell else "OFF"}</strong></div>'
         "</div>"
         f'<p class="status">{html.escape(str(intraday.get("message") or ""))} '
         f"Short CE/PE positions: BUY at {discount_percent:g}% below the lower of "
@@ -25548,6 +25679,13 @@ def render_position_close_schedule_panel() -> str:
         f"the guard modifies or places the BUY close order at {discount_percent:g}% below the "
         "hard-stop price only inside that DTE window. Before hard stop, spike closes above entry are skipped, "
         "and the passive missing-close guard can place a lower close order instead.</p>"
+        '<div class="actions">'
+        '<button type="submit" formaction="/positions/intraday-guard-run" class="secondary">Run Scheduler Now</button>'
+        '<button type="submit" formaction="/positions/intraday-guard-start" class="secondary">Start Scheduler</button>'
+        '<button type="submit" formaction="/positions/intraday-guard-stop" class="secondary">Stop Scheduler</button>'
+        '<button type="submit" formaction="/positions/load" class="secondary">Refresh Order Book</button>'
+        '<button type="submit" formaction="/positions/intraday-guard-clear" class="secondary danger-link" onclick="return confirm(\'Clear local Intraday Missing Close-Order Guard monitor history? This will NOT cancel or modify any Kite orders.\');">Clear Monitor</button>'
+        "</div>"
         f"{intraday_details}</section>"
     )
 
@@ -25947,6 +26085,7 @@ def render_positions_panel(
         <div>
           <p class="calm-quote">"Small drops makes the ocean"</p>
           <p class="status">Analysis of current Positions | P&L, margin, premium capture and roll signals.</p>
+          <input type="hidden" name="position_stop_option_sell_present" value="1">
           <label class="position-sell-stop-toggle">
             <input type="checkbox" name="position_stop_option_sell" value="1"{' checked' if state.position_stop_option_sell else ''}>
             <span class="ipo-badge {option_sell_stop_class}">{html.escape(option_sell_stop_text)}</span>
@@ -25954,6 +26093,7 @@ def render_positions_panel(
           </label>
         </div>
         <div class="actions">
+          <button type="submit" formaction="/positions/save-option-sell-flag" class="secondary">Save Option Sell Close Flag</button>
           <button type="submit" formaction="/positions-research/load">Refresh Active Positions</button>
           <button type="submit" formaction="/positions/load">Get Current Position / Preview BUY</button>
           {position_execute_button}
@@ -30999,7 +31139,7 @@ def render_page(state: PageState) -> bytes:
       white-space: nowrap;
     }}
     .dhan-watchlist-scroll {{
-      max-height: 560px;
+      max-height: 896px;
       overflow-y: auto;
       overflow-x: auto;
       border: 1px solid #dbeafe;
@@ -31097,11 +31237,61 @@ def render_page(state: PageState) -> bytes:
     .dhan-watchlist-table tr.current-holding td:first-child {{
       border-left: 4px solid #14b8a6;
     }}
+    .dhan-watch-select-cell {{
+      min-width: 76px;
+      text-align: center;
+    }}
+    .dhan-row-select {{
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 8px;
+      border: 1px solid #bfdbfe;
+      border-radius: 999px;
+      background: #eff6ff;
+      color: #0f3b65;
+      font-size: 11px;
+      font-weight: 950;
+      white-space: nowrap;
+    }}
+    .dhan-row-select input {{
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: #0f766e;
+    }}
     .dhan-symbol-cell strong {{
       display: block;
       color: #0f172a;
       font-size: 13px;
       letter-spacing: 0.01em;
+    }}
+    .dhan-symbol-screener-link {{
+      display: block;
+      color: #0f3b65;
+      text-decoration: none;
+    }}
+    .dhan-symbol-screener-link:hover {{
+      color: #006c67;
+      text-decoration: underline;
+    }}
+    .dhan-cmp-day-cell strong {{
+      display: block;
+      color: #07152b;
+      font-size: 17px;
+      line-height: 1.05;
+      font-weight: 950;
+      letter-spacing: -0.01em;
+    }}
+    .dhan-cmp-day-cell small {{
+      display: inline-block;
+      margin-top: 4px;
+      padding: 3px 7px;
+      border-radius: 999px;
+      background: #f8fafc;
+      font-size: 13px;
+      font-weight: 950;
+      line-height: 1.1;
     }}
     .dhan-symbol-cell small {{
       display: block;
@@ -31692,6 +31882,10 @@ def render_page(state: PageState) -> bytes:
     }}
     .dhan-it-position-table td {{
       vertical-align: top;
+      text-align: center;
+    }}
+    .dhan-it-position-table th {{
+      text-align: center;
     }}
     .dhan-it-position-table {{
       table-layout: auto;
@@ -31722,6 +31916,14 @@ def render_page(state: PageState) -> bytes:
       text-align: center;
       white-space: nowrap;
     }}
+    .dhan-it-position-table .dhan-position-pnl-cell {{
+      min-width: 82px;
+      max-width: 96px;
+      text-align: center;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 950;
+    }}
     .dhan-it-position-table .dhan-pair-action-cell .dhan-action-btn {{
       padding: 6px 8px;
       min-height: 28px;
@@ -31740,16 +31942,19 @@ def render_page(state: PageState) -> bytes:
       max-width: 180px;
       overflow-wrap: anywhere;
       white-space: normal;
+      margin-left: auto;
+      margin-right: auto;
       line-height: 1.2;
     }}
     .dhan-it-option-chip {{
       border-radius: 12px;
       padding: 6px 8px;
-      margin: 2px 0 5px;
+      margin: 2px auto 5px;
       border: 1px solid #e2e8f0;
       box-shadow: 0 5px 14px rgba(15, 23, 42, 0.05);
       min-width: 150px;
       max-width: 190px;
+      text-align: center;
     }}
     .dhan-it-option-chip span {{
       display: block;
@@ -34473,6 +34678,7 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(investingTable);
     enableTableSorting(document.getElementById('income-growth-table'));
     enableTableSorting(document.getElementById('dividend-income-table'));
+    enableTableSorting(document.getElementById('dhan-watchlist-table'));
     enableTableSorting(document.getElementById('dhan-opportunity-table'));
     enableTableSorting(document.getElementById('dhan-it-opportunity-table'));
     enableTableSorting(document.getElementById('dhan-it-comparison-table'));
@@ -34502,6 +34708,15 @@ def render_page(state: PageState) -> bytes:
     }}
     positionSelectAll && positionSelectAll.addEventListener('click', () => setPositionCheckboxes(true));
     positionUnselectAll && positionUnselectAll.addEventListener('click', () => setPositionCheckboxes(false));
+    const dhanSelectAllActions = document.getElementById('dhan-select-all-actions');
+    const dhanClearAllActions = document.getElementById('dhan-clear-all-actions');
+    function setDhanActionCheckboxes(checked) {{
+      for (const checkbox of document.querySelectorAll('#kite-spreads-panel input[name="dhan_watch_action"]:not(:disabled)')) {{
+        checkbox.checked = checked;
+      }}
+    }}
+    dhanSelectAllActions && dhanSelectAllActions.addEventListener('click', () => setDhanActionCheckboxes(true));
+    dhanClearAllActions && dhanClearAllActions.addEventListener('click', () => setDhanActionCheckboxes(false));
     for (const button of document.querySelectorAll('.price-step-button')) {{
       button.addEventListener('click', () => {{
         const wrapper = button.closest('.price-adjuster');
@@ -37023,7 +37238,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             position_keep_existing_orders=checked(form, "position_keep_existing_orders"),
             position_max_orders=first(form, "position_max_orders"),
             position_live_confirmed=first(form, "position_live_confirmed") == "1",
-            position_stop_option_sell=checked(form, "position_stop_option_sell", True),
+            position_stop_option_sell=(
+                checked(form, "position_stop_option_sell")
+                if "position_stop_option_sell_present" in form
+                else position_stop_option_sell_setting()
+            ),
             gpt_url=first(form, "gpt_url", DEFAULT_GPT_SHARE_URL),
             gpt_conversation=first(form, "gpt_conversation"),
             gpt_csv_text=first(form, "gpt_csv_text"),
@@ -37179,10 +37398,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if request_path.startswith("/positions") and "position_discount_percent" in form:
             if 0 <= state.position_discount_percent < 100:
                 save_app_settings(
-                    {"position_close_discount_percent": state.position_discount_percent}
+                    {
+                        "position_close_discount_percent": state.position_discount_percent,
+                        "position_stop_option_sell": state.position_stop_option_sell,
+                    }
                 )
             else:
                 state.position_discount_percent = position_close_discount_percent_setting()
+                state.position_stop_option_sell = position_stop_option_sell_setting()
 
         if (
             request_path.startswith("/nifty-income")
@@ -37376,8 +37599,53 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             elif request_path == "/positions/settings":
                 state.message = (
                     f"BUY Preview discount saved at {state.position_discount_percent:g}%. "
-                    "Scheduled Default Close Orders and Intraday Missing Close-Order Guard will use this value."
+                    f"STOP OPTION SELL saved as {'ON' if state.position_stop_option_sell else 'OFF'}. "
+                    "Scheduled Default Close Orders and Intraday Missing Close-Order Guard will use these values."
                 )
+            elif request_path == "/positions/save-option-sell-flag":
+                state.message = (
+                    "Position server cache saved: "
+                    + (
+                        "STOP OPTION SELL: ON. SELL close orders for long option BUY positions remain blocked."
+                        if state.position_stop_option_sell
+                        else "OPTION SELL CLOSE: ENABLED. SELL close orders for long option BUY positions are allowed until you change and save this flag again."
+                    )
+                )
+            elif request_path == "/positions/intraday-guard-run":
+                result = run_scheduled_job_now("intraday_position_close")
+                state.message = (
+                    "Intraday Missing Close-Order Guard manual run finished with status "
+                    f"{str(result.get('status') or 'UNKNOWN').upper()}: "
+                    f"{result.get('message', '')}"
+                )
+            elif request_path == "/positions/intraday-guard-start":
+                updated = update_scheduled_job_control("intraday_position_close", "start")
+                state.message = str(
+                    updated.get("message")
+                    or "Intraday Missing Close-Order Guard started."
+                )
+            elif request_path == "/positions/intraday-guard-stop":
+                updated = update_scheduled_job_control("intraday_position_close", "stop")
+                state.message = str(
+                    updated.get("message")
+                    or "Intraday Missing Close-Order Guard stopped."
+                )
+            elif request_path == "/positions/intraday-guard-clear":
+                intraday_state = intraday_position_close_schedule_state()
+                enabled = bool(intraday_state.get("enabled", True))
+                save_intraday_position_close_schedule_state(
+                    status="WAITING" if enabled else "STOPPED",
+                    message=(
+                        "Intraday Missing Close-Order Guard monitor history cleared locally. "
+                        "No Kite orders were cancelled or modified."
+                    ),
+                    results=[],
+                    order_count=0,
+                    pe_risk_evaluations=[],
+                    loss_limit_evaluations=[],
+                    close_order_evaluations=[],
+                )
+                state.message = "Cleared Intraday Missing Close-Order Guard monitor history."
             elif request_path == "/positions/execute":
                 orders_payload = first(form, "position_orders_payload")
                 state.position_orders = decode_orders(orders_payload) if orders_payload else None
@@ -38206,6 +38474,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         strategy="BOTH",
                         state=state,
                     )
+                    state.dhan_opportunities = sort_dhan_opportunities_by_max_gain(state.dhan_opportunities)
                     state.dhan_opportunities_generated_at = dhan_opportunity_stamp()
                     repository.save_opportunities(state.dhan_opportunities, state.dhan_opportunities_generated_at, "DHAN")
                     repository.export_outputs(state.dhan_opportunities)
@@ -38239,6 +38508,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     strategy=state.dhan_strategy,
                     state=state,
                 )
+                state.dhan_opportunities = sort_dhan_opportunities_by_max_gain(state.dhan_opportunities)
                 state.dhan_opportunities_generated_at = dhan_opportunity_stamp()
                 repository.save_opportunities(state.dhan_opportunities, state.dhan_opportunities_generated_at, "DHAN")
                 repository.export_outputs(state.dhan_opportunities)
@@ -38257,6 +38527,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     strategy="BOTH",
                     state=state,
                 )
+                state.dhan_opportunities = sort_dhan_opportunities_by_max_gain(state.dhan_opportunities)
                 state.dhan_opportunities_generated_at = dhan_opportunity_stamp()
                 state.dhan_selected_index = ""
                 state.dhan_selected_symbol = ""
@@ -38267,6 +38538,77 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 load_dhan_state(state)
                 note_text = f" {' '.join(live_notes)}" if live_notes else ""
                 state.message = f"Analyzed PE and CE DHAN pairs for {len(active_symbols)} active stock(s). Added {len(state.dhan_opportunities)} row(s) to Opportunity Table.{note_text}"
+            elif request_path == "/kite-spreads/analyze-selected-actions":
+                repository = DhanRepository(APP_DB_PATH)
+                universe = DhanStockUniverse(repository)
+                watchlist = universe.active_watchlist()
+                watchlist_by_symbol = {
+                    str(row.get("symbol") or "").strip().upper(): row
+                    for row in watchlist
+                    if str(row.get("symbol") or "").strip()
+                }
+                fno_run = repository.latest_dhan_fno_top10_run()
+                fno_top10_by_symbol = {
+                    str(item.get("symbol") or "").strip().upper(): item
+                    for item in fno_run.get("top10") or []
+                    if str(item.get("symbol") or "").strip()
+                }
+                selected_actions: list[tuple[str, str]] = []
+                analyze_all_actions = first(form, "dhan_analyze_all_actions") == "1"
+                if analyze_all_actions:
+                    selected_actions = [
+                        (
+                            symbol,
+                            dhan_watch_action_strategy(
+                                watchlist_by_symbol[symbol],
+                                fno_top10_by_symbol.get(symbol) or {},
+                            ),
+                        )
+                        for symbol in sorted(watchlist_by_symbol)
+                    ]
+                else:
+                    for raw_value in form.get("dhan_watch_action", []):
+                        symbol_text, _, strategy_text = str(raw_value or "").partition("|")
+                        clean_symbol = symbol_text.strip().upper()
+                        clean_strategy = strategy_text.strip().upper() or "BOTH"
+                        if clean_strategy not in {"BOTH", "BEAR_CALL_SPREAD", "BULL_PUT_SPREAD"}:
+                            clean_strategy = "BOTH"
+                        if clean_symbol and clean_symbol in watchlist_by_symbol:
+                            selected_actions.append((clean_symbol, clean_strategy))
+                if not selected_actions:
+                    raise ValueError("Select at least one DHAN stock/action checkbox before running focused analysis.")
+                selected_rows: list[dict[str, Any]] = []
+                live_notes: list[str] = []
+                for selected_symbol, selected_strategy in selected_actions:
+                    rows, notes = build_dhan_opportunities_for_symbols(
+                        [watchlist_by_symbol[selected_symbol]],
+                        [selected_symbol],
+                        strategy=selected_strategy,
+                        state=state,
+                    )
+                    selected_rows.extend(rows)
+                    live_notes.extend(notes)
+                state.dhan_opportunities = sort_dhan_opportunities_by_max_gain(selected_rows)
+                state.dhan_opportunities_generated_at = dhan_opportunity_stamp()
+                state.dhan_selected_index = ""
+                state.dhan_selected_symbol = ""
+                state.dhan_popup_strategy = ""
+                state.dhan_selected_expiry_choice = ""
+                repository.save_opportunities(state.dhan_opportunities, state.dhan_opportunities_generated_at, "DHAN")
+                repository.export_outputs(state.dhan_opportunities)
+                load_dhan_state(state)
+                selected_summary = ", ".join(
+                    f"{symbol} {'CE' if strategy == 'BEAR_CALL_SPREAD' else 'PE' if strategy == 'BULL_PUT_SPREAD' else 'PE/CE'}"
+                    for symbol, strategy in selected_actions[:8]
+                )
+                extra_count = len(selected_actions) - 8
+                note_text = f" {' '.join(live_notes)}" if live_notes else ""
+                state.message = (
+                    f"Analyzed {len(selected_actions)} selected DHAN stock/action item(s) "
+                    f"({selected_summary}{', +' + str(extra_count) + ' more' if extra_count > 0 else ''}). "
+                    f"Opportunity Table is sorted by maximum gain first; built {len(state.dhan_opportunities)} row(s)."
+                    f"{note_text}"
+                )
             elif request_path == "/kite-spreads/analyze-symbol":
                 repository = DhanRepository(APP_DB_PATH)
                 universe = DhanStockUniverse(repository)
