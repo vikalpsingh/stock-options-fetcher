@@ -108,7 +108,7 @@ def test_aggressive_buy_close_uses_ask_or_ltp_plus_buffer():
 def test_build_option_probability_risk_marks_missing_inputs_as_warning():
     risk = app.build_option_probability_risk(
         {
-            "tradingsymbol": "ABC26JUL120CE",
+            "tradingsymbol": "ABC26SEP120CE",
             "quantity": -100,
             "average_price": 1.5,
             "ltp": 1.0,

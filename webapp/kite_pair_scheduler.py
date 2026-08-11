@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import kite_spread_config as spread_cfg
-from kite_pair_execution import build_kite_order_payload
+from kite_pair_execution import build_kite_order_payload, round_limit_price_to_tick
 from kite_spread_repository import KiteSpreadRepository
 
 
@@ -48,7 +48,9 @@ def run_kite_pair_scheduler_once(repository: KiteSpreadRepository, broker: Any, 
         execution_mode = str(pair.get("execution_mode") or "HEDGE_FIRST")
         if execution_mode == "HEDGE_FIRST":
             if buy_status in COMPLETE and sell_id and sell_status not in COMPLETE and not pair.get("sell_leg_modified_at"):
-                target_price = round(float(payload.get("sell_cmp_limit_price") or payload.get("sell_limit_price") or payload.get("sell_leg_premium") or 0), 2)
+                target_price = round_limit_price_to_tick(
+                    float(payload.get("sell_cmp_limit_price") or payload.get("sell_limit_price") or payload.get("sell_leg_premium") or 0)
+                )
                 broker.modify_order("regular", sell_id, {"order_type": "LIMIT", "price": target_price})
                 repository.update_pair(
                     pair_id,

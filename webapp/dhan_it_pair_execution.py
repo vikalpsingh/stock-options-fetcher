@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from kite_pair_execution import build_kite_order_payload, dhan_initial_sell_limit_price
+from kite_option_liquidity import preview_has_bilateral_order_depth
+from kite_pair_execution import build_kite_order_payload, dhan_initial_sell_limit_price, round_limit_price_to_tick
 import risk_config
 
 
@@ -169,9 +170,14 @@ class DhanItPairRepository:
 def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepository, broker: Any, user_confirmed: bool, mode: str = "PAPER") -> dict[str, Any]:
     if not user_confirmed:
         raise ValueError("Explicit confirmation is required before placing a DHAN-IT paired spread.")
-    if str(preview.get("pair_liquidity_condition") or "").upper() == "RED" or preview.get("liquidity_order_allowed") is False:
+    is_live = str(mode or "PAPER").upper() == "LIVE"
+    liquidity_depth_clear = preview_has_bilateral_order_depth(preview)
+    if is_live and (
+        str(preview.get("pair_liquidity_condition") or "").upper() == "RED"
+        or preview.get("liquidity_order_allowed") is False
+    ) and not liquidity_depth_clear:
         repository.log("", "LIQUIDITY_RED_ORDER_BLOCKED", str(preview.get("liquidity_reason") or "RED liquidity blocked order"))
-        raise ValueError("LIQUIDITY_RED_ORDER_BLOCKED: DHAN-IT blocks RED liquidity in both Paper and Live mode.")
+        raise ValueError("LIQUIDITY_RED_ORDER_BLOCKED: DHAN-IT blocks RED liquidity in live mode.")
     quote_stamp = str(preview.get("option_quote_generated_at") or "").strip()
     if quote_stamp:
         try:
@@ -182,13 +188,14 @@ def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepositor
         if age > float(getattr(risk_config, "DHAN_IT_QUOTE_TTL_SECONDS", 30)):
             repository.log("", "QUOTE_STALE_ORDER_BLOCKED", f"Quote age {age:.0f}s")
             raise ValueError("QUOTE_STALE_ORDER_BLOCKED: refresh DHAN-IT liquidity before submitting.")
-    hard_reasons: list[str] = []
+    accepted_risk_warnings: list[str] = []
     if float(preview.get("pop_estimate") or 0) < float(getattr(risk_config, "DHAN_IT_MIN_POP", 70.0)):
-        hard_reasons.append("POP below DHAN-IT minimum")
+        accepted_risk_warnings.append("POP below DHAN-IT minimum")
     if float(preview.get("return_on_risk_pct") or 0) < float(getattr(risk_config, "DHAN_IT_MIN_RETURN_ON_RISK_PCT", 8.0)):
-        hard_reasons.append("return on risk below DHAN-IT minimum")
+        accepted_risk_warnings.append("return on risk below DHAN-IT minimum")
     if float(preview.get("max_loss") or 0) > float(getattr(risk_config, "DHAN_IT_MAX_ACCEPTABLE_PAIR_LOSS_INR", 40_000)):
-        hard_reasons.append("max loss above configured limit")
+        accepted_risk_warnings.append("max loss above configured limit")
+    hard_reasons: list[str] = []
     if str(preview.get("event_risk") or "").upper() == "YES":
         hard_reasons.append("event risk")
     if str(preview.get("dma_status") or "").upper() == "RED":
@@ -197,12 +204,36 @@ def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepositor
         reason = "; ".join(hard_reasons)
         repository.log("", "DHAN_IT_RISK_REWARD_BLOCKED", reason)
         raise ValueError(f"DHAN_IT_RISK_REWARD_BLOCKED: {reason}")
+    if accepted_risk_warnings:
+        repository.log("", "DHAN_IT_ACCEPTED_RISK_WARNINGS", "; ".join(accepted_risk_warnings))
     if str(preview.get("risk_decision") or "").upper() != "APPROVED":
-        raise ValueError(f"DHAN-IT spread is blocked: {preview.get('risk_reason') or preview.get('reason')}")
+        risk_reason = str(preview.get("risk_reason") or preview.get("reason") or "")
+        blocking_codes = (
+            "CMP_UNAVAILABLE",
+            "CONTRACT_UNRESOLVED",
+            "OPTION_PREMIUM_UNAVAILABLE",
+            "NET_CREDIT_NON_POSITIVE",
+            "MAX_LOSS_INVALID",
+            "CALENDAR_HEDGE_EXPIRES_BEFORE_SHORT",
+            "EVENT_RISK",
+        )
+        if liquidity_depth_clear and not any(code in risk_reason for code in blocking_codes):
+            preview = dict(preview)
+            preview["risk_override"] = "DHAN_IT_BILATERAL_DEPTH_CLEAR"
+            preview["risk_decision_original"] = preview.get("risk_decision")
+            preview["risk_reason_original"] = risk_reason
+            preview["risk_decision"] = "APPROVED"
+            preview["risk_reason"] = (
+                "User confirmed defined-risk pair; liquidity cleared by bilateral depth "
+                f">= {int(getattr(risk_config, 'LIQUIDITY_AMBER_MIN_TOTAL_ORDERS', 20) or 20)} buy and sell orders on both legs."
+            )
+            preview["reason"] = preview["risk_reason"]
+        else:
+            raise ValueError(f"DHAN-IT spread is blocked: {preview.get('risk_reason') or preview.get('reason')}")
     pair_id = repository.create_pair(preview, mode=mode, user_confirmed=True, execution_mode="HEDGE_FIRST")
     tag = pair_id[-20:]
     buy_payload = build_kite_order_payload(preview["buy_leg_tradingsymbol"], "BUY", preview["quantity"], preview["buy_limit_price"], tag)
-    sell_cmp_limit_price = round(float(preview["sell_limit_price"]), 2)
+    sell_cmp_limit_price = round_limit_price_to_tick(float(preview["sell_limit_price"]))
     sell_initial_limit_price = dhan_initial_sell_limit_price(sell_cmp_limit_price)
     sell_payload = build_kite_order_payload(preview["sell_leg_tradingsymbol"], "SELL", preview["quantity"], sell_initial_limit_price, tag)
     buy_result = broker.place_order(buy_payload)
@@ -218,6 +249,7 @@ def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepositor
         payload_json=json.dumps(
             {
                 **preview,
+                "accepted_risk_warnings": accepted_risk_warnings,
                 "buy_order_payload": buy_payload,
                 "sell_order_payload": sell_payload,
                 "sell_cmp_limit_price": sell_cmp_limit_price,

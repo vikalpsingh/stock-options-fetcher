@@ -71,7 +71,7 @@ def test_fallback_never_moves_more_than_two_hundred_points():
     assert adjusted["liquidity_shift_points"] == 200
 
 
-def test_manual_ce_order_uses_adjusted_tradable_symbol_and_markup():
+def test_manual_ce_order_uses_bounded_otm_symbol_and_quote_limit():
     quote_map = {
         f"NFO:{_symbol(25100, 'CE')}": {"last_price": 0, "oi": 50_000, "volume": 500},
         f"NFO:{_symbol(25000, 'CE')}": {"last_price": 0, "oi": 50_000, "volume": 500},
@@ -101,6 +101,44 @@ def test_manual_ce_order_uses_adjusted_tradable_symbol_and_markup():
     assert orders[0]["tradingsymbol"] == _symbol(24900, "CE")
     assert orders[0]["strike"] == 24900
     assert orders[0]["option_ltp"] == 12.0
-    assert orders[0]["price"] == 14.4
-    assert orders[0]["liquidity_shift_points"] == 200
-    assert previews[0]["original_strike"] == 25100
+    assert orders[0]["price"] == 11.35
+    assert orders[0]["execution_price_mode"] == "BID_MINUS_2_PERCENT"
+    assert orders[0]["execution_price_warnings"] == ["LTP_ONLY_SELL_PRICE"]
+    assert orders[0]["liquidity_shift_points"] == 0
+    assert previews[0]["original_strike"] == 24900
+
+
+def test_manual_ce_hedge_keeps_own_symbol_after_sell_liquidity_adjustment():
+    quote_map = {
+        f"NFO:{_symbol(25100, 'CE')}": {"last_price": 0, "oi": 50_000, "volume": 500},
+        f"NFO:{_symbol(25000, 'CE')}": {"last_price": 0, "oi": 50_000, "volume": 500},
+        f"NFO:{_symbol(24900, 'CE')}": {"last_price": 12.0, "oi": 50_000, "volume": 500},
+        f"NFO:{_symbol(25200, 'CE')}": {"last_price": 4.0, "oi": 50_000, "volume": 500},
+    }
+
+    with patch.object(app, "nifty_symbol_for_leg", side_effect=lambda _items, _expiry, strike, option_type: _symbol(int(strike), option_type)):
+        orders, previews = app.nifty_income_pair_orders_from_otm(
+            [],
+            date(2026, 8, 4),
+            spot=24000,
+            pe_otm_pct=5.5,
+            ce_otm_pct=4.5,
+            config={
+                "lot_size": 65,
+                "strike_rounding": 100,
+                "manual_pair_sell_markup_percent": 20.0,
+            },
+            quote_map=quote_map,
+            lots=1,
+            include_pe=False,
+            include_ce=True,
+            include_cover=True,
+        )
+
+    by_side = {(row["transaction_type"], row["option_type"]): row for row in orders}
+    assert by_side[("SELL", "CE")]["tradingsymbol"] == _symbol(24900, "CE")
+    assert by_side[("SELL", "CE")]["strike"] == 24900
+    assert by_side[("BUY", "CE")]["tradingsymbol"] == _symbol(25200, "CE")
+    assert by_side[("BUY", "CE")]["strike"] == 25200
+    assert previews[0]["tradingsymbol"] == _symbol(25200, "CE")
+    assert previews[1]["tradingsymbol"] == _symbol(24900, "CE")

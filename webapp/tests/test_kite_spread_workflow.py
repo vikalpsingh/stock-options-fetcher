@@ -10,7 +10,7 @@ import risk_config
 from kite_broker_adapter import KiteBrokerAdapter
 from kite_spread_evaluator import evaluate_spread_with_expiry_comparison
 from kite_option_resolver import KiteOptionResolver, next_otm_strike
-from kite_pair_execution import submit_kite_pair
+from kite_pair_execution import round_limit_price_to_tick, submit_kite_pair
 from kite_pair_scheduler import run_kite_pair_scheduler_once
 from kite_spread_engine import build_kite_spread_preview, fetch_cmp_from_kite, fetch_fresh_equity_quotes_from_kite
 from kite_option_liquidity import analyze_option_liquidity, analyze_pair_liquidity
@@ -540,6 +540,10 @@ def test_dhan_stock_rows_have_simple_pe_ce_evaluation_actions(tmp_path, monkeypa
     assert "/kite-spreads/analyze-selected-actions" in html
     assert 'name="dhan_analyze_all_actions" value="1"' in html
     assert 'name="dhan_watch_action"' in html
+    assert 'data-dhan-watch-filter="ALL"' in html
+    assert 'data-dhan-watch-filter="CE"' in html
+    assert 'data-dhan-watch-filter="PE"' in html
+    assert 'data-dhan-watch-action=' in html
     assert "Analysis results are saved locally and remain visible after refresh until you recalculate." in html
     assert "/kite-spreads/open-symbol" in html
     assert "Run Analysis on All Stocks" in html
@@ -577,6 +581,7 @@ def test_dhan_stock_rows_show_fresh_cmp_when_available(tmp_path, monkeypatch):
 
     assert "CMP / Day" in html
     assert "dhan-cmp-day-cell" in html
+    assert 'class="dhan-cmp-day-cell" data-sort-value="8.32"' in html
     assert "1141.20" in html
     assert "8.32%" in html
 
@@ -661,6 +666,8 @@ def test_dhan_parent_stock_table_shows_latest_fno_sheet_evaluation_details():
     assert "Live Status / Risk Reason" in html
     assert "#1" in html
     assert "CE SELL" in html
+    assert 'data-dhan-watch-action="CE"' in html
+    assert 'name="dhan_watch_action" value="ALKEM|BEAR_CALL_SPREAD"' in html
     assert "6000.00" in html
     assert "49.40 prem" in html
     assert "Final <strong>87.50</strong>" in html
@@ -847,6 +854,38 @@ def test_dhan_popup_uses_recommended_expiry_by_default(tmp_path, monkeypatch):
     assert 'name="dhan_selected_expiry_choice" value="CURRENT_MONTH" data-expiry-preview-action="/kite-spreads/preview-pair"' in html
     assert 'name="dhan_selected_expiry_choice" value="NEXT_SELL_CURRENT_BUY" data-expiry-preview-action="/kite-spreads/preview-pair"' in html
     assert "SELL next month + BUY current hedge" in html
+
+
+def test_dhan_popup_selected_execution_expiry_renders_and_unlocks_acknowledged_pair(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=12, next_buy=5))["recommended_preview"]
+    selected_next = app.apply_dhan_expiry_choice(preview, "NEXT_MONTH", allow_unapproved_preview=True)
+
+    assert preview["recommended_expiry"] == "CURRENT_MONTH"
+    assert selected_next["selected_expiry_choice"] == "NEXT_MONTH"
+    assert selected_next["sell_leg_tradingsymbol"] == "RELIANCE09241050CE"
+    assert selected_next["buy_leg_tradingsymbol"] == "RELIANCE09241100CE"
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_opportunities=[preview],
+            dhan_selected_index="0",
+            dhan_selected_expiry_choice="NEXT_MONTH",
+            dhan_confirm_pair_order=True,
+        )
+    )
+    ticket = html.split('id="dhan-pair-order-modal"', 1)[1]
+
+    assert "Selected expiry: <strong>NEXT_MONTH</strong>" in ticket
+    assert "Recommended: CURRENT_MONTH" in ticket
+    assert 'name="dhan_selected_expiry_choice" value="NEXT_MONTH" data-expiry-preview-action="/kite-spreads/preview-pair" checked' in ticket
+    assert "<strong>RELIANCE09241050CE</strong>" in ticket
+    assert "<strong>RELIANCE09241100CE</strong>" in ticket
+    assert "<strong>RELIANCE08271050CE</strong>" not in ticket
+    assert "<strong>RELIANCE08271100CE</strong>" not in ticket
+    assert 'id="dhan-confirm-pair-order" type="checkbox" name="dhan_confirm_pair_order" value="1" data-orderable="1" data-auto-clear="0" checked' in ticket
+    assert 'id="dhan-pair-review" type="button" class="secondary">' in ticket
 
 
 def test_dhan_popup_allows_acknowledged_soft_no_trade_pair_to_start_review(tmp_path, monkeypatch):
@@ -1144,6 +1183,23 @@ def test_dhan_best_selection_prefers_gain_3000_and_loss_40000_quality_row():
     ) == "1"
 
 
+def test_dhan_opportunities_sort_by_equal_pop_and_gain_weight():
+    high_gain_lower_pop = {
+        "symbol": "GAIN",
+        "max_gain": 20000,
+        "pop_estimate": 60,
+    }
+    high_pop_lower_gain = {
+        "symbol": "POP",
+        "max_gain": 10000,
+        "pop_estimate": 95,
+    }
+
+    sorted_rows = app.sort_dhan_opportunities_by_max_gain([high_pop_lower_gain, high_gain_lower_pop])
+
+    assert [row["symbol"] for row in sorted_rows] == ["GAIN", "POP"]
+
+
 def test_dhan_opportunity_table_highlights_pop_and_gain_and_opens_popup(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
     preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=50, next_buy=5))["recommended_preview"]
@@ -1171,6 +1227,7 @@ def test_dhan_opportunity_table_highlights_pop_and_gain_and_opens_popup(tmp_path
     assert 'class="sort-header" data-sort-col="5">Current Gain' in html
     assert 'class="sort-header" data-sort-col="14">Recommended' in html
     assert 'class="sort-header" data-sort-col="29">Best Pick' in html
+    assert 'class="table-wrap dhan-ten-row-scroll"><table id="dhan-opportunity-table"' in html
     assert 'class="dhan-best-pick-cell"><strong>BEST PICK</strong>' in html
     assert 'class="dhan-best-pick-row"' in html
     assert 'formaction="/kite-spreads/preview-pair"' in html
@@ -1179,6 +1236,64 @@ def test_dhan_opportunity_table_highlights_pop_and_gain_and_opens_popup(tmp_path
     assert "12500.00" in html
     assert 'formaction="/kite-spreads/clear-pair-monitor"' in html
     assert "Clear Monitor" in html
+
+
+def test_dhan_ready_for_trade_table_prevalidates_and_links_to_selected_expiry(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=50, next_buy=5))["recommended_preview"]
+    stamp = app.dhan_opportunity_stamp()
+
+    ready = app.dhan_ready_trade_rows([preview], [], paper_trading=True)
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_opportunities=[preview],
+            dhan_opportunities_generated_at=stamp,
+        )
+    )
+
+    assert ready
+    assert ready[0]["expiry_choice"] in {"CURRENT_MONTH", "NEXT_MONTH"}
+    assert "READY for TRADE - Pre-Validated DHAN Pairs" in html
+    assert "Run READY Pre-Validation Job" in html
+    assert "READY scan valid for 30 more minute" in html
+    assert 'id="dhan-ready-table"' in html
+    assert (
+        'class="table-wrap dhan-ten-row-scroll"><table id="dhan-ready-table" '
+        'class="ipo-table dhan-ready-table" data-default-sort-col="6" data-default-sort-dir="desc"'
+    ) in html
+    assert (
+        '<th class="sort-header" data-sort-col="0">Symbol</th>'
+        '<th class="sort-header" data-sort-col="1">Credit</th>'
+        '<th class="sort-header" data-sort-col="2">Max Gain</th>'
+        '<th class="sort-header" data-sort-col="3">Max Loss</th>'
+        '<th class="sort-header" data-sort-col="4">POP</th>'
+        '<th class="sort-header" data-sort-col="5">RoR</th>'
+        '<th class="sort-header" data-sort-col="6">Score</th>'
+        '<th class="sort-header" data-sort-col="7">Liquidity</th>'
+    ) in html
+    assert "50% POP / 50% gain" in html
+    assert ">Score<" in html
+    assert 'name="dhan_ready_choice" value="0|CURRENT_MONTH"' in html
+    assert "Place via 10s review" in html
+    assert "RELIANCE08271050CE" in html
+
+
+def test_dhan_ready_table_expires_after_thirty_minutes(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=50, next_buy=5))["recommended_preview"]
+    old_stamp = (app.datetime.now(app.INDIA_TIME_ZONE) - app.timedelta(minutes=31)).isoformat(timespec="seconds")
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_opportunities=[preview],
+            dhan_opportunities_generated_at=old_stamp,
+        )
+    )
+
+    assert "READY scan is older than 30 minutes" in html
+    assert "Place via 10s review" not in html
 
 
 def test_dhan_opportunity_data_expires_after_ten_minutes_in_render(tmp_path, monkeypatch):
@@ -1449,7 +1564,7 @@ def test_dhan_evaluate_can_fill_missing_market_data_from_kite(monkeypatch):
     assert any("Fresh Kite LTP/day-change fetched" in note for note in notes)
 
 
-def test_ce_spread_is_blocked_when_income_growth_shares_do_not_cover_lot_size():
+def test_ce_spread_share_coverage_is_advisory_for_hedged_dhan_spread():
     local_instruments = [
         {
             "tradingsymbol": "WAAREEENER26AUG1400CE",
@@ -1457,7 +1572,7 @@ def test_ce_spread_is_blocked_when_income_growth_shares_do_not_cover_lot_size():
             "expiry": "2026-08-27",
             "instrument_type": "CE",
             "strike": 1400,
-            "last_price": 12,
+            "last_price": 20,
             "lot_size": 150,
         },
         {
@@ -1482,8 +1597,11 @@ def test_ce_spread_is_blocked_when_income_growth_shares_do_not_cover_lot_size():
         AllowRisk(),
     )
 
-    assert preview["risk_decision"] == "BLOCKED"
-    assert "CE_NOT_FULLY_COVERED_BY_SHARES_130_LT_150" in preview["risk_reason"]
+    assert "CE_NOT_FULLY_COVERED_BY_SHARES_130_LT_150" not in preview["risk_reason"]
+    assert "CE_COVERAGE_BLOCKED_NO_SHARES" not in preview["risk_reason"]
+    assert preview["ce_share_coverage_status"] == "PARTIAL_OR_NOT_COVERED"
+    assert "BUY hedge defines max loss" in preview["ce_share_coverage_note"]
+    assert app.dhan_pair_is_defined_risk_orderable(preview)
 
 
 def test_nuvama_is_excluded_from_dhan_even_if_already_in_watchlist(tmp_path):
@@ -1737,6 +1855,39 @@ def test_dhan_pair_order_registers_monitor_and_reprices_sell_after_buy_fill(tmp_
         ("regular", result["sell_leg_order_id"], {"order_type": "LIMIT", "price": preview["sell_limit_price"]})
     ]
     assert pair_after_scheduler["pair_status"] == "HEDGE_FILLED_SELL_REPRICED"
+
+
+def test_dhan_pair_limit_prices_are_rounded_to_zerodha_tick_size(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    broker = MockKiteAdapter()
+    preview = approved_preview()
+    preview["buy_limit_price"] = 5.03
+    preview["buy_leg_premium"] = 5.03
+    preview["sell_limit_price"] = 11.94
+    preview["sell_leg_premium"] = 11.94
+
+    result = app.submit_pair_order(preview, repo, broker, user_confirmed=True, paper_trading=True)
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert round_limit_price_to_tick(11.94) == 11.95
+    assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[0]["price"] == 5.05
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.placed[1]["price"] == 13.15
+    assert payload["sell_cmp_limit_price"] == 11.95
+    assert payload["sell_initial_limit_price"] == 13.15
+
+    broker.orders = [
+        {"order_id": result["buy_leg_order_id"], "status": "COMPLETE"},
+        {"order_id": result["sell_leg_order_id"], "status": "OPEN"},
+    ]
+    summary = run_kite_pair_scheduler_once(repo, broker)
+
+    assert summary["modified"] == 1
+    assert broker.modified == [
+        ("regular", result["sell_leg_order_id"], {"order_type": "LIMIT", "price": 11.95})
+    ]
 
 
 def test_simultaneous_mode_modifies_sibling_when_one_leg_complete(tmp_path):

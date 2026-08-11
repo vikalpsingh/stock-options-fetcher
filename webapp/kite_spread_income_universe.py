@@ -101,3 +101,47 @@ def ce_coverage_reason(symbol: str, requested_lots: int, lot_size: int) -> str:
     if holding.shares < clean_lots * clean_lot_size:
         return f"CE_NOT_FULLY_COVERED_BY_SHARES_{holding.shares}_LT_{clean_lots * clean_lot_size}"
     return ""
+
+
+def ce_coverage_context(symbol: str, requested_lots: int, lot_size: int) -> dict[str, Any]:
+    """Return advisory CE share-coverage context for hedged DHAN spreads.
+
+    DHAN now places defined-risk CE spreads with a BUY hedge, so equity holding
+    is helpful context but no longer a placement blocker. Covered-call-only
+    validation remains in the Income/covered CE order flow.
+    """
+
+    holding = INCOME_GROWTH_FNO_BY_SYMBOL.get(str(symbol or "").upper().strip())
+    clean_lots = max(int(requested_lots or 0), 0)
+    clean_lot_size = max(int(lot_size or 0), 0)
+    required_shares = clean_lots * clean_lot_size
+    if not holding:
+        return {
+            "ce_share_coverage_status": "NOT_TRACKED",
+            "ce_share_coverage_note": "No Income Growth share holding tracked; CE spread remains allowed because it has a BUY hedge.",
+            "holding_qty": 0,
+            "covered_lots": 0,
+            "required_shares": required_shares,
+        }
+    covered_lots = (holding.shares // clean_lot_size) if clean_lot_size > 0 else 0
+    fully_covered = clean_lot_size > 0 and holding.shares >= required_shares and clean_lots <= max(holding.max_covered_lots, covered_lots)
+    if fully_covered:
+        status = "COVERED_POSITIVE"
+        note = f"Positive: you hold {holding.shares} shares; CE spread is additionally covered by stock for {clean_lots} lot(s)."
+    elif holding.shares > 0:
+        status = "PARTIAL_OR_NOT_COVERED"
+        note = (
+            f"Shares held: {holding.shares}; required for full stock cover: {required_shares}. "
+            "CE spread is still allowed because the BUY hedge defines max loss."
+        )
+    else:
+        status = "NO_SHARES"
+        note = "No shares held; CE spread is still allowed because the BUY hedge defines max loss."
+    return {
+        "ce_share_coverage_status": status,
+        "ce_share_coverage_note": note,
+        "holding_qty": holding.shares,
+        "covered_lots": covered_lots,
+        "required_shares": required_shares,
+        "max_covered_lots": holding.max_covered_lots,
+    }

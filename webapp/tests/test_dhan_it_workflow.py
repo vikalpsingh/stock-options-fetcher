@@ -10,6 +10,7 @@ from dhan_it_pair_monitor import run_dhan_it_pair_monitor_once
 from dhan_it_signal_engine import evaluate_it_signal
 from dhan_it_spread_builder import build_dhan_it_spread
 from dhan_it_universe import IT_FNO_SYMBOLS, dhan_it_universe_rows, is_dhan_it_symbol
+from kite_pair_execution import round_limit_price_to_tick
 
 
 class AllowRisk:
@@ -308,6 +309,7 @@ def test_dhan_it_holding_position_analyzer_scopes_to_it_symbols_and_suggests_pai
 
     assert set(by_symbol) == {"TCS", "INFY", "HCLTECH", "TECHM"}
     assert by_symbol["TCS"]["pair_status"] == "PAIR ACTIVE"
+    assert by_symbol["TCS"]["cmp"] == 3200
     assert by_symbol["TCS"]["option_pnl"] == 900
     assert by_symbol["TCS"]["sell_options"][0]["strike"] == "4000"
     assert by_symbol["TCS"]["buy_options"][0]["strike"] == "4200"
@@ -366,8 +368,50 @@ def test_dhan_it_holding_position_table_renders_below_call_watch():
     assert "Holding Qty" not in html
     assert "SELL CE Option Holdings" in html
     assert "BUY CE Hedge Holdings" in html
+    assert "<th>CMP</th>" in html
+    assert "<th>% Change</th>" in html
+    assert "3200.00" in html
     assert "<th>P&L</th>" in html
     assert 'formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol" value="INFY"' in html
+
+
+def test_dhan_it_pair_status_cmp_uses_live_call_watch_card_when_no_equity_holding():
+    rows = [
+        {
+            "symbol": "TCS",
+            "equity_qty": 0,
+            "average_price": "",
+            "last_price": "",
+            "cmp": "",
+            "pnl": "",
+            "sell_count": 1,
+            "buy_count": 0,
+            "sell_symbols": "TCS26AUG4000CE",
+            "buy_symbols": "",
+            "pair_status": "SHORT CE UNHEDGED",
+            "suggestion": "BUY hedge leg or rebuild paired CE spread.",
+            "action": "BUY_HEDGE",
+        }
+    ]
+    cards = [{"symbol": "TCS", "price": 3344.25, "day_change_pct": 2.45}]
+
+    enriched = app.enrich_dhan_it_holding_positions_with_call_watch_cmp(rows, cards)
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=dhan_it_universe_rows(),
+            dhan_it_call_watch_cards=cards,
+            dhan_it_holding_positions=rows,
+        )
+    )
+
+    assert enriched[0]["cmp"] == 3344.25
+    assert enriched[0]["day_change_pct"] == 2.45
+    assert enriched[0]["cmp_source"] == "DHAN-IT live card"
+    assert "<th>CMP</th>" in html
+    assert "<th>% Change</th>" in html
+    assert "3344.25" in html
+    assert "2.45%" in html
 
 
 def test_dhan_it_holding_position_table_offers_repair_for_incomplete_pair():
@@ -565,7 +609,7 @@ def test_dhan_it_near_cmp_strike_profile_moves_targets_one_percent_closer():
     assert preview["buy_leg_tradingsymbol"] == "TCS08271200CE"
 
 
-def test_dhan_it_red_liquidity_blocks_paper_and_live_popup_flow():
+def test_dhan_it_red_liquidity_allows_paper_popup_flow_but_blocks_live_popup_flow():
     preview = approved_preview()
     preview["pair_liquidity_condition"] = "RED"
     preview["liquidity_order_allowed"] = False
@@ -595,9 +639,9 @@ def test_dhan_it_red_liquidity_blocks_paper_and_live_popup_flow():
     )
 
     assert "Liquidity Condition" in paper_html
-    assert "DHAN-IT blocks RED liquidity in both Paper and Live mode" in paper_html
-    assert 'data-orderable="0"' in paper_html
-    assert 'id="dhan-it-review" type="button" class="secondary" disabled' in paper_html
+    assert "Poor liquidity — paper flow allowed; live order blocked" in paper_html
+    assert 'data-orderable="1"' in paper_html
+    assert 'id="dhan-it-review" type="button" class="secondary">' in paper_html
     assert "DHAN-IT blocks RED liquidity in both Paper and Live mode" in live_html
     assert 'data-orderable="0"' in live_html
 
@@ -623,7 +667,7 @@ def test_dhan_it_amber_liquidity_allows_acknowledged_review():
     assert 'id="dhan-it-review" type="button" class="secondary">' in html
 
 
-def test_dhan_it_red_liquidity_blocks_live_and_paper_submit(tmp_path):
+def test_dhan_it_red_liquidity_blocks_live_but_allows_paper_submit(tmp_path):
     repo = DhanItPairRepository(tmp_path / "dhan_it.db")
     broker = MockBroker()
     preview = approved_preview()
@@ -640,13 +684,62 @@ def test_dhan_it_red_liquidity_blocks_live_and_paper_submit(tmp_path):
     assert broker.placed == []
 
     paper_broker = MockBroker()
-    try:
-        submit_dhan_it_pair(preview, repo, paper_broker, user_confirmed=True, mode="PAPER")
-    except ValueError as exc:
-        assert "LIQUIDITY_RED_ORDER_BLOCKED" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("RED liquidity must block DHAN-IT paper submission too")
-    assert paper_broker.placed == []
+    result = submit_dhan_it_pair(preview, repo, paper_broker, user_confirmed=True, mode="PAPER")
+    assert result["pair_id"]
+    assert len(paper_broker.placed) == 2
+
+
+def test_dhan_it_bilateral_depth_clears_red_wide_liquidity_for_live_review_and_submit(tmp_path):
+    repo = DhanItPairRepository(tmp_path / "dhan_it.db")
+    broker = MockBroker()
+    preview = approved_preview()
+    preview["pair_liquidity_condition"] = "RED"
+    preview["liquidity_order_allowed"] = False
+    preview["liquidity_reason"] = "Liquidity condition is RED.; WIDE_BID_ASK; LIQUIDITY_RED_ORDER_BLOCKED"
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "WIDE_BID_ASK; LIQUIDITY_RED_ORDER_BLOCKED"
+    preview["reason"] = preview["risk_reason"]
+    preview["sell_leg_buy_orders"] = 20
+    preview["sell_leg_sell_orders"] = 20
+    preview["hedge_leg_buy_orders"] = 20
+    preview["hedge_leg_sell_orders"] = 20
+    preview["sell_leg_liquidity"] = {
+        "top_5_buy_order_count": 20,
+        "top_5_sell_order_count": 20,
+        "liquidity_condition": "RED",
+        "liquidity_reason": "WIDE_BID_ASK",
+    }
+    preview["hedge_leg_liquidity"] = {
+        "top_5_buy_order_count": 20,
+        "top_5_sell_order_count": 20,
+        "liquidity_condition": "RED",
+        "liquidity_reason": "WIDE_BID_ASK",
+    }
+
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=dhan_it_universe_rows(),
+            dhan_it_opportunities=[preview],
+            dhan_it_selected_index="0",
+            dhan_it_confirm_order=True,
+            dhan_it_paper_trading=False,
+        )
+    )
+
+    assert "Depth override: both legs have at least 20 buy and sell limit orders" in html
+    assert 'data-orderable="1"' in html
+    assert 'id="dhan-it-review" type="button" class="secondary">' in html
+    assert 'id="dhan-it-place-order" type="submit" class="danger" formaction="/dhan-it/submit" disabled' in html
+
+    result = submit_dhan_it_pair(preview, repo, broker, user_confirmed=True, mode="LIVE")
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert result["pair_id"]
+    assert len(broker.placed) == 2
+    assert payload["risk_override"] == "DHAN_IT_BILATERAL_DEPTH_CLEAR"
+    assert "bilateral depth" in payload["risk_reason"]
 
 
 def test_dhan_it_stale_option_quote_blocks_submit(tmp_path):
@@ -684,6 +777,84 @@ def test_dhan_it_popup_uses_main_live_mode_selector():
     assert 'data-orderable="1"' in html
     assert 'id="dhan-it-review" type="button" class="secondary">' in html
     assert 'name="dhan_it_submit_mode"' not in html
+
+
+def test_dhan_it_standard_cycle_ack_unlocks_place_order_for_defined_risk_soft_block():
+    preview = approved_preview()
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "POP below DHAN-IT minimum; max loss above configured limit"
+    preview["reason"] = preview["risk_reason"]
+    preview["pop_estimate"] = 66.5
+    preview["return_on_risk_pct"] = 14.09
+    preview["max_gain"] = 7410.0
+    preview["max_loss"] = 52590.0
+
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=dhan_it_universe_rows(),
+            dhan_it_opportunities=[preview],
+            dhan_it_selected_index="0",
+            dhan_it_confirm_order=True,
+        )
+    )
+
+    assert 'data-orderable="1"' in html
+    assert 'id="dhan-it-review" type="button" class="secondary">' in html
+    assert 'id="dhan-it-place-order" type="submit" class="secondary" formaction="/dhan-it/submit" disabled' in html
+    assert "I UNDERSTAND the RISK of MAX LOSS" in html
+
+
+def test_dhan_it_paper_red_liquidity_ack_enables_countdown_for_execution_flow():
+    preview = approved_preview()
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "POP below 70.0%; max loss above ₹40,000, liquidity weak"
+    preview["reason"] = preview["risk_reason"]
+    preview["pop_estimate"] = 66.5
+    preview["return_on_risk_pct"] = 14.09
+    preview["max_gain"] = 7410.0
+    preview["max_loss"] = 52590.0
+    preview["pair_liquidity_condition"] = "RED"
+    preview["liquidity_order_allowed"] = False
+    preview["liquidity_reason"] = "Poor liquidity — paper flow allowed; live order blocked."
+
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=dhan_it_universe_rows(),
+            dhan_it_opportunities=[preview],
+            dhan_it_selected_index="0",
+            dhan_it_confirm_order=True,
+            dhan_it_paper_trading=True,
+        )
+    )
+
+    assert "Poor liquidity — paper flow allowed; live order blocked" in html
+    assert 'data-orderable="1"' in html
+    assert 'id="dhan-it-review" type="button" class="secondary">' in html
+    assert 'id="dhan-it-place-order" type="submit" class="secondary" formaction="/dhan-it/submit" disabled' in html
+
+
+def test_dhan_it_submit_accepts_defined_risk_soft_pop_and_loss_breaches(tmp_path):
+    repo = DhanItPairRepository(tmp_path / "dhan_it.db")
+    broker = MockBroker()
+    preview = approved_preview()
+    preview["pop_estimate"] = 66.5
+    preview["return_on_risk_pct"] = 14.09
+    preview["max_gain"] = 7410.0
+    preview["max_loss"] = 52590.0
+
+    result = submit_dhan_it_pair(preview, repo, broker, user_confirmed=True, mode="PAPER")
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert len(broker.placed) == 2
+    assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert payload["accepted_risk_warnings"] == [
+        "POP below DHAN-IT minimum",
+        "max loss above configured limit",
+    ]
 
 
 def test_dhan_it_popup_mixed_expiry_changes_selected_values():
@@ -739,6 +910,43 @@ def test_dhan_it_popup_uses_next_month_legs_when_recommended_next_month():
     assert "<span>BUY HEDGE</span>" in html
     assert "<strong>TCS09241100CE</strong>" in html
     assert 'name="dhan_it_preview_choice" value="0|NEXT_MONTH"' in html
+
+
+def test_dhan_it_compare_link_uses_clicked_next_month_even_when_not_recommended():
+    preview = build_preview(
+        "BEAR_CALL_SPREAD",
+        symbol="TECHM",
+        chain=it_chain(symbol="TECHM", current_sell=35, current_buy=10, next_sell=22.9, next_buy=2.65),
+    )
+    assert preview["recommended_expiry"] == "CURRENT_MONTH"
+    preview["next_month"]["risk_decision"] = "NO_TRADE"
+    preview["next_month"]["risk_reason"] = "POP below DHAN-IT minimum; max loss above configured limit"
+    preview["next_month_preview"]["risk_decision"] = "NO_TRADE"
+    preview["next_month_preview"]["risk_reason"] = preview["next_month"]["risk_reason"]
+    selected = app.apply_dhan_expiry_choice(preview, "NEXT_MONTH", allow_unapproved_preview=True)
+
+    assert selected["sell_leg_tradingsymbol"] == "TECHM09241050CE"
+    assert selected["buy_leg_tradingsymbol"] == "TECHM09241100CE"
+    assert selected["sell_expiry"] == "2026-09-24"
+    assert selected["buy_expiry"] == "2026-09-24"
+
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=dhan_it_universe_rows(),
+            dhan_it_opportunities=[preview],
+            dhan_it_selected_index="0",
+            dhan_it_expiry_mode="NEXT_MONTH",
+        )
+    )
+    ticket = html.split('id="dhan-it-order-modal"', 1)[1]
+
+    assert 'name="dhan_it_preview_choice" value="0|NEXT_MONTH"' in html
+    assert 'value="NEXT_MONTH" data-expiry-preview-action="/dhan-it/preview" checked' in ticket
+    assert "<strong>TECHM09241050CE</strong>" in ticket
+    assert "<strong>TECHM09241100CE</strong>" in ticket
+    assert "<strong>TECHM08271050CE</strong>" not in ticket
+    assert "<strong>TECHM08271100CE</strong>" not in ticket
 
 
 def test_dhan_it_opportunity_data_expires_after_ten_minutes_in_render():
@@ -797,6 +1005,34 @@ def test_monitor_reprices_parked_sell_after_buy_hedge_completes(tmp_path):
     assert pair_after_fill["sell_leg_placed"] == 1
     assert pair_after_fill["pair_status"] == "HEDGE_FILLED_SELL_REPRICED"
     assert payload_after_fill["sell_repriced_after_hedge_at"]
+
+
+def test_dhan_it_limit_prices_are_rounded_to_zerodha_tick_size(tmp_path):
+    repo = DhanItPairRepository(tmp_path / "dhan_it.db")
+    broker = MockBroker()
+    preview = approved_preview()
+    preview["buy_limit_price"] = 5.03
+    preview["buy_leg_premium"] = 5.03
+    preview["sell_limit_price"] = 11.94
+    preview["sell_leg_premium"] = 11.94
+
+    result = submit_dhan_it_pair(preview, repo, broker, user_confirmed=True, mode="PAPER")
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert round_limit_price_to_tick(11.94) == 11.95
+    assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[0]["price"] == 5.05
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.placed[1]["price"] == 13.15
+    assert payload["sell_cmp_limit_price"] == 11.95
+    assert payload["sell_initial_limit_price"] == 13.15
+
+    broker.orders = [{"order_id": "MOCK-1", "status": "COMPLETE"}, {"order_id": "MOCK-2", "status": "OPEN"}]
+    monitor_result = run_dhan_it_pair_monitor_once(repo, broker)
+
+    assert monitor_result["modified"] == 1
+    assert broker.modified == [("regular", "MOCK-2", {"order_type": "LIMIT", "price": 11.95})]
 
 
 def test_monitor_blocks_sell_when_refreshed_liquidity_turns_red(tmp_path):

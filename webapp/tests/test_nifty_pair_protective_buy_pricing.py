@@ -6,7 +6,7 @@ import app
 
 
 class NiftyPairProtectiveBuyPricingTest(unittest.TestCase):
-    def test_nifty_pair_protective_buy_legs_are_discounted_below_ltp(self):
+    def test_nifty_pair_uses_bounded_otm_hedges_and_tick_safe_quote_limits(self):
         expiry = date(2026, 7, 28)
         spot = 24098.65
         config = {
@@ -15,10 +15,10 @@ class NiftyPairProtectiveBuyPricingTest(unittest.TestCase):
             "manual_pair_sell_markup_percent": 20.0,
         }
         quote_map = {
-            "NFO:NIFTYTEST22500PE": {"last_price": 29.05, "oi": 20_000, "volume": 100},
-            "NFO:NIFTYTEST22200PE": {"last_price": 20.95, "oi": 20_000, "volume": 100},
-            "NFO:NIFTYTEST25200CE": {"last_price": 39.85, "oi": 20_000, "volume": 100},
-            "NFO:NIFTYTEST25500CE": {"last_price": 18.10, "oi": 20_000, "volume": 100},
+            "NFO:NIFTYTEST23200PE": {"last_price": 29.05, "oi": 20_000, "volume": 100},
+            "NFO:NIFTYTEST22900PE": {"last_price": 20.95, "oi": 20_000, "volume": 100},
+            "NFO:NIFTYTEST25000CE": {"last_price": 39.85, "oi": 20_000, "volume": 100},
+            "NFO:NIFTYTEST25300CE": {"last_price": 18.10, "oi": 20_000, "volume": 100},
         }
 
         with patch.object(
@@ -42,15 +42,19 @@ class NiftyPairProtectiveBuyPricingTest(unittest.TestCase):
 
         by_symbol = {row["tradingsymbol"]: row for row in orders}
         risk = app.calculate_nifty_manual_pair_risk(orders)
-        self.assertEqual(by_symbol["NIFTYTEST22500PE"]["price"], 34.9)
-        self.assertEqual(by_symbol["NIFTYTEST25200CE"]["price"], 47.85)
-        self.assertEqual(by_symbol["NIFTYTEST22200PE"]["price"], 16.75)
-        self.assertEqual(by_symbol["NIFTYTEST25500CE"]["price"], 14.45)
-        self.assertEqual(by_symbol["NIFTYTEST22200PE"]["protective_buy_discount_percent"], 20.0)
-        self.assertEqual(by_symbol["NIFTYTEST25500CE"]["protective_buy_discount_percent"], 20.0)
-        self.assertAlmostEqual(risk["net_credit"], 3350.75)
-        self.assertAlmostEqual(risk["margin_required"], 18320.25)
-        self.assertAlmostEqual(risk["return_on_margin_pct"], 18.289870225570608, places=5)
+        self.assertEqual(by_symbol["NIFTYTEST23200PE"]["price"], 27.55)
+        self.assertEqual(by_symbol["NIFTYTEST25000CE"]["price"], 37.85)
+        self.assertEqual(by_symbol["NIFTYTEST22900PE"]["price"], 22.0)
+        self.assertEqual(by_symbol["NIFTYTEST25300CE"]["price"], 19.05)
+        self.assertEqual(by_symbol["NIFTYTEST22900PE"]["execution_price_mode"], "ASK_PLUS_2_PERCENT")
+        self.assertEqual(by_symbol["NIFTYTEST25300CE"]["execution_price_mode"], "ASK_PLUS_2_PERCENT")
+        self.assertLess(by_symbol["NIFTYTEST23200PE"]["otm_pct"], 4.0)
+        self.assertLess(by_symbol["NIFTYTEST25000CE"]["otm_pct"], 4.0)
+        self.assertLess(by_symbol["NIFTYTEST22900PE"]["otm_pct"], 5.5)
+        self.assertLess(by_symbol["NIFTYTEST25300CE"]["otm_pct"], 5.5)
+        self.assertAlmostEqual(risk["net_credit"], 1582.75)
+        self.assertAlmostEqual(risk["margin_required"], 19139.25)
+        self.assertAlmostEqual(risk["return_on_margin_pct"], 8.26965528952284, places=5)
 
     def test_nfo_price_protection_keeps_valid_discounted_buy_limit(self):
         order = {

@@ -26,7 +26,7 @@ class NiftyDynamicHedgeWidthTest(unittest.TestCase):
                 self.assertEqual(decision["action"], expected_action)
                 self.assertEqual(decision["allowed"], expected_allowed)
 
-    def test_nifty_pair_uses_dynamic_width_for_pe_and_ce_hedges(self):
+    def test_nifty_pair_caps_high_vix_hedges_inside_credit_zone(self):
         expiry = date(2026, 7, 28)
         spot = 24098.65
         config = {
@@ -35,10 +35,10 @@ class NiftyDynamicHedgeWidthTest(unittest.TestCase):
             "manual_pair_sell_markup_percent": 20.0,
         }
         quote_map = {
-            "NFO:NIFTYTEST22500PE": {"last_price": 29.05, "oi": 20_000, "volume": 100},
-            "NFO:NIFTYTEST22000PE": {"last_price": 12.00, "oi": 20_000, "volume": 100},
-            "NFO:NIFTYTEST25200CE": {"last_price": 39.85, "oi": 20_000, "volume": 100},
-            "NFO:NIFTYTEST25700CE": {"last_price": 10.00, "oi": 20_000, "volume": 100},
+            "NFO:NIFTYTEST23200PE": {"last_price": 29.05, "oi": 20_000, "volume": 100},
+            "NFO:NIFTYTEST22800PE": {"last_price": 12.00, "oi": 20_000, "volume": 100},
+            "NFO:NIFTYTEST25000CE": {"last_price": 39.85, "oi": 20_000, "volume": 100},
+            "NFO:NIFTYTEST25400CE": {"last_price": 10.00, "oi": 20_000, "volume": 100},
         }
 
         with patch.object(
@@ -62,13 +62,17 @@ class NiftyDynamicHedgeWidthTest(unittest.TestCase):
             )
 
         by_symbol = {row["tradingsymbol"]: row for row in orders}
-        self.assertIn("NIFTYTEST22000PE", by_symbol)
-        self.assertIn("NIFTYTEST25700CE", by_symbol)
-        self.assertEqual(by_symbol["NIFTYTEST22000PE"]["transaction_type"], "BUY")
-        self.assertEqual(by_symbol["NIFTYTEST25700CE"]["transaction_type"], "BUY")
-        self.assertEqual(by_symbol["NIFTYTEST22000PE"]["hedge_width_points"], 500)
-        self.assertEqual(by_symbol["NIFTYTEST25700CE"]["hedge_width_points"], 500)
-        self.assertEqual(by_symbol["NIFTYTEST22500PE"]["vix_hedge_regime"], "HIGH_VIX")
+        self.assertIn("NIFTYTEST22800PE", by_symbol)
+        self.assertIn("NIFTYTEST25400CE", by_symbol)
+        self.assertEqual(by_symbol["NIFTYTEST22800PE"]["transaction_type"], "BUY")
+        self.assertEqual(by_symbol["NIFTYTEST25400CE"]["transaction_type"], "BUY")
+        self.assertEqual(by_symbol["NIFTYTEST22800PE"]["hedge_width_points"], 500)
+        self.assertEqual(by_symbol["NIFTYTEST25400CE"]["hedge_width_points"], 500)
+        self.assertEqual(by_symbol["NIFTYTEST22800PE"]["bounded_hedge_width_points"], 400)
+        self.assertEqual(by_symbol["NIFTYTEST25400CE"]["bounded_hedge_width_points"], 400)
+        self.assertLess(by_symbol["NIFTYTEST22800PE"]["otm_pct"], 5.5)
+        self.assertLess(by_symbol["NIFTYTEST25400CE"]["otm_pct"], 5.5)
+        self.assertEqual(by_symbol["NIFTYTEST23200PE"]["vix_hedge_regime"], "HIGH_VIX")
 
     def test_very_high_vix_reduces_lots_for_nifty_pair(self):
         expiry = date(2026, 7, 28)

@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from kite_spread_repository import KiteSpreadRepository
+
+
+def round_limit_price_to_tick(price: float, tick_size: float = 0.05) -> float:
+    """Round an NFO LIMIT price to the broker-accepted tick size."""
+
+    value = Decimal(str(float(price or 0)))
+    tick = Decimal(str(tick_size))
+    if value <= 0 or tick <= 0:
+        return 0.0
+    ticks = (value / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float((ticks * tick).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def build_kite_order_payload(tradingsymbol: str, transaction_type: str, quantity: int, price: float, tag: str = "") -> dict[str, Any]:
@@ -17,7 +29,7 @@ def build_kite_order_payload(tradingsymbol: str, transaction_type: str, quantity
         "quantity": int(quantity),
         "product": "NRML",
         "order_type": "LIMIT",
-        "price": round(float(price), 2),
+        "price": round_limit_price_to_tick(float(price)),
         "validity": "DAY",
         "tag": tag[:20],
     }
@@ -26,7 +38,7 @@ def build_kite_order_payload(tradingsymbol: str, transaction_type: str, quantity
 def dhan_initial_sell_limit_price(option_cmp: float) -> float:
     """Park the short leg 10% above evaluated option CMP until hedge is filled."""
 
-    return round(float(option_cmp or 0) * 1.10, 2)
+    return round_limit_price_to_tick(float(option_cmp or 0) * 1.10)
 
 
 def submit_kite_pair(preview: dict[str, Any], repository: KiteSpreadRepository, broker: Any, user_confirmed: bool, mode: str = "PAPER", execution_mode: str = "HEDGE_FIRST") -> dict[str, Any]:
@@ -43,7 +55,7 @@ def submit_kite_pair(preview: dict[str, Any], repository: KiteSpreadRepository, 
     pair_id = repository.create_pair(preview, mode=mode, user_confirmed=True, execution_mode=execution_mode)
     tag = pair_id[-20:]
     buy_payload = build_kite_order_payload(preview["buy_leg_tradingsymbol"], "BUY", preview["quantity"], preview["buy_limit_price"], tag)
-    sell_cmp_limit_price = round(float(preview["sell_limit_price"]), 2)
+    sell_cmp_limit_price = round_limit_price_to_tick(float(preview["sell_limit_price"]))
     sell_entry_limit_price = dhan_initial_sell_limit_price(sell_cmp_limit_price) if execution_mode == "HEDGE_FIRST" else sell_cmp_limit_price
     sell_payload = build_kite_order_payload(preview["sell_leg_tradingsymbol"], "SELL", preview["quantity"], sell_entry_limit_price, tag)
     if execution_mode == "HEDGE_FIRST":

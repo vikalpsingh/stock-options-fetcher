@@ -6,7 +6,7 @@ from datetime import date
 from typing import Any
 
 import kite_spread_config as spread_cfg
-from kite_spread_income_universe import ce_coverage_reason
+from kite_spread_income_universe import ce_coverage_context
 from kite_option_resolver import KiteOptionResolver
 from kite_option_liquidity import analyze_pair_liquidity
 from risk_engine import RiskVetoEngine
@@ -185,9 +185,7 @@ def build_kite_spread_preview(
     if not pair_liquidity.get("liquidity_order_allowed", True):
         reasons.append("LIQUIDITY_RED_ORDER_BLOCKED")
     option_type = "CE" if strategy == "BEAR_CALL_SPREAD" else "PE"
-    coverage_reason = ce_coverage_reason(symbol, lots, lot_size) if option_type == "CE" else ""
-    if coverage_reason:
-        reasons.append(coverage_reason)
+    coverage_context = ce_coverage_context(symbol, lots, lot_size) if option_type == "CE" else {}
     risk_trade = {
         "symbol": symbol, "tradingsymbol": sell_ts, "option_type": option_type, "transaction_type": "SELL",
         "quantity": quantity, "lot_size": lot_size or quantity or 1, "premium": sell_premium,
@@ -217,6 +215,11 @@ def build_kite_spread_preview(
         "event_risk": "YES" if event_risk else "NO", "risk_decision": "BLOCKED" if reasons else "APPROVED",
         "risk_reason": "; ".join(reasons) if reasons else "Spread risk checks passed.", "risk_engine": risk,
         "risk_veto_advisory": risk_veto_advisory,
+        "ce_share_coverage_status": coverage_context.get("ce_share_coverage_status", ""),
+        "ce_share_coverage_note": coverage_context.get("ce_share_coverage_note", ""),
+        "holding_qty": coverage_context.get("holding_qty"),
+        "covered_lots": coverage_context.get("covered_lots"),
+        "required_shares": coverage_context.get("required_shares"),
         "spot": cmp, "sell_strike": sell_strike, "hedge_strike": buy_strike,
         "strike_step": strike_step, "sell_target_strike": sell_target_strike,
         "hedge_target_strike": hedge_target_strike,

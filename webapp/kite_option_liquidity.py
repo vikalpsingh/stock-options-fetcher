@@ -163,6 +163,33 @@ def fallback_option_liquidity(tradingsymbol: str, reason: str = "Live Kite depth
     }
 
 
+def preview_has_bilateral_order_depth(preview: dict[str, Any], min_orders: int | None = None) -> bool:
+    """Return True when both option legs have enough visible buy and sell limit orders.
+
+    This is intentionally stricter than the generic overall-depth check. For a
+    paired-spread execution override we need usable depth on both sides of both
+    contracts, because the BUY hedge and parked SELL leg may interact with
+    different sides of the book as prices move.
+    """
+
+    threshold = int(min_orders or getattr(risk_config, "LIQUIDITY_AMBER_MIN_TOTAL_ORDERS", 20) or 20)
+
+    def flat_or_nested(flat_key: str, nested_key: str, side_key: str) -> float:
+        flat_value = _num(preview.get(flat_key))
+        if flat_value:
+            return flat_value
+        nested = preview.get(nested_key) if isinstance(preview.get(nested_key), dict) else {}
+        return _num(nested.get(side_key))
+
+    values = (
+        flat_or_nested("sell_leg_buy_orders", "sell_leg_liquidity", "top_5_buy_order_count"),
+        flat_or_nested("sell_leg_sell_orders", "sell_leg_liquidity", "top_5_sell_order_count"),
+        flat_or_nested("hedge_leg_buy_orders", "hedge_leg_liquidity", "top_5_buy_order_count"),
+        flat_or_nested("hedge_leg_sell_orders", "hedge_leg_liquidity", "top_5_sell_order_count"),
+    )
+    return all(value >= threshold for value in values)
+
+
 def analyze_pair_liquidity(
     sell_tradingsymbol: str,
     sell_quote: dict[str, Any] | None,
