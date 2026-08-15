@@ -176,15 +176,26 @@ def test_value_stock_repository_upserts_latest_snapshot(tmp_path) -> None:
     repo = ValueStockRepository(tmp_path / "value_stock.db")
 
     first = repo.upsert_parsed(parsed)
+    first_rows = repo.list_companies()
     parsed.metrics["Current Price"]["value"] = 450
     second = repo.upsert_parsed(parsed)
     rows = repo.list_companies()
     detail = repo.get_company(parsed.company_key)
 
     assert first["document_id"] == second["document_id"]
+    assert first_rows[0]["quantity"] == 23
+    assert first_rows[0]["avg_price"] == 434
+    assert first_rows[0]["buy_value"] == 9982
     assert rows[0]["cmp"] == 450
+    assert rows[0]["quantity"] == 23
+    assert rows[0]["avg_price"] == 434
+    assert rows[0]["buy_value"] == 9982
+    assert rows[0]["return_pct"] == 3.69
+    assert rows[0]["buy_date"]
     assert detail is not None
     assert detail["annual"]["Sales"]["Mar 2026"] == 30.65
+    assert detail["quantity"] == 23
+    assert detail["avg_price"] == 434
     assert json.loads(json.dumps(detail["score"]))["decision"]
 
 
@@ -292,6 +303,12 @@ def test_value_stock_panel_shows_screener_link_and_delete_action() -> None:
                     "decision": "WATCH",
                     "confidence": "Medium",
                     "freshness": "2026-08-02",
+                    "cmp": 125,
+                    "quantity": 80,
+                    "avg_price": 100,
+                    "buy_value": 8000,
+                    "buy_date": "2026-08-12",
+                    "return_pct": 25,
                     "warnings": [],
                 }
             ],
@@ -300,6 +317,19 @@ def test_value_stock_panel_shows_screener_link_and_delete_action() -> None:
 
     assert "Screener" in html
     assert "https://www.screener.in/company/PARKHOSPS/" in html
+    assert "Quantity Q" in html
+    assert "Avg Price" in html
+    assert "Buy Value" in html
+    assert "Buy Date" in html
+    assert "% Return" in html
+    assert "80" in html
+    assert "8,000.00" in html
+    assert "25.00%" in html
+    assert 'id="value-stock-comparison-table"' in html
+    assert 'class="sort-header" data-sort-col="3">CMP' in html
+    assert 'data-sort-value="125.0"' in html
+    assert 'data-sort-value="20260812"' in html
+    assert 'data-sort-value="25.0"' in html
     assert 'formaction="/value-stock/delete"' in html
     assert "Delete this Value-Stock row permanently" in html
 

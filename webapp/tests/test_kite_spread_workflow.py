@@ -888,6 +888,44 @@ def test_dhan_popup_selected_execution_expiry_renders_and_unlocks_acknowledged_p
     assert 'id="dhan-pair-review" type="button" class="secondary">' in ticket
 
 
+def test_dhan_popup_blocks_trade_when_quarterly_result_is_within_ten_days(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    result_day = app.datetime.now(app.INDIA_TIME_ZONE).date() + app.timedelta(days=5)
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=12, next_buy=5))["recommended_preview"]
+    preview["next_result_date"] = result_day.isoformat()
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(
+            active_tab="kite-spreads",
+            dhan_opportunities=[preview],
+            dhan_selected_index="0",
+            dhan_confirm_pair_order=True,
+        )
+    )
+    ticket = html.split('id="dhan-pair-order-modal"', 1)[1]
+
+    assert "Next result date" in ticket
+    assert f"Quarterly results is on {result_day.strftime('%d %b %Y')} hence blocking the trade" in ticket
+    assert "RESULT BLOCK" in ticket
+    assert 'data-orderable="0"' in ticket
+    assert 'id="dhan-pair-review" type="button" class="secondary" disabled' in ticket
+
+
+def test_dhan_popup_shows_no_nearby_result_when_result_date_is_far(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    result_day = app.datetime.now(app.INDIA_TIME_ZONE).date() + app.timedelta(days=30)
+    preview = expiry_comparison(chain=comparison_chain(current_sell=30, current_buy=5, next_sell=12, next_buy=5))["recommended_preview"]
+    preview["next_result_date"] = result_day.isoformat()
+
+    html = app.render_kite_spreads_panel(
+        app.PageState(active_tab="kite-spreads", dhan_opportunities=[preview], dhan_selected_index="0")
+    )
+
+    assert "Next result date" in html
+    assert "NO near by results date" in html
+    assert 'data-orderable="1"' in html
+
+
 def test_dhan_popup_allows_acknowledged_soft_no_trade_pair_to_start_review(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
     preview = expiry_comparison(chain=comparison_chain(current_sell=12, current_buy=5, next_sell=13, next_buy=5))["recommended_preview"]
@@ -1048,6 +1086,22 @@ def test_dhan_submit_allows_basic_pop_gain_clear_with_confirmation(tmp_path):
     assert result["buy_leg_order_id"] == "KITE-1"
     assert pair["risk_decision"] == "APPROVED"
     assert "Basic clear" in payload["risk_reason"]
+
+
+def test_dhan_submit_blocks_near_quarterly_result_even_with_confirmation(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    broker = MockKiteAdapter()
+    preview = approved_preview()
+    result_day = app.datetime.now(app.INDIA_TIME_ZONE).date() + app.timedelta(days=3)
+    preview["next_result_date"] = result_day.isoformat()
+
+    try:
+        app.submit_pair_order(preview, repo, broker, user_confirmed=True, paper_trading=True)
+    except ValueError as exc:
+        assert f"Quarterly results is on {result_day.strftime('%d %b %Y')} hence blocking the trade" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("near result date must block DHAN order submission")
+    assert broker.placed == []
 
 
 def test_dhan_submit_allows_acknowledged_pop_ror_clear(tmp_path):
@@ -1260,7 +1314,7 @@ def test_dhan_ready_for_trade_table_prevalidates_and_links_to_selected_expiry(tm
     assert 'id="dhan-ready-table"' in html
     assert (
         'class="table-wrap dhan-ten-row-scroll"><table id="dhan-ready-table" '
-        'class="ipo-table dhan-ready-table" data-default-sort-col="6" data-default-sort-dir="desc"'
+        'class="ipo-table dhan-ready-table" data-default-sort-col="10" data-default-sort-dir="desc"'
     ) in html
     assert (
         '<th class="sort-header" data-sort-col="0">Symbol</th>'
@@ -1269,13 +1323,24 @@ def test_dhan_ready_for_trade_table_prevalidates_and_links_to_selected_expiry(tm
         '<th class="sort-header" data-sort-col="3">Max Loss</th>'
         '<th class="sort-header" data-sort-col="4">POP</th>'
         '<th class="sort-header" data-sort-col="5">RoR</th>'
-        '<th class="sort-header" data-sort-col="6">Score</th>'
-        '<th class="sort-header" data-sort-col="7">Liquidity</th>'
+        '<th class="sort-header" data-sort-col="6">CMP / Day</th>'
+        '<th class="sort-header" data-sort-col="7">DMA Zone</th>'
+        '<th class="sort-header" data-sort-col="8">Sell Leg</th>'
+        '<th class="sort-header" data-sort-col="9">Buy Hedge</th>'
+        '<th class="sort-header" data-sort-col="10">Score</th>'
+        '<th class="sort-header" data-sort-col="11">Liquidity</th>'
     ) in html
+    assert ">Status</th>" not in html.split('id="dhan-ready-table"', 1)[1].split("</table>", 1)[0]
+    assert ">Risk</th>" not in html.split('id="dhan-ready-table"', 1)[1].split("</table>", 1)[0]
+    assert ">Action</th>" not in html.split('id="dhan-ready-table"', 1)[1].split("</table>", 1)[0]
+    assert "dhan-cmp-day-cell" in html
+    assert "dhan-cmp-zone-cell" in html
+    assert "50 DMA" in html
+    assert "200 DMA" in html
     assert "50% POP / 50% gain" in html
     assert ">Score<" in html
     assert 'name="dhan_ready_choice" value="0|CURRENT_MONTH"' in html
-    assert "Place via 10s review" in html
+    assert "Place via 10s review" not in html
     assert "RELIANCE08271050CE" in html
 
 

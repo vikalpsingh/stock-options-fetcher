@@ -667,6 +667,27 @@ def test_dhan_it_amber_liquidity_allows_acknowledged_review():
     assert 'id="dhan-it-review" type="button" class="secondary">' in html
 
 
+def test_dhan_it_popup_blocks_trade_when_quarterly_result_is_within_ten_days():
+    preview = approved_preview()
+    result_day = datetime.now(app.INDIA_TIME_ZONE).date() + timedelta(days=4)
+    preview["next_result_date"] = result_day.isoformat()
+
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=dhan_it_universe_rows(),
+            dhan_it_opportunities=[preview],
+            dhan_it_selected_index="0",
+            dhan_it_confirm_order=True,
+        )
+    )
+
+    assert "Next result date" in html
+    assert f"Quarterly results is on {result_day.strftime('%d %b %Y')} hence blocking the trade" in html
+    assert 'data-orderable="0"' in html
+    assert 'id="dhan-it-review" type="button" class="secondary" disabled' in html
+
+
 def test_dhan_it_red_liquidity_blocks_live_but_allows_paper_submit(tmp_path):
     repo = DhanItPairRepository(tmp_path / "dhan_it.db")
     broker = MockBroker()
@@ -687,6 +708,23 @@ def test_dhan_it_red_liquidity_blocks_live_but_allows_paper_submit(tmp_path):
     result = submit_dhan_it_pair(preview, repo, paper_broker, user_confirmed=True, mode="PAPER")
     assert result["pair_id"]
     assert len(paper_broker.placed) == 2
+
+
+def test_dhan_it_submit_blocks_near_quarterly_result_even_in_paper(tmp_path):
+    repo = DhanItPairRepository(tmp_path / "dhan_it.db")
+    broker = MockBroker()
+    preview = approved_preview()
+    result_day = datetime.now(app.INDIA_TIME_ZONE).date() + timedelta(days=2)
+    guarded = app.apply_dhan_result_date_guard(preview | {"next_result_date": result_day.isoformat()})
+
+    try:
+        submit_dhan_it_pair(guarded, repo, broker, user_confirmed=True, mode="PAPER")
+    except ValueError as exc:
+        assert "DHAN_IT_RISK_REWARD_BLOCKED" in str(exc)
+        assert f"Quarterly results is on {result_day.strftime('%d %b %Y')} hence blocking the trade" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("near result date must block DHAN-IT order submission")
+    assert broker.placed == []
 
 
 def test_dhan_it_bilateral_depth_clears_red_wide_liquidity_for_live_review_and_submit(tmp_path):
@@ -803,6 +841,47 @@ def test_dhan_it_standard_cycle_ack_unlocks_place_order_for_defined_risk_soft_bl
     assert 'id="dhan-it-review" type="button" class="secondary">' in html
     assert 'id="dhan-it-place-order" type="submit" class="secondary" formaction="/dhan-it/submit" disabled' in html
     assert "I UNDERSTAND the RISK of MAX LOSS" in html
+
+
+def test_dhan_it_dma_red_allows_good_liquidity_defined_risk_pair_submit(tmp_path):
+    repo = DhanItPairRepository(tmp_path / "dhan_it.db")
+    broker = MockBroker()
+    preview = approved_preview()
+    preview.update(
+        {
+            "symbol": "TECHM",
+            "dma_status": "RED",
+            "dma_decision": "CONFIRM_REQUIRED",
+            "dma_reasons": "50/200 DMA gate RED",
+            "pair_liquidity_condition": "GREEN",
+            "liquidity_order_allowed": True,
+            "liquidity_reason": "Good liquidity",
+            "pop_estimate": 71.3,
+            "return_on_risk_pct": 9.66,
+            "max_gain": 4230.0,
+            "max_loss": 43770.0,
+        }
+    )
+
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=dhan_it_universe_rows(),
+            dhan_it_opportunities=[preview],
+            dhan_it_selected_index="0",
+            dhan_it_confirm_order=True,
+            dhan_it_paper_trading=False,
+        )
+    )
+
+    assert "DMA RED shown as warning only because this defined-risk pair has good executable liquidity." in html
+    assert 'data-orderable="1"' in html
+    assert 'id="dhan-it-review" type="button" class="secondary">' in html
+
+    result = submit_dhan_it_pair(preview, repo, broker, user_confirmed=True, mode="LIVE")
+
+    assert result["pair_id"]
+    assert len(broker.placed) == 2
 
 
 def test_dhan_it_paper_red_liquidity_ack_enables_countdown_for_execution_flow():

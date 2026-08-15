@@ -20638,6 +20638,25 @@ def fmt_value_stock_number(value: Any, decimals: int = 2, suffix: str = "") -> s
     return html.escape(f"{rendered}{suffix}")
 
 
+def value_stock_sort_value(value: Any, *, missing: float = -999_999_999_999.0) -> str:
+    if value is None or value == "":
+        return str(missing)
+    try:
+        return str(float(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def value_stock_date_sort_value(value: Any) -> str:
+    if value is None or value == "":
+        return "0"
+    try:
+        parsed = datetime.fromisoformat(str(value)).date()
+        return parsed.strftime("%Y%m%d")
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def value_stock_status_class(status: Any) -> str:
     return {
         "positive": "vs-positive",
@@ -20646,6 +20665,18 @@ def value_stock_status_class(status: Any) -> str:
         "neutral": "vs-neutral",
         "unavailable": "vs-unavailable",
     }.get(str(status or "").lower(), "vs-neutral")
+
+
+def value_stock_return_class(value: Any) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "vs-unavailable"
+    if numeric > 0:
+        return "vs-positive"
+    if numeric < 0:
+        return "vs-negative"
+    return "vs-warning"
 
 
 def load_value_stock_state(state: PageState) -> None:
@@ -20756,6 +20787,32 @@ def render_value_stock_panel(state: PageState) -> str:
         for value in ("Latest assessment", "Trend heatmap", "No colours")
     )
     row_html = []
+    comparison_headers = [
+        "Company",
+        "Screener",
+        "Sector",
+        "CMP",
+        "Quantity Q",
+        "Avg Price",
+        "Buy Value",
+        "Buy Date",
+        "% Return",
+        "Market Cap Cr",
+        "OPM",
+        "ROCE",
+        "ROE",
+        "D/E",
+        "P/E",
+        "EV/EBITDA",
+        "Score",
+        "Decision",
+        "Freshness",
+        "Action",
+    ]
+    comparison_header_html = "".join(
+        f'<th class="sort-header" data-sort-col="{index}">{html.escape(label)}</th>'
+        for index, label in enumerate(comparison_headers)
+    )
     for row in rows:
         key = str(row.get("company_key") or "")
         decision = str(row.get("decision") or "WATCH")
@@ -20772,28 +20829,34 @@ def render_value_stock_panel(state: PageState) -> str:
             if screener_url
             else '<span class="muted-cell">-</span>'
         )
+        confidence_text = str(row.get("confidence") or "")
         row_html.append(
             "<tr>"
-            f"<td><button type=\"submit\" class=\"link-button\" formaction=\"/value-stock/detail\" name=\"value_stock_selected_key\" value=\"{html.escape(key, quote=True)}\">{html.escape(str(row.get('company_name') or ''))}</button>"
+            f"<td data-sort-value=\"{html.escape(str(row.get('company_name') or ''), quote=True)}\"><button type=\"submit\" class=\"link-button\" formaction=\"/value-stock/detail\" name=\"value_stock_selected_key\" value=\"{html.escape(key, quote=True)}\">{html.escape(str(row.get('company_name') or ''))}</button>"
             f"<small>{html.escape(str(row.get('exchange') or ''))} {html.escape(str(row.get('industry') or ''))}</small></td>"
-            f"<td>{screener_link_html}</td>"
-            f"<td>{html.escape(str(row.get('sector') or '-'))}</td>"
-            f"<td>{fmt_value_stock_number(row.get('cmp'), 2)}</td>"
-            f"<td>{fmt_value_stock_number(row.get('market_cap'), 0)}</td>"
-            f"<td>{fmt_value_stock_number(row.get('opm'), 1, '%')}</td>"
-            f"<td>{fmt_value_stock_number(row.get('roce'), 1, '%')}</td>"
-            f"<td>{fmt_value_stock_number(row.get('roe'), 1, '%')}</td>"
-            f"<td>{fmt_value_stock_number(row.get('debt_equity'), 2)}</td>"
-            f"<td>{fmt_value_stock_number(row.get('pe'), 1)}</td>"
-            f"<td>{fmt_value_stock_number(row.get('ev_ebitda'), 1)}</td>"
-            f"<td><span class=\"value-score\">{fmt_value_stock_number(row.get('score'), 1)}</span></td>"
-            f"<td><span class=\"ipo-badge {decision_class}\">{html.escape(decision)}</span><small>{html.escape(str(row.get('confidence') or ''))}</small></td>"
-            f"<td>{html.escape(str(row.get('freshness') or '-'))}{f'<small>{html.escape(warning_text)}</small>' if warning_text else ''}</td>"
-            f"<td><button type=\"submit\" class=\"mini-link button-link danger-link\" formaction=\"/value-stock/delete\" name=\"value_stock_selected_key\" value=\"{html.escape(key, quote=True)}\" onclick=\"return confirm('Delete this Value-Stock row permanently?');\">Delete</button></td>"
+            f"<td data-sort-value=\"{html.escape(screener_url, quote=True)}\">{screener_link_html}</td>"
+            f"<td data-sort-value=\"{html.escape(str(row.get('sector') or ''), quote=True)}\">{html.escape(str(row.get('sector') or '-'))}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('cmp')), quote=True)}\">{fmt_value_stock_number(row.get('cmp'), 2)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('quantity')), quote=True)}\">{fmt_value_stock_number(row.get('quantity'), 0)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('avg_price')), quote=True)}\">{fmt_value_stock_number(row.get('avg_price'), 2)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('buy_value')), quote=True)}\">{fmt_value_stock_number(row.get('buy_value'), 2)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_date_sort_value(row.get('buy_date')), quote=True)}\">{html.escape(str(row.get('buy_date') or '-'))}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('return_pct')), quote=True)}\"><span class=\"{value_stock_return_class(row.get('return_pct'))}\">{fmt_value_stock_number(row.get('return_pct'), 2, '%')}</span></td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('market_cap')), quote=True)}\">{fmt_value_stock_number(row.get('market_cap'), 0)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('opm')), quote=True)}\">{fmt_value_stock_number(row.get('opm'), 1, '%')}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('roce')), quote=True)}\">{fmt_value_stock_number(row.get('roce'), 1, '%')}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('roe')), quote=True)}\">{fmt_value_stock_number(row.get('roe'), 1, '%')}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('debt_equity')), quote=True)}\">{fmt_value_stock_number(row.get('debt_equity'), 2)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('pe')), quote=True)}\">{fmt_value_stock_number(row.get('pe'), 1)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('ev_ebitda')), quote=True)}\">{fmt_value_stock_number(row.get('ev_ebitda'), 1)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('score')), quote=True)}\"><span class=\"value-score\">{fmt_value_stock_number(row.get('score'), 1)}</span></td>"
+            f"<td data-sort-value=\"{html.escape(decision + ' ' + confidence_text, quote=True)}\"><span class=\"ipo-badge {decision_class}\">{html.escape(decision)}</span><small>{html.escape(confidence_text)}</small></td>"
+            f"<td data-sort-value=\"{html.escape(str(row.get('freshness') or ''), quote=True)}\">{html.escape(str(row.get('freshness') or '-'))}{f'<small>{html.escape(warning_text)}</small>' if warning_text else ''}</td>"
+            f"<td data-sort-value=\"delete\"><button type=\"submit\" class=\"mini-link button-link danger-link\" formaction=\"/value-stock/delete\" name=\"value_stock_selected_key\" value=\"{html.escape(key, quote=True)}\" onclick=\"return confirm('Delete this Value-Stock row permanently?');\">Delete</button></td>"
             "</tr>"
         )
     if not row_html:
-        row_html.append('<tr><td colspan="15" class="muted-cell">No Value-Stock PDFs uploaded yet. Upload a Screener company PDF to create the comparison table.</td></tr>')
+        row_html.append('<tr><td colspan="20" class="muted-cell">No Value-Stock PDFs uploaded yet. Upload a Screener company PDF to create the comparison table.</td></tr>')
 
     detail_html = ""
     detail = state.value_stock_detail or {}
@@ -20905,9 +20968,9 @@ def render_value_stock_panel(state: PageState) -> str:
         <div class="panel-title">Comparison Table</div>
         <p class="status">Colours are decision labels from the scoring engine. Missing data is kept unavailable; it is never converted to zero.</p>
         <div class="table-wrap value-stock-table-wrap">
-          <table class="value-stock-table">
+          <table id="value-stock-comparison-table" class="value-stock-table ipo-table">
             <thead><tr>
-              <th>Company</th><th>Screener</th><th>Sector</th><th>CMP</th><th>Market Cap Cr</th><th>OPM</th><th>ROCE</th><th>ROE</th><th>D/E</th><th>P/E</th><th>EV/EBITDA</th><th>Score</th><th>Decision</th><th>Freshness</th><th>Action</th>
+              {comparison_header_html}
             </tr></thead>
             <tbody>{''.join(row_html)}</tbody>
           </table>
@@ -21270,7 +21333,261 @@ DHAN_CRITICAL_ORDER_BLOCKS = {
     "MAX_LOSS_INVALID",
     "CALENDAR_HEDGE_EXPIRES_BEFORE_SHORT",
     "LIQUIDITY_RED_ORDER_BLOCKED",
+    "QUARTERLY_RESULTS_WITHIN_10_DAYS",
 }
+
+DHAN_RESULT_BLOCK_WINDOW_DAYS = 10
+
+
+def parse_dhan_result_date(value: Any) -> date | None:
+    """Parse a result-date value from local payloads or public calendar rows."""
+    if isinstance(value, datetime):
+        return value.astimezone(INDIA_TIME_ZONE).date() if value.tzinfo else value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"\s+", " ", text)
+    for fmt in (
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+    ):
+        try:
+            return datetime.strptime(text[:30], fmt).date()
+        except ValueError:
+            pass
+    iso_match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    if iso_match:
+        try:
+            return date.fromisoformat(iso_match.group(0))
+        except ValueError:
+            pass
+    day_month_year = re.search(
+        r"\b(\d{1,2})[-/\s]+([A-Za-z]{3,9}|\d{1,2})[-/,\s]+(\d{4})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if day_month_year:
+        raw = " ".join(day_month_year.groups())
+        for fmt in ("%d %m %Y", "%d %b %Y", "%d %B %Y"):
+            try:
+                return datetime.strptime(raw, fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def _dhan_result_calendar_rows_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("data", "rows", "result", "results"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    return [payload]
+
+
+def fetch_dhan_result_date_uncached(symbol: str) -> dict[str, Any]:
+    """Fetch the nearest upcoming quarterly result date for an NSE equity.
+
+    NSE endpoint shapes change occasionally, so this parser accepts several
+    common date/purpose field names and falls back gracefully when no calendar
+    row is available.
+    """
+    clean_symbol = str(symbol or "").strip().upper().removeprefix("NSE:")
+    if not clean_symbol:
+        return {"symbol": "", "next_result_date": "", "source": "", "error": "symbol missing"}
+    today_ist = datetime.now(INDIA_TIME_ZONE).date()
+    headers = {
+        "User-Agent": "Mozilla/5.0 KiteTraderLocalApp/1.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+    }
+    endpoints = [
+        f"https://www.nseindia.com/api/event-calendar?index=equities&symbol={quote_plus(clean_symbol)}",
+        f"https://www.nseindia.com/api/corporate-event?index=equities&symbol={quote_plus(clean_symbol)}",
+    ]
+    errors: list[str] = []
+    # Warm NSE cookies; failures are non-fatal because some deployments/proxies
+    # allow the API directly.
+    try:
+        with urlopen(Request("https://www.nseindia.com/", headers=headers), timeout=8):
+            pass
+    except Exception as exc:
+        errors.append(str(exc))
+    for endpoint in endpoints:
+        try:
+            with urlopen(Request(endpoint, headers=headers), timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+        candidates: list[date] = []
+        for row in _dhan_result_calendar_rows_from_payload(payload):
+            purpose = " ".join(
+                str(row.get(key) or "")
+                for key in (
+                    "purpose",
+                    "subject",
+                    "event",
+                    "eventType",
+                    "event_type",
+                    "bm_purpose",
+                    "desc",
+                    "details",
+                )
+            ).lower()
+            if purpose and not any(term in purpose for term in ("result", "financial", "earning", "quarter")):
+                continue
+            for key in (
+                "date",
+                "eventDate",
+                "event_date",
+                "bm_date",
+                "boardMeetingDate",
+                "board_meeting_date",
+                "meetingDate",
+                "meeting_date",
+                "exDate",
+                "toDate",
+            ):
+                parsed = parse_dhan_result_date(row.get(key))
+                if parsed and parsed >= today_ist:
+                    candidates.append(parsed)
+        if candidates:
+            nearest = min(candidates)
+            return {
+                "symbol": clean_symbol,
+                "next_result_date": nearest.isoformat(),
+                "source": endpoint,
+                "error": "",
+            }
+    return {
+        "symbol": clean_symbol,
+        "next_result_date": "",
+        "source": "",
+        "error": "; ".join(errors[-2:]),
+    }
+
+
+def dhan_result_runtime_lookup_enabled() -> bool:
+    value = str(os.environ.get("DHAN_RESULT_DATE_RUNTIME_LOOKUP", "YES") or "YES").strip().upper()
+    if value in {"0", "NO", "FALSE", "OFF"}:
+        return False
+    # Unit tests must stay deterministic and offline; tests can still exercise
+    # the guard through explicit preview dates.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    return True
+
+
+def dhan_result_date_context(
+    symbol: str,
+    preview: dict[str, Any] | None = None,
+    *,
+    as_of: date | None = None,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    clean_symbol = str(symbol or "").strip().upper().removeprefix("NSE:")
+    today_ist = as_of or datetime.now(INDIA_TIME_ZONE).date()
+    preview = preview or {}
+    event_payload = preview.get("event_data") if isinstance(preview.get("event_data"), dict) else {}
+    raw_date = (
+        preview.get("next_result_date")
+        or preview.get("result_date")
+        or preview.get("result_event_date")
+        or event_payload.get("next_event_date")
+        or event_payload.get("result_date")
+    )
+    source = "preview"
+    parsed = parse_dhan_result_date(raw_date)
+    error = ""
+    if parsed is None and clean_symbol and dhan_result_runtime_lookup_enabled():
+        cache_key = f"dhan-result-calendar:{clean_symbol}"
+        if force_refresh:
+            APP_CACHE.pop(cache_key, None)
+        try:
+            fetched = cached_value(cache_key, lambda: fetch_dhan_result_date_uncached(clean_symbol), 6 * 60 * 60)
+        except Exception as exc:
+            fetched = {"next_result_date": "", "source": "", "error": str(exc)}
+        parsed = parse_dhan_result_date((fetched or {}).get("next_result_date"))
+        source = str((fetched or {}).get("source") or "")
+        error = str((fetched or {}).get("error") or "")
+    if parsed:
+        days_until = (parsed - today_ist).days
+        display = parsed.strftime("%d %b %Y")
+        is_near = 0 <= days_until <= DHAN_RESULT_BLOCK_WINDOW_DAYS
+        return {
+            "symbol": clean_symbol,
+            "next_result_date": parsed.isoformat(),
+            "next_result_date_display": display,
+            "days_to_result": days_until,
+            "result_date_near": is_near,
+            "result_date_source": source,
+            "result_date_error": error,
+            "result_date_message": (
+                f"Quarterly results is on {display} hence blocking the trade"
+                if is_near
+                else "NO near by results date"
+            ),
+        }
+    return {
+        "symbol": clean_symbol,
+        "next_result_date": "",
+        "next_result_date_display": "Not available",
+        "days_to_result": None,
+        "result_date_near": False,
+        "result_date_source": source,
+        "result_date_error": error,
+        "result_date_message": "NO near by results date",
+    }
+
+
+def apply_dhan_result_date_guard(
+    preview: dict[str, Any],
+    *,
+    as_of: date | None = None,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    guarded = dict(preview or {})
+    context = dhan_result_date_context(
+        str(guarded.get("symbol") or guarded.get("underlying") or ""),
+        guarded,
+        as_of=as_of,
+        force_refresh=force_refresh,
+    )
+    guarded.update(context)
+    if context.get("result_date_near"):
+        reason = f"QUARTERLY_RESULTS_WITHIN_10_DAYS: {context['result_date_message']}"
+        existing_reason = str(guarded.get("risk_reason") or guarded.get("reason") or "").strip()
+        if reason not in existing_reason:
+            existing_reason = f"{existing_reason}; {reason}" if existing_reason else reason
+        guarded["risk_decision"] = "BLOCKED"
+        guarded["risk_reason"] = existing_reason
+        guarded["reason"] = existing_reason
+        guarded["event_risk"] = "YES"
+    return guarded
+
+
+def merge_result_date_fields_from_source(
+    preview: dict[str, Any],
+    source: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(preview or {})
+    source = source or {}
+    for key in ("next_result_date", "result_date", "result_event_date", "event_data"):
+        if not merged.get(key) and source.get(key):
+            merged[key] = source.get(key)
+    return merged
 
 
 def dhan_pair_is_defined_risk_orderable(preview: dict[str, Any], allow_red_liquidity: bool = False) -> bool:
@@ -21286,7 +21603,9 @@ def submit_pair_order(
     user_confirmed: bool,
     paper_trading: bool = True,
 ) -> dict[str, Any]:
-    clean_opportunity = dict(opportunity)
+    clean_opportunity = apply_dhan_result_date_guard(dict(opportunity))
+    if bool(clean_opportunity.get("result_date_near")):
+        raise ValueError(str(clean_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))
     if str(clean_opportunity.get("risk_decision") or "").upper() != "APPROVED" and user_confirmed:
         basic_quality_clear = dhan_pair_simple_quality_clears(clean_opportunity)
         defined_risk_orderable = dhan_pair_is_defined_risk_orderable(clean_opportunity, allow_red_liquidity=paper_trading)
@@ -21870,6 +22189,24 @@ def dhan_it_quality_override_reason(preview: dict[str, Any]) -> str:
     return "Quality override unavailable: POP/gain/loss or hard order-shape checks are not satisfied."
 
 
+def dhan_it_dma_red_can_be_warning(preview: dict[str, Any]) -> bool:
+    """Allow DMA RED as a warning when liquidity/order shape is strong enough.
+
+    DHAN-IT is primarily a tactical CE spread screen. A RED DMA gate should
+    remain highly visible, but it should not block a defined-risk paired order
+    when the option pair has clean executable liquidity.
+    """
+    pair_condition = str(preview.get("pair_liquidity_condition") or "").upper()
+    liquidity_allowed = bool(preview.get("liquidity_order_allowed", pair_condition in {"AMBER", "GREEN"}))
+    return bool(
+        dhan_pair_has_valid_order_shape(preview, allow_red_liquidity=True)
+        and (
+            (pair_condition in {"AMBER", "GREEN"} and liquidity_allowed)
+            or preview_has_bilateral_order_depth(preview)
+        )
+    )
+
+
 def dhan_opportunity_best_pick_reasons(preview: dict[str, Any]) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     if _dhan_metric_float(preview.get("pop_estimate")) < DHAN_BEST_PICK_MIN_POP:
@@ -21956,6 +22293,8 @@ def dhan_ready_trade_rows(
                     "max_loss": max_loss,
                     "pop_estimate": pop,
                     "return_on_risk_pct": ror,
+                    "cmp": selected.get("cmp") or selected.get("spot"),
+                    "day_change_pct": selected.get("day_change_pct"),
                     "pair_liquidity_condition": selected.get("pair_liquidity_condition"),
                     "risk_decision": selected.get("risk_decision"),
                     "ready_reason": (
@@ -23054,6 +23393,13 @@ def render_kite_spreads_panel(state: PageState) -> str:
             expiry_label = text_value(ready.get("expiry"))
             if choice == "NEXT_SELL_CURRENT_BUY":
                 expiry_label = f"SELL {text_value(ready.get('sell_expiry'))} / BUY {text_value(ready.get('buy_expiry'))}"
+            try:
+                ready_day_change = float(ready.get("day_change_pct") or 0)
+            except (TypeError, ValueError):
+                ready_day_change = 0.0
+            ready_day_change_class = "pnl-positive" if ready_day_change >= 0 else "pnl-negative"
+            ready_dma_ctx = dhan_stock_dma_context(text_value(ready.get("symbol")), ready)
+            ready_zone_class = str(ready_dma_ctx.get("dma_zone_class") or "neutral")
             ready_rows.append(
                 "<tr class=\"dhan-ready-row\">"
                 f"<td><button type=\"submit\" class=\"mini-link button-link\" formaction=\"/kite-spreads/preview-pair\" name=\"dhan_ready_choice\" value=\"{row_index}|{html.escape(choice, quote=True)}\">{html.escape(text_value(ready.get('symbol')))}<small>Open ticket</small></button></td>"
@@ -23062,16 +23408,15 @@ def render_kite_spreads_panel(state: PageState) -> str:
                 f"<td>{money(ready.get('max_loss'))}</td>"
                 f"<td>{money(ready.get('pop_estimate'))}%</td>"
                 f"<td>{money(ready.get('return_on_risk_pct'))}%</td>"
+                f"<td class=\"dhan-cmp-day-cell\" data-sort-value=\"{html.escape(str(ready_day_change), quote=True)}\"><strong>{money(ready.get('cmp'))}</strong><small class=\"{ready_day_change_class}\">{money(ready.get('day_change_pct'))}%</small></td>"
+                f"<td class=\"dhan-cmp-zone-cell\"><span class=\"ipo-badge {html.escape(ready_zone_class)}\">{html.escape(text_value(ready_dma_ctx.get('dma_zone')))}</span><small>50 DMA {money(ready_dma_ctx.get('dma_50'))} | 200 DMA {money(ready_dma_ctx.get('dma_200'))}</small><small>{html.escape(text_value(ready_dma_ctx.get('dma_zone_reason'), ''))}</small></td>"
+                f"<td>{html.escape(text_value(ready.get('sell_leg_tradingsymbol')))}</td>"
+                f"<td>{html.escape(text_value(ready.get('buy_leg_tradingsymbol')))}</td>"
                 f"<td><strong>{money(ready.get('weighted_score'))}</strong><small>50% POP / 50% gain</small></td>"
                 f"<td><span class=\"ipo-badge {liquidity_badge_class(ready.get('pair_liquidity_condition'))}\">{html.escape(text_value(ready.get('pair_liquidity_condition')))}</span></td>"
-                f"<td><span class=\"ipo-badge good\">READY</span><small>{html.escape(text_value(ready.get('ready_reason')))}</small></td>"
                 f"<td>{html.escape(strategy_short)}</td>"
                 f"<td>{html.escape(choice)}</td>"
                 f"<td>{html.escape(expiry_label)}</td>"
-                f"<td>{html.escape(text_value(ready.get('sell_leg_tradingsymbol')))}</td>"
-                f"<td>{html.escape(text_value(ready.get('buy_leg_tradingsymbol')))}</td>"
-                f"<td>{html.escape(text_value(ready.get('risk_decision')))}</td>"
-                f"<td><button type=\"submit\" class=\"success mini-link button-link\" formaction=\"/kite-spreads/preview-pair\" name=\"dhan_ready_choice\" value=\"{row_index}|{html.escape(choice, quote=True)}\">Place via 10s review</button></td>"
                 "</tr>"
             )
     ready_empty_message = (
@@ -23079,7 +23424,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
         if opportunities and not ready_scan_fresh
         else "No clean READY trades found. Current/next/mixed expiries were scanned; blocked trades remain in Opportunity Table for review."
     )
-    ready_table_rows = "".join(ready_rows) or f'<tr><td colspan="16" class="muted-cell">{html.escape(ready_empty_message)}</td></tr>'
+    ready_table_rows = "".join(ready_rows) or f'<tr><td colspan="15" class="muted-cell">{html.escape(ready_empty_message)}</td></tr>'
 
     selected_preview = ""
     selected_idx = int(float(state.dhan_selected_index)) if str(state.dhan_selected_index or "").isdigit() else -1
@@ -23095,6 +23440,8 @@ def render_kite_spreads_panel(state: PageState) -> str:
             )
         except Exception:
             selected = original_selected
+        selected = merge_result_date_fields_from_source(selected, original_selected)
+        selected = apply_dhan_result_date_guard(selected)
         is_approved = str(selected.get("risk_decision") or "").upper() == "APPROVED"
         existing_pair_row = dhan_existing_option_position_for_pair(selected, state.dhan_holding_positions)
         basic_quality_clear = dhan_pair_simple_quality_clears(selected)
@@ -23112,14 +23459,21 @@ def render_kite_spreads_panel(state: PageState) -> str:
         if existing_pair_row:
             is_orderable = False
             quality_auto_clear = False
+        if bool(selected.get("result_date_near")):
+            is_orderable = False
+            quality_auto_clear = False
         review_disabled = " disabled"
         place_button_disabled = " disabled"
         risk_badge = "good" if is_approved or basic_quality_clear else "neutral" if acknowledgement_quality_clear else "bad"
         if existing_pair_row:
             risk_badge = "warn"
+        if bool(selected.get("result_date_near")):
+            risk_badge = "bad"
         ticket_decision_label = (
             "OPEN POSITION"
             if existing_pair_row
+            else "RESULT BLOCK"
+            if bool(selected.get("result_date_near"))
             else "APPROVED"
             if is_approved
             else "BASIC CLEAR"
@@ -23135,6 +23489,9 @@ def render_kite_spreads_panel(state: PageState) -> str:
                 "Do not place a new paired order here; use Repair from Current Kite Option Holdings / Pair Status."
             )
             if existing_pair_row
+            else
+            text_value(selected.get("result_date_message"))
+            if bool(selected.get("result_date_near"))
             else
             "Risk is low enough for this engine; submit stays paper/live-confirm gated."
             if is_approved
@@ -23212,6 +23569,14 @@ def render_kite_spreads_panel(state: PageState) -> str:
             expiry_card_label = f"SELL {text_value(selected.get('sell_expiry'))} / BUY {text_value(selected.get('buy_expiry'))}"
         loss_label = "Estimated loss" if selected.get("structure_type") == "NEXT_SELL_CURRENT_BUY_CALENDAR_HEDGE" else "Defined max loss"
         loss_hint = "Hedge expires first" if selected.get("structure_type") == "NEXT_SELL_CURRENT_BUY_CALENDAR_HEDGE" else "Known before entry"
+        result_date_badge = "bad" if selected.get("result_date_near") else "good"
+        result_date_card_html = (
+            f'<article class="dhan-ticket-card">'
+            f'<span>Next result date</span>'
+            f'<strong>{html.escape(text_value(selected.get("next_result_date_display"), "Not available"))}</strong>'
+            f'<small><span class="ipo-badge {result_date_badge}">{html.escape(text_value(selected.get("result_date_message"), "NO near by results date"))}</span></small>'
+            f'</article>'
+        )
         selected_preview = f"""
         <div class="live-modal-backdrop visible" id="dhan-pair-order-modal">
           <div class="live-modal income-pe-order-modal-card nifty-pair-order-modal-card dhan-order-modal-card">
@@ -23266,6 +23631,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
                 <strong>{money(selected.get('pop_estimate'))}%</strong>
                 <small>{'Approximate model' if selected.get('pop_is_approx') else 'Model estimate'}</small>
               </article>
+              {result_date_card_html}
               <article class="dhan-ticket-card">
                 <span>Strike grid</span>
                 <strong>{money(selected.get('strike_step'))}</strong>
@@ -23419,7 +23785,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
           <button type="submit" formaction="/kite-spreads/ready-trades" class="success">Run READY Pre-Validation Job</button>
           <button type="submit" formaction="/kite-spreads/ready-trades" class="secondary">Refresh READY Table</button>
         </div>
-        <div class="table-wrap dhan-ten-row-scroll"><table id="dhan-ready-table" class="ipo-table dhan-ready-table" data-default-sort-col="6" data-default-sort-dir="desc"><thead><tr><th class="sort-header" data-sort-col="0">Symbol</th><th class="sort-header" data-sort-col="1">Credit</th><th class="sort-header" data-sort-col="2">Max Gain</th><th class="sort-header" data-sort-col="3">Max Loss</th><th class="sort-header" data-sort-col="4">POP</th><th class="sort-header" data-sort-col="5">RoR</th><th class="sort-header" data-sort-col="6">Score</th><th class="sort-header" data-sort-col="7">Liquidity</th><th class="sort-header" data-sort-col="8">Status</th><th class="sort-header" data-sort-col="9">Side</th><th class="sort-header" data-sort-col="10">Expiry Choice</th><th class="sort-header" data-sort-col="11">Expiry</th><th class="sort-header" data-sort-col="12">Sell Leg</th><th class="sort-header" data-sort-col="13">Buy Hedge</th><th class="sort-header" data-sort-col="14">Risk</th><th>Action</th></tr></thead><tbody>{ready_table_rows}</tbody></table></div>
+        <div class="table-wrap dhan-ten-row-scroll"><table id="dhan-ready-table" class="ipo-table dhan-ready-table" data-default-sort-col="10" data-default-sort-dir="desc"><thead><tr><th class="sort-header" data-sort-col="0">Symbol</th><th class="sort-header" data-sort-col="1">Credit</th><th class="sort-header" data-sort-col="2">Max Gain</th><th class="sort-header" data-sort-col="3">Max Loss</th><th class="sort-header" data-sort-col="4">POP</th><th class="sort-header" data-sort-col="5">RoR</th><th class="sort-header" data-sort-col="6">CMP / Day</th><th class="sort-header" data-sort-col="7">DMA Zone</th><th class="sort-header" data-sort-col="8">Sell Leg</th><th class="sort-header" data-sort-col="9">Buy Hedge</th><th class="sort-header" data-sort-col="10">Score</th><th class="sort-header" data-sort-col="11">Liquidity</th><th class="sort-header" data-sort-col="12">Side</th><th class="sort-header" data-sort-col="13">Expiry Choice</th><th class="sort-header" data-sort-col="14">Expiry</th></tr></thead><tbody>{ready_table_rows}</tbody></table></div>
       </section>
       <section class="panel dhan-opportunities-panel{best_pair_section_class}">
         <div class="panel-title">Opportunity Table - Compare POP, Gain and Risk</div>
@@ -24481,6 +24847,8 @@ def render_dhan_it_panel(state: PageState) -> str:
             )
         except Exception:
             selected = original_selected
+        selected = merge_result_date_fields_from_source(selected, original_selected)
+        selected = apply_dhan_result_date_guard(selected)
         is_orderable = dhan_pair_is_defined_risk_orderable(
             selected,
             allow_red_liquidity=state.dhan_it_paper_trading,
@@ -24489,11 +24857,26 @@ def render_dhan_it_panel(state: PageState) -> str:
         dma_status = str((dma_card or {}).get("status") or selected.get("dma_status") or "").upper()
         dma_decision = str((dma_card or {}).get("decision") or selected.get("dma_decision") or "").upper()
         dma_gate_active = call_watch_gate_active or bool(selected.get("dma_status") or selected.get("dma_decision"))
-        if dma_gate_active and str(selected.get("strategy_type") or "").upper() == "BEAR_CALL_SPREAD" and dma_status == "RED":
+        dma_red_warning_only = (
+            dma_gate_active
+            and str(selected.get("strategy_type") or "").upper() == "BEAR_CALL_SPREAD"
+            and dma_status == "RED"
+            and dhan_it_dma_red_can_be_warning(selected)
+        )
+        if (
+            dma_gate_active
+            and str(selected.get("strategy_type") or "").upper() == "BEAR_CALL_SPREAD"
+            and dma_status == "RED"
+            and not dma_red_warning_only
+        ):
+            is_orderable = False
+        if bool(selected.get("result_date_near")):
             is_orderable = False
         quality_auto_clear = dhan_it_quality_override_clears(selected) or (
             dhan_pair_quality_auto_clears(selected) and (not dma_gate_active or dma_decision != "CONFIRM_REQUIRED")
         )
+        if bool(selected.get("result_date_near")):
+            quality_auto_clear = False
         submit_mode = "PAPER" if state.dhan_it_paper_trading else "LIVE"
         submit_disabled = " disabled"
         review_disabled = "" if is_orderable and (state.dhan_it_confirm_order or quality_auto_clear) else " disabled"
@@ -24521,6 +24904,11 @@ def render_dhan_it_panel(state: PageState) -> str:
         near_strike_checked = " checked" if strike_mode == "NEAR_CMP_1PCT" else ""
         strike_profile_label = "1% nearer CMP" if strike_mode == "NEAR_CMP_1PCT" else "Standard"
         dma_reason = "; ".join(str(item) for item in ((dma_card or {}).get("reasons") or [])) or text_value(selected.get("dma_reasons"))
+        if dma_red_warning_only:
+            dma_reason = (
+                (f"{dma_reason}; " if dma_reason and dma_reason != "-" else "")
+                + "DMA RED shown as warning only because this defined-risk pair has good executable liquidity."
+            )
         dma_badge_class = "good" if dma_status == "GREEN" else "neutral" if dma_status == "AMBER" else "bad" if dma_status else "neutral"
         dma_summary = (
             f'<article class="dhan-ticket-card"><span>50/200 DMA Gate</span><strong><span class="ipo-badge {dma_badge_class}">{html.escape(dma_status or "N/A")}</span></strong>'
@@ -24530,6 +24918,12 @@ def render_dhan_it_panel(state: PageState) -> str:
         max_gain_value = money(selected.get("max_gain"))
         sell_otm_value = money(selected.get("sell_otm_pct"))
         hedge_otm_value = money(selected.get("hedge_otm_pct"))
+        result_date_badge = "bad" if selected.get("result_date_near") else "good"
+        result_date_card_html = (
+            f'<article><span>Next result date</span>'
+            f'<strong>{html.escape(text_value(selected.get("next_result_date_display"), "Not available"))}</strong>'
+            f'<small><span class="ipo-badge {result_date_badge}">{html.escape(text_value(selected.get("result_date_message"), "NO near by results date"))}</span></small></article>'
+        )
         selected_preview = f"""
         <div class="live-modal-backdrop visible" id="dhan-it-order-modal"><div class="live-modal dhan-order-modal-card">
           <h2>DHAN-IT Order Ticket - {html.escape(text_value(selected.get('symbol')))}</h2>
@@ -24540,6 +24934,7 @@ def render_dhan_it_panel(state: PageState) -> str:
             <article><span>Selected expiry</span><strong>{html.escape(selected_expiry_label)}</strong><small>{html.escape(submit_mode)} | {'Live hedge-first execution' if submit_mode == 'LIVE' else 'Paper simulation'} | DTE {html.escape(text_value(selected.get('dte')))}</small></article>
             <article><span>POP / RoR</span><strong>{money(selected.get('pop_estimate'))}% / {money(selected.get('return_on_risk_pct'))}%</strong><small>Probability and return on risk</small></article>
             <article><span>Max Gain / Loss</span><strong>{max_gain_value} / {max_loss_value}</strong><small>Defined-risk pair</small></article>
+            {result_date_card_html}
           </div>
           <div class="dhan-it-execution-leg-grid">
             <article class="dhan-it-execution-leg sell">
@@ -24579,7 +24974,7 @@ def render_dhan_it_panel(state: PageState) -> str:
             <label><input type="radio" name="dhan_it_expiry_mode" value="NEXT_SELL_CURRENT_BUY" data-expiry-preview-action="/dhan-it/preview"{calendar_checked}{calendar_disabled}> SELL next month + BUY current hedge</label>
             <small>Changing expiry reloads this order ticket with selected-month data.</small>
           </div>
-          <div class="income-equity-order-summary">{html.escape(dma_reason)}<br>{dhan_it_quality_override_reason(selected) if is_orderable else 'This DHAN-IT pair is not orderable because hard risk/DMA/liquidity checks did not approve it.'}</div>
+          <div class="income-equity-order-summary">{html.escape(dma_reason)}<br>{html.escape(text_value(selected.get('result_date_message')))}<br>{dhan_it_quality_override_reason(selected) if is_orderable else 'This DHAN-IT pair is not orderable because hard risk/DMA/liquidity checks did not approve it.'}</div>
           {f'<div class="status success">Soft-blocker override available: POP > {DHAN_IT_QUALITY_UNLOCK_MIN_POP:.0f}%, max gain > ₹{DHAN_IT_QUALITY_UNLOCK_MIN_GAIN_INR:,.0f}, and max loss < ₹{DHAN_IT_QUALITY_UNLOCK_MAX_LOSS_INR:,.0f}. You can start countdown directly, or tick acknowledgement manually.</div>' if quality_auto_clear else ''}
           <label class="inline-check"><input id="dhan-it-confirm-order" type="checkbox" name="dhan_it_confirm_order" value="1" data-orderable="{'1' if is_orderable else '0'}" data-auto-clear="{'1' if quality_auto_clear else '0'}"{confirm_checked}> I UNDERSTAND the RISK of MAX LOSS ₹{html.escape(max_loss_value)} for this paired order.</label>
           <div class="breath-circle income-pe-breath" id="dhan-it-breath"></div>
@@ -37560,6 +37955,7 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(document.getElementById('dhan-opportunity-table'));
     enableTableSorting(document.getElementById('dhan-it-opportunity-table'));
     enableTableSorting(document.getElementById('dhan-it-comparison-table'));
+    enableTableSorting(document.getElementById('value-stock-comparison-table'));
     enableTableSorting(document.getElementById('equity-holdings-table'));
     enableTableSorting(document.getElementById('ipo-listed-table'));
     enableTableSorting(document.getElementById('ipo-mainboard-table'));
@@ -42128,6 +42524,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         max_loss=DHAN_SELECTION_MAX_LOSS_INR,
                         allow_unapproved_preview=True,
                     )
+                    selected_opportunity = merge_result_date_fields_from_source(
+                        selected_opportunity,
+                        (state.dhan_opportunities or [])[selected_idx],
+                    )
+                    selected_opportunity = apply_dhan_result_date_guard(selected_opportunity)
+                    if bool(selected_opportunity.get("result_date_near")):
+                        raise ValueError(str(selected_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))
                     existing_pair_row = dhan_existing_option_position_for_pair(selected_opportunity, state.dhan_holding_positions)
                     if existing_pair_row:
                         option_type = text_value(existing_pair_row.get("option_type")).upper()
@@ -42358,11 +42761,19 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         ),
                         allow_unapproved_preview=True,
                     )
+                    selected_opportunity = merge_result_date_fields_from_source(
+                        selected_opportunity,
+                        (state.dhan_it_opportunities or [])[selected_idx],
+                    )
+                    selected_opportunity = apply_dhan_result_date_guard(selected_opportunity)
+                    if bool(selected_opportunity.get("result_date_near")):
+                        raise ValueError(str(selected_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))
                     selected_dma_status = str(selected_opportunity.get("dma_status") or "").upper()
                     selected_dma_decision = str(selected_opportunity.get("dma_decision") or "").upper()
                     if (
                         str(selected_opportunity.get("strategy_type") or "").upper() == "BEAR_CALL_SPREAD"
                         and selected_dma_status == "RED"
+                        and not dhan_it_dma_red_can_be_warning(selected_opportunity)
                     ):
                         raise ValueError(
                             f"DHAN-IT DMA gate blocked this CE spread: {selected_opportunity.get('dma_reasons') or '50/200 DMA setup is not approved.'}"

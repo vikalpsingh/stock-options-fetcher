@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,18 @@ class ValueStockRepository:
                     operating_metrics_json TEXT NOT NULL,
                     score_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS value_stock_tracking (
+                    company_key TEXT PRIMARY KEY,
+                    investment_amount REAL NOT NULL DEFAULT 10000,
+                    quantity REAL NOT NULL,
+                    avg_price REAL NOT NULL,
+                    buy_value REAL NOT NULL,
+                    buy_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(company_key) REFERENCES value_stock_company(company_key) ON DELETE CASCADE
                 );
                 """
             )
@@ -182,15 +195,18 @@ class ValueStockRepository:
                     now,
                 ),
             )
+            self._ensure_tracking_for_company(conn, parsed.company_key, parsed.metrics, now)
         return {"status": status, "document_id": document_id, "company_key": parsed.company_key}
 
     def list_companies(self, search: str = "", sector: str = "", decision: str = "") -> list[dict[str, Any]]:
         query = """
             SELECT c.*, s.metrics_json, s.score_json, s.updated_at AS snapshot_updated_at,
-                   d.filename, d.source_date, d.uploaded_at, d.warnings_json
+                   d.filename, d.source_date, d.uploaded_at, d.warnings_json,
+                   t.investment_amount, t.quantity, t.avg_price, t.buy_value, t.buy_date
             FROM value_stock_company c
             LEFT JOIN value_stock_snapshot s ON s.company_key = c.company_key
             LEFT JOIN value_stock_document d ON d.id = c.latest_source_document_id
+            LEFT JOIN value_stock_tracking t ON t.company_key = c.company_key
         """
         rows: list[Any] = []
         clauses: list[str] = []
@@ -205,6 +221,7 @@ class ValueStockRepository:
             query += " WHERE " + " AND ".join(clauses)
         with self.connect() as conn:
             records = [self._hydrate_summary(row) for row in conn.execute(query, rows).fetchall()]
+            self._ensure_tracking_for_summaries(conn, records)
         if decision:
             records = [
                 row for row in records
@@ -224,10 +241,12 @@ class ValueStockRepository:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT c.*, s.*, d.filename, d.source_date, d.uploaded_at, d.warnings_json, d.raw_text
+                SELECT c.*, s.*, d.filename, d.source_date, d.uploaded_at, d.warnings_json, d.raw_text,
+                       t.investment_amount, t.quantity, t.avg_price, t.buy_value, t.buy_date
                 FROM value_stock_company c
                 LEFT JOIN value_stock_snapshot s ON s.company_key = c.company_key
                 LEFT JOIN value_stock_document d ON d.id = c.latest_source_document_id
+                LEFT JOIN value_stock_tracking t ON t.company_key = c.company_key
                 WHERE c.company_key = ?
                 """,
                 (company_key,),
@@ -249,6 +268,7 @@ class ValueStockRepository:
                 return False
             conn.execute("DELETE FROM value_stock_snapshot WHERE company_key = ?", (key,))
             conn.execute("DELETE FROM value_stock_document WHERE company_key = ?", (key,))
+            conn.execute("DELETE FROM value_stock_tracking WHERE company_key = ?", (key,))
             conn.execute("DELETE FROM value_stock_company WHERE company_key = ?", (key,))
         return True
 
@@ -289,9 +309,117 @@ class ValueStockRepository:
             return item.get("value")
         return None
 
+    def _tracking_seed(self, company_key: str, cmp_value: Any, now: str) -> dict[str, Any] | None:
+        try:
+            avg_price = float(cmp_value or 0)
+        except (TypeError, ValueError):
+            avg_price = 0.0
+        if avg_price <= 0 or not math.isfinite(avg_price):
+            return None
+        investment_amount = 10_000.0
+        quantity = max(1.0, math.floor(investment_amount / avg_price))
+        buy_value = round(quantity * avg_price, 2)
+        return {
+            "company_key": company_key,
+            "investment_amount": investment_amount,
+            "quantity": quantity,
+            "avg_price": avg_price,
+            "buy_value": buy_value,
+            "buy_date": datetime.now(timezone.utc).date().isoformat(),
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def _ensure_tracking_for_company(
+        self,
+        conn: sqlite3.Connection,
+        company_key: str,
+        metrics: dict[str, Any],
+        now: str,
+    ) -> None:
+        if conn.execute(
+            "SELECT company_key FROM value_stock_tracking WHERE company_key = ?",
+            (company_key,),
+        ).fetchone():
+            return
+        seed = self._tracking_seed(company_key, self._metric_value(metrics, "Current Price"), now)
+        if not seed:
+            return
+        conn.execute(
+            """
+            INSERT INTO value_stock_tracking(
+                company_key, investment_amount, quantity, avg_price, buy_value,
+                buy_date, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                seed["company_key"],
+                seed["investment_amount"],
+                seed["quantity"],
+                seed["avg_price"],
+                seed["buy_value"],
+                seed["buy_date"],
+                seed["created_at"],
+                seed["updated_at"],
+            ),
+        )
+
+    def _ensure_tracking_for_summaries(
+        self,
+        conn: sqlite3.Connection,
+        records: list[dict[str, Any]],
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for record in records:
+            if record.get("quantity") not in {None, ""}:
+                continue
+            seed = self._tracking_seed(str(record.get("company_key") or ""), record.get("cmp"), now)
+            if not seed:
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO value_stock_tracking(
+                    company_key, investment_amount, quantity, avg_price, buy_value,
+                    buy_date, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    seed["company_key"],
+                    seed["investment_amount"],
+                    seed["quantity"],
+                    seed["avg_price"],
+                    seed["buy_value"],
+                    seed["buy_date"],
+                    seed["created_at"],
+                    seed["updated_at"],
+                ),
+            )
+            record.update(
+                {
+                    "investment_amount": seed["investment_amount"],
+                    "quantity": seed["quantity"],
+                    "avg_price": seed["avg_price"],
+                    "buy_value": seed["buy_value"],
+                    "buy_date": seed["buy_date"],
+                    "return_pct": self._tracking_return_pct(record.get("cmp"), seed["avg_price"]),
+                }
+            )
+
+    def _tracking_return_pct(self, cmp_value: Any, avg_price: Any) -> float | None:
+        try:
+            cmp_float = float(cmp_value or 0)
+            avg_float = float(avg_price or 0)
+        except (TypeError, ValueError):
+            return None
+        if avg_float <= 0:
+            return None
+        return round(((cmp_float - avg_float) / avg_float) * 100, 2)
+
     def _hydrate_summary(self, row: sqlite3.Row) -> dict[str, Any]:
         metrics = self._json(row, "metrics_json", {})
         score = self._json(row, "score_json", {})
+        cmp_value = self._metric_value(metrics, "Current Price")
+        avg_price = row["avg_price"] if "avg_price" in row.keys() else None
         return {
             "company_key": row["company_key"],
             "company_name": row["company_name"],
@@ -299,7 +427,7 @@ class ValueStockRepository:
             "industry": row["industry"] or "",
             "exchange": row["exchange"] or "",
             "screener_url": row["screener_url"] or "",
-            "cmp": self._metric_value(metrics, "Current Price"),
+            "cmp": cmp_value,
             "market_cap": self._metric_value(metrics, "Market Cap"),
             "sales_last_year": self._metric_value(metrics, "Sales last year"),
             "pat_last_year": self._metric_value(metrics, "NP Ann"),
@@ -314,6 +442,12 @@ class ValueStockRepository:
             "confidence": score.get("confidence") or "Low",
             "freshness": row["source_date"] or row["uploaded_at"] or "",
             "warnings": self._json(row, "warnings_json", []),
+            "investment_amount": row["investment_amount"] if "investment_amount" in row.keys() else None,
+            "quantity": row["quantity"] if "quantity" in row.keys() else None,
+            "avg_price": avg_price,
+            "buy_value": row["buy_value"] if "buy_value" in row.keys() else None,
+            "buy_date": row["buy_date"] if "buy_date" in row.keys() else "",
+            "return_pct": self._tracking_return_pct(cmp_value, avg_price),
         }
 
     def _hydrate_detail(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -331,4 +465,8 @@ class ValueStockRepository:
             "warnings_json",
         ):
             detail[key.removesuffix("_json")] = self._json(row, key, [] if key == "warnings_json" else {})
+        detail["return_pct"] = self._tracking_return_pct(
+            self._metric_value(detail.get("metrics") or {}, "Current Price"),
+            detail.get("avg_price"),
+        )
         return detail

@@ -21,6 +21,26 @@ def now_text() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def dhan_it_dma_red_can_be_warning(preview: dict[str, Any]) -> bool:
+    pair_condition = str(preview.get("pair_liquidity_condition") or "").upper()
+    liquidity_allowed = bool(preview.get("liquidity_order_allowed", pair_condition in {"AMBER", "GREEN"}))
+    has_order_shape = bool(
+        preview.get("sell_leg_tradingsymbol")
+        and preview.get("buy_leg_tradingsymbol")
+        and float(preview.get("quantity") or 0) > 0
+        and float(preview.get("sell_limit_price") or 0) > 0
+        and float(preview.get("buy_limit_price") or 0) > 0
+        and float(preview.get("max_loss") or 0) > 0
+    )
+    return bool(
+        has_order_shape
+        and (
+            (pair_condition in {"AMBER", "GREEN"} and liquidity_allowed)
+            or preview_has_bilateral_order_depth(preview)
+        )
+    )
+
+
 class DhanItPairRepository:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -196,9 +216,11 @@ def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepositor
     if float(preview.get("max_loss") or 0) > float(getattr(risk_config, "DHAN_IT_MAX_ACCEPTABLE_PAIR_LOSS_INR", 40_000)):
         accepted_risk_warnings.append("max loss above configured limit")
     hard_reasons: list[str] = []
+    if bool(preview.get("result_date_near")):
+        hard_reasons.append(str(preview.get("result_date_message") or "Quarterly results date is nearby"))
     if str(preview.get("event_risk") or "").upper() == "YES":
         hard_reasons.append("event risk")
-    if str(preview.get("dma_status") or "").upper() == "RED":
+    if str(preview.get("dma_status") or "").upper() == "RED" and not dhan_it_dma_red_can_be_warning(preview):
         hard_reasons.append("DMA/technical gate RED")
     if hard_reasons:
         reason = "; ".join(hard_reasons)
