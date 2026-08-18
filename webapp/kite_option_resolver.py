@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from functools import lru_cache
 import math
+import re
 from typing import Any
 
 import kite_spread_config as spread_cfg
@@ -60,6 +61,29 @@ def _parse_expiry(value: Any) -> date | None:
         return None
 
 
+def _tradingsymbol_underlying(value: Any) -> str:
+    symbol = str(value or "").strip().upper()
+    if not symbol:
+        return ""
+    match = re.match(
+        r"^(?P<underlying>[A-Z0-9-]+?)(?P<yy>\d{2})(?:(?P<month_name>JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)|(?P<month_code>[1-9OND])\d{2})(?P<strike>\d+(?:\.\d+)?)(?:CE|PE)$",
+        symbol,
+    )
+    return str(match.group("underlying") if match else "").upper()
+
+
+def _contract_matches_underlying(row: dict[str, Any], underlying: str) -> bool:
+    symbol = str(underlying or "").strip().upper()
+    if not symbol:
+        return False
+    candidates = {
+        str(row.get("name") or "").strip().upper(),
+        str(row.get("underlying") or "").strip().upper(),
+        _tradingsymbol_underlying(row.get("tradingsymbol") or row.get("symbol")),
+    }
+    return symbol in {item for item in candidates if item}
+
+
 @lru_cache(maxsize=2)
 def cached_nfo_instruments_for_day(cache_key: str, adapter_id: int, adapter: Any) -> tuple[dict[str, Any], ...]:
     return tuple(dict(row) for row in adapter.get_instruments("NFO"))
@@ -81,12 +105,11 @@ class KiteOptionResolver:
         return self._instruments
 
     def option_contracts(self, underlying: str, option_type: str, expiry: str | date | None = None) -> list[dict[str, Any]]:
-        symbol = str(underlying or "").upper()
         opt = str(option_type or "").upper()
         expiry_date = _parse_expiry(expiry) if expiry else None
         rows = []
         for row in self.instruments():
-            if str(row.get("name") or row.get("underlying") or "").upper() != symbol:
+            if not _contract_matches_underlying(row, underlying):
                 continue
             if str(row.get("instrument_type") or row.get("option_type") or "").upper() != opt:
                 continue
@@ -99,7 +122,7 @@ class KiteOptionResolver:
         expiries = sorted({
             parsed
             for row in self.instruments()
-            if str(row.get("name") or row.get("underlying") or "").upper() == str(underlying).upper()
+            if _contract_matches_underlying(row, underlying)
             if (parsed := _parse_expiry(row.get("expiry"))) is not None and parsed >= self.today
         })
         return expiries

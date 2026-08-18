@@ -129,7 +129,7 @@ from kite_option_liquidity import preview_has_bilateral_order_depth
 from kite_spread_repository import KiteSpreadRepository
 from kite_pair_execution import build_kite_order_payload
 from kite_spread_universe import KiteSpreadUniverse
-from dhan_it_universe import IT_FNO_SYMBOLS, dhan_it_universe_rows
+from dhan_it_universe import IT_FNO_SYMBOLS, dhan_it_universe_rows, dhan_it_stock_config
 from dhan_it_signal_engine import evaluate_it_signal
 from dhan_it_spread_builder import build_dhan_it_spread
 from dhan_it_pair_execution import DhanItPairRepository, submit_dhan_it_pair
@@ -8165,7 +8165,7 @@ DHAN_IT_RESULT_NEWS_TERMS = {
 
 
 def fetch_dhan_it_sector_news_uncached() -> list[dict[str, str]]:
-    query = quote_plus("NIFTY IT TCS Infosys HCLTech Tech Mahindra results earnings NSE stock")
+    query = quote_plus("NIFTY IT TCS Infosys HCLTech Tech Mahindra Wipro LTIMindtree LTM results earnings NSE stock")
     url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     request = Request(url, headers={"User-Agent": "KiteTraderLocalApp/1.0"})
     with urlopen(request, timeout=8) as response:
@@ -20657,6 +20657,92 @@ def value_stock_date_sort_value(value: Any) -> str:
         return str(value)
 
 
+def value_stock_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def value_stock_screener_symbol(row: dict[str, Any]) -> str:
+    screener_url = str(row.get("screener_url") or "").strip()
+    if screener_url:
+        match = re.search(r"/company/([^/?#]+)", urlparse(screener_url).path, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip().upper()
+    symbol = str(row.get("symbol") or "").strip().upper().removeprefix("NSE:")
+    if symbol and re.fullmatch(r"[A-Z0-9&-]+", symbol):
+        return symbol
+    return ""
+
+
+def value_stock_tracking_return_pct(cmp_value: Any, avg_price: Any) -> float | None:
+    cmp_float = value_stock_float(cmp_value)
+    avg_float = value_stock_float(avg_price)
+    if cmp_float is None or avg_float is None:
+        return None
+    return round(((cmp_float - avg_float) / avg_float) * 100, 2)
+
+
+def enrich_value_stock_rows_with_live_cmp(rows: list[dict[str, Any]]) -> tuple[int, str]:
+    for row in rows:
+        row["pdf_cmp"] = row.get("cmp")
+        row["cmp_source"] = "PDF snapshot"
+        row["live_symbol"] = value_stock_screener_symbol(row)
+    symbols = sorted({str(row.get("live_symbol") or "") for row in rows if row.get("live_symbol")})
+    if not symbols:
+        return 0, ""
+    if kite_orders is None:
+        return 0, "Value-Stock live CMP skipped: Kite module is unavailable."
+    try:
+        kite = kite_orders.kite_client()
+        live_cmp_by_symbol = fresh_equity_cmp_map(kite, symbols, ttl_seconds=0)
+    except Exception as exc:
+        return 0, f"Value-Stock live CMP unavailable: {friendly_external_error(exc, 'Kite live CMP')}"
+    updated = 0
+    for row in rows:
+        symbol = str(row.get("live_symbol") or "")
+        live_cmp = value_stock_float(live_cmp_by_symbol.get(symbol))
+        if live_cmp is None:
+            continue
+        row["cmp"] = live_cmp
+        row["cmp_source"] = "Live Kite"
+        row["return_pct"] = value_stock_tracking_return_pct(live_cmp, row.get("avg_price"))
+        updated += 1
+    return updated, f"Value-Stock live CMP refreshed for {updated}/{len(symbols)} symbol(s) from Kite."
+
+
+def enrich_value_stock_detail_with_live_cmp(detail: dict[str, Any] | None) -> tuple[bool, str]:
+    if not detail:
+        return False, ""
+    rows = [
+        {
+            "screener_url": detail.get("screener_url"),
+            "symbol": detail.get("symbol"),
+            "cmp": ((detail.get("metrics") or {}).get("Current Price") or {}).get("value")
+            if isinstance((detail.get("metrics") or {}).get("Current Price"), dict)
+            else None,
+            "avg_price": detail.get("avg_price"),
+        }
+    ]
+    updated, message = enrich_value_stock_rows_with_live_cmp(rows)
+    row = rows[0]
+    detail["pdf_cmp"] = row.get("pdf_cmp")
+    detail["cmp_source"] = row.get("cmp_source")
+    detail["live_symbol"] = row.get("live_symbol")
+    if updated:
+        metrics = detail.setdefault("metrics", {})
+        current_price = metrics.setdefault("Current Price", {})
+        if isinstance(current_price, dict):
+            current_price["value"] = row.get("cmp")
+            current_price["source"] = "Live Kite"
+        detail["return_pct"] = row.get("return_pct")
+    return bool(updated), message
+
+
 def value_stock_status_class(status: Any) -> str:
     return {
         "positive": "vs-positive",
@@ -20690,8 +20776,14 @@ def load_value_stock_state(state: PageState) -> None:
         sector=state.value_stock_sector,
         decision=state.value_stock_decision,
     )
+    live_count, live_message = enrich_value_stock_rows_with_live_cmp(state.value_stock_rows)
+    if live_message:
+        state.console_log = f"{state.console_log}\n{live_message}".strip()
     if state.value_stock_selected_key:
         state.value_stock_detail = service.get_company(state.value_stock_selected_key)
+        detail_updated, detail_message = enrich_value_stock_detail_with_live_cmp(state.value_stock_detail)
+        if detail_message and not live_count and detail_updated:
+            state.console_log = f"{state.console_log}\n{detail_message}".strip()
 
 
 def render_value_stock_matrix(title: str, data: Any, max_rows: int = 12, colour_mode: str = "Latest assessment") -> str:
@@ -20836,7 +20928,7 @@ def render_value_stock_panel(state: PageState) -> str:
             f"<small>{html.escape(str(row.get('exchange') or ''))} {html.escape(str(row.get('industry') or ''))}</small></td>"
             f"<td data-sort-value=\"{html.escape(screener_url, quote=True)}\">{screener_link_html}</td>"
             f"<td data-sort-value=\"{html.escape(str(row.get('sector') or ''), quote=True)}\">{html.escape(str(row.get('sector') or '-'))}</td>"
-            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('cmp')), quote=True)}\">{fmt_value_stock_number(row.get('cmp'), 2)}</td>"
+            f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('cmp')), quote=True)}\">{fmt_value_stock_number(row.get('cmp'), 2)}<small>{html.escape(str(row.get('cmp_source') or 'PDF snapshot'))}</small></td>"
             f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('quantity')), quote=True)}\">{fmt_value_stock_number(row.get('quantity'), 0)}</td>"
             f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('avg_price')), quote=True)}\">{fmt_value_stock_number(row.get('avg_price'), 2)}</td>"
             f"<td data-sort-value=\"{html.escape(value_stock_sort_value(row.get('buy_value')), quote=True)}\">{fmt_value_stock_number(row.get('buy_value'), 2)}</td>"
@@ -20867,10 +20959,11 @@ def render_value_stock_panel(state: PageState) -> str:
         def metric_value(label: str) -> Any:
             item = metrics.get(label) or {}
             return item.get("value") if isinstance(item, dict) else None
+        cmp_source = str(detail.get("cmp_source") or "PDF snapshot")
         key_metric_cards = "".join(
             f"<div><span>{html.escape(label)}</span><strong>{fmt_value_stock_number(value, decimals, suffix)}</strong></div>"
             for label, value, decimals, suffix in (
-                ("CMP", metric_value("Current Price"), 2, ""),
+                (f"CMP ({cmp_source})", metric_value("Current Price"), 2, ""),
                 ("Market Cap", metric_value("Market Cap"), 0, " Cr"),
                 ("P/E", metric_value("Stock P/E"), 1, ""),
                 ("ROCE", metric_value("ROCE"), 1, "%"),
@@ -21223,9 +21316,15 @@ def enrich_dhan_market_data_from_kite(
             wanted = set(missing_contracts)
             grouped: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in missing_contracts}
             for row in instruments:
-                symbol = str(row.get("name") or row.get("underlying") or "").strip().upper()
-                if symbol in wanted and str(row.get("instrument_type") or row.get("option_type") or "").upper() in {"CE", "PE"}:
-                    grouped.setdefault(symbol, []).append(dict(row))
+                row_underlyings = {
+                    str(row.get("name") or "").strip().upper(),
+                    str(row.get("underlying") or "").strip().upper(),
+                    underlying_for_symbol(str(row.get("tradingsymbol") or row.get("symbol") or "").strip().upper()),
+                }
+                matched_symbols = sorted(wanted.intersection(item for item in row_underlyings if item))
+                if matched_symbols and str(row.get("instrument_type") or row.get("option_type") or "").upper() in {"CE", "PE"}:
+                    for symbol in matched_symbols:
+                        grouped.setdefault(symbol, []).append(dict(row))
             for symbol, rows in grouped.items():
                 if rows:
                     contracts_by_symbol[symbol] = rows
@@ -22187,6 +22286,68 @@ def dhan_it_quality_override_reason(preview: dict[str, Any]) -> str:
             f"and max loss below ₹{DHAN_IT_QUALITY_UNLOCK_MAX_LOSS_INR:,.0f}."
         )
     return "Quality override unavailable: POP/gain/loss or hard order-shape checks are not satisfied."
+
+
+def dhan_it_acknowledged_soft_override_clears(preview: dict[str, Any], *, paper_trading: bool = True) -> bool:
+    """Allow DHAN-IT defined-risk CE pairs after explicit trader acknowledgement.
+
+    This intentionally relaxes soft strategy gates only. It still blocks missing
+    contracts/prices, non-credit pairs, invalid loss data, near result dates,
+    and explicit event-risk blocks.
+    """
+
+    if not dhan_pair_has_basic_order_shape(preview):
+        return False
+    if _dhan_metric_float(preview.get("max_loss")) <= 0:
+        return False
+    if bool(preview.get("result_date_near")):
+        return False
+    if str(preview.get("event_risk") or "").upper() == "YES":
+        return False
+    risk_reason = str(preview.get("risk_reason") or preview.get("reason") or "")
+    hard_blocks = {
+        "CMP_UNAVAILABLE",
+        "CONTRACT_UNRESOLVED",
+        "OPTION_PREMIUM_UNAVAILABLE",
+        "NET_CREDIT_NON_POSITIVE",
+        "MAX_LOSS_INVALID",
+        "CALENDAR_HEDGE_EXPIRES_BEFORE_SHORT",
+        "QUARTERLY_RESULTS_WITHIN_10_DAYS",
+        "EVENT_RISK",
+    }
+    if any(code in risk_reason for code in hard_blocks):
+        return False
+    liquidity_depth_clear = preview_has_bilateral_order_depth(preview)
+    if (
+        not paper_trading
+        and (
+            str(preview.get("pair_liquidity_condition") or "").upper() == "RED"
+            or preview.get("liquidity_order_allowed") is False
+            or "LIQUIDITY_RED_ORDER_BLOCKED" in risk_reason
+        )
+        and not liquidity_depth_clear
+    ):
+        return False
+    return True
+
+
+def dhan_it_acknowledged_soft_override_reason(preview: dict[str, Any]) -> str:
+    warnings: list[str] = []
+    risk_reason = str(preview.get("risk_reason") or preview.get("reason") or "").strip()
+    if risk_reason:
+        warnings.append(risk_reason)
+    if _dhan_metric_float(preview.get("pop_estimate")) < float(getattr(risk_config, "DHAN_IT_MIN_POP", 70.0)):
+        warnings.append("POP is below configured DHAN-IT minimum")
+    if _dhan_metric_float(preview.get("return_on_risk_pct")) < float(getattr(risk_config, "DHAN_IT_MIN_RETURN_ON_RISK_PCT", 8.0)):
+        warnings.append("return on risk is below configured minimum")
+    if _dhan_metric_float(preview.get("max_loss")) > float(getattr(risk_config, "DHAN_IT_MAX_ACCEPTABLE_PAIR_LOSS_INR", 40_000)):
+        warnings.append("max loss is above configured DHAN-IT limit")
+    if str(preview.get("pair_liquidity_condition") or "").upper() == "RED" or preview.get("liquidity_order_allowed") is False:
+        warnings.append("liquidity is weak/RED")
+    if str(preview.get("dma_status") or "").upper() == "RED":
+        warnings.append("DMA gate is RED")
+    compact = "; ".join(dict.fromkeys(item for item in warnings if item))
+    return f"Trader accepted soft DHAN-IT blockers after reviewing defined max loss. {compact}".strip()
 
 
 def dhan_it_dma_red_can_be_warning(preview: dict[str, Any]) -> bool:
@@ -23860,6 +24021,7 @@ def load_dhan_it_state(state: PageState) -> None:
     state.dhan_it_holding_positions = enrich_dhan_it_holding_positions_with_call_watch_cmp(
         state.dhan_it_holding_positions,
         state.dhan_it_call_watch_cards,
+        rows,
     )
 
 
@@ -24007,22 +24169,40 @@ def load_dhan_it_holding_position_rows() -> list[dict[str, Any]]:
 def enrich_dhan_it_holding_positions_with_call_watch_cmp(
     rows: list[dict[str, Any]] | None,
     cards: list[dict[str, Any]] | None,
+    stock_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Attach freshly fetched DHAN-IT card price fields to option-position rows."""
+    """Attach freshly fetched DHAN-IT quote fields to option-position rows.
+
+    The Current F&O Stock List is populated directly from the fresh watchlist
+    quote pull. The holdings table may not have equity holdings for every
+    scoped symbol, so use card data first and fall back to the stock-list quote
+    row to keep CMP and day-change aligned across both sections.
+    """
 
     card_by_symbol = {str(card.get("symbol") or "").strip().upper(): card for card in cards or []}
+    stock_by_symbol = {str(row.get("symbol") or "").strip().upper(): row for row in stock_rows or []}
     enriched: list[dict[str, Any]] = []
     for row in rows or []:
         next_row = dict(row)
         symbol = str(next_row.get("symbol") or "").strip().upper()
         card = card_by_symbol.get(symbol) or {}
+        stock = stock_by_symbol.get(symbol) or {}
         card_cmp = _dhan_metric_float(card.get("price") or card.get("cmp"))
+        stock_cmp = _dhan_metric_float(stock.get("cmp") or stock.get("price"))
         if card_cmp > 0:
             next_row["cmp"] = card_cmp
             next_row["cmp_source"] = "DHAN-IT live card"
+        elif stock_cmp > 0:
+            next_row["cmp"] = stock_cmp
+            next_row["cmp_source"] = "DHAN-IT stock list"
         card_change = card.get("day_change_pct")
+        stock_change = stock.get("day_change_pct")
         if card_change not in {None, ""}:
             next_row["day_change_pct"] = card_change
+            next_row["day_change_source"] = "DHAN-IT live card"
+        elif stock_change not in {None, ""}:
+            next_row["day_change_pct"] = stock_change
+            next_row["day_change_source"] = "DHAN-IT stock list"
         enriched.append(next_row)
     return enriched
 
@@ -24117,7 +24297,7 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
     return (
         '<section class="panel dhan-it-position-panel">'
         '<div class="panel-title">Current Kite Option Holdings / CE Pair Status</div>'
-        '<p class="status">Scope locked to TCS, INFY, HCLTECH and TECHM. Equity holdings are intentionally hidden here; SELL CE is red and BUY hedge CE is green.</p>'
+        f'<p class="status">Scope locked to {html.escape(dhan_it_symbol_list_text())}. Equity holdings are intentionally hidden here; SELL CE is red and BUY hedge CE is green.</p>'
         '<div class="table-wrap"><table class="ipo-table dhan-it-position-table">'
         '<thead><tr><th>Stock</th><th>CMP</th><th>% Change</th><th>P&L</th><th>SELL CE Option Holdings</th><th>BUY CE Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th><th>Action</th></tr></thead>'
         f'<tbody>{"".join(rendered_rows)}</tbody></table></div></section>'
@@ -24132,7 +24312,7 @@ def build_dhan_it_repair_preview_from_opportunity(
     action = str(repair_action or "").strip().upper()
     symbol = str(opportunity.get("symbol") or holding_row.get("symbol") or "").strip().upper()
     if symbol not in set(IT_FNO_SYMBOLS):
-        raise ValueError("DHAN-IT repair is restricted to TCS, INFY, HCLTECH and TECHM.")
+        raise ValueError(f"DHAN-IT repair is restricted to {dhan_it_symbol_list_text()}.")
     if action == "BUY_HEDGE":
         tradingsymbol = str(opportunity.get("buy_leg_tradingsymbol") or "").strip().upper()
         price = _dhan_metric_float(opportunity.get("buy_limit_price") or opportunity.get("buy_leg_premium"))
@@ -24273,7 +24453,7 @@ def submit_dhan_it_repair_order(
         raise ValueError("Explicit confirmation is required before placing a DHAN-IT repair order.")
     symbol = str(preview.get("symbol") or "").strip().upper()
     if symbol not in set(IT_FNO_SYMBOLS):
-        raise ValueError("DHAN-IT repair is restricted to TCS, INFY, HCLTECH and TECHM.")
+        raise ValueError(f"DHAN-IT repair is restricted to {dhan_it_symbol_list_text()}.")
     tradingsymbol = str(preview.get("tradingsymbol") or "").strip().upper()
     transaction_type = str(preview.get("transaction_type") or "").strip().upper()
     quantity = int(float(preview.get("quantity") or 0))
@@ -24380,6 +24560,10 @@ def _dhan_it_quote_key(symbol: str) -> str:
     return "NSE:NIFTY IT" if str(symbol or "").strip().upper() == NIFTY_IT_SYMBOL else f"NSE:{str(symbol or '').strip().upper()}"
 
 
+def dhan_it_symbol_list_text() -> str:
+    return ", ".join(IT_FNO_SYMBOLS)
+
+
 def _dhan_it_quote_change_pct(quote: dict[str, Any]) -> float | None:
     try:
         ltp = float(quote.get("last_price") or 0)
@@ -24474,6 +24658,22 @@ def render_dhan_it_call_watch(cards: list[dict[str, Any]]) -> str:
         except (TypeError, ValueError):
             return "-"
 
+    def compact_message(card: dict[str, Any], decision: str) -> str:
+        messages: list[str] = []
+        seen: set[str] = set()
+        for raw in [*(card.get("warnings") or []), *(card.get("reasons") or [])]:
+            text = str(raw or "").strip()
+            if not text or text.upper() == decision.upper():
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            messages.append(text)
+            if len(messages) >= 2:
+                break
+        return "; ".join(messages)
+
     card_html: list[str] = []
     for card in cards:
         symbol = str(card.get("symbol") or "")
@@ -24482,9 +24682,14 @@ def render_dhan_it_call_watch(cards: list[dict[str, Any]]) -> str:
         change = card.get("day_change_pct")
         change_class = "up" if _dhan_metric_float(change) >= 0 else "down"
         css_class = "buy-now" if status == "GREEN" else "below-200-dma" if status == "AMBER" else ""
-        reasons = "; ".join([str(item) for item in (card.get("reasons") or [])][:2]) or decision
-        warnings = "; ".join([str(item) for item in (card.get("warnings") or [])][:2])
+        note = compact_message(card, decision)
         badge_class = "good" if status == "GREEN" else "neutral" if status == "AMBER" else "bad"
+        delta_min = _dhan_metric_float(card.get("short_call_delta_min"))
+        delta_max = _dhan_metric_float(card.get("short_call_delta_max"))
+        delta_text = f"{delta_min:.2f}-{delta_max:.2f}" if delta_min > 0 and delta_max > 0 else "-"
+        trend = str(card.get("trend") or "-")
+        nifty_regime = str(card.get("nifty_it_regime") or "-")
+        risk_bucket = str(card.get("risk_bucket") or "-")
         if symbol == NIFTY_IT_SYMBOL:
             action = '<button type="submit" formaction="/dhan-it/load" class="commodity-buy-button secondary">Refresh Sector Signal</button>'
         elif status in {"GREEN", "AMBER"}:
@@ -24496,19 +24701,34 @@ def render_dhan_it_call_watch(cards: list[dict[str, Any]]) -> str:
             action = '<button type="button" class="commodity-buy-button secondary" disabled>Blocked</button>'
         card_html.append(
             f"""
-            <article class="commodity-card dhan-it-watch-card {css_class}">
-              <div class="commodity-meta"><span class="commodity-label">{html.escape(str(card.get('label') or symbol))}</span><strong>{html.escape(symbol)}</strong></div>
-              <div class="commodity-price">{fmt(card.get('price'))}</div>
-              <div class="commodity-change {change_class}">{fmt(change, '%')}</div>
-              <div class="commodity-dma">
-                <span>50 DMA {fmt(card.get('dma_50'))}</span>
-                <span class="dma-200">200 DMA {fmt(card.get('dma_200'))}</span>
-                <span>50D Dist {fmt(card.get('distance_50_pct'), '%')}</span>
-                <span>200D Dist {fmt(card.get('distance_200_pct'), '%')}</span>
+            <article class="commodity-card dhan-it-watch-card dhan-it-watch-card-compact {css_class}">
+              <div class="dhan-it-watch-top">
+                <div>
+                  <strong>{html.escape(symbol)}</strong>
+                  <span>{html.escape(str(card.get('label') or symbol))}</span>
+                </div>
+                <span class="ipo-badge {badge_class}">{html.escape(status)}</span>
               </div>
-              <div class="commodity-threshold">Trend: {html.escape(str(card.get('trend') or '-'))} | NIFTY IT: {html.escape(str(card.get('nifty_it_regime') or '-'))}</div>
-              <div class="commodity-action"><span class="ipo-badge {badge_class}">{html.escape(status)}</span> {html.escape(decision)}</div>
-              <small class="status">{html.escape(reasons)}{('<br>' + html.escape(warnings)) if warnings else ''}</small>
+              <div class="dhan-it-watch-price-row">
+                <div class="commodity-price">{fmt(card.get('price'))}</div>
+                <div class="commodity-change {change_class}">{fmt(change, '%')}</div>
+              </div>
+              <div class="dhan-it-watch-decision">{html.escape(decision)}</div>
+              <div class="dhan-it-watch-regime">
+                <span>Stock {html.escape(trend)}</span>
+                <span>NIFTY IT {html.escape(nifty_regime)}</span>
+              </div>
+              <div class="commodity-dma dhan-it-watch-dma">
+                <span>50D {fmt(card.get('distance_50_pct'), '%')}</span>
+                <span class="dma-200">200D {fmt(card.get('distance_200_pct'), '%')}</span>
+              </div>
+              <div class="dhan-it-watch-plan">
+                <span>{html.escape(risk_bucket)}</span>
+                <span>SELL {fmt(card.get('target_short_otm_pct'), '%')}</span>
+                <span>HEDGE {fmt(card.get('target_hedge_otm_pct'), '%')}</span>
+                <span>Delta {html.escape(delta_text)}</span>
+              </div>
+              {f'<small class="status dhan-it-watch-note">{html.escape(note)}</small>' if note else ''}
               <div class="commodity-buy-form">{action}</div>
             </article>
             """
@@ -24516,7 +24736,7 @@ def render_dhan_it_call_watch(cards: list[dict[str, Any]]) -> str:
     return (
         '<section class="panel commodity-panel dhan-it-watch-panel">'
         '<div class="panel-title">DHAN-IT Call Spread Watch</div>'
-        '<p class="status">Uses NIFTY IT, TCS, INFY, HCLTECH and TECHM with 50/200 DMA filters. GREEN supports CE credit-spread review; AMBER requires manual acknowledgement; RED blocks live execution.</p>'
+        f'<p class="status">Uses NIFTY IT plus {html.escape(dhan_it_symbol_list_text())} with 50/200 DMA filters. GREEN supports CE credit-spread review; AMBER requires manual acknowledgement; RED blocks live execution.</p>'
         f'<div class="commodity-grid">{"".join(card_html)}</div>'
         '</section>'
     )
@@ -24574,9 +24794,22 @@ def render_dhan_it_news_alerts(news_items: list[dict[str, Any]] | None) -> str:
 
 
 def build_dhan_it_opportunities(state: PageState) -> tuple[list[dict[str, Any]], list[str]]:
-    def effective_otm_pair() -> tuple[float, float]:
-        sell_pct = max(float(state.dhan_it_sell_otm_pct or 5.0), 0.5)
-        hedge_pct = max(float(state.dhan_it_hedge_otm_pct or 10.0), sell_pct + 0.5)
+    def effective_otm_pair(row: dict[str, Any]) -> tuple[float, float]:
+        config = dhan_it_stock_config(str(row.get("symbol") or ""))
+        state_sell = float(state.dhan_it_sell_otm_pct or 5.0)
+        state_hedge = float(state.dhan_it_hedge_otm_pct or 10.0)
+        sell_pct = (
+            float(config.get("target_short_otm_pct") or state_sell)
+            if math.isclose(state_sell, 5.0)
+            else state_sell
+        )
+        hedge_pct = (
+            float(config.get("target_hedge_otm_pct") or state_hedge)
+            if math.isclose(state_hedge, 10.0)
+            else state_hedge
+        )
+        sell_pct = max(sell_pct, 0.5)
+        hedge_pct = max(hedge_pct, sell_pct + 0.5)
         if str(state.dhan_it_strike_mode or "").upper() == "NEAR_CMP_1PCT":
             shift = float(getattr(risk_config, "DHAN_IT_NEAR_CMP_SHIFT_PCT", 1.0))
             sell_pct = max(sell_pct - shift, 0.5)
@@ -24597,9 +24830,10 @@ def build_dhan_it_opportunities(state: PageState) -> tuple[list[dict[str, Any]],
         strategies.append("BEAR_CALL_SPREAD")
     opportunities: list[dict[str, Any]] = []
     today = datetime.now(INDIA_TIME_ZONE).date()
-    sell_otm_pct, hedge_otm_pct = effective_otm_pair()
     for row in selected_rows:
         symbol = row["symbol"]
+        stock_config = dhan_it_stock_config(symbol)
+        sell_otm_pct, hedge_otm_pct = effective_otm_pair(row)
         signal = evaluate_it_signal(symbol, market_data={"cmp": spot_by_symbol.get(symbol)}, technical_data={}, event_data={}, liquidity_view="UNKNOWN")
         for strategy in strategies:
             preview = build_dhan_it_spread(
@@ -24619,6 +24853,10 @@ def build_dhan_it_opportunities(state: PageState) -> tuple[list[dict[str, Any]],
                     "min_pop": getattr(risk_config, "DHAN_IT_MIN_POP", 70.0),
                     "min_return_on_risk_pct": getattr(risk_config, "DHAN_IT_MIN_RETURN_ON_RISK_PCT", 8.0),
                     "max_acceptable_pair_loss": getattr(risk_config, "DHAN_IT_MAX_ACCEPTABLE_PAIR_LOSS_INR", 40_000),
+                    "short_call_delta_min": stock_config.get("short_call_delta_min"),
+                    "short_call_delta_max": stock_config.get("short_call_delta_max"),
+                    "risk_bucket": stock_config.get("risk_bucket"),
+                    "max_open_spreads": stock_config.get("max_open_spreads"),
                 },
                 event_data={"event_risk": signal.get("event_risk") == "YES"},
             )
@@ -24635,6 +24873,10 @@ def build_dhan_it_opportunities(state: PageState) -> tuple[list[dict[str, Any]],
                     "strike_mode": state.dhan_it_strike_mode,
                     "sell_otm_pct": sell_otm_pct,
                     "hedge_otm_pct": hedge_otm_pct,
+                    "risk_bucket": stock_config.get("risk_bucket"),
+                    "short_call_delta_min": stock_config.get("short_call_delta_min"),
+                    "short_call_delta_max": stock_config.get("short_call_delta_max"),
+                    "max_open_spreads": stock_config.get("max_open_spreads"),
                 }
             )
             preview = apply_dhan_it_evaluation_expiry_mode(preview, state.dhan_it_expiry_mode)
@@ -24693,6 +24935,7 @@ def render_dhan_it_panel(state: PageState) -> str:
     holding_positions = enrich_dhan_it_holding_positions_with_call_watch_cmp(
         state.dhan_it_holding_positions,
         call_watch_cards,
+        rows,
     )
     news_alerts = state.dhan_it_news_alerts or []
 
@@ -24752,9 +24995,11 @@ def render_dhan_it_panel(state: PageState) -> str:
         stock_rows.append(
             "<tr>"
             f'<td><input type="checkbox" name="dhan_it_symbols" value="{html.escape(symbol, quote=True)}"{checked_attr}></td>'
-            f'<td><button type="submit" class="mini-link button-link" formaction="/dhan-it/open-symbol" name="dhan_it_open_symbol" value="{html.escape(symbol, quote=True)}">{html.escape(symbol)}</button>{call_pair_indicator}</td><td>{html.escape(text_value(row.get("company_name")))}</td>'
+            f'<td><button type="submit" class="mini-link button-link" formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol" value="{html.escape(symbol, quote=True)}">{html.escape(symbol)}</button>{call_pair_indicator}</td><td>{html.escape(text_value(row.get("company_name")))}</td>'
             f"<td>{money(row.get('cmp'))}<small class=\"{day_change_class}\">{money(row.get('day_change_pct'))}%</small></td><td>{html.escape(text_value(row.get('stock_regime') or row.get('trend_view')))}</td>"
             f"<td>{html.escape(text_value(row.get('nifty_it_regime')))}</td><td>{money(row.get('distance_from_50dma_pct'))}%</td><td>{money(row.get('distance_from_200dma_pct'))}%</td>"
+            f"<td>{html.escape(text_value(row.get('risk_bucket')))}<small>SELL {money(row.get('target_short_otm_pct'))}% | HEDGE {money(row.get('target_hedge_otm_pct'))}%</small></td>"
+            f"<td>{money(row.get('short_call_delta_min'))}-{money(row.get('short_call_delta_max'))}<small>max spreads {html.escape(text_value(row.get('max_open_spreads')))}</small></td>"
             f"<td>{money(row.get('rsi'))}<small>{html.escape(text_value(row.get('rsi_direction')))}</small></td><td>{money(row.get('atr_pct'))}%</td>"
             f"<td>{money(row.get('distance_to_resistance_pct'))}%</td><td>{html.escape(rejection_label)}</td>"
             f"<td>{html.escape(text_value(row.get('event_risk')))}</td><td>{html.escape(text_value(row.get('liquidity_view')))}</td>"
@@ -24849,10 +25094,15 @@ def render_dhan_it_panel(state: PageState) -> str:
             selected = original_selected
         selected = merge_result_date_fields_from_source(selected, original_selected)
         selected = apply_dhan_result_date_guard(selected)
-        is_orderable = dhan_pair_is_defined_risk_orderable(
+        strict_orderable = dhan_pair_is_defined_risk_orderable(
             selected,
             allow_red_liquidity=state.dhan_it_paper_trading,
         )
+        acknowledged_soft_orderable = dhan_it_acknowledged_soft_override_clears(
+            selected,
+            paper_trading=state.dhan_it_paper_trading,
+        )
+        is_orderable = strict_orderable or acknowledged_soft_orderable
         dma_card = call_watch_by_symbol.get(str(selected.get("symbol") or "").strip().upper())
         dma_status = str((dma_card or {}).get("status") or selected.get("dma_status") or "").upper()
         dma_decision = str((dma_card or {}).get("decision") or selected.get("dma_decision") or "").upper()
@@ -24868,6 +25118,7 @@ def render_dhan_it_panel(state: PageState) -> str:
             and str(selected.get("strategy_type") or "").upper() == "BEAR_CALL_SPREAD"
             and dma_status == "RED"
             and not dma_red_warning_only
+            and not acknowledged_soft_orderable
         ):
             is_orderable = False
         if bool(selected.get("result_date_near")):
@@ -24974,7 +25225,7 @@ def render_dhan_it_panel(state: PageState) -> str:
             <label><input type="radio" name="dhan_it_expiry_mode" value="NEXT_SELL_CURRENT_BUY" data-expiry-preview-action="/dhan-it/preview"{calendar_checked}{calendar_disabled}> SELL next month + BUY current hedge</label>
             <small>Changing expiry reloads this order ticket with selected-month data.</small>
           </div>
-          <div class="income-equity-order-summary">{html.escape(dma_reason)}<br>{html.escape(text_value(selected.get('result_date_message')))}<br>{dhan_it_quality_override_reason(selected) if is_orderable else 'This DHAN-IT pair is not orderable because hard risk/DMA/liquidity checks did not approve it.'}</div>
+          <div class="income-equity-order-summary">{html.escape(dma_reason)}<br>{html.escape(text_value(selected.get('result_date_message')))}<br>{dhan_it_quality_override_reason(selected) if quality_auto_clear else dhan_it_acknowledged_soft_override_reason(selected) if acknowledged_soft_orderable and not strict_orderable else 'Risk engine approved.' if strict_orderable else 'This DHAN-IT pair is not orderable because hard data, event, result-date, or invalid leg checks did not approve it.'}</div>
           {f'<div class="status success">Soft-blocker override available: POP > {DHAN_IT_QUALITY_UNLOCK_MIN_POP:.0f}%, max gain > ₹{DHAN_IT_QUALITY_UNLOCK_MIN_GAIN_INR:,.0f}, and max loss < ₹{DHAN_IT_QUALITY_UNLOCK_MAX_LOSS_INR:,.0f}. You can start countdown directly, or tick acknowledgement manually.</div>' if quality_auto_clear else ''}
           <label class="inline-check"><input id="dhan-it-confirm-order" type="checkbox" name="dhan_it_confirm_order" value="1" data-orderable="{'1' if is_orderable else '0'}" data-auto-clear="{'1' if quality_auto_clear else '0'}"{confirm_checked}> I UNDERSTAND the RISK of MAX LOSS ₹{html.escape(max_loss_value)} for this paired order.</label>
           <div class="breath-circle income-pe-breath" id="dhan-it-breath"></div>
@@ -25027,13 +25278,13 @@ def render_dhan_it_panel(state: PageState) -> str:
       <input type="hidden" name="dhan_it_opportunities_generated_at" value="{opportunities_stamp}">
       <input type="hidden" name="dhan_spot_json" value="{html.escape(state.dhan_spot_json, quote=True)}">
       <input type="hidden" name="dhan_contracts_json" value="{html.escape(state.dhan_contracts_json, quote=True)}">
-      <section class="panel dhan-hero dhan-it-compact-hero"><div><div class="panel-title">DHAN-IT</div><p class="status">IT CE-spread execution: TCS, INFY, HCLTECH, TECHM.</p></div>{render_dhan_it_news_refresh_button()}</section>
+      <section class="panel dhan-hero dhan-it-compact-hero"><div><div class="panel-title">DHAN-IT</div><p class="status">IT CE-spread execution: {html.escape(dhan_it_symbol_list_text())}.</p></div>{render_dhan_it_news_refresh_button()}</section>
       {render_console(state.console_log)}
       {render_dhan_it_news_alerts(news_alerts)}
       {render_dhan_it_call_watch(call_watch_cards)}
       {render_dhan_it_holding_positions(holding_positions)}
       {render_dhan_it_repair_modal(state)}
-      <section class="panel"><div class="panel-title">Current F&O Stock List</div><p class="status">Daily change above {risk_config.DHAN_IT_WATCH_RISE_PCT:.1f}% creates WATCH RISE only. DHAN-IT recommendations are restricted to BEAR_CALL_SPREAD, WATCH, or NO_TRADE.</p><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Select</th><th>Symbol</th><th>Company Name</th><th>CMP / Day</th><th>Stock Regime</th><th>NIFTY IT Regime</th><th>50 DMA Dist</th><th>200 DMA Dist</th><th>RSI / Dir</th><th>ATR %</th><th>Resistance Dist</th><th>Rejection</th><th>Event Risk</th><th>Liquidity</th><th>Signal Status</th><th>Confidence</th><th>Recommended Strategy</th><th>Decision Reason</th></tr></thead><tbody>{''.join(stock_rows)}</tbody></table></div></section>
+      <section class="panel"><div class="panel-title">Current F&O Stock List</div><p class="status">Daily change above {risk_config.DHAN_IT_WATCH_RISE_PCT:.1f}% creates WATCH RISE only. DHAN-IT recommendations are restricted to BEAR_CALL_SPREAD, WATCH, or NO_TRADE.</p><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Select</th><th>Symbol</th><th>Company Name</th><th>CMP / Day</th><th>Stock Regime</th><th>NIFTY IT Regime</th><th>50 DMA Dist</th><th>200 DMA Dist</th><th>Risk / OTM</th><th>Delta Band</th><th>RSI / Dir</th><th>ATR %</th><th>Resistance Dist</th><th>Rejection</th><th>Event Risk</th><th>Liquidity</th><th>Signal Status</th><th>Confidence</th><th>Recommended Strategy</th><th>Decision Reason</th></tr></thead><tbody>{''.join(stock_rows)}</tbody></table></div></section>
       <section class="panel"><div class="panel-title">Strategy Controls</div><div class="compact-grid">
         <label><span>Strategy</span><select name="dhan_it_strategy">{option("BEAR_CALL_SPREAD", "CE Spread only", "BEAR_CALL_SPREAD")}</select></label>
         <label><span>Expiry mode</span><select name="dhan_it_expiry_mode">{option("CURRENT_AND_NEXT", "Current + Next Month", state.dhan_it_expiry_mode)}{option("AUTO_COMPARE", "Auto Compare", state.dhan_it_expiry_mode)}{option("CURRENT_MONTH", "Current Month Only", state.dhan_it_expiry_mode)}{option("NEXT_MONTH", "Next Month Only", state.dhan_it_expiry_mode)}</select></label>
@@ -31922,6 +32173,92 @@ def render_page(state: PageState) -> bytes:
       background: #dcfce7;
       color: #166534;
       border: 1px solid #86efac;
+    }}
+    .dhan-it-watch-panel {{
+      border-color: #bae6fd;
+      background: linear-gradient(135deg, #ffffff 0%, #f8fafc 58%, #eef2ff 100%);
+    }}
+    .dhan-it-watch-card-compact {{
+      min-height: 0;
+      padding: 12px;
+      gap: 8px;
+    }}
+    .dhan-it-watch-top,
+    .dhan-it-watch-price-row,
+    .dhan-it-watch-regime,
+    .dhan-it-watch-plan {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }}
+    .dhan-it-watch-top strong {{
+      display: block;
+      color: #075985;
+      font-size: 16px;
+      line-height: 1.1;
+      font-weight: 950;
+    }}
+    .dhan-it-watch-top span:not(.ipo-badge) {{
+      display: block;
+      margin-top: 2px;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1.2;
+    }}
+    .dhan-it-watch-card-compact .commodity-price {{
+      margin-top: 0;
+      font-size: 25px;
+    }}
+    .dhan-it-watch-decision {{
+      border-radius: 10px;
+      padding: 7px 9px;
+      background: #f8fafc;
+      color: #334155;
+      font-size: 12px;
+      font-weight: 950;
+      text-align: center;
+      border: 1px solid #e2e8f0;
+    }}
+    .dhan-it-watch-card-compact.buy-now .dhan-it-watch-decision {{
+      background: #dcfce7;
+      border-color: #86efac;
+      color: #166534;
+    }}
+    .dhan-it-watch-card-compact.below-200-dma:not(.buy-now) .dhan-it-watch-decision {{
+      background: #f0fdf4;
+      border-color: #bbf7d0;
+      color: #166534;
+    }}
+    .dhan-it-watch-regime {{
+      color: #475569;
+      font-size: 11px;
+      font-weight: 850;
+    }}
+    .dhan-it-watch-dma {{
+      margin-top: 0;
+    }}
+    .dhan-it-watch-plan {{
+      flex-wrap: wrap;
+      justify-content: flex-start;
+      margin-top: 1px;
+    }}
+    .dhan-it-watch-plan span {{
+      border-radius: 999px;
+      padding: 4px 7px;
+      background: #eef2ff;
+      color: #334155;
+      font-size: 10px;
+      font-weight: 950;
+      white-space: nowrap;
+    }}
+    .dhan-it-watch-note {{
+      display: block;
+      min-height: 0;
+      color: #64748b;
+      font-size: 11px;
+      line-height: 1.25;
     }}
     .commodity-threshold {{
       margin-top: 8px;
@@ -42623,7 +42960,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     raise ValueError("Choose one valid DHAN-IT stock to open.")
                 repository = DhanItPairRepository(APP_DB_PATH)
                 state.dhan_it_selected_symbols = [selected_symbol]
-                state.dhan_it_strategy = "BEAR_CALL_SPREAD" if request_path == "/dhan-it/open-call-symbol" else "BOTH"
+                state.dhan_it_strategy = "BEAR_CALL_SPREAD"
                 state.dhan_it_opportunities, live_notes = build_dhan_it_opportunities(state)
                 state.dhan_it_opportunities_generated_at = dhan_opportunity_stamp()
                 state.dhan_it_selected_index = best_dhan_opportunity_index(state.dhan_it_opportunities)
@@ -42682,7 +43019,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 repair_action = repair_action.strip().upper()
                 repair_expiry_mode = last(form, "dhan_it_repair_expiry_mode", "")
                 if repair_symbol not in set(IT_FNO_SYMBOLS):
-                    raise ValueError("DHAN-IT repair is restricted to TCS, INFY, HCLTECH and TECHM.")
+                    raise ValueError(f"DHAN-IT repair is restricted to {dhan_it_symbol_list_text()}.")
                 load_dhan_it_state(state)
                 holding_row = next(
                     (row for row in (state.dhan_it_holding_positions or []) if str(row.get("symbol") or "").strip().upper() == repair_symbol),
@@ -42770,10 +43107,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         raise ValueError(str(selected_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))
                     selected_dma_status = str(selected_opportunity.get("dma_status") or "").upper()
                     selected_dma_decision = str(selected_opportunity.get("dma_decision") or "").upper()
+                    acknowledged_soft_orderable = dhan_it_acknowledged_soft_override_clears(
+                        selected_opportunity,
+                        paper_trading=state.dhan_it_paper_trading,
+                    )
                     if (
                         str(selected_opportunity.get("strategy_type") or "").upper() == "BEAR_CALL_SPREAD"
                         and selected_dma_status == "RED"
                         and not dhan_it_dma_red_can_be_warning(selected_opportunity)
+                        and not (state.dhan_it_confirm_order and acknowledged_soft_orderable)
                     ):
                         raise ValueError(
                             f"DHAN-IT DMA gate blocked this CE spread: {selected_opportunity.get('dma_reasons') or '50/200 DMA setup is not approved.'}"
@@ -42784,22 +43126,27 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     if str(selected_opportunity.get("risk_decision") or "").upper() != "APPROVED" and (
                         state.dhan_it_confirm_order or quality_auto_clear
                     ):
-                        if not dhan_pair_is_defined_risk_orderable(
+                        strict_orderable = dhan_pair_is_defined_risk_orderable(
                             selected_opportunity,
                             allow_red_liquidity=state.dhan_it_paper_trading,
-                        ):
+                        )
+                        if not (strict_orderable or (state.dhan_it_confirm_order and acknowledged_soft_orderable)):
                             raise ValueError(
                                 f"DHAN-IT pair is not orderable: {selected_opportunity.get('risk_reason') or selected_opportunity.get('reason')}"
                             )
                         unblock_reason = (
                             dhan_it_quality_override_reason(selected_opportunity)
                             if quality_auto_clear
+                            else dhan_it_acknowledged_soft_override_reason(selected_opportunity)
+                            if acknowledged_soft_orderable
                             else "User confirmed defined-risk paired spread override."
                         )
                         selected_opportunity = dict(selected_opportunity)
                         selected_opportunity["risk_override"] = (
                             "DHAN_IT_QUALITY_POP_GAIN_LOSS_CLEAR"
                             if quality_auto_clear and not state.dhan_it_confirm_order
+                            else "DHAN_IT_USER_ACCEPTED_SOFT_BLOCKERS"
+                            if acknowledged_soft_orderable
                             else "USER_CONFIRMED_DEFINED_RISK_PAIR"
                         )
                         selected_opportunity["risk_decision_original"] = selected_opportunity.get("risk_decision")

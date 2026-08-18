@@ -21,16 +21,83 @@ def now_text() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _float_value(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def dhan_it_pair_has_basic_order_shape(preview: dict[str, Any]) -> bool:
+    return bool(
+        preview.get("sell_leg_tradingsymbol")
+        and preview.get("buy_leg_tradingsymbol")
+        and _float_value(preview.get("quantity")) > 0
+        and _float_value(preview.get("sell_limit_price")) > 0
+        and _float_value(preview.get("buy_limit_price")) > 0
+        and _float_value(preview.get("net_credit")) > 0
+        and _float_value(preview.get("max_gain")) > 0
+        and _float_value(preview.get("max_loss")) > 0
+    )
+
+
+def dhan_it_acknowledged_soft_override_clears(preview: dict[str, Any], *, is_live: bool) -> bool:
+    if not dhan_it_pair_has_basic_order_shape(preview):
+        return False
+    if bool(preview.get("result_date_near")):
+        return False
+    if str(preview.get("event_risk") or "").upper() == "YES":
+        return False
+    risk_reason = str(preview.get("risk_reason") or preview.get("reason") or "")
+    hard_blocks = {
+        "CMP_UNAVAILABLE",
+        "CONTRACT_UNRESOLVED",
+        "OPTION_PREMIUM_UNAVAILABLE",
+        "NET_CREDIT_NON_POSITIVE",
+        "MAX_LOSS_INVALID",
+        "CALENDAR_HEDGE_EXPIRES_BEFORE_SHORT",
+        "QUARTERLY_RESULTS_WITHIN_10_DAYS",
+        "EVENT_RISK",
+    }
+    if any(code in risk_reason for code in hard_blocks):
+        return False
+    liquidity_depth_clear = preview_has_bilateral_order_depth(preview)
+    if is_live and (
+        str(preview.get("pair_liquidity_condition") or "").upper() == "RED"
+        or preview.get("liquidity_order_allowed") is False
+        or "LIQUIDITY_RED_ORDER_BLOCKED" in risk_reason
+    ) and not liquidity_depth_clear:
+        return False
+    return True
+
+
+def dhan_it_accepted_soft_override_reason(preview: dict[str, Any]) -> str:
+    warnings: list[str] = []
+    risk_reason = str(preview.get("risk_reason") or preview.get("reason") or "").strip()
+    if risk_reason:
+        warnings.append(risk_reason)
+    if _float_value(preview.get("pop_estimate")) < float(getattr(risk_config, "DHAN_IT_MIN_POP", 70.0)):
+        warnings.append("POP below DHAN-IT minimum")
+    if _float_value(preview.get("return_on_risk_pct")) < float(getattr(risk_config, "DHAN_IT_MIN_RETURN_ON_RISK_PCT", 8.0)):
+        warnings.append("return on risk below DHAN-IT minimum")
+    if _float_value(preview.get("max_loss")) > float(getattr(risk_config, "DHAN_IT_MAX_ACCEPTABLE_PAIR_LOSS_INR", 40_000)):
+        warnings.append("max loss above configured limit")
+    if str(preview.get("pair_liquidity_condition") or "").upper() == "RED" or preview.get("liquidity_order_allowed") is False:
+        warnings.append("liquidity weak/RED")
+    compact = "; ".join(dict.fromkeys(item for item in warnings if item))
+    return f"User accepted DHAN-IT soft blockers after reviewing defined max loss. {compact}".strip()
+
+
 def dhan_it_dma_red_can_be_warning(preview: dict[str, Any]) -> bool:
     pair_condition = str(preview.get("pair_liquidity_condition") or "").upper()
     liquidity_allowed = bool(preview.get("liquidity_order_allowed", pair_condition in {"AMBER", "GREEN"}))
     has_order_shape = bool(
         preview.get("sell_leg_tradingsymbol")
         and preview.get("buy_leg_tradingsymbol")
-        and float(preview.get("quantity") or 0) > 0
-        and float(preview.get("sell_limit_price") or 0) > 0
-        and float(preview.get("buy_limit_price") or 0) > 0
-        and float(preview.get("max_loss") or 0) > 0
+        and _float_value(preview.get("quantity")) > 0
+        and _float_value(preview.get("sell_limit_price")) > 0
+        and _float_value(preview.get("buy_limit_price")) > 0
+        and _float_value(preview.get("max_loss")) > 0
     )
     return bool(
         has_order_shape
@@ -249,6 +316,14 @@ def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepositor
                 "User confirmed defined-risk pair; liquidity cleared by bilateral depth "
                 f">= {int(getattr(risk_config, 'LIQUIDITY_AMBER_MIN_TOTAL_ORDERS', 20) or 20)} buy and sell orders on both legs."
             )
+            preview["reason"] = preview["risk_reason"]
+        elif user_confirmed and dhan_it_acknowledged_soft_override_clears(preview, is_live=is_live):
+            preview = dict(preview)
+            preview["risk_override"] = "DHAN_IT_USER_ACCEPTED_SOFT_BLOCKERS"
+            preview["risk_decision_original"] = preview.get("risk_decision")
+            preview["risk_reason_original"] = risk_reason
+            preview["risk_decision"] = "APPROVED"
+            preview["risk_reason"] = dhan_it_accepted_soft_override_reason(preview)
             preview["reason"] = preview["risk_reason"]
         else:
             raise ValueError(f"DHAN-IT spread is blocked: {preview.get('risk_reason') or preview.get('reason')}")

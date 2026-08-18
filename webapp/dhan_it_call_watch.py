@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import risk_config
-from dhan_it_universe import IT_FNO_SYMBOLS
+from dhan_it_universe import IT_FNO_SYMBOLS, dhan_it_stock_config
 
 
 NIFTY_IT_SYMBOL = "NIFTY IT"
@@ -422,6 +422,7 @@ def build_dhan_it_card_view_model(
     pair_preview: dict[str, Any] | None = None,
     is_sector: bool = False,
 ) -> dict[str, Any]:
+    stock_config = dhan_it_stock_config(symbol)
     signal = build_dhan_it_call_spread_signal(
         symbol=symbol,
         company_name=label,
@@ -462,6 +463,12 @@ def build_dhan_it_card_view_model(
             "distance_to_resistance_pct": signal.distance_to_resistance_pct,
             "rejection_confirmed": signal.rejection_confirmed,
             "rejection_reasons": signal.rejection_reasons,
+            "risk_bucket": stock_config.get("risk_bucket") or market_data.get("risk_bucket"),
+            "target_short_otm_pct": stock_config.get("target_short_otm_pct") or market_data.get("target_short_otm_pct"),
+            "target_hedge_otm_pct": stock_config.get("target_hedge_otm_pct") or market_data.get("target_hedge_otm_pct"),
+            "short_call_delta_min": stock_config.get("short_call_delta_min") or market_data.get("short_call_delta_min"),
+            "short_call_delta_max": stock_config.get("short_call_delta_max") or market_data.get("short_call_delta_max"),
+            "max_open_spreads": stock_config.get("max_open_spreads") or market_data.get("max_open_spreads"),
         }
     )
     return gate

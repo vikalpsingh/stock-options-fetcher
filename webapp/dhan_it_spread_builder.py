@@ -7,6 +7,7 @@ from typing import Any
 
 from kite_option_resolver import KiteOptionResolver
 from kite_spread_evaluator import evaluate_spread_with_expiry_comparison
+from dhan_it_universe import dhan_it_stock_config
 import risk_config
 
 
@@ -31,9 +32,14 @@ def build_dhan_it_spread(
         current_date = resolver.selected_expiry(symbol, current)
         later_expiries = [item for item in resolver.monthly_expiries(symbol) if current_date and item > current_date]
         later = later_expiries[0].isoformat() if later_expiries else ""
+    stock_config = dhan_it_stock_config(symbol)
     dhan_it_technical_data = {
-        "sell_otm_pct": 5.0,
-        "hedge_otm_pct": 10.0,
+        "sell_otm_pct": stock_config.get("target_short_otm_pct", 5.0),
+        "hedge_otm_pct": stock_config.get("target_hedge_otm_pct", 10.0),
+        "short_call_delta_min": stock_config.get("short_call_delta_min"),
+        "short_call_delta_max": stock_config.get("short_call_delta_max"),
+        "risk_bucket": stock_config.get("risk_bucket"),
+        "max_open_spreads": stock_config.get("max_open_spreads"),
         "min_pair_max_gain": getattr(risk_config, "DHAN_IT_MIN_PAIR_MAX_GAIN_INR", 2_000),
         "auto_check_gain_below": getattr(risk_config, "DHAN_IT_MIN_PAIR_MAX_GAIN_INR", 2_000),
         "min_pop": getattr(risk_config, "DHAN_IT_MIN_POP", 70.0),

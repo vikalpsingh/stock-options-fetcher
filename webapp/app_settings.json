@@ -523,7 +523,7 @@
       "NIFTY_INCOME_ENABLED": false
     },
     "Monika": {
-      "KITE_ACCESS_TOKEN": "G5dO1VBh5pPMEVdgS2OXBUSVc3N4nAaB",
+      "KITE_ACCESS_TOKEN": "iMZRXQ2OolUu8cnWFiaOJTZ4CfHzCAZv",
       "KITE_API_KEY": "tnaa26kee3iza58w",
       "KITE_API_SECRET": "pk55c56ih0ak3pd6cfmk24z14yt22946",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
@@ -678,5 +678,5 @@
     "status": "ERROR"
   },
   "position_stop_option_sell": true,
-  "selected_kite_profile": "Shanti"
+  "selected_kite_profile": "Monika"
 }

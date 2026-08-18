@@ -1,9 +1,12 @@
 .env
 .env.local
+.env.*
+!.env.example
 node_modules/
 .venv/
 venv/
 __pycache__/
+**/__pycache__/
 .pytest_cache/
 .next/
 out/
@@ -12,10 +15,34 @@ build/
 coverage/
 logs/
 tmp/
+runtime/
+uploads/
+uploaded/
+downloads/
 *.log
 *.csv
 *.parquet
 *.pyc
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*token*
+*access_token*
+*refresh_token*
+*kite*token*
+*dhan*token*
+broker_tokens*
+kite_credentials*
+dhan_credentials*
+order_exports/
+trade_exports/
+risk_outputs/
+dhan_outputs/
+dhan_it_outputs/
+dhan_fno_sheet_outputs/
+kite_spread_outputs/
 
 # Legacy local application files kept outside this website repository
 app.py

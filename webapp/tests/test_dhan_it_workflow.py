@@ -9,7 +9,7 @@ from dhan_it_pair_execution import DhanItPairRepository, submit_dhan_it_pair
 from dhan_it_pair_monitor import run_dhan_it_pair_monitor_once
 from dhan_it_signal_engine import evaluate_it_signal
 from dhan_it_spread_builder import build_dhan_it_spread
-from dhan_it_universe import IT_FNO_SYMBOLS, dhan_it_universe_rows, is_dhan_it_symbol
+from dhan_it_universe import IT_FNO_SYMBOLS, dhan_it_stock_config, dhan_it_universe_rows, is_dhan_it_symbol
 from kite_pair_execution import round_limit_price_to_tick
 
 
@@ -111,11 +111,30 @@ def approved_preview() -> dict:
     return preview
 
 
-def test_dhan_it_universe_is_fixed_to_four_it_fno_symbols():
-    assert IT_FNO_SYMBOLS == ["TCS", "INFY", "HCLTECH", "TECHM"]
+def test_dhan_it_universe_contains_six_orderable_it_fno_symbols_with_ltm_canonical():
+    assert IT_FNO_SYMBOLS == ["TCS", "INFY", "HCLTECH", "TECHM", "WIPRO", "LTM"]
     assert [row["symbol"] for row in dhan_it_universe_rows()] == IT_FNO_SYMBOLS
     assert is_dhan_it_symbol("infy")
+    assert is_dhan_it_symbol("WIPRO")
+    assert is_dhan_it_symbol("LTM")
+    assert not is_dhan_it_symbol("LTI")
+    assert not is_dhan_it_symbol("LTIS")
+    assert not is_dhan_it_symbol("LTIM")
+    assert not is_dhan_it_symbol("LTIMINDTREE")
     assert not is_dhan_it_symbol("RELIANCE")
+    by_symbol = {row["symbol"]: row for row in dhan_it_universe_rows()}
+    assert by_symbol["WIPRO"]["company_name"] == "Wipro Ltd"
+    assert by_symbol["WIPRO"]["risk_bucket"] == "CONSERVATIVE"
+    assert by_symbol["WIPRO"]["target_short_otm_pct"] == 7.0
+    assert by_symbol["WIPRO"]["target_hedge_otm_pct"] == 12.0
+    assert by_symbol["WIPRO"]["max_open_spreads"] == 2
+    assert by_symbol["LTM"]["company_name"] == "LTIMindtree Ltd"
+    assert by_symbol["LTM"]["risk_bucket"] == "MODERATE"
+    assert by_symbol["LTM"]["target_short_otm_pct"] == 9.0
+    assert by_symbol["LTM"]["target_hedge_otm_pct"] == 14.0
+    assert by_symbol["LTM"]["short_call_delta_min"] == 0.12
+    assert by_symbol["LTM"]["short_call_delta_max"] == 0.16
+    assert by_symbol["LTM"]["max_open_spreads"] == 1
 
 
 def test_signal_engine_is_canonical_ce_watch_no_trade_only_and_blocks_event_risk():
@@ -132,6 +151,17 @@ def test_signal_engine_is_canonical_ce_watch_no_trade_only_and_blocks_event_risk
     assert {ce["recommended_strategy"], watch["recommended_strategy"], blocked["recommended_strategy"]} <= {"BEAR_CALL_SPREAD", "WATCH", "NO_TRADE"}
 
 
+def test_dhan_it_quote_keys_use_wipro_and_canonical_ltm_only():
+    keys = [app._dhan_it_quote_key(symbol) for symbol in IT_FNO_SYMBOLS]
+
+    assert "NSE:WIPRO" in keys
+    assert "NSE:LTM" in keys
+    assert "NSE:LTI" not in keys
+    assert "NSE:LTIS" not in keys
+    assert "NSE:LTIM" not in keys
+    assert "NSE:LTIMINDTREE" not in keys
+
+
 def test_builds_current_month_ce_spread_when_gain_threshold_is_met():
     preview = build_preview("BEAR_CALL_SPREAD")
     assert preview["screen_name"] == "DHAN-IT"
@@ -141,6 +171,48 @@ def test_builds_current_month_ce_spread_when_gain_threshold_is_met():
     assert preview["current_month"]["expiry"] == preview["expiry"]
     assert preview["quantity"] == preview["lot_size"]
     assert preview["max_gain"] >= 5000
+
+
+def test_dhan_it_spread_builder_uses_wipro_ltm_configured_otm_anchors():
+    wipro_chain = [
+        option_row("WIPRO", "2026-08-27", 1080, "CE", 18),
+        option_row("WIPRO", "2026-08-27", 1120, "CE", 5),
+        option_row("WIPRO", "2026-09-24", 1080, "CE", 18),
+        option_row("WIPRO", "2026-09-24", 1120, "CE", 5),
+    ]
+    ltm_chain = [
+        option_row("LTM", "2026-08-27", 1100, "CE", 22),
+        option_row("LTM", "2026-08-27", 1150, "CE", 6),
+        option_row("LTM", "2026-09-24", 1100, "CE", 22),
+        option_row("LTM", "2026-09-24", 1150, "CE", 6),
+    ]
+
+    wipro = build_dhan_it_spread(
+        symbol="WIPRO",
+        strategy_type="BEAR_CALL_SPREAD",
+        spot=1000,
+        lots=1,
+        option_chain_data=wipro_chain,
+        risk_engine=AllowRisk(),
+        market_data={"today": date(2026, 8, 4)},
+    )
+    ltm = build_dhan_it_spread(
+        symbol="LTM",
+        strategy_type="BEAR_CALL_SPREAD",
+        spot=1000,
+        lots=1,
+        option_chain_data=ltm_chain,
+        risk_engine=AllowRisk(),
+        market_data={"today": date(2026, 8, 4)},
+    )
+
+    assert dhan_it_stock_config("WIPRO")["target_short_otm_pct"] == 7.0
+    assert wipro["sell_leg_tradingsymbol"].endswith("1080CE")
+    assert wipro["buy_leg_tradingsymbol"].endswith("1120CE")
+    assert dhan_it_stock_config("LTM")["target_short_otm_pct"] == 9.0
+    assert ltm["sell_leg_tradingsymbol"].endswith("1100CE")
+    assert ltm["buy_leg_tradingsymbol"].endswith("1150CE")
+    assert "LTIS" not in {row["name"] for row in ltm_chain}
 
 
 def test_builds_current_month_pe_spread_when_gain_threshold_is_met():
@@ -282,6 +354,139 @@ def test_dhan_it_panel_renders_comparison_and_popup_states():
     assert "Blocked for test" in html
 
 
+def test_dhan_it_cards_and_parent_table_render_wipro_and_ltm_defaults():
+    rows = dhan_it_universe_rows()
+    cards = app.build_dhan_it_call_watch_cards_from_rows(
+        [
+            {"symbol": "NIFTY IT", "company_name": "NIFTY IT Sector Index", "cmp": 30000, "dma_50": 31000, "dma_200": 32000},
+            *[
+                {
+                    **row,
+                    "cmp": 1000,
+                    "dma_50": 1050,
+                    "dma_200": 1100,
+                    "source": "test fixture",
+                }
+                for row in rows
+            ],
+        ],
+        [],
+    )
+
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=rows,
+            dhan_it_call_watch_cards=cards,
+            dhan_it_holding_positions=[],
+        )
+    )
+
+    assert "IT CE-spread execution: TCS, INFY, HCLTECH, TECHM, WIPRO, LTM." in html
+    assert "Wipro Ltd" in html
+    assert "LTIMindtree Ltd" in html
+    assert "WIPRO" in html
+    assert "LTM" in html
+    assert "LTIS" not in html
+    assert "LTIMINDTREE" not in html
+    for symbol in IT_FNO_SYMBOLS:
+        assert f'formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol" value="{symbol}"' in html
+    assert 'formaction="/dhan-it/open-symbol" name="dhan_it_open_symbol"' not in html
+    assert "Risk / OTM" in html
+    assert "Delta Band" in html
+    assert "SELL 7.00%" in html
+    assert "HEDGE 12.00%" in html
+    assert "SELL 9.00%" in html
+    assert "HEDGE 14.00%" in html
+    assert "Delta 0.12-0.16" in html
+
+
+def test_dhan_it_ltm_stock_list_click_path_renders_ltm_execution_ticket():
+    ltm_chain = [
+        option_row("LTM", "2026-08-27", 1100, "CE", 22),
+        option_row("LTM", "2026-08-27", 1150, "CE", 6),
+        option_row("LTM", "2026-09-24", 1100, "CE", 22),
+        option_row("LTM", "2026-09-24", 1150, "CE", 6),
+    ]
+    for contract in ltm_chain:
+        contract["name"] = "LTIMINDTREE LIMITED"
+        contract["underlying"] = ""
+    ltm_preview = build_dhan_it_spread(
+        symbol="LTM",
+        strategy_type="BEAR_CALL_SPREAD",
+        spot=1000,
+        lots=1,
+        option_chain_data=ltm_chain,
+        risk_engine=AllowRisk(),
+        market_data={"today": date(2026, 8, 4)},
+    )
+    html = app.render_dhan_it_panel(
+        app.PageState(
+            active_tab="dhan-it",
+            dhan_it_rows=dhan_it_universe_rows(),
+            dhan_it_opportunities=[ltm_preview],
+            dhan_it_selected_index="0",
+            dhan_it_selected_symbols=["LTM"],
+            dhan_it_strategy="BEAR_CALL_SPREAD",
+            dhan_it_call_watch_cards=[],
+            dhan_it_holding_positions=[],
+        )
+    )
+
+    assert "DHAN-IT Order Ticket - LTM" in html
+    assert "LTM08271100CE" in html
+    assert "LTM08271150CE" in html
+    assert "LTIS" not in html
+    assert "LTTS" not in html
+
+
+def test_dhan_it_ltm_kite_contract_fetch_groups_by_tradingsymbol_when_name_differs(monkeypatch):
+    class FakeBroker(MockBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def get_quote(self, instruments):
+            return {
+                "NSE:LTM": {
+                    "last_price": 3509.9,
+                    "ohlc": {"close": 3475.0},
+                }
+            }
+
+        def get_instruments(self, exchange):
+            contracts = [
+                {
+                    **option_row("LTM", "2026-08-27", 3900, "CE", 22),
+                    "tradingsymbol": "LTM26AUG3900CE",
+                },
+                {
+                    **option_row("LTM", "2026-08-27", 4000, "CE", 6),
+                    "tradingsymbol": "LTM26AUG4000CE",
+                },
+            ]
+            for contract in contracts:
+                contract["name"] = "LTIMINDTREE LIMITED"
+                contract["underlying"] = ""
+            return contracts
+
+    monkeypatch.setattr(app, "DhanBrokerAdapter", FakeBroker)
+    spot_by_symbol: dict[str, float] = {}
+    contracts_by_symbol: dict[str, list[dict]] = {}
+
+    _adapter, _notes, fresh_quotes = app.enrich_dhan_market_data_from_kite(
+        ["LTM"],
+        spot_by_symbol,
+        contracts_by_symbol,
+    )
+
+    assert spot_by_symbol["LTM"] == 3509.9
+    assert fresh_quotes["LTM"]["day_change_pct"] == 1.0
+    assert [row["tradingsymbol"] for row in contracts_by_symbol["LTM"]] == [
+        "LTM26AUG3900CE",
+        "LTM26AUG4000CE",
+    ]
+
+
 def test_dhan_it_current_and_next_expiry_mode_is_available_for_evaluation():
     html = app.render_dhan_it_panel(
         app.PageState(active_tab="dhan-it", dhan_it_rows=dhan_it_universe_rows(), dhan_it_expiry_mode="CURRENT_AND_NEXT")
@@ -307,7 +512,7 @@ def test_dhan_it_holding_position_analyzer_scopes_to_it_symbols_and_suggests_pai
     )
     by_symbol = {row["symbol"]: row for row in rows}
 
-    assert set(by_symbol) == {"TCS", "INFY", "HCLTECH", "TECHM"}
+    assert set(by_symbol) == set(IT_FNO_SYMBOLS)
     assert by_symbol["TCS"]["pair_status"] == "PAIR ACTIVE"
     assert by_symbol["TCS"]["cmp"] == 3200
     assert by_symbol["TCS"]["option_pnl"] == 900
@@ -319,6 +524,8 @@ def test_dhan_it_holding_position_analyzer_scopes_to_it_symbols_and_suggests_pai
     assert by_symbol["INFY"]["buy_qty_abs"] == 0
     assert by_symbol["HCLTECH"]["pair_status"] == "NO CE PAIR"
     assert by_symbol["TECHM"]["suggestion"] == "Build CE SELL + BUY hedge pair from DHAN-IT popup."
+    assert by_symbol["WIPRO"]["pair_status"] == "NO CE PAIR"
+    assert by_symbol["LTM"]["pair_status"] == "NO CE PAIR"
 
 
 def test_dhan_it_holding_position_table_renders_below_call_watch():
@@ -412,6 +619,38 @@ def test_dhan_it_pair_status_cmp_uses_live_call_watch_card_when_no_equity_holdin
     assert "<th>% Change</th>" in html
     assert "3344.25" in html
     assert "2.45%" in html
+
+
+def test_dhan_it_pair_status_day_change_falls_back_to_current_stock_list_row():
+    rows = [
+        {
+            "symbol": "TECHM",
+            "equity_qty": 0,
+            "average_price": "",
+            "last_price": "",
+            "cmp": "",
+            "pnl": "",
+            "sell_count": 0,
+            "buy_count": 0,
+            "sell_symbols": "",
+            "buy_symbols": "",
+            "pair_status": "NO CE PAIR",
+            "suggestion": "Build CE SELL + BUY hedge pair from DHAN-IT popup.",
+            "action": "BUILD_PAIR",
+        }
+    ]
+    cards = [{"symbol": "TECHM"}]
+    stock_rows = [{"symbol": "TECHM", "cmp": 1643.0, "day_change_pct": 3.21}]
+
+    enriched = app.enrich_dhan_it_holding_positions_with_call_watch_cmp(rows, cards, stock_rows)
+    html = app.render_dhan_it_holding_positions(enriched)
+
+    assert enriched[0]["cmp"] == 1643.0
+    assert enriched[0]["cmp_source"] == "DHAN-IT stock list"
+    assert enriched[0]["day_change_pct"] == 3.21
+    assert enriched[0]["day_change_source"] == "DHAN-IT stock list"
+    assert "1643.00" in html
+    assert "3.21%" in html
 
 
 def test_dhan_it_holding_position_table_offers_repair_for_incomplete_pair():
@@ -934,6 +1173,28 @@ def test_dhan_it_submit_accepts_defined_risk_soft_pop_and_loss_breaches(tmp_path
         "POP below DHAN-IT minimum",
         "max loss above configured limit",
     ]
+
+
+def test_dhan_it_submit_accepts_acknowledged_soft_blocked_opportunity(tmp_path):
+    repo = DhanItPairRepository(tmp_path / "dhan_it.db")
+    broker = MockBroker()
+    preview = approved_preview()
+    preview["risk_decision"] = "BLOCKED"
+    preview["risk_reason"] = "risk engine did not approve, POP below 70.0%, max loss above ₹40,000"
+    preview["reason"] = preview["risk_reason"]
+    preview["pop_estimate"] = 66.5
+    preview["return_on_risk_pct"] = 14.09
+    preview["max_gain"] = 7410.0
+    preview["max_loss"] = 52590.0
+
+    result = submit_dhan_it_pair(preview, repo, broker, user_confirmed=True, mode="PAPER")
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert len(broker.placed) == 2
+    assert payload["risk_override"] == "DHAN_IT_USER_ACCEPTED_SOFT_BLOCKERS"
+    assert payload["risk_decision_original"] == "BLOCKED"
+    assert "User accepted DHAN-IT soft blockers" in payload["risk_reason"]
 
 
 def test_dhan_it_popup_mixed_expiry_changes_selected_values():

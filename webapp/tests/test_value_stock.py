@@ -5,7 +5,15 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-from app import PageState, parse_multipart_form, render_value_stock_panel
+import app as app_module
+from app import (
+    PageState,
+    enrich_value_stock_detail_with_live_cmp,
+    enrich_value_stock_rows_with_live_cmp,
+    parse_multipart_form,
+    render_value_stock_panel,
+    value_stock_screener_symbol,
+)
 from value_stock.models import ParsedValueStock
 import value_stock.pdf_parser as pdf_parser
 from value_stock.assessment import assess_metric, assess_table
@@ -240,6 +248,68 @@ def test_value_stock_repository_delete_company_removes_comparison_row_permanentl
     assert repo.delete_company(parsed.company_key) is False
 
 
+def test_value_stock_live_cmp_uses_screener_symbol_and_preserves_pdf_seed(monkeypatch) -> None:
+    row = {
+        "company_name": "Park Medi World Ltd",
+        "screener_url": "https://www.screener.in/company/PARKHOSPS/",
+        "cmp": 125,
+        "avg_price": 100,
+        "return_pct": 25,
+    }
+    fake_kite_orders = SimpleNamespace(kite_client=lambda: object())
+    monkeypatch.setattr(app_module, "kite_orders", fake_kite_orders)
+    monkeypatch.setattr(app_module, "fresh_equity_cmp_map", lambda _kite, symbols, ttl_seconds=0: {"PARKHOSPS": 150})
+
+    updated, message = enrich_value_stock_rows_with_live_cmp([row])
+
+    assert value_stock_screener_symbol(row) == "PARKHOSPS"
+    assert updated == 1
+    assert "1/1" in message
+    assert row["pdf_cmp"] == 125
+    assert row["cmp"] == 150
+    assert row["cmp_source"] == "Live Kite"
+    assert row["return_pct"] == 50
+
+
+def test_value_stock_live_cmp_falls_back_to_pdf_when_kite_unavailable(monkeypatch) -> None:
+    row = {
+        "company_name": "Park Medi World Ltd",
+        "screener_url": "https://www.screener.in/company/PARKHOSPS/",
+        "cmp": 125,
+        "avg_price": 100,
+        "return_pct": 25,
+    }
+    monkeypatch.setattr(app_module, "kite_orders", None)
+
+    updated, message = enrich_value_stock_rows_with_live_cmp([row])
+
+    assert updated == 0
+    assert "Kite module is unavailable" in message
+    assert row["cmp"] == 125
+    assert row["cmp_source"] == "PDF snapshot"
+    assert row["return_pct"] == 25
+
+
+def test_value_stock_detail_live_cmp_updates_current_price_metric(monkeypatch) -> None:
+    detail = {
+        "screener_url": "https://www.screener.in/company/APSISAERO/",
+        "avg_price": 434,
+        "metrics": {"Current Price": {"value": 434}},
+        "return_pct": 0,
+    }
+    monkeypatch.setattr(app_module, "kite_orders", SimpleNamespace(kite_client=lambda: object()))
+    monkeypatch.setattr(app_module, "fresh_equity_cmp_map", lambda _kite, symbols, ttl_seconds=0: {"APSISAERO": 455})
+
+    updated, _message = enrich_value_stock_detail_with_live_cmp(detail)
+
+    assert updated is True
+    assert detail["pdf_cmp"] == 434
+    assert detail["metrics"]["Current Price"]["value"] == 455
+    assert detail["metrics"]["Current Price"]["source"] == "Live Kite"
+    assert detail["cmp_source"] == "Live Kite"
+    assert detail["return_pct"] == 4.84
+
+
 def test_score_stays_low_confidence_when_critical_data_is_missing() -> None:
     parsed = ParsedValueStock(
         company_name="Sparse Ltd",
@@ -325,6 +395,7 @@ def test_value_stock_panel_shows_screener_link_and_delete_action() -> None:
     assert "80" in html
     assert "8,000.00" in html
     assert "25.00%" in html
+    assert "PDF snapshot" in html
     assert 'id="value-stock-comparison-table"' in html
     assert 'class="sort-header" data-sort-col="3">CMP' in html
     assert 'data-sort-value="125.0"' in html
