@@ -144,11 +144,14 @@ from dhan_it_call_watch import (
     evaluate_call_spread_dma_gate,
 )
 from dhan_fno_top10_engine import generate_dhan_top10_from_fno_sheet
+from fii_sector_pdf_parser import FiiSectorPdfError, FiiSectorPdfParser
+from fii_sector_repository import FiiSectorSnapshotRepository
 from sector_income import (
     DEFAULT_SECTOR_PRIORITY,
     SECTOR_LABELS,
     SECTOR_SCORE_WEIGHTS,
     calculate_sector_sell_on_rise_score,
+    fii_rows_to_snapshot_map,
     configured_sector_symbols,
     rank_all_sectors,
     load_fii_sector_snapshot,
@@ -7648,6 +7651,10 @@ class PageState:
     sector_income_selected_index: str = ""
     sector_income_generated_at: str = ""
     sector_income_show_rank_modal: bool = False
+    sector_income_pending_fii_snapshot: dict[str, Any] | None = None
+    sector_income_active_fii_snapshot: dict[str, Any] | None = None
+    sector_income_fii_upload_message: str = ""
+    sector_income_score_snapshot: dict[str, Any] | None = None
 
 
 def mask_secret(value: str | None) -> str:
@@ -24968,10 +24975,107 @@ def build_sector_income_rows(sector_key: str) -> list[dict[str, Any]]:
     return rows
 
 
+def sector_income_snapshot_age_status(snapshot_row: dict[str, Any] | None) -> str:
+    if not snapshot_row:
+        return "STATIC_SUPPLIED_SNAPSHOT"
+    report_date = str(snapshot_row.get("report_date") or "").strip()
+    try:
+        parsed = datetime.fromisoformat(report_date).date()
+    except ValueError:
+        return "UNKNOWN_AGE"
+    age_days = (datetime.now(INDIA_TIME_ZONE).date() - parsed).days
+    return "STALE" if age_days > 30 else "FRESH"
+
+
+def sector_income_active_snapshot_rows(state: PageState) -> list[dict[str, Any]]:
+    snapshot_row = state.sector_income_active_fii_snapshot or FiiSectorSnapshotRepository(APP_DB_PATH).get_active_snapshot()
+    state.sector_income_active_fii_snapshot = snapshot_row
+    return list((snapshot_row or {}).get("rows") or [])
+
+
+def sector_income_pending_or_active_snapshot_rows(state: PageState) -> list[dict[str, Any]]:
+    if state.sector_income_pending_fii_snapshot:
+        return list(state.sector_income_pending_fii_snapshot.get("rows") or [])
+    return sector_income_active_snapshot_rows(state)
+
+
+def sector_income_snapshot_status_for_score(state: PageState) -> str:
+    if state.sector_income_pending_fii_snapshot:
+        return "PENDING_PREVIEW"
+    return sector_income_snapshot_age_status(state.sector_income_active_fii_snapshot)
+
+
+def build_sector_income_score_ranking(
+    *,
+    selected_sector: str,
+    sector_technical: dict[str, Any] | None = None,
+    valid_fno_count: int = 0,
+    state: PageState,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshot_rows = sector_income_pending_or_active_snapshot_rows(state)
+    snapshot_status = sector_income_snapshot_status_for_score(state)
+    ranking = rank_all_sectors(
+        fii_snapshot_rows=snapshot_rows,
+        fii_snapshot_status=snapshot_status,
+    )
+    score = calculate_sector_sell_on_rise_score(
+        selected_sector,
+        sector_technical=sector_technical or {},
+        fii_snapshot_rows=snapshot_rows,
+        fii_snapshot_status=snapshot_status,
+        valid_fno_count=valid_fno_count,
+    )
+    sector_rank_rows = {
+        str(item.get("sector_key") or item.get("sector") or "").upper(): item
+        for item in (ranking.get("all_sectors") or [])
+    }
+    sector_rank_rows[normalize_sector_key(selected_sector)] = {**sector_rank_rows.get(normalize_sector_key(selected_sector), {}), **score}
+    ranking["all_sectors"] = sorted(
+        sector_rank_rows.values(),
+        key=lambda item: (
+            {"GREEN": 3, "AMBER": 2, "RED": 1}.get(str(item.get("status") or ""), 0),
+            {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNUSABLE": 0}.get(str(item.get("confidence") or ""), 0),
+            _dhan_metric_float(item.get("sector_score")),
+            {"LOW": 3, "MODERATE": 2, "HIGH": 1, "EXTREME": 0}.get(str(item.get("rebound_risk") or ""), 0),
+        ),
+        reverse=True,
+    )
+    for rank, item in enumerate(ranking["all_sectors"], start=1):
+        item["rank"] = rank
+    ranking["top_sectors"] = ranking["all_sectors"][:3]
+    ranking["selected_sector"] = normalize_sector_key(selected_sector)
+    return score, ranking
+
+
+def save_sector_income_score_state(state: PageState, source: str = "SECTOR_SCORE_DETAILS") -> dict[str, Any]:
+    if not state.sector_income_score or not state.sector_income_ranking:
+        return {}
+    active_fii = state.sector_income_active_fii_snapshot or {}
+    pending_fii = state.sector_income_pending_fii_snapshot or {}
+    snapshot_id = pending_fii.get("snapshot_id") or active_fii.get("snapshot_id")
+    saved = FiiSectorSnapshotRepository(APP_DB_PATH).save_sector_score_snapshot(
+        selected_sector=normalize_sector_key(state.sector_income_sector or state.sector_income_ranking.get("selected_sector")),
+        score=state.sector_income_score,
+        ranking=state.sector_income_ranking,
+        source=source,
+        fii_snapshot_id=int(snapshot_id) if snapshot_id else None,
+    )
+    state.sector_income_score_snapshot = saved
+    return saved
+
+
 def load_sector_income_state(state: PageState) -> None:
-    ranking = rank_all_sectors()
+    sector_repo = FiiSectorSnapshotRepository(APP_DB_PATH)
+    state.sector_income_active_fii_snapshot = sector_repo.get_active_snapshot()
+    saved_score_snapshot = state.sector_income_score_snapshot or sector_repo.get_latest_sector_score_snapshot()
+    state.sector_income_score_snapshot = saved_score_snapshot
+    ranking = rank_all_sectors(
+        fii_snapshot_rows=sector_income_pending_or_active_snapshot_rows(state),
+        fii_snapshot_status=sector_income_snapshot_status_for_score(state),
+    )
     requested_key = str(state.sector_income_sector or "").strip().upper()
-    key = normalize_sector_key(requested_key or ranking.get("selected_sector"))
+    saved_key = str((saved_score_snapshot or {}).get("selected_sector") or ((saved_score_snapshot or {}).get("ranking") or {}).get("selected_sector") or "")
+    key = normalize_sector_key(requested_key or saved_key or ranking.get("selected_sector"))
     rows = build_sector_income_rows(key)
     symbols = [str(row.get("symbol") or "").strip().upper() for row in rows]
     spot_by_symbol = _dhan_json_number_map(state.dhan_spot_json)
@@ -25006,25 +25110,19 @@ def load_sector_income_state(state: PageState) -> None:
         "distance_200_pct": calculate_dma_distance(sector_proxy.get("cmp"), sector_proxy.get("dma_200")),
     }
     valid_fno_count = sum(1 for row in rows if row.get("fno_eligible"))
-    sector_score = calculate_sector_sell_on_rise_score(key, sector_technical=sector_technical, valid_fno_count=valid_fno_count)
-    sector_rank_rows = {
-        str(item.get("sector_key") or item.get("sector") or "").upper(): item
-        for item in (ranking.get("all_sectors") or [])
-    }
-    sector_rank_rows[key] = {**sector_rank_rows.get(key, {}), **sector_score}
-    ranking["all_sectors"] = sorted(
-        sector_rank_rows.values(),
-        key=lambda item: (
-            {"GREEN": 3, "AMBER": 2, "RED": 1}.get(str(item.get("status") or ""), 0),
-            {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNUSABLE": 0}.get(str(item.get("confidence") or ""), 0),
-            _dhan_metric_float(item.get("sector_score")),
-        ),
-        reverse=True,
+    sector_score, ranking = build_sector_income_score_ranking(
+        selected_sector=key,
+        sector_technical=sector_technical,
+        valid_fno_count=valid_fno_count,
+        state=state,
     )
-    for rank, item in enumerate(ranking["all_sectors"], start=1):
-        item["rank"] = rank
-    ranking["top_sectors"] = ranking["all_sectors"][:3]
-    ranking["selected_sector"] = key
+    if saved_score_snapshot and not state.sector_income_pending_fii_snapshot and key == normalize_sector_key(saved_key):
+        saved_score = dict(saved_score_snapshot.get("score") or {})
+        saved_ranking = dict(saved_score_snapshot.get("ranking") or {})
+        if saved_score and saved_ranking:
+            sector_score = saved_score
+            ranking = saved_ranking
+            ranking["selected_sector"] = key
     ranked = rank_sector_candidates(rows, sector_score, top_n=4)
     sector_regime = str(sector_score.get("sector_regime") or "DATA_UNAVAILABLE")
     opportunities, notes = build_sector_income_opportunities(state, ranked, sector_score)
@@ -25194,6 +25292,72 @@ def render_sector_income_panel(state: PageState) -> str:
     def render_sector_rank_modal() -> str:
         if not state.sector_income_show_rank_modal:
             return ""
+        pending_snapshot = state.sector_income_pending_fii_snapshot or {}
+        active_snapshot = state.sector_income_active_fii_snapshot or FiiSectorSnapshotRepository(APP_DB_PATH).get_active_snapshot() or {}
+        preview_rows = list(pending_snapshot.get("rows") or active_snapshot.get("rows") or [])
+        preview_source = "Pending PDF preview" if pending_snapshot else "Active accepted snapshot" if active_snapshot else "Built-in static snapshot"
+        upload_message = state.sector_income_fii_upload_message or ""
+        status_cards = "".join(
+            f"<article><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></article>"
+            for label, value in [
+                ("Preview source", preview_source),
+                ("Active report date", text_value(active_snapshot.get("report_date"), snapshot.snapshot_date)),
+                ("Uploaded at", text_value(active_snapshot.get("uploaded_at"))),
+                ("Valid sectors", text_value((pending_snapshot or active_snapshot).get("recognized_sector_count"), str(len(fii_rows_to_snapshot_map(preview_rows))))),
+                ("FII age status", sector_income_snapshot_status_for_score(state)),
+            ]
+        )
+        preview_html_rows = []
+        for row in preview_rows:
+            status = str(row.get("validation_status") or "").upper()
+            badge = "good" if status == "VALID" else "neutral" if status == "REVIEW_REQUIRED" else "muted" if status == "UNMAPPED" else "bad"
+            preview_html_rows.append(
+                "<tr>"
+                f"<td>{html.escape(text_value(row.get('source_sector_name')))}</td>"
+                f"<td>{money(row.get('fii_aum_pct'))}%</td>"
+                f"<td>{money(row.get('fortnight_flow_cr'))}</td>"
+                f"<td>{money(row.get('one_year_flow_cr'))}</td>"
+                f"<td>{html.escape(text_value(row.get('fii_regime')))}</td>"
+                f"<td>{money(float(row.get('extraction_confidence') or 0) * 100)}%</td>"
+                f"<td><span class=\"ipo-badge {badge}\">{html.escape(status or 'STATIC')}</span><small>{html.escape('; '.join(str(item) for item in row.get('validation_messages') or []))}</small></td>"
+                "</tr>"
+            )
+        if not preview_html_rows:
+            preview_html_rows.append('<tr><td colspan="7" class="muted-cell">No uploaded PDF snapshot yet. Built-in static FII snapshot is used until a valid PDF is uploaded and applied.</td></tr>')
+        top_cards = []
+        for item in ranking.get("top_sectors", []):
+            sector = str(item.get("sector_key") or item.get("sector") or "")
+            status = str(item.get("status") or "RED").upper()
+            badge_class = "good" if status == "GREEN" else "neutral" if status == "AMBER" else "bad"
+            disabled = " disabled" if status == "RED" else ""
+            top_cards.append(
+                f"""
+                <article class="commodity-card dhan-it-watch-card dhan-it-watch-card-compact">
+                  <div class="dhan-it-watch-top"><div><strong>#{html.escape(text_value(item.get('rank')))} {html.escape(text_value(item.get('display_name') or item.get('sector_label')))}</strong><span>{html.escape(text_value(item.get('fii_regime')))}</span></div><span class="ipo-badge {badge_class}">{html.escape(status)}</span></div>
+                  <div class="dhan-it-watch-price-row"><div class="commodity-price">{money(item.get('score') or item.get('sector_score'))}</div><div class="commodity-change up">{html.escape(text_value(item.get('confidence')))}</div></div>
+                  <div class="dhan-it-watch-plan"><span>Regime {html.escape(text_value(item.get('regime') or item.get('sector_regime')))}</span><span>Liquidity {html.escape(text_value(item.get('liquidity_status')))}</span><span>Rebound {html.escape(text_value(item.get('rebound_risk')))}</span></div>
+                  <small class="status dhan-it-watch-note">{html.escape('; '.join(str(reason) for reason in (item.get('reasons') or [])[:3]))}</small>
+                  <button type="submit" formaction="/sector-income/apply-sector" name="sector_income_sector" value="{html.escape(sector, quote=True)}"{disabled}>Apply This Sector</button>
+                </article>
+                """
+            )
+        all_sector_rows = []
+        for item in ranking.get("all_sectors", []):
+            status = str(item.get("status") or "RED").upper()
+            badge_class = "good" if status == "GREEN" else "neutral" if status == "AMBER" else "bad"
+            all_sector_rows.append(
+                "<tr>"
+                f"<td>{html.escape(text_value(item.get('rank')))}</td>"
+                f"<td><strong>{html.escape(text_value(item.get('display_name') or item.get('sector_label')))}</strong></td>"
+                f"<td>{money(item.get('sector_score') or item.get('score'))}</td>"
+                f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(status)}</span></td>"
+                f"<td>{html.escape(text_value(item.get('confidence')))}</td>"
+                f"<td>{html.escape(text_value(item.get('fii_regime')))}</td>"
+                f"<td>{html.escape(text_value(item.get('liquidity_status')))}</td>"
+                f"<td>{html.escape(text_value(item.get('rebound_risk')))}</td>"
+                f"<td>{html.escape('; '.join(str(reason) for reason in (item.get('reasons') or [])[:2]))}</td>"
+                "</tr>"
+            )
         component_rows = []
         for key_name, item in (score.get("component_scores") or {}).items():
             component_rows.append(
@@ -25205,15 +25369,42 @@ def render_sector_income_panel(state: PageState) -> str:
                 "</tr>"
             )
         weights_total = sum(SECTOR_SCORE_WEIGHTS.values())
+        first_valid_sector = next(
+            (
+                str(item.get("sector_key") or item.get("sector") or "")
+                for item in ranking.get("top_sectors", [])
+                if str(item.get("status") or "").upper() in {"GREEN", "AMBER"}
+            ),
+            "",
+        )
+        apply_rank_one_button = (
+            f'<button type="submit" formaction="/sector-income/apply-sector" name="sector_income_sector" value="{html.escape(first_valid_sector, quote=True)}">Apply Rank 1 Sector</button>'
+            if first_valid_sector
+            else '<button type="button" disabled>NO SECTOR CURRENTLY QUALIFIES</button>'
+        )
+        activate_pending_button = (
+            f'<button type="submit" formaction="/sector-income/activate-fii-snapshot" name="sector_income_snapshot_id" value="{html.escape(str(pending_snapshot.get("snapshot_id") or ""), quote=True)}">Use Uploaded FII Snapshot</button>'
+            if pending_snapshot.get("snapshot_id")
+            else ""
+        )
         return f"""
-        <div class="live-modal-backdrop visible" id="sector-income-rank-modal"><div class="live-modal dhan-order-modal-card">
-          <h2>Sector Ranking Detail - {html.escape(SECTOR_LABELS.get(sector_key, sector_key))}</h2>
-          <p class="status">This score ranks sectors for defined-risk SELL CALL on rise scans only. It never bypasses stock, option, liquidity, event, max-loss, or hedge-first checks.</p>
-          <div class="dhan-ticket-summary">{metric_cards}<article><span>Weight total</span><strong>{weights_total}</strong><small>Expected 100</small></article></div>
-          <section class="panel"><div class="panel-title">Why this sector?</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Component</th><th>Score</th><th>Weight</th><th>Detail</th></tr></thead><tbody>{"".join(component_rows)}</tbody></table></div></section>
+        <div class="live-modal-backdrop visible" id="sector-income-rank-modal"><div class="live-modal dhan-order-modal-card sector-income-score-modal">
+          <h2>SECTOR-Income - FII Upload & Sector Score Details</h2>
+          <p class="status">This popup performs sector analysis and selection only. It cannot place orders. FII sentiment contributes 30% of the ranking score; stock, option, event, max-loss and hedge-first checks still happen later in the order ticket.</p>
+          <section class="panel"><div class="panel-title">1. Current Data Status</div><div class="dhan-ticket-summary">{status_cards}<article><span>Weight total</span><strong>{weights_total}</strong><small>Expected 100</small></article></div></section>
+          <section class="panel"><div class="panel-title">2. Upload FII Investment PDF</div>
+            <label><span>Choose PDF</span><input name="sector_income_fii_pdf" type="file" accept="application/pdf,.pdf"></label>
+            <div class="actions"><button type="submit" formaction="/sector-income/upload-fii-pdf">Upload & Extract</button>{activate_pending_button}<button type="submit" class="secondary" formaction="/sector-income/recalculate-sectors">Recalculate Top 3</button></div>
+            <p class="status">{html.escape(upload_message or "PDF upload is preview-only until you click Use Uploaded FII Snapshot / Apply Rank 1 Sector.")}</p>
+          </section>
+          <section class="panel"><div class="panel-title">3. Extracted FII Data Preview</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Sector</th><th>AUM %</th><th>Fortnight Flow Cr</th><th>1Y Flow Cr</th><th>FII Regime</th><th>Confidence</th><th>Validation</th></tr></thead><tbody>{"".join(preview_html_rows)}</tbody></table></div></section>
+          <section class="panel"><div class="panel-title">4-5. Top 3 Sectors for SELL CALL on Rise</div><div class="commodity-grid">{"".join(top_cards) if top_cards else '<p class="status">NO SECTOR CURRENTLY QUALIFIES</p>'}</div></section>
+          <section class="panel"><div class="panel-title">6. Detailed Sector Score Comparison - All Sectors</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Rank</th><th>Sector</th><th>Total Score</th><th>Status</th><th>Confidence</th><th>FII Regime</th><th>Liquidity</th><th>Rebound</th><th>Top Reasons</th></tr></thead><tbody>{"".join(all_sector_rows)}</tbody></table></div></section>
+          <section class="panel"><div class="panel-title">Parameter-by-Parameter Score Details - Selected Sector</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Component</th><th>Score</th><th>Weight</th><th>Detail</th></tr></thead><tbody>{"".join(component_rows)}</tbody></table></div></section>
           <div class="modal-actions">
             <button type="submit" class="secondary" formaction="/sector-income/rank-close">Close</button>
-            <button type="submit" formaction="/sector-income/recalculate-sectors">Rerun Sector Evaluation</button>
+            <button type="submit" class="secondary" formaction="/sector-income/recalculate-sectors">Rerun Evaluation</button>
+            {apply_rank_one_button}
           </div>
         </div></div>
         """
@@ -25264,6 +25455,11 @@ def render_sector_income_panel(state: PageState) -> str:
     if not opp_rows:
         opp_rows.append('<tr><td colspan="20" class="muted-cell">No sector CE opportunity data yet. Run Scan Selected Sector.</td></tr>')
     snapshot = load_fii_sector_snapshot()
+    active_snapshot_json = html.escape(json.dumps(state.sector_income_active_fii_snapshot or {}, default=str), quote=True)
+    pending_snapshot_json = html.escape(json.dumps(state.sector_income_pending_fii_snapshot or {}, default=str), quote=True)
+    score_json = html.escape(json.dumps(state.sector_income_score or {}, default=str), quote=True)
+    ranking_json = html.escape(json.dumps(state.sector_income_ranking or {}, default=str), quote=True)
+    score_snapshot_json = html.escape(json.dumps(state.sector_income_score_snapshot or {}, default=str), quote=True)
     opportunities_json = html.escape(json.dumps(opportunities, default=str), quote=True)
     selected_preview = ""
     selected_idx = int(float(state.sector_income_selected_index)) if str(state.sector_income_selected_index or "").isdigit() else -1
@@ -25336,10 +25532,16 @@ def render_sector_income_panel(state: PageState) -> str:
         else "No scheduler run recorded yet."
     )
     return f"""
-    <form id="sector-income-panel" method="post" action="/sector-income/load"{panel_style}>
+    <form id="sector-income-panel" method="post" action="/sector-income/load" enctype="multipart/form-data"{panel_style}>
       {env_hidden_fields_for_render()}
       <input type="hidden" name="sector_income_opportunities_json" value="{opportunities_json}">
       <input type="hidden" name="sector_income_generated_at" value="{html.escape(state.sector_income_generated_at, quote=True)}">
+      <input type="hidden" name="sector_income_active_fii_snapshot_json" value="{active_snapshot_json}">
+      <input type="hidden" name="sector_income_pending_fii_snapshot_json" value="{pending_snapshot_json}">
+      <input type="hidden" name="sector_income_score_json" value="{score_json}">
+      <input type="hidden" name="sector_income_ranking_json" value="{ranking_json}">
+      <input type="hidden" name="sector_income_score_snapshot_json" value="{score_snapshot_json}">
+      <input type="hidden" name="sector_income_fii_upload_message" value="{html.escape(state.sector_income_fii_upload_message, quote=True)}">
       <input type="hidden" name="dhan_it_opportunities_json" value="{opportunities_json}">
       <input type="hidden" name="dhan_it_opportunities_generated_at" value="{html.escape(state.sector_income_generated_at, quote=True)}">
       <input type="hidden" name="dhan_spot_json" value="{html.escape(state.dhan_spot_json, quote=True)}">
@@ -35531,6 +35733,15 @@ def render_page(state: PageState) -> bytes:
       max-height: calc(100vh - 36px);
       overflow-y: auto;
     }}
+    .sector-income-score-modal {{
+      width: min(1380px, calc(100vw - 24px));
+      max-height: calc(100vh - 20px);
+      text-align: left;
+    }}
+    .sector-income-score-modal h2,
+    .sector-income-score-modal .modal-actions {{
+      text-align: center;
+    }}
     .dhan-ticket-header {{
       display: flex;
       justify-content: space-between;
@@ -41832,6 +42043,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             sector_income_opportunities=_dhan_json_loads(first(form, "sector_income_opportunities_json") or first(form, "dhan_it_opportunities_json"), []),
             sector_income_generated_at=first(form, "sector_income_generated_at") or first(form, "dhan_it_opportunities_generated_at"),
             sector_income_show_rank_modal=checked(form, "sector_income_show_rank_modal"),
+            sector_income_score=_dhan_json_loads(first(form, "sector_income_score_json"), None),
+            sector_income_ranking=_dhan_json_loads(first(form, "sector_income_ranking_json"), None),
+            sector_income_pending_fii_snapshot=_dhan_json_loads(first(form, "sector_income_pending_fii_snapshot_json"), None),
+            sector_income_active_fii_snapshot=_dhan_json_loads(first(form, "sector_income_active_fii_snapshot_json"), None),
+            sector_income_fii_upload_message=first(form, "sector_income_fii_upload_message"),
+            sector_income_score_snapshot=_dhan_json_loads(first(form, "sector_income_score_snapshot_json"), None),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -43470,15 +43687,87 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = "Closed SECTOR-Income paired-spread popup."
             elif request_path == "/sector-income/rank-detail":
                 load_sector_income_state(state)
+                save_sector_income_score_state(state, "SECTOR_SCORE_DETAILS_OPEN")
                 state.sector_income_show_rank_modal = True
                 state.message = "Opened sector ranking detail."
-            elif request_path == "/sector-income/rank-close":
+            elif request_path == "/sector-income/upload-fii-pdf":
+                upload = uploaded_files.get("sector_income_fii_pdf") or {}
+                if not upload:
+                    raise ValueError("Choose a Screener FII Investment PDF before upload.")
+                try:
+                    parsed_snapshot = FiiSectorPdfParser().parse(
+                        bytes(upload.get("content") or b""),
+                        filename=str(upload.get("filename") or "fii-sector.pdf"),
+                        content_type=str(upload.get("content_type") or "application/pdf"),
+                    )
+                    pending = FiiSectorSnapshotRepository(APP_DB_PATH).save_pending_snapshot(parsed_snapshot)
+                    state.sector_income_pending_fii_snapshot = pending
+                    state.sector_income_active_fii_snapshot = FiiSectorSnapshotRepository(APP_DB_PATH).get_active_snapshot()
+                    state.sector_income_show_rank_modal = True
+                    load_sector_income_state(state)
+                    save_sector_income_score_state(state, "FII_PDF_PENDING_PREVIEW")
+                    state.sector_income_show_rank_modal = True
+                    state.sector_income_fii_upload_message = (
+                        f"Extracted {pending.get('recognized_sector_count')} valid FII sector row(s). "
+                        "Preview the data, then click Use Uploaded FII Snapshot or Apply Rank 1 Sector to activate it."
+                    )
+                    state.message = "FII PDF extracted for preview. Snapshot is not active until you confirm."
+                except FiiSectorPdfError as exc:
+                    state.sector_income_pending_fii_snapshot = None
+                    state.sector_income_show_rank_modal = True
+                    load_sector_income_state(state)
+                    state.sector_income_show_rank_modal = True
+                    state.sector_income_fii_upload_message = str(exc)
+                    state.message = "FII PDF upload was rejected; previous active snapshot remains unchanged."
+            elif request_path == "/sector-income/activate-fii-snapshot":
+                snapshot_id = int(float(first(form, "sector_income_snapshot_id", "0") or 0))
+                if snapshot_id <= 0:
+                    raise ValueError("No valid pending FII snapshot selected for activation.")
+                active_snapshot = FiiSectorSnapshotRepository(APP_DB_PATH).activate_snapshot(snapshot_id)
+                state.sector_income_active_fii_snapshot = active_snapshot
+                state.sector_income_pending_fii_snapshot = None
+                state.sector_income_show_rank_modal = True
                 load_sector_income_state(state)
+                save_sector_income_score_state(state, "FII_PDF_ACTIVATED")
+                state.sector_income_show_rank_modal = True
+                state.sector_income_fii_upload_message = (
+                    f"Activated FII snapshot from {active_snapshot.get('source_filename')} "
+                    f"with {active_snapshot.get('recognized_sector_count')} valid sector row(s)."
+                )
+                state.message = "Activated uploaded FII snapshot and recalculated Sector-Income rankings."
+            elif request_path == "/sector-income/apply-sector":
+                apply_sector = normalize_sector_key(first(form, "sector_income_sector"))
+                if state.sector_income_pending_fii_snapshot and state.sector_income_pending_fii_snapshot.get("snapshot_id"):
+                    active_snapshot = FiiSectorSnapshotRepository(APP_DB_PATH).activate_snapshot(
+                        int(state.sector_income_pending_fii_snapshot["snapshot_id"])
+                    )
+                    state.sector_income_active_fii_snapshot = active_snapshot
+                    state.sector_income_pending_fii_snapshot = None
+                    state.sector_income_fii_upload_message = (
+                        f"Activated uploaded FII snapshot and applied {SECTOR_LABELS.get(apply_sector, apply_sector)}."
+                    )
+                state.sector_income_sector = apply_sector
                 state.sector_income_show_rank_modal = False
-                state.message = "Closed sector ranking detail."
+                state.sector_income_selected_index = ""
+                load_sector_income_state(state)
+                save_sector_income_score_state(state, "SECTOR_APPLIED")
+                state.message = f"Applied {SECTOR_LABELS.get(apply_sector, apply_sector)} to SECTOR-Income and refreshed top companies."
+            elif request_path == "/sector-income/rank-close":
+                popup_score = dict(state.sector_income_score or {})
+                popup_ranking = dict(state.sector_income_ranking or {})
+                if popup_score and popup_ranking:
+                    save_sector_income_score_state(state, "SECTOR_SCORE_DETAILS_CLOSE")
+                load_sector_income_state(state)
+                if popup_score:
+                    state.sector_income_score = popup_score
+                if popup_ranking:
+                    state.sector_income_ranking = popup_ranking
+                state.sector_income_show_rank_modal = False
+                state.message = "Closed sector ranking detail and refreshed the visible Top 3 sector ranking."
             elif request_path == "/sector-income/recalculate-sectors":
                 state.sector_income_sector = ""
                 load_sector_income_state(state)
+                save_sector_income_score_state(state, "SECTOR_SCORE_DETAILS_RERUN")
                 state.sector_income_show_rank_modal = True
                 state.message = "Recalculated all sectors and selected the highest ranked eligible sector."
             elif request_path == "/sector-income/submit":

@@ -77,16 +77,16 @@ DEFAULT_SECTOR_PRIORITY = [
 ]
 
 SECTOR_SCORE_WEIGHTS: dict[str, int] = {
-    "trend_structure": 20,
-    "rise_into_resistance": 15,
-    "relative_weakness": 12,
-    "breadth_weakness": 12,
+    "fii_flow_regime": 30,
+    "trend_structure": 15,
+    "rise_into_resistance": 12,
+    "relative_weakness": 10,
+    "breadth_weakness": 8,
     "iv_premium_quality": 10,
     "options_liquidity": 10,
-    "fii_flow_regime": 8,
-    "event_risk": 5,
-    "rebound_risk": 5,
-    "portfolio_capacity": 3,
+    "event_risk": 2,
+    "rebound_risk": 2,
+    "portfolio_capacity": 1,
 }
 
 SECTOR_INDEX_CONFIG: dict[str, dict[str, str]] = {
@@ -134,6 +134,25 @@ def load_fii_sector_snapshot() -> SectorIncomeSnapshot:
     return SectorIncomeSnapshot()
 
 
+def fii_rows_to_snapshot_map(rows: Iterable[dict[str, Any]] | None) -> dict[str, dict[str, float]]:
+    mapped: dict[str, dict[str, float]] = {}
+    for row in rows or []:
+        code = str(row.get("sector_code") or row.get("sector_key") or "").strip().upper()
+        if not code or code == "UNMAPPED":
+            continue
+        if str(row.get("validation_status") or "VALID").upper() != "VALID":
+            continue
+        try:
+            mapped[code] = {
+                "fii_aum_pct": float(row.get("fii_aum_pct")),
+                "fortnight_flow_cr": float(row.get("fortnight_flow_cr")),
+                "one_year_flow_cr": float(row.get("one_year_flow_cr")),
+            }
+        except (TypeError, ValueError):
+            continue
+    return mapped
+
+
 def classify_fii_flow_regime(one_year_flow_cr: Any, fortnight_flow_cr: Any) -> str:
     try:
         one_year = float(one_year_flow_cr)
@@ -177,12 +196,16 @@ def calculate_sector_sell_on_rise_score(
     sector_key: str,
     *,
     sector_technical: dict[str, Any] | None = None,
+    fii_snapshot_rows: Iterable[dict[str, Any]] | None = None,
+    fii_snapshot_status: str = "STATIC_SUPPLIED_SNAPSHOT",
     valid_fno_count: int = 0,
     active_sector_exposure: int = 0,
 ) -> dict[str, Any]:
     snapshot = load_fii_sector_snapshot()
     key = normalize_sector_key(sector_key)
-    fii = snapshot.rows.get(key, {})
+    uploaded_rows = fii_rows_to_snapshot_map(fii_snapshot_rows)
+    fii = uploaded_rows.get(key) or snapshot.rows.get(key, {})
+    using_uploaded_fii = key in uploaded_rows
     fii_regime = classify_fii_flow_regime(fii.get("one_year_flow_cr"), fii.get("fortnight_flow_cr"))
     technical = sector_technical or {}
     sector_regime = str(technical.get("sector_regime") or technical.get("trend") or "DATA_UNAVAILABLE").upper()
@@ -190,6 +213,8 @@ def calculate_sector_sell_on_rise_score(
     component_scores = calculate_sector_component_scores(
         key,
         sector_technical=technical,
+        fii_snapshot_rows=fii_snapshot_rows,
+        fii_snapshot_status=fii_snapshot_status,
         valid_fno_count=valid_fno_count,
         active_sector_exposure=active_sector_exposure,
     )
@@ -225,6 +250,8 @@ def calculate_sector_sell_on_rise_score(
         "fortnight_flow_cr": fii.get("fortnight_flow_cr"),
         "one_year_flow_cr": fii.get("one_year_flow_cr"),
         "fii_regime": fii_regime,
+        "fii_source": "UPLOADED_PDF" if using_uploaded_fii else "STATIC_SUPPLIED_SNAPSHOT",
+        "fii_snapshot_status": fii_snapshot_status if using_uploaded_fii else snapshot.freshness_status,
         "sector_regime": sector_regime,
         "valid_fno_count": valid_fno_count,
         "active_sector_exposure": active_sector_exposure,
@@ -247,12 +274,15 @@ def calculate_sector_component_scores(
     sector_key: str,
     *,
     sector_technical: dict[str, Any] | None = None,
+    fii_snapshot_rows: Iterable[dict[str, Any]] | None = None,
+    fii_snapshot_status: str = "STATIC_SUPPLIED_SNAPSHOT",
     valid_fno_count: int = 0,
     active_sector_exposure: int = 0,
 ) -> dict[str, dict[str, Any]]:
     key = normalize_sector_key(sector_key)
     snapshot = load_fii_sector_snapshot()
-    fii = snapshot.rows.get(key, {})
+    uploaded_rows = fii_rows_to_snapshot_map(fii_snapshot_rows)
+    fii = uploaded_rows.get(key) or snapshot.rows.get(key, {})
     technical = sector_technical or {}
     regime = str(technical.get("sector_regime") or technical.get("trend") or "DATA_UNAVAILABLE").upper()
     day_change = _float(technical.get("today_change_pct"))
@@ -288,7 +318,17 @@ def calculate_sector_component_scores(
     breadth_value = _float(breadth_50)
     breadth_score = 10 if not breadth_missing and breadth_value < 45 else 4 if not breadth_missing and breadth_value <= 65 else 2 if breadth_missing else 0
     liquidity_score = 10 if liquidity == "GREEN" else 5 if liquidity == "AMBER" else 0
-    fii_score = 8 if fii_regime == "RELIEF_RALLY_SELL_ON_RISE" else 6 if fii_regime == "STRUCTURAL_WEAKNESS" else 3 if fii_regime == "PROFIT_BOOKING_ONLY" else 0
+    fii_weight = SECTOR_SCORE_WEIGHTS["fii_flow_regime"]
+    stale_penalty = 0.65 if str(fii_snapshot_status or "").upper() == "STALE" and key in uploaded_rows else 1.0
+    fii_score = (
+        fii_weight
+        if fii_regime == "RELIEF_RALLY_SELL_ON_RISE"
+        else fii_weight * 0.62
+        if fii_regime == "STRUCTURAL_WEAKNESS"
+        else fii_weight * 0.35
+        if fii_regime == "PROFIT_BOOKING_ONLY"
+        else 0
+    ) * stale_penalty
     return {
         "trend_structure": item("trend_structure", trend_score, f"Sector regime {regime}", regime == "DATA_UNAVAILABLE"),
         "rise_into_resistance": item("rise_into_resistance", rise_score, f"Today {day_change:.2f}%, 50DMA dist {distance_50:.2f}%"),
@@ -296,7 +336,7 @@ def calculate_sector_component_scores(
         "breadth_weakness": item("breadth_weakness", breadth_score, "Breadth unavailable" if breadth_missing else f"{breadth_value:.2f}% above 50DMA", breadth_missing),
         "iv_premium_quality": item("iv_premium_quality", 5, "IV percentile unavailable; using spread premium checks"),
         "options_liquidity": item("options_liquidity", liquidity_score, f"{valid_fno_count} configured F&O candidate(s); {liquidity} liquidity"),
-        "fii_flow_regime": item("fii_flow_regime", fii_score, fii_regime),
+        "fii_flow_regime": item("fii_flow_regime", fii_score, f"{fii_regime}; AUM {fii.get('fii_aum_pct')}%; 1Y {fii.get('one_year_flow_cr')} Cr; 2W {fii.get('fortnight_flow_cr')} Cr"),
         "event_risk": item("event_risk", 0 if event_risk else 5, "EVENT RISK - NO NEW SECTOR TRADE" if event_risk else "No configured sector event risk"),
         "rebound_risk": item("rebound_risk", 0 if rebound_risk == "EXTREME" else 2 if rebound_risk == "HIGH" else 4 if rebound_risk == "MODERATE" else 5, rebound_risk),
         "portfolio_capacity": item("portfolio_capacity", 0 if active_sector_exposure >= 3 else 3, f"{active_sector_exposure}/3 sector CE spreads used"),
@@ -336,6 +376,8 @@ def rank_all_sectors(
     sector_technicals: dict[str, dict[str, Any]] | None = None,
     fno_counts: dict[str, int] | None = None,
     active_exposure: dict[str, int] | None = None,
+    fii_snapshot_rows: Iterable[dict[str, Any]] | None = None,
+    fii_snapshot_status: str = "STATIC_SUPPLIED_SNAPSHOT",
     *,
     generated_at: str | None = None,
 ) -> dict[str, Any]:
@@ -346,6 +388,8 @@ def rank_all_sectors(
         calculate_sector_sell_on_rise_score(
             sector,
             sector_technical=technicals.get(sector, {}),
+            fii_snapshot_rows=fii_snapshot_rows,
+            fii_snapshot_status=fii_snapshot_status,
             valid_fno_count=int(counts.get(sector, len(configured_sector_symbols(sector)))),
             active_sector_exposure=int(exposure.get(sector, 0)),
         )

@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 import app
+import pytest
+from fii_sector_pdf_parser import (
+    FiiSectorPdfError,
+    FiiSectorPdfParser,
+    map_fii_sector_name,
+    normalize_indian_currency,
+    validate_pdf_upload,
+)
+from fii_sector_repository import FiiSectorSnapshotRepository
 from sector_income import (
     SECTOR_SCORE_WEIGHTS,
     SECTOR_INCOME_UNIVERSE,
@@ -13,6 +22,189 @@ from sector_income import (
     sector_options,
     validate_sector_fno_symbols,
 )
+
+
+FII_FIXTURE_TEXT = """
+30 Aug 2026
+Financial Services
+27.1% of AUM
++6,950 Cr Last fortnight
+-1,35,301 Cr 1Y net flow
+Automobile and Auto Components
+7.1% of AUM
++4,393 Cr Last fortnight
+-28,630 Cr 1Y net flow
+Healthcare
+6.8% of AUM
++2,910 Cr Last fortnight
+-24,869 Cr 1Y net flow
+Capital Goods
+6.5% of AUM
+-1,556 Cr Last fortnight
++16,914 Cr 1Y net flow
+Oil, Gas & Consumable Fuels
+6.0% of AUM
++492 Cr Last fortnight
+-15,517 Cr 1Y net flow
+Information Technology
+5.1% of AUM
++2,530 Cr Last fortnight
+-52,281 Cr 1Y net flow
+Telecommunication
+5.0% of AUM
+-3,322 Cr Last fortnight
+-7,789 Cr 1Y net flow
+Fast Moving Consumer Goods
+3.9% of AUM
+-189 Cr Last fortnight
+-48,177 Cr 1Y net flow
+Metals & Mining
+3.8% of AUM
++720 Cr Last fortnight
++25,344 Cr 1Y net flow
+Consumer Services
+3.7% of AUM
++3,398 Cr Last fortnight
+-14,766 Cr 1Y net flow
+Power
+3.4% of AUM
+-2,216 Cr Last fortnight
+-17,292 Cr 1Y net flow
+Consumer Durables
+2.6% of AUM
++1,472 Cr Last fortnight
+-2,192 Cr 1Y net flow
+Realty
+1.9% of AUM
+-1,206 Cr Last fortnight
+-13,202 Cr 1Y net flow
+Construction Materials
+1.4% of AUM
++384 Cr Last fortnight
+-9,604 Cr 1Y net flow
+"""
+
+
+def test_fii_sector_parser_validates_upload_and_numbers() -> None:
+    validate_pdf_upload(b"%PDF-1.7\nbody", "fii.pdf", "application/pdf")
+
+    assert normalize_indian_currency("₹ -1,35,301 Cr") == -135301.0
+    assert normalize_indian_currency("▲ + 6,950 Cr") == 6950.0
+    assert normalize_indian_currency("▼ -1,556 Cr") == -1556.0
+    assert normalize_indian_currency("1.00 Cr") == 1.0
+    assert map_fii_sector_name("Automobile and Auto Components") == "AUTOMOBILE_AUTO_COMPONENTS"
+    assert map_fii_sector_name("Unknown Theme") == "UNMAPPED"
+
+    with pytest.raises(FiiSectorPdfError):
+        validate_pdf_upload(b"not-pdf", "fii.txt", "text/plain")
+
+    with pytest.raises(FiiSectorPdfError):
+        validate_pdf_upload(b"%PDF-1.7" + (b"x" * (11 * 1024 * 1024)), "fii.pdf", "application/pdf")
+
+
+def test_fii_sector_parser_extracts_valid_screener_layout_text() -> None:
+    snapshot = FiiSectorPdfParser().parse_text(FII_FIXTURE_TEXT, source_filename="fii.pdf")
+    by_sector = {row.sector_code: row for row in snapshot.rows}
+
+    assert snapshot.extraction_status == "VALID"
+    assert snapshot.recognized_sector_count >= 8
+    assert by_sector["INFORMATION_TECHNOLOGY"].fii_aum_pct == 5.1
+    assert by_sector["INFORMATION_TECHNOLOGY"].fortnight_flow_cr == 2530.0
+    assert by_sector["INFORMATION_TECHNOLOGY"].one_year_flow_cr == -52281.0
+    assert by_sector["INFORMATION_TECHNOLOGY"].fii_regime == "RELIEF_RALLY_SELL_ON_RISE"
+    assert all(row.validation_status == "VALID" for row in snapshot.valid_rows())
+
+
+def test_fii_sector_parser_rejects_insufficient_or_duplicate_extraction() -> None:
+    with pytest.raises(FiiSectorPdfError):
+        FiiSectorPdfParser().parse_text(
+            """
+            Information Technology
+            5.1% of AUM
+            +2,530 Cr Last fortnight
+            -52,281 Cr 1Y net flow
+            """,
+            source_filename="fii.pdf",
+        )
+
+
+def test_fii_sector_repository_keeps_pending_until_activation(tmp_path) -> None:
+    repo = FiiSectorSnapshotRepository(tmp_path / "fii.db")
+    snapshot = FiiSectorPdfParser().parse_text(FII_FIXTURE_TEXT, source_filename="fii.pdf")
+
+    pending = repo.save_pending_snapshot(snapshot)
+
+    assert pending["active"] is False
+    assert repo.get_active_snapshot() is None
+
+    active = repo.activate_snapshot(int(pending["snapshot_id"]))
+
+    assert active["active"] is True
+    assert active["recognized_sector_count"] >= 8
+    assert repo.get_active_snapshot()["snapshot_id"] == pending["snapshot_id"]
+
+
+def test_sector_score_repository_persists_latest_calculation(tmp_path) -> None:
+    repo = FiiSectorSnapshotRepository(tmp_path / "fii.db")
+    saved = repo.save_sector_score_snapshot(
+        selected_sector="INFORMATION_TECHNOLOGY",
+        score={"sector_key": "INFORMATION_TECHNOLOGY", "sector_score": 88.5},
+        ranking={
+            "selected_sector": "INFORMATION_TECHNOLOGY",
+            "top_sectors": [{"sector_key": "INFORMATION_TECHNOLOGY", "sector_score": 88.5}],
+            "all_sectors": [],
+        },
+        source="TEST",
+    )
+
+    latest = repo.get_latest_sector_score_snapshot()
+
+    assert saved["score_snapshot_id"] == latest["score_snapshot_id"]
+    assert latest["selected_sector"] == "INFORMATION_TECHNOLOGY"
+    assert latest["score"]["sector_score"] == 88.5
+    assert latest["ranking"]["top_sectors"][0]["sector_score"] == 88.5
+
+
+def test_sector_income_parent_loads_saved_score_snapshot(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(app, "APP_DB_PATH", tmp_path / "app.db")
+    monkeypatch.setattr(app, "enrich_dhan_market_data_from_kite", lambda *args, **kwargs: (None, [], {}))
+    monkeypatch.setattr(app, "stock_moving_averages", lambda *args, **kwargs: {})
+    monkeypatch.setattr(app, "load_dhan_it_holding_position_rows", lambda: [])
+    monkeypatch.setattr(app, "build_sector_income_opportunities", lambda *args, **kwargs: ([], []))
+
+    repo = FiiSectorSnapshotRepository(app.APP_DB_PATH)
+    repo.save_sector_score_snapshot(
+        selected_sector="HEALTHCARE_PHARMA",
+        score={
+            "sector_key": "HEALTHCARE_PHARMA",
+            "sector_label": "Healthcare & Pharmaceuticals",
+            "sector_score": 91.25,
+            "component_scores": {},
+        },
+        ranking={
+            "selected_sector": "HEALTHCARE_PHARMA",
+            "top_sectors": [
+                {
+                    "rank": 1,
+                    "sector_key": "HEALTHCARE_PHARMA",
+                    "sector_label": "Healthcare & Pharmaceuticals",
+                    "sector_score": 91.25,
+                    "status": "GREEN",
+                    "confidence": "HIGH",
+                    "decision": "SCAN_TOP_4",
+                }
+            ],
+            "all_sectors": [],
+        },
+        source="TEST_PARENT_LOAD",
+    )
+
+    state = app.PageState(active_tab="sector-income")
+    app.load_sector_income_state(state)
+
+    assert state.sector_income_sector == "HEALTHCARE_PHARMA"
+    assert state.sector_income_score["sector_score"] == 91.25
+    assert state.sector_income_ranking["top_sectors"][0]["sector_score"] == 91.25
 
 
 def test_sector_income_selector_contains_configured_sectors() -> None:
@@ -31,8 +223,7 @@ def test_sector_income_scorecard_weights_and_default_sector_are_deterministic() 
 
     assert len(ranking["all_sectors"]) == len(SECTOR_INCOME_UNIVERSE)
     assert len(ranking["top_sectors"]) == 3
-    assert ranking["selected_sector"] == ""
-    assert ranking["message"] == "NO SECTOR CURRENTLY QUALIFIES"
+    assert ranking["selected_sector"] in SECTOR_INCOME_UNIVERSE
     assert ranking["generated_at"] == "2026-08-30T10:00:00+00:00"
 
     assert (
@@ -44,6 +235,28 @@ def test_sector_income_scorecard_weights_and_default_sector_are_deterministic() 
         )
         == "LOWER_SCORE_READY"
     )
+
+
+def test_sector_income_fii_snapshot_has_thirty_percent_weightage() -> None:
+    snapshot = FiiSectorPdfParser().parse_text(FII_FIXTURE_TEXT, source_filename="fii.pdf")
+    rows = [row.to_dict() for row in snapshot.rows]
+    score = calculate_sector_sell_on_rise_score(
+        "INFORMATION_TECHNOLOGY",
+        fii_snapshot_rows=rows,
+        sector_technical={"sector_regime": "BEARISH_RALLY", "today_change_pct": 1.5, "distance_50_pct": -1.0},
+        valid_fno_count=6,
+    )
+    metals = calculate_sector_sell_on_rise_score(
+        "METALS_MINING",
+        fii_snapshot_rows=rows,
+        sector_technical={"sector_regime": "BEARISH_RALLY", "today_change_pct": 1.5, "distance_50_pct": -1.0},
+        valid_fno_count=6,
+    )
+
+    assert SECTOR_SCORE_WEIGHTS["fii_flow_regime"] == 30
+    assert score["fii_source"] == "UPLOADED_PDF"
+    assert score["component_scores"]["fii_flow_regime"]["score"] == 30
+    assert metals["component_scores"]["fii_flow_regime"]["score"] == 0
 
 
 def test_sector_income_fii_flow_regimes_do_not_use_ownership_as_standalone_signal() -> None:
@@ -207,6 +420,15 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
             "generated_at": "2026-08-30T10:00:00+00:00",
         },
         sector_income_show_rank_modal=True,
+        sector_income_pending_fii_snapshot={
+            "snapshot_id": 99,
+            "report_date": "2026-08-30",
+            "source_filename": "fii.pdf",
+            "uploaded_at": "2026-08-30T10:00:00+00:00",
+            "recognized_sector_count": 14,
+            "rows": [row.to_dict() for row in FiiSectorPdfParser().parse_text(FII_FIXTURE_TEXT, source_filename="fii.pdf").rows],
+        },
+        sector_income_fii_upload_message="Extracted 14 valid FII sector row(s).",
         sector_income_cards=[],
         sector_income_holding_positions=[],
         sector_income_opportunities=[opportunity],
@@ -221,6 +443,14 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
     assert "Information Technology" in html
     assert "Top 3 Sector Ranking" in html
     assert 'id="sector-income-rank-modal"' in html
+    assert "SECTOR-Income - FII Upload & Sector Score Details" in html
+    assert 'name="sector_income_fii_pdf" type="file"' in html
+    assert 'formaction="/sector-income/upload-fii-pdf"' in html
+    assert 'formaction="/sector-income/activate-fii-snapshot"' in html
+    assert 'formaction="/sector-income/apply-sector"' in html
+    assert 'name="sector_income_ranking_json"' in html
+    assert 'name="sector_income_score_json"' in html
+    assert "Detailed Sector Score Comparison - All Sectors" in html
     assert 'formaction="/sector-income/recalculate-sectors"' in html
     assert "Sector Decision & FII Flow" in html
     assert "Current Kite Option Holdings / CE Pair Status" in html
