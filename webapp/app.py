@@ -138,10 +138,25 @@ from dhan_it_call_watch import (
     DHAN_IT_WATCH_SYMBOLS,
     NIFTY_IT_SYMBOL,
     build_dhan_it_card_view_model,
+    calculate_dma_distance,
+    classify_dhan_it_regime,
     classify_nifty_it_regime,
     evaluate_call_spread_dma_gate,
 )
 from dhan_fno_top10_engine import generate_dhan_top10_from_fno_sheet
+from sector_income import (
+    DEFAULT_SECTOR_PRIORITY,
+    SECTOR_LABELS,
+    SECTOR_SCORE_WEIGHTS,
+    calculate_sector_sell_on_rise_score,
+    configured_sector_symbols,
+    rank_all_sectors,
+    load_fii_sector_snapshot,
+    normalize_sector_key,
+    rank_sector_candidates,
+    sector_options,
+    validate_sector_fno_symbols,
+)
 
 # Compatibility aliases for the DHAN page wiring. These point to Kite-specific
 # modules/tables only; the visible page name is DHAN, execution remains Kite.
@@ -7623,6 +7638,16 @@ class PageState:
     dhan_it_repair_preview: dict[str, Any] | None = None
     dhan_it_confirm_repair_order: bool = False
     dhan_it_opportunities_generated_at: str = ""
+    sector_income_sector: str = ""
+    sector_income_rows: list[dict[str, Any]] | None = None
+    sector_income_cards: list[dict[str, Any]] | None = None
+    sector_income_holding_positions: list[dict[str, Any]] | None = None
+    sector_income_opportunities: list[dict[str, Any]] | None = None
+    sector_income_score: dict[str, Any] | None = None
+    sector_income_ranking: dict[str, Any] | None = None
+    sector_income_selected_index: str = ""
+    sector_income_generated_at: str = ""
+    sector_income_show_rank_modal: bool = False
 
 
 def mask_secret(value: str | None) -> str:
@@ -7852,6 +7877,7 @@ def is_app_page_request(path: str) -> bool:
         "/value-stock",
         "/kite-spreads",
         "/dhan-it",
+        "/sector-income",
         "/income-growth",
         "/commodity",
         "/analytics",
@@ -8165,7 +8191,7 @@ DHAN_IT_RESULT_NEWS_TERMS = {
 
 
 def fetch_dhan_it_sector_news_uncached() -> list[dict[str, str]]:
-    query = quote_plus("NIFTY IT TCS Infosys HCLTech Tech Mahindra Wipro LTIMindtree LTM results earnings NSE stock")
+    query = quote_plus("NIFTY IT TCS Infosys HCLTech Tech Mahindra Coforge COFORGE Mphasis MPHASIS Persistent Systems PERSISTENT LTIMindtree LTM results earnings NSE stock")
     url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     request = Request(url, headers={"User-Agent": "KiteTraderLocalApp/1.0"})
     with urlopen(request, timeout=8) as response:
@@ -24225,6 +24251,15 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             return "pnl-negative"
         return ""
 
+    def sort_number(value: Any) -> str:
+        try:
+            return f"{float(value):.6f}"
+        except (TypeError, ValueError):
+            return "-999999999999.000000"
+
+    def sort_header(label: str, col: int) -> str:
+        return f'<button type="button" class="sort-header" data-sort-col="{col}">{html.escape(label)}</button>'
+
     def option_chips(options: Any, side: str, fallback_symbol_text: str, fallback_qty: Any) -> str:
         option_rows = options if isinstance(options, list) else []
         css_side = "sell" if side == "SELL" else "buy"
@@ -24283,8 +24318,8 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             "<tr>"
             f"<td><strong>{html.escape(symbol)}</strong></td>"
             f"<td class=\"dhan-it-cmp-cell\"><strong>{money(row.get('cmp') or row.get('last_price'))}</strong></td>"
-            f"<td class=\"dhan-it-change-cell {day_change_class}\"><strong>{money(row.get('day_change_pct'))}%</strong></td>"
-            f"<td class=\"dhan-position-pnl-cell {pnl_class(row.get('option_pnl'))}\">{money(row.get('option_pnl'))}</td>"
+            f"<td class=\"dhan-it-change-cell {day_change_class}\" data-sort-value=\"{sort_number(row.get('day_change_pct'))}\"><strong>{money(row.get('day_change_pct'))}%</strong></td>"
+            f"<td class=\"dhan-position-pnl-cell {pnl_class(row.get('option_pnl'))}\" data-sort-value=\"{sort_number(row.get('option_pnl'))}\">{money(row.get('option_pnl'))}</td>"
             f"<td>{option_chips(row.get('sell_options'), 'SELL', str(row.get('sell_symbols') or ''), row.get('sell_qty_abs'))}</td>"
             f"<td>{option_chips(row.get('buy_options'), 'BUY', str(row.get('buy_symbols') or ''), row.get('buy_qty_abs'))}</td>"
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(pair_status)}</span></td>"
@@ -24298,8 +24333,8 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
         '<section class="panel dhan-it-position-panel">'
         '<div class="panel-title">Current Kite Option Holdings / CE Pair Status</div>'
         f'<p class="status">Scope locked to {html.escape(dhan_it_symbol_list_text())}. Equity holdings are intentionally hidden here; SELL CE is red and BUY hedge CE is green.</p>'
-        '<div class="table-wrap"><table class="ipo-table dhan-it-position-table">'
-        '<thead><tr><th>Stock</th><th>CMP</th><th>% Change</th><th>P&L</th><th>SELL CE Option Holdings</th><th>BUY CE Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th><th>Action</th></tr></thead>'
+        '<div class="table-wrap"><table id="dhan-it-position-table" class="ipo-table dhan-it-position-table">'
+        f'<thead><tr><th>Stock</th><th>CMP</th><th>{sort_header("% Change", 2)}</th><th>{sort_header("P&L", 3)}</th><th>SELL CE Option Holdings</th><th>BUY CE Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th><th>Action</th></tr></thead>'
         f'<tbody>{"".join(rendered_rows)}</tbody></table></div></section>'
     )
 
@@ -24909,6 +24944,441 @@ def build_dhan_it_opportunities(state: PageState) -> tuple[list[dict[str, Any]],
     except Exception as exc:
         notes.append(f"DHAN-IT DMA watch unavailable: {friendly_external_error(exc, 'DHAN-IT DMA watch')}")
     return opportunities, notes
+
+
+def build_sector_income_rows(sector_key: str) -> list[dict[str, Any]]:
+    key = normalize_sector_key(sector_key)
+    rows = []
+    for item in validate_sector_fno_symbols(key):
+        symbol = str(item.get("symbol") or "").strip().upper()
+        rows.append(
+            {
+                **item,
+                "sector_key": key,
+                "sector_label": SECTOR_LABELS.get(key, key.replace("_", " ").title()),
+                "company_name": symbol,
+                "risk_bucket": "MODERATE",
+                "target_short_otm_pct": 8.0,
+                "target_hedge_otm_pct": 13.0,
+                "short_call_delta_min": 0.12,
+                "short_call_delta_max": 0.18,
+                "max_open_spreads": 1,
+            }
+        )
+    return rows
+
+
+def load_sector_income_state(state: PageState) -> None:
+    ranking = rank_all_sectors()
+    requested_key = str(state.sector_income_sector or "").strip().upper()
+    key = normalize_sector_key(requested_key or ranking.get("selected_sector"))
+    rows = build_sector_income_rows(key)
+    symbols = [str(row.get("symbol") or "").strip().upper() for row in rows]
+    spot_by_symbol = _dhan_json_number_map(state.dhan_spot_json)
+    contracts_by_symbol = _dhan_json_contract_map(state.dhan_contracts_json)
+    _, notes, fresh_quotes = enrich_dhan_market_data_from_kite(symbols, spot_by_symbol, contracts_by_symbol)
+    available_from_contracts = set(contracts_by_symbol)
+    fno_rows = {row["symbol"]: row for row in validate_sector_fno_symbols(key, available_from_contracts)}
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        row.update(fno_rows.get(symbol, {}))
+        quote = fresh_quotes.get(symbol) or {}
+        if spot_by_symbol.get(symbol):
+            row["cmp"] = spot_by_symbol.get(symbol)
+        if quote.get("day_change_pct") is not None:
+            row["day_change_pct"] = quote.get("day_change_pct")
+        try:
+            row.update(stock_moving_averages(_dhan_it_yahoo_symbol(symbol)))
+        except Exception as exc:
+            row["dma_error"] = friendly_external_error(exc, "SECTOR-Income DMA")
+        sector_regime = "DATA_UNAVAILABLE"
+        row["stock_regime"] = classify_dhan_it_regime(row.get("cmp"), row.get("dma_50"), row.get("dma_200"))
+        row["distance_from_50dma_pct"] = calculate_dma_distance(row.get("cmp"), row.get("dma_50"))
+        row["distance_from_200dma_pct"] = calculate_dma_distance(row.get("cmp"), row.get("dma_200"))
+        row["nifty_it_regime"] = sector_regime
+        if notes:
+            row["source_note"] = "; ".join(notes[:2])
+
+    sector_proxy = next((row for row in rows if row.get("cmp") and row.get("dma_50") and row.get("dma_200")), {})
+    sector_technical = {
+        "sector_regime": classify_dhan_it_regime(sector_proxy.get("cmp"), sector_proxy.get("dma_50"), sector_proxy.get("dma_200")),
+        "distance_50_pct": calculate_dma_distance(sector_proxy.get("cmp"), sector_proxy.get("dma_50")),
+        "distance_200_pct": calculate_dma_distance(sector_proxy.get("cmp"), sector_proxy.get("dma_200")),
+    }
+    valid_fno_count = sum(1 for row in rows if row.get("fno_eligible"))
+    sector_score = calculate_sector_sell_on_rise_score(key, sector_technical=sector_technical, valid_fno_count=valid_fno_count)
+    sector_rank_rows = {
+        str(item.get("sector_key") or item.get("sector") or "").upper(): item
+        for item in (ranking.get("all_sectors") or [])
+    }
+    sector_rank_rows[key] = {**sector_rank_rows.get(key, {}), **sector_score}
+    ranking["all_sectors"] = sorted(
+        sector_rank_rows.values(),
+        key=lambda item: (
+            {"GREEN": 3, "AMBER": 2, "RED": 1}.get(str(item.get("status") or ""), 0),
+            {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNUSABLE": 0}.get(str(item.get("confidence") or ""), 0),
+            _dhan_metric_float(item.get("sector_score")),
+        ),
+        reverse=True,
+    )
+    for rank, item in enumerate(ranking["all_sectors"], start=1):
+        item["rank"] = rank
+    ranking["top_sectors"] = ranking["all_sectors"][:3]
+    ranking["selected_sector"] = key
+    ranked = rank_sector_candidates(rows, sector_score, top_n=4)
+    sector_regime = str(sector_score.get("sector_regime") or "DATA_UNAVAILABLE")
+    opportunities, notes = build_sector_income_opportunities(state, ranked, sector_score)
+    pair_by_symbol = _dhan_it_best_ce_preview_by_symbol(opportunities)
+    cards = [
+        build_dhan_it_card_view_model(
+            symbol=str(row.get("symbol") or ""),
+            label=str(row.get("company_name") or row.get("symbol") or ""),
+            market_data={**row, "event_risk": "NO"},
+            nifty_it_regime=sector_regime,
+            pair_preview=pair_by_symbol.get(str(row.get("symbol") or "").strip().upper()),
+        )
+        for row in ranked
+    ]
+    for card, row in zip(cards, ranked):
+        card["sector_label"] = sector_score.get("sector_label")
+        card["fii_regime"] = sector_score.get("fii_regime")
+        card["stock_score"] = row.get("stock_score")
+        card["decision"] = row.get("final_decision") if row.get("final_decision") != "ALLOWED" else card.get("decision")
+        card["reasons"] = row.get("reasons") or card.get("reasons") or []
+
+    state.sector_income_sector = key
+    state.sector_income_rows = ranked
+    state.sector_income_score = sector_score
+    state.sector_income_ranking = ranking
+    state.sector_income_cards = cards
+    state.sector_income_opportunities = opportunities
+    state.sector_income_generated_at = datetime.now(INDIA_TIME_ZONE).isoformat(timespec="seconds")
+    holdings = load_dhan_it_holding_position_rows()
+    allowed_symbols = {row["symbol"] for row in rows}
+    state.sector_income_holding_positions = [row for row in holdings if str(row.get("symbol") or "").strip().upper() in allowed_symbols]
+    state.dhan_it_pair_orders = DhanItPairRepository(APP_DB_PATH).list_pairs()
+
+
+def build_sector_income_opportunities(
+    state: PageState,
+    rows: list[dict[str, Any]],
+    sector_score: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    symbols = [str(row.get("symbol") or "").strip().upper() for row in rows if row.get("fno_eligible")]
+    spot_by_symbol = _dhan_json_number_map(state.dhan_spot_json)
+    contracts_by_symbol = _dhan_json_contract_map(state.dhan_contracts_json)
+    adapter, notes, fresh_quotes = enrich_dhan_market_data_from_kite(symbols, spot_by_symbol, contracts_by_symbol)
+    today = datetime.now(INDIA_TIME_ZONE).date()
+    sector_score = sector_score or state.sector_income_score or {}
+    opportunities: list[dict[str, Any]] = []
+    for rank, row in enumerate(rows, start=1):
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not row.get("fno_eligible", True):
+            continue
+        preview = build_dhan_it_spread(
+            symbol=symbol,
+            strategy_type="BEAR_CALL_SPREAD",
+            spot=spot_by_symbol.get(symbol) or row.get("cmp"),
+            lots=max(1, int(state.dhan_it_lots or 1)),
+            option_chain_data=contracts_by_symbol.get(symbol, []),
+            kite_adapter=adapter,
+            risk_engine=None,
+            market_data={"today": today},
+            technical_data={
+                "sell_otm_pct": float(row.get("target_short_otm_pct") or 8.0),
+                "hedge_otm_pct": float(row.get("target_hedge_otm_pct") or 13.0),
+                "min_pair_max_gain": getattr(risk_config, "DHAN_IT_MIN_PAIR_MAX_GAIN_INR", 2_000),
+                "min_pop": getattr(risk_config, "DHAN_IT_MIN_POP", 70.0),
+                "min_return_on_risk_pct": getattr(risk_config, "DHAN_IT_MIN_RETURN_ON_RISK_PCT", 8.0),
+                "max_acceptable_pair_loss": getattr(risk_config, "DHAN_IT_MAX_ACCEPTABLE_PAIR_LOSS_INR", 40_000),
+            },
+            event_data={"event_risk": False},
+        )
+        quote = fresh_quotes.get(symbol) or {}
+        preview.update(
+            {
+                "screen_name": "SECTOR-Income",
+                "rank": rank,
+                "sector_key": normalize_sector_key(state.sector_income_sector),
+                "sector_label": SECTOR_LABELS.get(normalize_sector_key(state.sector_income_sector), state.sector_income_sector),
+                "cmp": spot_by_symbol.get(symbol) or row.get("cmp"),
+                "day_change_pct": quote.get("day_change_pct", row.get("day_change_pct")),
+                "stock_score": row.get("stock_score"),
+                "sector_score": sector_score.get("sector_score"),
+                "fii_regime": sector_score.get("fii_regime"),
+                "option_quote_generated_at": datetime.now(INDIA_TIME_ZONE).astimezone(timezone.utc).isoformat(timespec="seconds"),
+            }
+        )
+        preview = apply_dhan_it_evaluation_expiry_mode(preview, state.dhan_it_expiry_mode)
+        opportunities.append(preview)
+    return opportunities, notes
+
+
+def render_sector_income_panel(state: PageState) -> str:
+    if state.active_tab == "sector-income" and state.sector_income_rows is None:
+        try:
+            load_sector_income_state(state)
+        except Exception as exc:
+            state.error = f"{friendly_external_error(exc, 'SECTOR-Income')}\n\n{traceback.format_exc()}"
+            state.sector_income_rows = build_sector_income_rows(state.sector_income_sector)
+            state.sector_income_opportunities = []
+            state.sector_income_cards = []
+    panel_style = "" if state.active_tab == "sector-income" else ' style="display:none"'
+    sector_key = normalize_sector_key(state.sector_income_sector)
+    score = state.sector_income_score or calculate_sector_sell_on_rise_score(sector_key)
+    rows = state.sector_income_rows or []
+    cards = state.sector_income_cards or []
+    opportunities = state.sector_income_opportunities or []
+
+    def text_value(value: Any, default: str = "-") -> str:
+        return str(value if value not in {None, ""} else default)
+
+    def money(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return "-"
+
+    def option(value: str, label: str, current: str) -> str:
+        selected = " selected" if str(current or "").upper() == value else ""
+        return f'<option value="{html.escape(value, quote=True)}"{selected}>{html.escape(label)}</option>'
+
+    sector_select = "".join(option(item["key"], item["label"], sector_key) for item in sector_options())
+    metric_cards = "".join(
+        f"<article><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></article>"
+        for label, value in [
+            ("Sector score", money(score.get("sector_score"))),
+            ("FII regime", text_value(score.get("fii_regime"))),
+            ("FII AUM", f"{money(score.get('fii_aum_pct'))}%"),
+            ("Fortnight flow", f"₹{money(score.get('fortnight_flow_cr'))} Cr"),
+            ("1Y flow", f"₹{money(score.get('one_year_flow_cr'))} Cr"),
+            ("Decision", text_value(score.get("decision"))),
+        ]
+    )
+    ranking = state.sector_income_ranking or rank_all_sectors()
+
+    def render_top_sector_cards() -> str:
+        cards_html: list[str] = []
+        for item in ranking.get("top_sectors", []):
+            sector = str(item.get("sector_key") or item.get("sector") or "")
+            status = str(item.get("status") or "RED").upper()
+            badge_class = "good" if status == "GREEN" else "neutral" if status == "AMBER" else "bad"
+            selected = sector == sector_key
+            button = (
+                f'<button type="submit" formaction="/sector-income/evaluate" name="sector_income_sector" value="{html.escape(sector, quote=True)}" class="commodity-buy-button">{"Selected - Load Top 4" if selected else "Select Sector"}</button>'
+                if status in {"GREEN", "AMBER"}
+                else '<button type="button" class="commodity-buy-button secondary" disabled>Sector Blocked</button>'
+            )
+            cards_html.append(
+                f"""
+                <article class="commodity-card dhan-it-watch-card dhan-it-watch-card-compact">
+                  <div class="dhan-it-watch-top"><div><strong>#{html.escape(text_value(item.get('rank')))} {html.escape(text_value(item.get('display_name') or item.get('sector_label')))}</strong><span>{html.escape(text_value(item.get('fii_regime')))}</span></div><span class="ipo-badge {badge_class}">{html.escape(status)}</span></div>
+                  <div class="dhan-it-watch-price-row"><div class="commodity-price">{money(item.get('score') or item.get('sector_score'))}</div><div class="commodity-change up">{html.escape(text_value(item.get('confidence')))}</div></div>
+                  <div class="dhan-it-watch-decision">{html.escape(text_value(item.get('decision')))}</div>
+                  <div class="dhan-it-watch-plan"><span>Liquidity {html.escape(text_value(item.get('liquidity_status')))}</span><span>Rebound {html.escape(text_value(item.get('rebound_risk')))}</span><span>F&O {html.escape(text_value(item.get('valid_fno_count')))}</span></div>
+                  <small class="status dhan-it-watch-note">{html.escape('; '.join(str(reason) for reason in (item.get('reasons') or [])[:2]))}</small>
+                  <div class="commodity-buy-form">{button}</div>
+                </article>
+                """
+            )
+        if not cards_html:
+            cards_html.append('<p class="status">NO SECTOR CURRENTLY QUALIFIES</p>')
+        return (
+            '<section class="panel commodity-panel dhan-it-watch-panel">'
+            '<div class="panel-title">Top 3 Sector Ranking</div>'
+            '<p class="status">Ranked by orderable status, data confidence, score, liquidity, rebound risk and event risk.</p>'
+            f'<div class="commodity-grid">{"".join(cards_html)}</div>'
+            '</section>'
+        )
+
+    def render_sector_rank_modal() -> str:
+        if not state.sector_income_show_rank_modal:
+            return ""
+        component_rows = []
+        for key_name, item in (score.get("component_scores") or {}).items():
+            component_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(key_name).replace('_', ' ').title())}</td>"
+                f"<td>{money(item.get('score'))}</td>"
+                f"<td>{html.escape(text_value(item.get('weight')))}</td>"
+                f"<td>{html.escape(text_value(item.get('detail')))}</td>"
+                "</tr>"
+            )
+        weights_total = sum(SECTOR_SCORE_WEIGHTS.values())
+        return f"""
+        <div class="live-modal-backdrop visible" id="sector-income-rank-modal"><div class="live-modal dhan-order-modal-card">
+          <h2>Sector Ranking Detail - {html.escape(SECTOR_LABELS.get(sector_key, sector_key))}</h2>
+          <p class="status">This score ranks sectors for defined-risk SELL CALL on rise scans only. It never bypasses stock, option, liquidity, event, max-loss, or hedge-first checks.</p>
+          <div class="dhan-ticket-summary">{metric_cards}<article><span>Weight total</span><strong>{weights_total}</strong><small>Expected 100</small></article></div>
+          <section class="panel"><div class="panel-title">Why this sector?</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Component</th><th>Score</th><th>Weight</th><th>Detail</th></tr></thead><tbody>{"".join(component_rows)}</tbody></table></div></section>
+          <div class="modal-actions">
+            <button type="submit" class="secondary" formaction="/sector-income/rank-close">Close</button>
+            <button type="submit" formaction="/sector-income/recalculate-sectors">Rerun Sector Evaluation</button>
+          </div>
+        </div></div>
+        """
+
+    card_html = ""
+    if cards:
+        card_html = (
+            render_dhan_it_call_watch(cards)
+            .replace("DHAN-IT Call Spread Watch", "Top 4 Sector Call-Spread Cards")
+            .replace('formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol"', 'formaction="/sector-income/open-symbol" name="sector_income_open_symbol"')
+        )
+    else:
+        card_html = '<section class="panel"><div class="panel-title">Top 4 Sector Call-Spread Cards</div><p class="status">Run sector scan to build cards.</p></section>'
+    holding_html = render_dhan_it_holding_positions(state.sector_income_holding_positions or []).replace(
+        f"Scope locked to {html.escape(dhan_it_symbol_list_text())}.",
+        f"Scope locked to {html.escape(SECTOR_LABELS.get(sector_key, sector_key))}.",
+    )
+    row_html = []
+    for row in rows:
+        status_class = "good" if row.get("final_decision") == "ALLOWED" else "neutral" if row.get("final_decision") == "CONFIRM_REQUIRED" else "bad"
+        row_html.append(
+            "<tr>"
+            f"<td>{html.escape(text_value(row.get('stock_score')))}</td><td><strong>{html.escape(text_value(row.get('symbol')))}</strong></td>"
+            f"<td>{money(row.get('cmp'))}<small>{money(row.get('day_change_pct'))}%</small></td><td>{html.escape(text_value(row.get('stock_regime')))}</td>"
+            f"<td>{money(row.get('dma_50'))}</td><td>{money(row.get('dma_200'))}</td><td>{money(row.get('distance_from_50dma_pct'))}%</td>"
+            f"<td>{money(row.get('distance_from_200dma_pct'))}%</td><td>{html.escape(text_value(row.get('fno_eligible')))}</td>"
+            f"<td><span class=\"ipo-badge {status_class}\">{html.escape(text_value(row.get('final_decision')))}</span></td>"
+            f"<td>{html.escape('; '.join(str(item) for item in (row.get('reasons') or [])) or text_value(row.get('status')))}</td>"
+            "</tr>"
+        )
+    if not row_html:
+        row_html.append('<tr><td colspan="11" class="muted-cell">Run sector scan to rank top four stocks.</td></tr>')
+    opp_rows = []
+    for idx, row in enumerate(opportunities):
+        opp_rows.append(
+            "<tr>"
+            f"<td>{html.escape(text_value(row.get('rank')))}</td>"
+            f"<td><button type=\"submit\" class=\"mini-link button-link\" formaction=\"/sector-income/preview\" name=\"sector_income_selected_index\" value=\"{idx}\">{html.escape(text_value(row.get('symbol')))}<small>Open order ticket</small></button></td>"
+            f"<td>{money(row.get('sector_score'))}</td><td>{money(row.get('stock_score'))}</td><td>{html.escape(text_value(row.get('fii_regime')))}</td>"
+            f"<td>{money(row.get('cmp') or row.get('spot'))}</td><td>{money(row.get('day_change_pct'))}%</td><td>{html.escape(text_value(row.get('expiry')))}</td>"
+            f"<td>{html.escape(text_value(row.get('sell_leg_tradingsymbol')))}</td><td>{html.escape(text_value(row.get('buy_leg_tradingsymbol')))}</td>"
+            f"<td>{money(row.get('sell_leg_premium'))}</td><td>{money(row.get('buy_leg_premium'))}</td><td>{money(row.get('net_credit'))}</td>"
+            f"<td>{money(row.get('max_gain'))}</td><td>{money(row.get('max_loss'))}</td><td>{money(row.get('pop_estimate'))}%</td><td>{money(row.get('return_on_risk_pct'))}%</td>"
+            f"<td>{html.escape(text_value(row.get('pair_liquidity_condition') or row.get('liquidity_view')))}</td><td>{html.escape(text_value(row.get('risk_decision')))}</td>"
+            f"<td>{html.escape(text_value(row.get('risk_reason') or row.get('recommendation_reason') or row.get('reason')))}</td>"
+            "</tr>"
+        )
+    if not opp_rows:
+        opp_rows.append('<tr><td colspan="20" class="muted-cell">No sector CE opportunity data yet. Run Scan Selected Sector.</td></tr>')
+    snapshot = load_fii_sector_snapshot()
+    opportunities_json = html.escape(json.dumps(opportunities, default=str), quote=True)
+    selected_preview = ""
+    selected_idx = int(float(state.sector_income_selected_index)) if str(state.sector_income_selected_index or "").isdigit() else -1
+    if 0 <= selected_idx < len(opportunities):
+        selected = dict(opportunities[selected_idx])
+        selected = apply_dhan_result_date_guard(selected)
+        is_orderable = dhan_pair_is_defined_risk_orderable(selected, allow_red_liquidity=state.dhan_it_paper_trading)
+        quality_auto_clear = dhan_it_quality_override_clears(selected) or dhan_pair_quality_auto_clears(selected)
+        if bool(selected.get("result_date_near")):
+            is_orderable = False
+            quality_auto_clear = False
+        submit_mode = "PAPER" if state.dhan_it_paper_trading else "LIVE"
+        max_loss_value = money(selected.get("max_loss"))
+        review_disabled = "" if is_orderable or quality_auto_clear or state.dhan_it_confirm_order else " disabled"
+        submit_class = "danger" if submit_mode == "LIVE" else "secondary"
+        confirm_checked = " checked" if state.dhan_it_confirm_order else ""
+        selected_preview = f"""
+        <div class="live-modal-backdrop visible" id="dhan-it-order-modal"><div class="live-modal dhan-order-modal-card">
+          <h2>SECTOR-Income Order Ticket - {html.escape(text_value(selected.get('symbol')))}</h2>
+          <p class="status">Defined-risk sector CE spread. BUY hedge is submitted first; SELL leg is placed by the monitor only after hedge fill.</p>
+          <input type="hidden" name="sector_income_selected_index" value="{selected_idx}">
+          <input type="hidden" name="dhan_it_selected_index" value="{selected_idx}">
+          <input type="hidden" name="dhan_it_trade_mode" value="{html.escape(submit_mode, quote=True)}">
+          <div class="dhan-ticket-summary">
+            <article><span>Sector</span><strong>{html.escape(text_value(selected.get('sector_label')))}</strong><small>Score {money(selected.get('sector_score'))} | {html.escape(text_value(selected.get('fii_regime')))}</small></article>
+            <article><span>POP / RoR</span><strong>{money(selected.get('pop_estimate'))}% / {money(selected.get('return_on_risk_pct'))}%</strong><small>Probability and return on risk</small></article>
+            <article><span>Max Gain / Loss</span><strong>{money(selected.get('max_gain'))} / {max_loss_value}</strong><small>Defined-risk pair</small></article>
+            <article><span>Next result date</span><strong>{html.escape(text_value(selected.get('next_result_date_display'), 'Not available'))}</strong><small>{html.escape(text_value(selected.get('result_date_message'), 'NO near by results date'))}</small></article>
+          </div>
+          <div class="dhan-it-execution-leg-grid">
+            <article class="dhan-it-execution-leg sell"><span>SELL CE</span><strong>{html.escape(text_value(selected.get('sell_leg_tradingsymbol')))}</strong><small>Qty {html.escape(text_value(selected.get('quantity')))} | LIMIT/CMP {money(selected.get('sell_limit_price'))} | Expiry {html.escape(text_value(selected.get('sell_expiry') or selected.get('expiry')))}</small></article>
+            <article class="dhan-it-execution-leg buy"><span>BUY HEDGE</span><strong>{html.escape(text_value(selected.get('buy_leg_tradingsymbol')))}</strong><small>Qty {html.escape(text_value(selected.get('quantity')))} | LIMIT/CMP {money(selected.get('buy_limit_price'))} | Expiry {html.escape(text_value(selected.get('buy_expiry') or selected.get('expiry')))}</small></article>
+          </div>
+          <div class="income-equity-order-summary">Sector score is only a ranking input. Final permission still requires valid CE legs, positive credit, max-loss guard, result-date guard, liquidity checks and hedge-first execution.</div>
+          {render_pair_liquidity_section(selected, paper_mode=state.dhan_it_paper_trading, strict_red_blocks=not state.dhan_it_paper_trading)}
+          <label class="inline-check"><input id="dhan-it-confirm-order" type="checkbox" name="dhan_it_confirm_order" value="1" data-orderable="{'1' if is_orderable else '0'}" data-auto-clear="{'1' if quality_auto_clear else '0'}"{confirm_checked}> I UNDERSTAND the RISK of MAX LOSS ₹{html.escape(max_loss_value)} for this sector paired order.</label>
+          <div class="breath-circle income-pe-breath" id="dhan-it-breath"></div>
+          <div class="breath-text" id="dhan-it-breath-text">Tick max-loss acknowledgement to start 10s review</div>
+          <div class="countdown" id="dhan-it-countdown">10</div>
+          <div class="modal-actions">
+            <button type="submit" class="secondary" formaction="/sector-income/close-popup">Cancel</button>
+            <button id="dhan-it-review" type="button" class="secondary"{review_disabled}>Start 10s Review</button>
+            <button id="dhan-it-place-order" type="submit" class="{submit_class}" formaction="/sector-income/submit" disabled>Place Order</button>
+          </div>
+        </div></div>
+        """
+    sector_symbols = set(configured_sector_symbols(sector_key))
+    pair_orders = [
+        row
+        for row in (state.dhan_it_pair_orders or [])
+        if str(row.get("symbol") or "").strip().upper() in sector_symbols
+    ]
+    pair_rows = []
+    for row in pair_orders:
+        pair_rows.append(
+            "<tr>"
+            f"<td>{html.escape(text_value(row.get('pair_id')))}</td><td>{html.escape(text_value(row.get('symbol')))}</td><td>{html.escape(text_value(row.get('strategy_type')))}</td><td>{html.escape(text_value(row.get('expiry')))}</td>"
+            f"<td>{html.escape(text_value(row.get('sell_leg_tradingsymbol')))}</td><td>{html.escape(text_value(row.get('buy_leg_tradingsymbol')))}</td><td>{html.escape(text_value(row.get('sell_leg_status')))}</td><td>{html.escape(text_value(row.get('buy_leg_status')))}</td>"
+            f"<td>{html.escape(text_value(row.get('pair_status')))}</td><td>{money(row.get('net_credit_expected'))}</td><td>{money(row.get('max_gain'))}</td><td>{money(row.get('max_loss'))}</td><td>{html.escape(text_value(row.get('last_checked_at')))}</td>"
+            "</tr>"
+        )
+    if not pair_rows:
+        pair_rows.append('<tr><td colspan="13" class="muted-cell">No SECTOR-Income pair orders for this selected sector yet.</td></tr>')
+    monitor_status = dhan_it_scheduler_status()
+    monitor_running = bool(monitor_status.get("running"))
+    monitor_result = dict(monitor_status.get("last_result") or {})
+    monitor_summary = (
+        f"Checked {monitor_result.get('checked', 0)} | modified {monitor_result.get('modified', 0)} | placed {monitor_result.get('placed', 0)} | failed {monitor_result.get('failed', 0)}"
+        if monitor_result
+        else "No scheduler run recorded yet."
+    )
+    return f"""
+    <form id="sector-income-panel" method="post" action="/sector-income/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <input type="hidden" name="sector_income_opportunities_json" value="{opportunities_json}">
+      <input type="hidden" name="sector_income_generated_at" value="{html.escape(state.sector_income_generated_at, quote=True)}">
+      <input type="hidden" name="dhan_it_opportunities_json" value="{opportunities_json}">
+      <input type="hidden" name="dhan_it_opportunities_generated_at" value="{html.escape(state.sector_income_generated_at, quote=True)}">
+      <input type="hidden" name="dhan_spot_json" value="{html.escape(state.dhan_spot_json, quote=True)}">
+      <input type="hidden" name="dhan_contracts_json" value="{html.escape(state.dhan_contracts_json, quote=True)}">
+      <section class="panel dhan-hero"><div><div class="panel-title">SECTOR-Income</div><p class="status">Sector sell-on-rise engine. Start with IT, but scan every selected sector using FII flow, DMA regime, option liquidity and existing positions.</p></div></section>
+      <section class="panel"><div class="panel-title">Sector Controls</div><div class="compact-grid">
+        <label><span>Sector</span><select name="sector_income_sector">{sector_select}</select></label>
+        <label><span>Expiry mode</span><select name="dhan_it_expiry_mode">{option("CURRENT_AND_NEXT", "Current + Next Month", state.dhan_it_expiry_mode)}{option("AUTO_COMPARE", "Auto Compare", state.dhan_it_expiry_mode)}{option("CURRENT_MONTH", "Current Month Only", state.dhan_it_expiry_mode)}{option("NEXT_MONTH", "Next Month Only", state.dhan_it_expiry_mode)}</select></label>
+        <label><span>Lots</span><input name="dhan_it_lots" value="{html.escape(str(state.dhan_it_lots), quote=True)}"></label>
+        <label><span>Mode</span><select name="dhan_it_trade_mode">{option("PAPER", "Paper", "PAPER" if state.dhan_it_paper_trading else "LIVE")}{option("LIVE", "Live", "PAPER" if state.dhan_it_paper_trading else "LIVE")}</select></label>
+        <button type="submit" formaction="/sector-income/evaluate">Scan Selected Sector</button>
+        <button type="submit" class="secondary" formaction="/sector-income/rank-detail" name="sector_income_show_rank_modal" value="1">Sector Score Details</button>
+      </div><p class="status">FII snapshot: {html.escape(snapshot.snapshot_date)} | {html.escape(snapshot.source_label)} | {html.escape(snapshot.freshness_status)}. Default priority: {html.escape(', '.join(SECTOR_LABELS.get(item, item) for item in DEFAULT_SECTOR_PRIORITY))}.</p></section>
+      {render_top_sector_cards()}
+      {render_sector_rank_modal()}
+      <section class="panel"><div class="panel-title">Sector Decision & FII Flow</div><div class="dhan-ticket-summary">{metric_cards}</div><p class="status">{html.escape('; '.join(str(item) for item in (score.get('reasons') or [])))}</p></section>
+      {card_html}
+      {holding_html}
+      <section class="panel"><div class="panel-title">Top Four Stock Ranking</div><div class="table-wrap"><table id="sector-income-ranking-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Score</th><th>Symbol</th><th class="sort-header" data-sort-col="2">CMP / Day</th><th>Regime</th><th>50 DMA</th><th>200 DMA</th><th>50D Dist</th><th>200D Dist</th><th>F&O</th><th>Decision</th><th>Reasons</th></tr></thead><tbody>{''.join(row_html)}</tbody></table></div></section>
+      <section class="panel"><div class="panel-title">Opportunity Table</div><p class="status">Only defined-risk CE pairs are shown. Click a symbol to open the existing hedge-first DHAN-IT ticket with 10-second review.</p><div class="table-wrap"><table id="sector-income-opportunity-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Rank</th><th>Symbol</th><th class="sort-header" data-sort-col="2">Sector Score</th><th class="sort-header" data-sort-col="3">Stock Score</th><th>FII Regime</th><th class="sort-header" data-sort-col="5">CMP</th><th class="sort-header" data-sort-col="6">Today %</th><th>Expiry</th><th>Short CE</th><th>Hedge CE</th><th>Sell Prem</th><th>Hedge Prem</th><th>Net Credit</th><th class="sort-header" data-sort-col="13">Max Profit</th><th class="sort-header" data-sort-col="14">Max Loss</th><th class="sort-header" data-sort-col="15">POP</th><th class="sort-header" data-sort-col="16">RoR</th><th>Liquidity</th><th>Decision</th><th>Reasons</th></tr></thead><tbody>{''.join(opp_rows)}</tbody></table></div></section>
+      {selected_preview}
+      <section class="panel dhan-monitor-panel">
+        <div class="panel-title">Pair Order Monitor</div>
+        <div class="dhan-job-status">
+          <article><span>Job Status</span><strong><span class="ipo-badge {'good' if monitor_running else 'neutral'}">{'RUNNING' if monitor_running else 'STOPPED'}</span></strong><small>Shared hedge-first monitor</small></article>
+          <article><span>Interval</span><strong>{html.escape(str(monitor_status.get('interval_seconds') or '-'))}s</strong><small>Auto SELL-leg checks</small></article>
+          <article><span>Last Run</span><strong>{html.escape(text_value(monitor_status.get('last_run_at')))}</strong><small>{html.escape(monitor_summary)}</small></article>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/sector-income/monitor-run" class="secondary">Run Scheduler Now</button>
+          <button type="submit" formaction="/sector-income/scheduler-start" class="secondary">Start Scheduler</button>
+          <button type="submit" formaction="/sector-income/scheduler-stop" class="secondary">Stop Scheduler</button>
+          <button type="submit" formaction="/sector-income/load" class="secondary">Refresh Order Book</button>
+          <button type="submit" formaction="/sector-income/clear-pair-monitor" class="secondary danger-link" onclick="return confirm('Clear shared local SECTOR/DHAN-IT Pair Order Monitor history? This will NOT cancel or modify Kite orders.');">Clear Monitor</button>
+        </div>
+        <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Pair ID</th><th>Symbol</th><th>Strategy</th><th>Expiry</th><th>Sell Leg</th><th>Buy Hedge Leg</th><th>Sell Status</th><th>Hedge Status</th><th>Pair Status</th><th>Expected Credit</th><th>Max Gain</th><th>Max Loss</th><th>Last Checked</th></tr></thead><tbody>{''.join(pair_rows)}</tbody></table></div>
+      </section>
+    </form>
+    """
 
 
 def render_dhan_it_panel(state: PageState) -> str:
@@ -31225,6 +31695,7 @@ def render_page(state: PageState) -> bytes:
     value_stock_tab_class = "active" if state.active_tab == "value-stock" else ""
     dhan_tab_class = "active" if state.active_tab == "kite-spreads" else ""
     dhan_it_tab_class = "active" if state.active_tab == "dhan-it" else ""
+    sector_income_tab_class = "active" if state.active_tab == "sector-income" else ""
     nifty_income_tab_class = "active" if state.active_tab == "nifty-income" else ""
     nifty_grow_tab_class = "active" if state.active_tab == "nifty-grow" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
@@ -37926,6 +38397,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {value_stock_tab_class}" type="button" data-tab="value-stock">Value-Stock</button>
       <button class="tab-button utility-action {dhan_tab_class}" type="button" data-tab="kite-spreads">DHAN</button>
       <button class="tab-button utility-action {dhan_it_tab_class}" type="button" data-tab="dhan-it">DHAN-IT</button>
+      <button class="tab-button utility-action {sector_income_tab_class}" type="button" data-tab="sector-income">SECTOR-Income</button>
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       {f'<button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>' if nifty_income_enabled else ''}
@@ -38069,6 +38541,7 @@ def render_page(state: PageState) -> bytes:
     {render_value_stock_panel(state)}
     {render_kite_spreads_panel(state)}
     {render_dhan_it_panel(state)}
+    {render_sector_income_panel(state)}
     {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
   </main>
@@ -38292,6 +38765,9 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(document.getElementById('dhan-opportunity-table'));
     enableTableSorting(document.getElementById('dhan-it-opportunity-table'));
     enableTableSorting(document.getElementById('dhan-it-comparison-table'));
+    enableTableSorting(document.getElementById('dhan-it-position-table'));
+    enableTableSorting(document.getElementById('sector-income-ranking-table'));
+    enableTableSorting(document.getElementById('sector-income-opportunity-table'));
     enableTableSorting(document.getElementById('value-stock-comparison-table'));
     enableTableSorting(document.getElementById('equity-holdings-table'));
     enableTableSorting(document.getElementById('ipo-listed-table'));
@@ -38387,6 +38863,7 @@ def render_page(state: PageState) -> bytes:
       document.getElementById('value-stock-panel').style.display = active === 'value-stock' ? '' : 'none';
       document.getElementById('kite-spreads-panel').style.display = active === 'kite-spreads' ? '' : 'none';
       document.getElementById('dhan-it-panel').style.display = active === 'dhan-it' ? '' : 'none';
+      document.getElementById('sector-income-panel').style.display = active === 'sector-income' ? '' : 'none';
       document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
       document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
       for (const item of document.querySelectorAll('.tab-button')) {{
@@ -38417,6 +38894,7 @@ def render_page(state: PageState) -> bytes:
           'value-stock': '/value-stock',
           'kite-spreads': '/kite-spreads',
           'dhan-it': '/dhan-it',
+          'sector-income': '/sector-income',
           'income-growth': '/income-growth',
           commodity: '/commodity',
           'order-management': '/orders',
@@ -40784,6 +41262,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.error = f"{friendly_external_error(exc, 'DHAN-IT')}\n\n{traceback.format_exc()}"
             self.send_page(state)
             return
+        if parsed_url.path == "/sector-income":
+            state = PageState(active_tab="sector-income")
+            try:
+                load_sector_income_state(state)
+            except Exception as exc:
+                state.error = f"{friendly_external_error(exc, 'SECTOR-Income')}\n\n{traceback.format_exc()}"
+            self.send_page(state)
+            return
         if parsed_url.path == "/income":
             state = PageState(active_tab="income")
             try:
@@ -41148,6 +41634,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/kite-spreads")
                 else "dhan-it"
                 if request_path.startswith("/dhan-it")
+                else "sector-income"
+                if request_path.startswith("/sector-income")
                 else "income-growth"
                 if request_path.startswith("/income-growth")
                 else "income"
@@ -41339,6 +41827,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             dhan_it_confirm_repair_order=checked(form, "dhan_it_confirm_repair_order"),
             dhan_it_opportunities=_dhan_json_loads(first(form, "dhan_it_opportunities_json"), []),
             dhan_it_opportunities_generated_at=first(form, "dhan_it_opportunities_generated_at"),
+            sector_income_sector=normalize_sector_key(first(form, "sector_income_sector")) if first(form, "sector_income_sector") else "",
+            sector_income_selected_index=first(form, "sector_income_selected_index"),
+            sector_income_opportunities=_dhan_json_loads(first(form, "sector_income_opportunities_json") or first(form, "dhan_it_opportunities_json"), []),
+            sector_income_generated_at=first(form, "sector_income_generated_at") or first(form, "dhan_it_opportunities_generated_at"),
+            sector_income_show_rank_modal=checked(form, "sector_income_show_rank_modal"),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -42932,6 +43425,134 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 load_dhan_state(state)
                 state.message = f"Cleared DHAN Pair Order Monitor locally: {deleted.get('pair_orders_deleted', 0)} pair row(s) removed. Kite orders were not changed."
+            elif request_path in {"/sector-income/load", "/sector-income/evaluate"}:
+                load_sector_income_state(state)
+                state.message = (
+                    f"Scanned {SECTOR_LABELS.get(state.sector_income_sector, state.sector_income_sector)} "
+                    f"and ranked {len(state.sector_income_rows or [])} sector candidate(s)."
+                )
+            elif request_path == "/sector-income/open-symbol":
+                selected_symbol = str(first(form, "sector_income_open_symbol") or "").strip().upper()
+                if selected_symbol not in set(configured_sector_symbols(state.sector_income_sector)):
+                    raise ValueError("Choose one valid stock from the selected SECTOR-Income universe.")
+                load_sector_income_state(state)
+                selected_idx = next(
+                    (
+                        idx
+                        for idx, item in enumerate(state.sector_income_opportunities or [])
+                        if str(item.get("symbol") or "").strip().upper() == selected_symbol
+                    ),
+                    -1,
+                )
+                if selected_idx < 0:
+                    raise ValueError(f"No defined-risk CE pair could be built for {selected_symbol}.")
+                state.sector_income_selected_index = str(selected_idx)
+                state.dhan_it_selected_index = ""
+                state.active_tab = "sector-income"
+                state.message = f"Opened SECTOR-Income {selected_symbol} hedge-first execution ticket."
+            elif request_path == "/sector-income/preview":
+                if not state.sector_income_opportunities:
+                    raise ValueError("Run Scan Selected Sector before opening a sector order ticket.")
+                selected_idx = int(float(state.sector_income_selected_index or "-1"))
+                if not 0 <= selected_idx < len(state.sector_income_opportunities):
+                    raise ValueError("Select one SECTOR-Income opportunity row before preview.")
+                state.dhan_it_selected_index = ""
+                state.active_tab = "sector-income"
+                state.message = (
+                    "Opened SECTOR-Income opportunity in the hedge-first execution ticket. "
+                    "Review max loss, acknowledge risk, then use the 10-second countdown."
+                )
+            elif request_path == "/sector-income/close-popup":
+                state.sector_income_selected_index = ""
+                state.dhan_it_selected_index = ""
+                state.dhan_it_confirm_order = False
+                load_sector_income_state(state)
+                state.message = "Closed SECTOR-Income paired-spread popup."
+            elif request_path == "/sector-income/rank-detail":
+                load_sector_income_state(state)
+                state.sector_income_show_rank_modal = True
+                state.message = "Opened sector ranking detail."
+            elif request_path == "/sector-income/rank-close":
+                load_sector_income_state(state)
+                state.sector_income_show_rank_modal = False
+                state.message = "Closed sector ranking detail."
+            elif request_path == "/sector-income/recalculate-sectors":
+                state.sector_income_sector = ""
+                load_sector_income_state(state)
+                state.sector_income_show_rank_modal = True
+                state.message = "Recalculated all sectors and selected the highest ranked eligible sector."
+            elif request_path == "/sector-income/submit":
+                if not state.sector_income_opportunities:
+                    raise ValueError("SECTOR-Income opportunity data is missing. Rerun sector scan before placing orders.")
+                selected_idx = int(float(state.sector_income_selected_index or state.dhan_it_selected_index or "-1"))
+                if selected_idx < 0 or selected_idx >= len(state.sector_income_opportunities):
+                    raise ValueError("Select one SECTOR-Income opportunity row before submitting.")
+                submit_mode = "PAPER" if state.dhan_it_paper_trading else "LIVE"
+                repository = DhanItPairRepository(APP_DB_PATH)
+                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
+                try:
+                    selected_opportunity = apply_dhan_result_date_guard(dict(state.sector_income_opportunities[selected_idx]))
+                    if bool(selected_opportunity.get("result_date_near")):
+                        raise ValueError(str(selected_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))
+                    strict_orderable = dhan_pair_is_defined_risk_orderable(
+                        selected_opportunity,
+                        allow_red_liquidity=state.dhan_it_paper_trading,
+                    )
+                    quality_auto_clear = dhan_it_quality_override_clears(selected_opportunity) or dhan_pair_quality_auto_clears(selected_opportunity)
+                    if not (strict_orderable or quality_auto_clear or state.dhan_it_confirm_order):
+                        raise ValueError(
+                            f"SECTOR-Income pair is not orderable: {selected_opportunity.get('risk_reason') or selected_opportunity.get('reason')}"
+                        )
+                    if str(selected_opportunity.get("risk_decision") or "").upper() != "APPROVED":
+                        selected_opportunity["risk_override"] = "SECTOR_INCOME_USER_CONFIRMED_DEFINED_RISK_PAIR"
+                        selected_opportunity["risk_decision_original"] = selected_opportunity.get("risk_decision")
+                        selected_opportunity["risk_decision"] = "APPROVED"
+                        selected_opportunity["risk_reason"] = "User confirmed SECTOR-Income defined-risk paired spread."
+                        selected_opportunity["reason"] = selected_opportunity["risk_reason"]
+                    outcome = submit_dhan_it_pair(
+                        selected_opportunity,
+                        repository,
+                        broker,
+                        user_confirmed=state.dhan_it_confirm_order or quality_auto_clear,
+                        mode=submit_mode,
+                    )
+                    repository.export_outputs(state.sector_income_opportunities)
+                    state.console_log = (
+                        "SECTOR-Income hedge-first order log\n"
+                        f"Pair ID: {outcome.get('pair_id')}\n"
+                        f"BUY hedge order: {outcome.get('buy_leg_order_id') or '-'}\n"
+                        f"SELL short order: {outcome.get('sell_leg_order_id') or 'waiting for monitor after hedge fill'}\n"
+                        f"Mode: {outcome.get('mode')}\n"
+                    )
+                    state.sector_income_selected_index = ""
+                    state.dhan_it_selected_index = ""
+                    state.dhan_it_confirm_order = False
+                except Exception:
+                    state.console_log = "SECTOR-Income Kite order error log\n" + traceback.format_exc()
+                    raise
+                load_sector_income_state(state)
+                state.message = f"Submitted SECTOR-Income paired spread {outcome.get('pair_id')} in {submit_mode.lower()} mode. Monitor will place SELL after BUY hedge is complete."
+            elif request_path == "/sector-income/monitor-run":
+                result = run_dhan_it_scheduler_now(paper_trading=state.dhan_it_paper_trading)
+                load_sector_income_state(state)
+                state.message = (
+                    f"SECTOR-Income scheduler checked {result.get('checked')} pair(s), modified {result.get('modified', 0)}, "
+                    f"placed {result.get('placed')} SELL leg(s), failed {result.get('failed')}, exit-required {result.get('exit_required')}."
+                )
+            elif request_path == "/sector-income/scheduler-start":
+                started = start_dhan_it_scheduler(paper_trading=state.dhan_it_paper_trading)
+                load_sector_income_state(state)
+                state.message = "Started SECTOR-Income scheduler." if started else "SECTOR-Income scheduler is already running."
+            elif request_path == "/sector-income/scheduler-stop":
+                stopped = stop_dhan_it_scheduler()
+                load_sector_income_state(state)
+                state.message = "Stopped SECTOR-Income scheduler." if stopped else "SECTOR-Income scheduler was not running."
+            elif request_path == "/sector-income/clear-pair-monitor":
+                repository = DhanItPairRepository(APP_DB_PATH)
+                deleted = repository.clear_pair_monitor()
+                repository.export_outputs(state.sector_income_opportunities)
+                load_sector_income_state(state)
+                state.message = f"Cleared shared SECTOR/DHAN-IT Pair Order Monitor locally: {deleted.get('pair_orders_deleted', 0)} pair row(s) removed. Kite orders were not changed."
             elif request_path == "/dhan-it/load":
                 load_dhan_it_state(state)
                 state.message = "Loaded DHAN-IT universe and pair monitor."

@@ -111,23 +111,36 @@ def approved_preview() -> dict:
     return preview
 
 
-def test_dhan_it_universe_contains_six_orderable_it_fno_symbols_with_ltm_canonical():
-    assert IT_FNO_SYMBOLS == ["TCS", "INFY", "HCLTECH", "TECHM", "WIPRO", "LTM"]
+def test_dhan_it_universe_contains_eight_orderable_it_fno_symbols_with_ltm_canonical():
+    assert IT_FNO_SYMBOLS == ["TCS", "INFY", "HCLTECH", "TECHM", "COFORGE", "MPHASIS", "PERSISTENT", "LTM"]
     assert [row["symbol"] for row in dhan_it_universe_rows()] == IT_FNO_SYMBOLS
     assert is_dhan_it_symbol("infy")
-    assert is_dhan_it_symbol("WIPRO")
+    assert is_dhan_it_symbol("COFORGE")
+    assert is_dhan_it_symbol("MPHASIS")
+    assert is_dhan_it_symbol("PERSISTENT")
     assert is_dhan_it_symbol("LTM")
+    assert not is_dhan_it_symbol("WIPRO")
     assert not is_dhan_it_symbol("LTI")
     assert not is_dhan_it_symbol("LTIS")
     assert not is_dhan_it_symbol("LTIM")
     assert not is_dhan_it_symbol("LTIMINDTREE")
     assert not is_dhan_it_symbol("RELIANCE")
     by_symbol = {row["symbol"]: row for row in dhan_it_universe_rows()}
-    assert by_symbol["WIPRO"]["company_name"] == "Wipro Ltd"
-    assert by_symbol["WIPRO"]["risk_bucket"] == "CONSERVATIVE"
-    assert by_symbol["WIPRO"]["target_short_otm_pct"] == 7.0
-    assert by_symbol["WIPRO"]["target_hedge_otm_pct"] == 12.0
-    assert by_symbol["WIPRO"]["max_open_spreads"] == 2
+    assert by_symbol["COFORGE"]["company_name"] == "Coforge Ltd"
+    assert by_symbol["COFORGE"]["risk_bucket"] == "MODERATE"
+    assert by_symbol["COFORGE"]["target_short_otm_pct"] == 8.0
+    assert by_symbol["COFORGE"]["target_hedge_otm_pct"] == 13.0
+    assert by_symbol["COFORGE"]["max_open_spreads"] == 1
+    assert by_symbol["MPHASIS"]["company_name"] == "Mphasis Ltd"
+    assert by_symbol["MPHASIS"]["risk_bucket"] == "MODERATE"
+    assert by_symbol["MPHASIS"]["target_short_otm_pct"] == 8.0
+    assert by_symbol["MPHASIS"]["target_hedge_otm_pct"] == 13.0
+    assert by_symbol["MPHASIS"]["max_open_spreads"] == 1
+    assert by_symbol["PERSISTENT"]["company_name"] == "Persistent Systems Ltd"
+    assert by_symbol["PERSISTENT"]["risk_bucket"] == "MODERATE"
+    assert by_symbol["PERSISTENT"]["target_short_otm_pct"] == 7.0
+    assert by_symbol["PERSISTENT"]["target_hedge_otm_pct"] == 12.0
+    assert by_symbol["PERSISTENT"]["max_open_spreads"] == 2
     assert by_symbol["LTM"]["company_name"] == "LTIMindtree Ltd"
     assert by_symbol["LTM"]["risk_bucket"] == "MODERATE"
     assert by_symbol["LTM"]["target_short_otm_pct"] == 9.0
@@ -151,11 +164,14 @@ def test_signal_engine_is_canonical_ce_watch_no_trade_only_and_blocks_event_risk
     assert {ce["recommended_strategy"], watch["recommended_strategy"], blocked["recommended_strategy"]} <= {"BEAR_CALL_SPREAD", "WATCH", "NO_TRADE"}
 
 
-def test_dhan_it_quote_keys_use_wipro_and_canonical_ltm_only():
+def test_dhan_it_quote_keys_use_persistent_and_canonical_ltm_only():
     keys = [app._dhan_it_quote_key(symbol) for symbol in IT_FNO_SYMBOLS]
 
-    assert "NSE:WIPRO" in keys
+    assert "NSE:COFORGE" in keys
+    assert "NSE:MPHASIS" in keys
+    assert "NSE:PERSISTENT" in keys
     assert "NSE:LTM" in keys
+    assert "NSE:WIPRO" not in keys
     assert "NSE:LTI" not in keys
     assert "NSE:LTIS" not in keys
     assert "NSE:LTIM" not in keys
@@ -173,12 +189,24 @@ def test_builds_current_month_ce_spread_when_gain_threshold_is_met():
     assert preview["max_gain"] >= 5000
 
 
-def test_dhan_it_spread_builder_uses_wipro_ltm_configured_otm_anchors():
-    wipro_chain = [
-        option_row("WIPRO", "2026-08-27", 1080, "CE", 18),
-        option_row("WIPRO", "2026-08-27", 1120, "CE", 5),
-        option_row("WIPRO", "2026-09-24", 1080, "CE", 18),
-        option_row("WIPRO", "2026-09-24", 1120, "CE", 5),
+def test_dhan_it_spread_builder_uses_expanded_symbol_configured_otm_anchors():
+    coforge_chain = [
+        option_row("COFORGE", "2026-08-27", 1080, "CE", 18),
+        option_row("COFORGE", "2026-08-27", 1130, "CE", 5),
+        option_row("COFORGE", "2026-09-24", 1080, "CE", 18),
+        option_row("COFORGE", "2026-09-24", 1130, "CE", 5),
+    ]
+    mphasis_chain = [
+        option_row("MPHASIS", "2026-08-27", 1080, "CE", 18),
+        option_row("MPHASIS", "2026-08-27", 1130, "CE", 5),
+        option_row("MPHASIS", "2026-09-24", 1080, "CE", 18),
+        option_row("MPHASIS", "2026-09-24", 1130, "CE", 5),
+    ]
+    persistent_chain = [
+        option_row("PERSISTENT", "2026-08-27", 1080, "CE", 18),
+        option_row("PERSISTENT", "2026-08-27", 1120, "CE", 5),
+        option_row("PERSISTENT", "2026-09-24", 1080, "CE", 18),
+        option_row("PERSISTENT", "2026-09-24", 1120, "CE", 5),
     ]
     ltm_chain = [
         option_row("LTM", "2026-08-27", 1100, "CE", 22),
@@ -187,12 +215,30 @@ def test_dhan_it_spread_builder_uses_wipro_ltm_configured_otm_anchors():
         option_row("LTM", "2026-09-24", 1150, "CE", 6),
     ]
 
-    wipro = build_dhan_it_spread(
-        symbol="WIPRO",
+    coforge = build_dhan_it_spread(
+        symbol="COFORGE",
         strategy_type="BEAR_CALL_SPREAD",
         spot=1000,
         lots=1,
-        option_chain_data=wipro_chain,
+        option_chain_data=coforge_chain,
+        risk_engine=AllowRisk(),
+        market_data={"today": date(2026, 8, 4)},
+    )
+    mphasis = build_dhan_it_spread(
+        symbol="MPHASIS",
+        strategy_type="BEAR_CALL_SPREAD",
+        spot=1000,
+        lots=1,
+        option_chain_data=mphasis_chain,
+        risk_engine=AllowRisk(),
+        market_data={"today": date(2026, 8, 4)},
+    )
+    persistent = build_dhan_it_spread(
+        symbol="PERSISTENT",
+        strategy_type="BEAR_CALL_SPREAD",
+        spot=1000,
+        lots=1,
+        option_chain_data=persistent_chain,
         risk_engine=AllowRisk(),
         market_data={"today": date(2026, 8, 4)},
     )
@@ -206,9 +252,15 @@ def test_dhan_it_spread_builder_uses_wipro_ltm_configured_otm_anchors():
         market_data={"today": date(2026, 8, 4)},
     )
 
-    assert dhan_it_stock_config("WIPRO")["target_short_otm_pct"] == 7.0
-    assert wipro["sell_leg_tradingsymbol"].endswith("1080CE")
-    assert wipro["buy_leg_tradingsymbol"].endswith("1120CE")
+    assert dhan_it_stock_config("COFORGE")["target_short_otm_pct"] == 8.0
+    assert coforge["sell_leg_tradingsymbol"].endswith("1080CE")
+    assert coforge["buy_leg_tradingsymbol"].endswith("1130CE")
+    assert dhan_it_stock_config("MPHASIS")["target_hedge_otm_pct"] == 13.0
+    assert mphasis["sell_leg_tradingsymbol"].endswith("1080CE")
+    assert mphasis["buy_leg_tradingsymbol"].endswith("1130CE")
+    assert dhan_it_stock_config("PERSISTENT")["target_short_otm_pct"] == 7.0
+    assert persistent["sell_leg_tradingsymbol"].endswith("1080CE")
+    assert persistent["buy_leg_tradingsymbol"].endswith("1120CE")
     assert dhan_it_stock_config("LTM")["target_short_otm_pct"] == 9.0
     assert ltm["sell_leg_tradingsymbol"].endswith("1100CE")
     assert ltm["buy_leg_tradingsymbol"].endswith("1150CE")
@@ -354,7 +406,7 @@ def test_dhan_it_panel_renders_comparison_and_popup_states():
     assert "Blocked for test" in html
 
 
-def test_dhan_it_cards_and_parent_table_render_wipro_and_ltm_defaults():
+def test_dhan_it_cards_and_parent_table_render_expanded_defaults():
     rows = dhan_it_universe_rows()
     cards = app.build_dhan_it_call_watch_cards_from_rows(
         [
@@ -382,11 +434,16 @@ def test_dhan_it_cards_and_parent_table_render_wipro_and_ltm_defaults():
         )
     )
 
-    assert "IT CE-spread execution: TCS, INFY, HCLTECH, TECHM, WIPRO, LTM." in html
-    assert "Wipro Ltd" in html
+    assert "IT CE-spread execution: TCS, INFY, HCLTECH, TECHM, COFORGE, MPHASIS, PERSISTENT, LTM." in html
+    assert "Coforge Ltd" in html
+    assert "Mphasis Ltd" in html
+    assert "Persistent Systems Ltd" in html
     assert "LTIMindtree Ltd" in html
-    assert "WIPRO" in html
+    assert "COFORGE" in html
+    assert "MPHASIS" in html
+    assert "PERSISTENT" in html
     assert "LTM" in html
+    assert "WIPRO" not in html
     assert "LTIS" not in html
     assert "LTIMINDTREE" not in html
     for symbol in IT_FNO_SYMBOLS:
@@ -524,7 +581,9 @@ def test_dhan_it_holding_position_analyzer_scopes_to_it_symbols_and_suggests_pai
     assert by_symbol["INFY"]["buy_qty_abs"] == 0
     assert by_symbol["HCLTECH"]["pair_status"] == "NO CE PAIR"
     assert by_symbol["TECHM"]["suggestion"] == "Build CE SELL + BUY hedge pair from DHAN-IT popup."
-    assert by_symbol["WIPRO"]["pair_status"] == "NO CE PAIR"
+    assert by_symbol["COFORGE"]["pair_status"] == "NO CE PAIR"
+    assert by_symbol["MPHASIS"]["pair_status"] == "NO CE PAIR"
+    assert by_symbol["PERSISTENT"]["pair_status"] == "NO CE PAIR"
     assert by_symbol["LTM"]["pair_status"] == "NO CE PAIR"
 
 
@@ -541,6 +600,8 @@ def test_dhan_it_holding_position_table_renders_below_call_watch():
                     "average_price": 3000,
                     "last_price": 3200,
                     "pnl": 20000,
+                    "day_change_pct": -1.25,
+                    "option_pnl": 20000,
                     "sell_count": 1,
                     "buy_count": 1,
                     "sell_symbols": "TCS26AUG4000CE",
@@ -576,9 +637,11 @@ def test_dhan_it_holding_position_table_renders_below_call_watch():
     assert "SELL CE Option Holdings" in html
     assert "BUY CE Hedge Holdings" in html
     assert "<th>CMP</th>" in html
-    assert "<th>% Change</th>" in html
+    assert '<button type="button" class="sort-header" data-sort-col="2">% Change</button>' in html
     assert "3200.00" in html
-    assert "<th>P&L</th>" in html
+    assert '<td class="dhan-it-change-cell pnl-negative" data-sort-value="-1.250000"><strong>-1.25%</strong></td>' in html
+    assert '<button type="button" class="sort-header" data-sort-col="3">P&amp;L</button>' in html
+    assert 'class="dhan-position-pnl-cell pnl-positive" data-sort-value="20000.000000">20000.00</td>' in html
     assert 'formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol" value="INFY"' in html
 
 
@@ -616,7 +679,7 @@ def test_dhan_it_pair_status_cmp_uses_live_call_watch_card_when_no_equity_holdin
     assert enriched[0]["day_change_pct"] == 2.45
     assert enriched[0]["cmp_source"] == "DHAN-IT live card"
     assert "<th>CMP</th>" in html
-    assert "<th>% Change</th>" in html
+    assert '<button type="button" class="sort-header" data-sort-col="2">% Change</button>' in html
     assert "3344.25" in html
     assert "2.45%" in html
 
