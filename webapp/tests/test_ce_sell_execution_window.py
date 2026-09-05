@@ -217,3 +217,14 @@ def test_ce_sell_modal_uses_wide_metric_layout_hooks():
     assert "data-ce-snapshot" in source
     assert "parseCeSellSnapshot" in source
     assert "applyCeSellData" in source
+
+
+def test_generic_app_modals_use_professional_wide_review_layout():
+    source = Path("app.py").read_text(encoding="utf-8-sig")
+
+    assert ".live-modal {{\n      width: min(780px, calc(100vw - 24px));" in source
+    assert ".income-pe-order-modal-card {{\n      width: min(1020px, calc(100vw - 24px));" in source
+    assert ".dhan-order-modal-card {{\n      width: min(1470px, calc(100vw - 32px));" in source
+    assert ".gpt-response-modal {{\n      width: min(1290px, calc(100vw - 32px));" in source
+    assert ".live-modal .table-wrap {{" in source
+    assert ".live-modal th,\n    .live-modal td {{" in source

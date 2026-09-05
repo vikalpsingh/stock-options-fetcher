@@ -121,7 +121,7 @@ import kite_spread_config as kite_spread_cfg
 from kite_broker_adapter import KiteBrokerAdapter
 from kite_spread_gpt_research import suggest_stocks_with_openai
 from kite_option_resolver import KiteOptionResolver
-from kite_pair_execution import submit_kite_pair
+from kite_pair_execution import round_limit_price_to_tick, submit_kite_pair
 from kite_pair_scheduler import run_kite_pair_scheduler_once
 from kite_spread_evaluator import evaluate_spread_with_expiry_comparison
 from kite_spread_engine import build_kite_spread_preview, fetch_cmp_from_kite, fetch_fresh_equity_quotes_from_kite
@@ -176,6 +176,15 @@ from fifty_two_week_ai_call_spread import (
     build_52w_ai_call_spread_preview,
     normalize_screener_csv,
     rank_sell_on_rise_evaluations,
+)
+from pnl_service import (
+    PnlFilters,
+    PnlRepository,
+    aggregate_by_dimension,
+    aggregate_summary,
+    calendar_rows as pnl_calendar_rows_for,
+    month_rows as pnl_month_rows_for,
+    snapshot_from_kite_positions,
 )
 
 # Compatibility aliases for the DHAN page wiring. These point to Kite-specific
@@ -7669,8 +7678,11 @@ class PageState:
     sector_income_generated_at: str = ""
     sector_income_show_rank_modal: bool = False
     sector_income_show_config_modal: bool = False
+    sector_income_show_cards_modal: bool = False
     sector_income_selected_sectors: list[str] | None = None
     sector_income_sector_company_selection: dict[str, list[str]] | None = None
+    sector_income_buy_limit_discount_pct: float = DEFAULT_BUY_LIMIT_DISCOUNT_PCT
+    sector_income_sell_limit_markup_pct: float = DEFAULT_SELL_LIMIT_MARKUP_PCT
     sector_income_pending_fii_snapshot: dict[str, Any] | None = None
     sector_income_active_fii_snapshot: dict[str, Any] | None = None
     sector_income_fii_upload_message: str = ""
@@ -7686,6 +7698,25 @@ class PageState:
     ai52_paper_trading: bool = True
     ai52_confirm_order: bool = False
     ai52_source_status: str = ""
+    pnl_period: str = "This Month"
+    pnl_year: int = field(default_factory=lambda: datetime.now().year)
+    pnl_from_date: str = ""
+    pnl_to_date: str = ""
+    pnl_account: str = "ALL"
+    pnl_strategy: str = "ALL"
+    pnl_theme: str = "ALL"
+    pnl_asset_class: str = "ALL"
+    pnl_underlying: str = ""
+    pnl_rows: list[dict[str, Any]] | None = None
+    pnl_summary: dict[str, Any] | None = None
+    pnl_strategy_rows: list[dict[str, Any]] | None = None
+    pnl_theme_rows: list[dict[str, Any]] | None = None
+    pnl_asset_rows: list[dict[str, Any]] | None = None
+    pnl_month_rows: list[dict[str, Any]] | None = None
+    pnl_calendar_rows: list[dict[str, Any]] | None = None
+    pnl_available_years: list[int] | None = None
+    pnl_filter_options: dict[str, list[str]] | None = None
+    pnl_export_path: str = ""
 
 
 def mask_secret(value: str | None) -> str:
@@ -7917,6 +7948,7 @@ def is_app_page_request(path: str) -> bool:
         "/dhan-it",
         "/52w-ai-call-spread",
         "/sector-income",
+        "/pnl",
         "/income-growth",
         "/commodity",
         "/analytics",
@@ -25323,6 +25355,54 @@ def build_sector_income_score_ranking(
     return score, ranking
 
 
+def apply_sector_income_limit_controls(
+    preview: dict[str, Any],
+    *,
+    buy_limit_discount_pct: float,
+    sell_limit_markup_pct: float,
+) -> dict[str, Any]:
+    adjusted = dict(preview or {})
+    buy_discount = max(0.0, min(float(buy_limit_discount_pct or 0), 50.0))
+    sell_markup = max(0.0, min(float(sell_limit_markup_pct or 0), 100.0))
+    buy_reference = _dhan_metric_float(
+        adjusted.get("buy_reference_price")
+        or adjusted.get("buy_leg_premium")
+        or adjusted.get("buy_ltp")
+        or adjusted.get("buy_limit_price")
+    )
+    sell_reference = _dhan_metric_float(
+        adjusted.get("sell_reference_price")
+        or adjusted.get("sell_leg_premium")
+        or adjusted.get("sell_ltp")
+        or adjusted.get("sell_limit_price")
+    )
+    buy_limit = round_limit_price_to_tick(buy_reference * (1 - buy_discount / 100)) if buy_reference > 0 else _dhan_metric_float(adjusted.get("buy_limit_price"))
+    sell_cmp_limit = round_limit_price_to_tick(sell_reference) if sell_reference > 0 else _dhan_metric_float(adjusted.get("sell_limit_price"))
+    sell_initial = round_limit_price_to_tick(sell_cmp_limit * (1 + sell_markup / 100)) if sell_cmp_limit > 0 else 0.0
+    if buy_limit > 0:
+        adjusted["buy_reference_price"] = buy_reference
+        adjusted["buy_limit_price"] = buy_limit
+    if sell_cmp_limit > 0:
+        adjusted["sell_reference_price"] = sell_reference
+        adjusted["sell_limit_price"] = sell_cmp_limit
+        adjusted["sell_initial_limit_price"] = sell_initial
+    adjusted["buy_limit_discount_pct"] = buy_discount
+    adjusted["sell_limit_markup_pct"] = sell_markup
+    if buy_limit > 0 and sell_cmp_limit > 0:
+        net_credit = round_limit_price_to_tick(sell_cmp_limit - buy_limit)
+        adjusted["net_credit"] = net_credit
+        quantity = _dhan_metric_float(adjusted.get("quantity"))
+        width = abs(_dhan_metric_float(adjusted.get("buy_strike")) - _dhan_metric_float(adjusted.get("sell_strike")))
+        if quantity > 0:
+            adjusted["max_gain"] = round(net_credit * quantity, 2)
+            if width > 0:
+                adjusted["max_loss"] = round(max(0.0, (width - net_credit) * quantity), 2)
+            if _dhan_metric_float(adjusted.get("max_loss")) > 0:
+                adjusted["return_on_risk_pct"] = round((adjusted["max_gain"] / float(adjusted["max_loss"])) * 100, 2)
+    adjusted["limit_control_source"] = "SECTOR_INCOME_PRICE_CONTROLS"
+    return adjusted
+
+
 def save_sector_income_score_state(state: PageState, source: str = "SECTOR_SCORE_DETAILS") -> dict[str, Any]:
     if not state.sector_income_score or not state.sector_income_ranking:
         return {}
@@ -25520,6 +25600,11 @@ def build_sector_income_opportunities(
             }
         )
         preview = apply_dhan_it_evaluation_expiry_mode(preview, state.dhan_it_expiry_mode)
+        preview = apply_sector_income_limit_controls(
+            preview,
+            buy_limit_discount_pct=state.sector_income_buy_limit_discount_pct,
+            sell_limit_markup_pct=state.sector_income_sell_limit_markup_pct,
+        )
         opportunities.append(preview)
     return opportunities, notes
 
@@ -25539,6 +25624,15 @@ def render_sector_income_panel(state: PageState) -> str:
     rows = state.sector_income_rows or []
     cards = state.sector_income_cards or []
     opportunities = state.sector_income_opportunities or []
+    if opportunities:
+        opportunities = [
+            apply_sector_income_limit_controls(
+                opportunity,
+                buy_limit_discount_pct=state.sector_income_buy_limit_discount_pct,
+                sell_limit_markup_pct=state.sector_income_sell_limit_markup_pct,
+            )
+            for opportunity in opportunities
+        ]
 
     def text_value(value: Any, default: str = "-") -> str:
         return str(value if value not in {None, ""} else default)
@@ -25795,15 +25889,64 @@ def render_sector_income_panel(state: PageState) -> str:
         </div></div>
         """
 
+    def card_is_unblocked(card: dict[str, Any]) -> bool:
+        status = str(card.get("status") or "").upper()
+        decision = str(card.get("decision") or "").upper()
+        return status in {"GREEN", "AMBER"} and decision not in {"", "BLOCKED", "RED", "NO_TRADE"}
+
+    unblocked_cards = [card for card in cards if card_is_unblocked(card)]
+    opportunity_by_symbol = {
+        str(row.get("symbol") or "").strip().upper(): row
+        for row in opportunities
+    }
+
+    def render_sector_cards_detail_modal() -> str:
+        if not state.sector_income_show_cards_modal:
+            return ""
+        detail_rows: list[str] = []
+        for card in unblocked_cards:
+            symbol = str(card.get("symbol") or "").strip().upper()
+            opportunity = opportunity_by_symbol.get(symbol, {})
+            status = str(card.get("status") or "AMBER").upper()
+            badge_class = "good" if status == "GREEN" else "neutral"
+            detail_rows.append(
+                "<tr>"
+                f"<td><button type=\"submit\" class=\"mini-link button-link\" formaction=\"/sector-income/open-symbol\" name=\"sector_income_open_symbol\" value=\"{html.escape(symbol, quote=True)}\"><strong>{html.escape(symbol)}</strong><small>Open order ticket</small></button></td>"
+                f"<td>{html.escape(text_value(card.get('label') or card.get('sector_label')))}</td>"
+                f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(status)}</span><small>{html.escape(text_value(card.get('decision')))}</small></td>"
+                f"<td>{money(card.get('price'))}<small>{money(card.get('day_change_pct'))}%</small></td>"
+                f"<td>{html.escape(text_value(card.get('trend')))}<small>50D {money(card.get('distance_50_pct'))}% | 200D {money(card.get('distance_200_pct'))}%</small></td>"
+                f"<td>{money(opportunity.get('max_gain'))}<small>Loss {money(opportunity.get('max_loss'))}</small></td>"
+                f"<td>{money(opportunity.get('pop_estimate'))}%<small>RoR {money(opportunity.get('return_on_risk_pct'))}%</small></td>"
+                f"<td>{html.escape(text_value(opportunity.get('sell_leg_tradingsymbol')))}<small>Hedge {html.escape(text_value(opportunity.get('buy_leg_tradingsymbol')))}</small></td>"
+                f"<td>{html.escape('; '.join(str(item) for item in (card.get('reasons') or card.get('warnings') or [])[:3]))}</td>"
+                "</tr>"
+            )
+        if not detail_rows:
+            detail_rows.append('<tr><td colspan="9" class="muted-cell">No unblocked sector call-spread cards currently available. Refresh the scan or choose another sector.</td></tr>')
+        return f"""
+        <div class="live-modal-backdrop visible" id="sector-income-cards-detail-modal"><div class="live-modal dhan-order-modal-card sector-income-score-modal">
+          <h2>Unblocked SECTOR-Income Call-Spread Details</h2>
+          <p class="status">Only GREEN/AMBER non-blocked stocks from the configured sector scope are listed here. Click a stock to open the existing hedge-first execution ticket.</p>
+          <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Stock</th><th>Company / Sector</th><th>Status</th><th>CMP / Day</th><th>DMA View</th><th>Max Gain / Loss</th><th>POP / RoR</th><th>CE Pair</th><th>Reason</th></tr></thead><tbody>{''.join(detail_rows)}</tbody></table></div>
+          <div class="modal-actions"><button type="submit" class="secondary" formaction="/sector-income/cards-detail-close">Close</button></div>
+        </div></div>
+        """
+
     card_html = ""
-    if cards:
+    if unblocked_cards:
         card_html = (
-            render_dhan_it_call_watch(cards)
+            render_dhan_it_call_watch(unblocked_cards)
             .replace("DHAN-IT Call Spread Watch", "Configured Sector Call-Spread Cards")
             .replace('formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol"', 'formaction="/sector-income/open-symbol" name="sector_income_open_symbol"')
+            .replace(
+                '</section>',
+                '<div class="actions"><button type="submit" class="secondary" formaction="/sector-income/cards-detail">View Unblocked Stock Details</button></div></section>',
+                1,
+            )
         )
     else:
-        card_html = '<section class="panel"><div class="panel-title">Configured Sector Call-Spread Cards</div><p class="status">Run sector scan to build cards.</p></section>'
+        card_html = '<section class="panel"><div class="panel-title">Configured Sector Call-Spread Cards</div><p class="status">No unblocked call-spread cards right now. Refresh the scan or select a different sector/company scope.</p><div class="actions"><button type="submit" class="secondary" formaction="/sector-income/cards-detail">View Details</button></div></section>'
     holding_html = render_dhan_it_holding_positions(state.sector_income_holding_positions or []).replace(
         f"Scope locked to {html.escape(dhan_it_symbol_list_text())}.",
         f"Scope locked to {html.escape(SECTOR_LABELS.get(sector_key, sector_key))}.",
@@ -25878,8 +26021,8 @@ def render_sector_income_panel(state: PageState) -> str:
             <article><span>Next result date</span><strong>{html.escape(text_value(selected.get('next_result_date_display'), 'Not available'))}</strong><small>{html.escape(text_value(selected.get('result_date_message'), 'NO near by results date'))}</small></article>
           </div>
           <div class="dhan-it-execution-leg-grid">
-            <article class="dhan-it-execution-leg sell"><span>SELL CE</span><strong>{html.escape(text_value(selected.get('sell_leg_tradingsymbol')))}</strong><small>Qty {html.escape(text_value(selected.get('quantity')))} | LIMIT/CMP {money(selected.get('sell_limit_price'))} | Expiry {html.escape(text_value(selected.get('sell_expiry') or selected.get('expiry')))}</small></article>
-            <article class="dhan-it-execution-leg buy"><span>BUY HEDGE</span><strong>{html.escape(text_value(selected.get('buy_leg_tradingsymbol')))}</strong><small>Qty {html.escape(text_value(selected.get('quantity')))} | LIMIT/CMP {money(selected.get('buy_limit_price'))} | Expiry {html.escape(text_value(selected.get('buy_expiry') or selected.get('expiry')))}</small></article>
+            <article class="dhan-it-execution-leg sell"><span>SELL CE PARKED</span><strong>{html.escape(text_value(selected.get('sell_leg_tradingsymbol')))}</strong><small>Qty {html.escape(text_value(selected.get('quantity')))} | CMP ref {money(selected.get('sell_reference_price') or selected.get('sell_limit_price'))} | Parked LIMIT {money(selected.get('sell_initial_limit_price') or selected.get('sell_limit_price'))} (+{money(selected.get('sell_limit_markup_pct'))}%) | Expiry {html.escape(text_value(selected.get('sell_expiry') or selected.get('expiry')))}</small></article>
+            <article class="dhan-it-execution-leg buy"><span>BUY HEDGE</span><strong>{html.escape(text_value(selected.get('buy_leg_tradingsymbol')))}</strong><small>Qty {html.escape(text_value(selected.get('quantity')))} | Ref {money(selected.get('buy_reference_price') or selected.get('buy_leg_premium'))} | LIMIT {money(selected.get('buy_limit_price'))} (-{money(selected.get('buy_limit_discount_pct'))}%) | Expiry {html.escape(text_value(selected.get('buy_expiry') or selected.get('expiry')))}</small></article>
           </div>
           <div class="income-equity-order-summary">Sector score is only a ranking input. Final permission still requires valid CE legs, positive credit, max-loss guard, result-date guard, liquidity checks and hedge-first execution.</div>
           {render_pair_liquidity_section(selected, paper_mode=state.dhan_it_paper_trading, strict_red_blocks=not state.dhan_it_paper_trading)}
@@ -25929,6 +26072,7 @@ def render_sector_income_panel(state: PageState) -> str:
       <input type="hidden" name="sector_income_score_json" value="{score_json}">
       <input type="hidden" name="sector_income_ranking_json" value="{ranking_json}">
       <input type="hidden" name="sector_income_score_snapshot_json" value="{score_snapshot_json}">
+      <input type="hidden" name="sector_income_show_cards_modal" value="{'1' if state.sector_income_show_cards_modal else ''}">
       <input type="hidden" name="sector_income_selected_sectors_json" value="{selected_sectors_json}">
       <input type="hidden" name="sector_income_sector_company_selection_json" value="{sector_companies_json}">
       <input type="hidden" name="sector_income_fii_upload_message" value="{html.escape(state.sector_income_fii_upload_message, quote=True)}">
@@ -25942,6 +26086,8 @@ def render_sector_income_panel(state: PageState) -> str:
         <label><span>Expiry mode</span><select name="dhan_it_expiry_mode">{option("CURRENT_AND_NEXT", "Current + Next Month", state.dhan_it_expiry_mode)}{option("AUTO_COMPARE", "Auto Compare", state.dhan_it_expiry_mode)}{option("CURRENT_MONTH", "Current Month Only", state.dhan_it_expiry_mode)}{option("NEXT_MONTH", "Next Month Only", state.dhan_it_expiry_mode)}</select></label>
         <label><span>Lots</span><input name="dhan_it_lots" value="{html.escape(str(state.dhan_it_lots), quote=True)}"></label>
         <label><span>Mode</span><select name="dhan_it_trade_mode">{option("PAPER", "Paper", "PAPER" if state.dhan_it_paper_trading else "LIVE")}{option("LIVE", "Live", "PAPER" if state.dhan_it_paper_trading else "LIVE")}</select></label>
+        {render_number_input("sector_income_buy_limit_discount_pct", "BUY limit discount %", state.sector_income_buy_limit_discount_pct, "0.05")}
+        {render_number_input("sector_income_sell_limit_markup_pct", "SELL parked markup %", state.sector_income_sell_limit_markup_pct, "0.05")}
         <button type="submit" formaction="/sector-income/evaluate">Scan Selected Sector</button>
         <button type="submit" class="secondary" formaction="/sector-income/config-open">Configure Sectors / Companies</button>
         <button type="submit" class="secondary" formaction="/sector-income/rank-detail" name="sector_income_show_rank_modal" value="1">Sector Score Details</button>
@@ -25949,6 +26095,7 @@ def render_sector_income_panel(state: PageState) -> str:
       {render_top_sector_cards()}
       {render_sector_rank_modal()}
       {render_sector_config_modal()}
+      {render_sector_cards_detail_modal()}
       <section class="panel"><div class="panel-title">Sector Decision & FII Flow</div><div class="dhan-ticket-summary">{metric_cards}</div><p class="status">{html.escape('; '.join(str(item) for item in (score.get('reasons') or [])))}</p></section>
       {card_html}
       {holding_html}
@@ -32349,6 +32496,231 @@ def render_nifty_income_panel(state: PageState) -> str:
     </form>"""
 
 
+def load_pnl_state(state: PageState) -> None:
+    repo = PnlRepository(APP_DB_PATH)
+    repo.ensure_schema()
+    state.pnl_available_years = repo.available_years()
+    state.pnl_filter_options = {
+        "accounts": repo.option_values("account_id"),
+        "strategies": repo.option_values("strategy"),
+        "themes": repo.option_values("theme"),
+        "asset_classes": repo.option_values("asset_class"),
+    }
+    filters = PnlFilters(
+        account_id=state.pnl_account,
+        period=state.pnl_period,
+        year=state.pnl_year,
+        from_date=state.pnl_from_date,
+        to_date=state.pnl_to_date,
+        strategy=state.pnl_strategy,
+        theme=state.pnl_theme,
+        asset_class=state.pnl_asset_class,
+        underlying=state.pnl_underlying,
+    )
+    state.pnl_rows = repo.query_daily_records(filters)
+    state.pnl_summary = aggregate_summary(state.pnl_rows)
+    state.pnl_strategy_rows = aggregate_by_dimension(state.pnl_rows, "strategy")
+    state.pnl_theme_rows = aggregate_by_dimension(state.pnl_rows, "theme")
+    state.pnl_asset_rows = aggregate_by_dimension(state.pnl_rows, "asset_class")
+    state.pnl_month_rows = pnl_month_rows_for(state.pnl_rows)
+    state.pnl_calendar_rows = pnl_calendar_rows_for(state.pnl_rows)
+
+
+def sync_today_pnl_from_kite(state: PageState) -> int:
+    if kite_orders is None:
+        raise RuntimeError(f"Could not import Kite order module: {IMPORT_ERROR}")
+    kite = kite_orders.kite_client()
+    positions = cached_kite_positions(kite, ttl_seconds=0)
+    records = snapshot_from_kite_positions(
+        positions,
+        account_id=selected_kite_profile_name(state.kite_profile),
+        trade_date=app_now().date(),
+    )
+    repo = PnlRepository(APP_DB_PATH)
+    return repo.upsert_daily_records(records, audit_event="KITE_POSITION_SYNC")
+
+
+def render_pnl_panel(state: PageState) -> str:
+    if state.active_tab == "pnl" and state.pnl_rows is None:
+        load_pnl_state(state)
+    panel_style = "" if state.active_tab == "pnl" else ' style="display:none"'
+    rows = state.pnl_rows or []
+    summary = state.pnl_summary or aggregate_summary(rows)
+    years = state.pnl_available_years or [datetime.now().year]
+    options = state.pnl_filter_options or {"accounts": [], "strategies": [], "themes": [], "asset_classes": []}
+
+    def fmt_money(value: Any) -> str:
+        try:
+            return f"{float(value):,.2f}"
+        except Exception:
+            return "-"
+
+    def fmt_pct(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}%"
+        except Exception:
+            return "-"
+
+    def metric_class(value: Any) -> str:
+        amount = 0.0
+        try:
+            amount = float(value or 0)
+        except Exception:
+            pass
+        if amount > 0:
+            return "metric-positive"
+        if amount < 0:
+            return "metric-negative"
+        return "metric-neutral"
+
+    def select_options(values: list[Any], selected: Any, include_all: bool = True) -> str:
+        items = ["ALL"] if include_all else []
+        items.extend(str(value) for value in values if str(value or "").strip())
+        if not items:
+            items = ["ALL"]
+        return "".join(
+            f'<option value="{html.escape(str(item), quote=True)}"{" selected" if str(item) == str(selected) else ""}>{html.escape(str(item))}</option>'
+            for item in dict.fromkeys(items)
+        )
+
+    def card(label: str, value: str, detail: str, css_value: Any = None) -> str:
+        return (
+            f'<article class="pnl-card"><span>{html.escape(label)}</span>'
+            f'<strong class="{metric_class(css_value)}">{html.escape(value)}</strong>'
+            f'<small>{html.escape(detail)}</small></article>'
+        )
+
+    def aggregate_table(title: str, dimension: str, agg_rows: list[dict[str, Any]]) -> str:
+        body = "".join(
+            "<tr>"
+            f"<td><strong>{html.escape(str(row.get(dimension) or '-'))}</strong></td>"
+            f"<td>{int(row.get('count') or 0)}</td>"
+            f"<td class=\"{metric_class(row.get('net_realized_pnl'))}\">{fmt_money(row.get('net_realized_pnl'))}</td>"
+            f"<td>{fmt_money(row.get('capital_deployed'))}</td>"
+            f"<td class=\"{metric_class(row.get('roi_pct'))}\">{fmt_pct(row.get('roi_pct'))}</td>"
+            f"<td>{fmt_pct(row.get('capital_efficiency'))}</td>"
+            f"<td>{row.get('profit_factor') if row.get('profit_factor') is not None else '-'}</td>"
+            f"<td class=\"{metric_class(row.get('max_drawdown'))}\">{fmt_money(row.get('max_drawdown'))}</td>"
+            "</tr>"
+            for row in agg_rows
+        ) or '<tr><td colspan="8" class="muted-cell">No P&L records for the selected filters.</td></tr>'
+        return (
+            f'<section class="panel pnl-subpanel"><div class="panel-title">{html.escape(title)}</div>'
+            f'<div class="table-wrap pnl-table-scroll"><table class="ipo-table pnl-sortable-table">'
+            '<thead><tr><th class="sort-header" data-sort-col="0">Name</th><th class="sort-header" data-sort-col="1">Rows</th>'
+            '<th class="sort-header" data-sort-col="2">Net realised</th><th class="sort-header" data-sort-col="3">Capital</th>'
+            '<th class="sort-header" data-sort-col="4">ROI</th><th class="sort-header" data-sort-col="5">Efficiency</th>'
+            '<th>Profit factor</th><th>Max DD</th></tr></thead>'
+            f'<tbody>{body}</tbody></table></div></section>'
+        )
+
+    calendar = "".join(
+        f'<div class="pnl-day {metric_class(row.get("net_realized_pnl"))}" title="{html.escape(str(row.get("trade_date") or ""))}: {html.escape(fmt_money(row.get("net_realized_pnl")))}">'
+        f'<span>{html.escape(str(row.get("trade_date") or "")[-2:])}</span><strong>{html.escape(fmt_money(row.get("net_realized_pnl")))}</strong></div>'
+        for row in state.pnl_calendar_rows or []
+    ) or '<div class="muted-cell">No day-level P&L yet. Click Sync Today’s P&L after Kite login, or keep historical records in the DB.</div>'
+
+    detail_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(row.get('trade_date') or '-'))}</td>"
+        f"<td>{html.escape(str(row.get('account_id') or '-'))}</td>"
+        f"<td><strong>{html.escape(str(row.get('strategy') or '-'))}</strong><small>{html.escape(str(row.get('theme') or '-'))}</small></td>"
+        f"<td>{html.escape(str(row.get('asset_class') or '-'))}</td>"
+        f"<td><strong>{html.escape(str(row.get('underlying') or '-'))}</strong><small>{html.escape(str(row.get('tradingsymbol') or '-'))}</small></td>"
+        f"<td class=\"{metric_class(row.get('realized_pnl'))}\">{fmt_money(row.get('realized_pnl'))}</td>"
+        f"<td class=\"{metric_class(row.get('unrealized_pnl'))}\">{fmt_money(row.get('unrealized_pnl'))}</td>"
+        f"<td>{fmt_money(row.get('charges'))}</td>"
+        f"<td class=\"{metric_class(row.get('net_realized_pnl'))}\"><strong>{fmt_money(row.get('net_realized_pnl'))}</strong></td>"
+        f"<td>{fmt_money(row.get('capital_deployed'))}</td>"
+        f"<td class=\"{metric_class(row.get('roi_pct'))}\">{fmt_pct(row.get('roi_pct'))}</td>"
+        f"<td>{html.escape(str(row.get('source') or '-'))}</td>"
+        "</tr>"
+        for row in rows
+    ) or '<tr><td colspan="12" class="muted-cell">No records found for selected filters.</td></tr>'
+
+    month_body = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(row.get('month') or '-'))}</td>"
+        f"<td class=\"{metric_class(row.get('net_realized_pnl'))}\"><strong>{fmt_money(row.get('net_realized_pnl'))}</strong></td>"
+        f"<td>{fmt_money(row.get('capital_deployed'))}</td>"
+        f"<td>{fmt_pct(row.get('roi_pct'))}</td>"
+        f"<td>{int(row.get('count') or 0)}</td>"
+        "</tr>"
+        for row in state.pnl_month_rows or []
+    ) or '<tr><td colspan="5" class="muted-cell">No monthly data available.</td></tr>'
+
+    insight = "Capital is cleanly classified by strategy/theme once broker snapshots exist."
+    best = (state.pnl_strategy_rows or [{}])[0] if state.pnl_strategy_rows else {}
+    if best:
+        insight = f"Best current contributor: {best.get('strategy')} with net realised {fmt_money(best.get('net_realized_pnl'))}."
+
+    period_options = "".join(
+        f'<option value="{label}"{" selected" if state.pnl_period == label else ""}>{label}</option>'
+        for label in ("Today", "This Week", "This Month", "This Year", "Custom")
+    )
+    year_options = "".join(
+        f'<option value="{year}"{" selected" if int(year) == int(state.pnl_year) else ""}>{year}</option>'
+        for year in years
+    )
+
+    return f"""
+    <form id="pnl-panel" method="post" action="/pnl/load"{panel_style}>
+      {env_hidden_fields_for_render()}
+      <section class="panel pnl-hero">
+        <div>
+          <div class="panel-title">P&amp;L Performance Desk</div>
+          <p class="status">One accounting screen for realised P&amp;L, unrealised P&amp;L, capital, ROI, strategy/theme attribution, and daily audit history. Sync is idempotent and does not place broker orders.</p>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/pnl/sync-today">Sync Today&apos;s P&amp;L</button>
+          <button type="submit" class="secondary" formaction="/pnl/load">Refresh Historical</button>
+          <button type="submit" class="secondary" formaction="/pnl/export-csv">Export CSV</button>
+        </div>
+      </section>
+      <section class="panel pnl-filter-panel">
+        <div class="compact-grid">
+          <label><span>Period</span><select name="pnl_period">{period_options}</select></label>
+          <label><span>Year</span><select name="pnl_year">{year_options}</select></label>
+          <label><span>From date</span><input type="date" name="pnl_from_date" value="{html.escape(state.pnl_from_date, quote=True)}"></label>
+          <label><span>To date</span><input type="date" name="pnl_to_date" value="{html.escape(state.pnl_to_date, quote=True)}"></label>
+          <label><span>Account</span><select name="pnl_account">{select_options(options.get('accounts', []), state.pnl_account)}</select></label>
+          <label><span>Strategy</span><select name="pnl_strategy">{select_options(options.get('strategies', []), state.pnl_strategy)}</select></label>
+          <label><span>Theme</span><select name="pnl_theme">{select_options(options.get('themes', []), state.pnl_theme)}</select></label>
+          <label><span>Asset class</span><select name="pnl_asset_class">{select_options(options.get('asset_classes', []), state.pnl_asset_class)}</select></label>
+          <label><span>Underlying / Symbol</span><input name="pnl_underlying" value="{html.escape(state.pnl_underlying, quote=True)}" placeholder="NIFTY, TECHM, TCS..."></label>
+        </div>
+      </section>
+      <section class="pnl-card-grid">
+        {card("Realised P&L", fmt_money(summary.get("realized_pnl")), "Booked / broker realised", summary.get("realized_pnl"))}
+        {card("Unrealised P&L", fmt_money(summary.get("unrealized_pnl")), "Open positions snapshot", summary.get("unrealized_pnl"))}
+        {card("Net Realised", fmt_money(summary.get("net_realized_pnl")), "Realised minus charges", summary.get("net_realized_pnl"))}
+        {card("Capital Deployed", fmt_money(summary.get("capital_deployed")), "Spread groups de-duplicated", None)}
+        {card("ROI / ROAC", fmt_pct(summary.get("roi_pct")), "Net realised / capital", summary.get("roi_pct"))}
+        {card("Profit Factor", str(summary.get("profit_factor") or "-"), "Winning days vs losing days", None)}
+        {card("Max Drawdown", fmt_money(summary.get("max_drawdown")), "Daily net realised curve", summary.get("max_drawdown"))}
+        {card("Monthly Target", fmt_pct(summary.get("target_progress_pct")), f"Target {fmt_money(summary.get('monthly_target'))}", summary.get("target_progress_pct"))}
+      </section>
+      <section class="panel pnl-insight"><strong>Insight:</strong> {html.escape(insight)}</section>
+      <section class="panel"><div class="panel-title">Daily P&amp;L Calendar</div><div class="pnl-calendar">{calendar}</div></section>
+      <div class="pnl-analytics-grid">
+        {aggregate_table("Strategy Performance", "strategy", state.pnl_strategy_rows or [])}
+        {aggregate_table("Theme Performance", "theme", state.pnl_theme_rows or [])}
+        {aggregate_table("Asset Class Performance", "asset_class", state.pnl_asset_rows or [])}
+      </div>
+      <section class="panel"><div class="panel-title">Monthly Trend</div><div class="table-wrap"><table class="ipo-table pnl-sortable-table"><thead><tr><th class="sort-header" data-sort-col="0">Month</th><th class="sort-header" data-sort-col="1">Net realised</th><th>Capital</th><th>ROI</th><th>Rows</th></tr></thead><tbody>{month_body}</tbody></table></div></section>
+      <section class="panel">
+        <div class="panel-title">Daily P&amp;L Ledger</div>
+        <p class="status">Historical layer is loaded from local DB. “Sync Today” refreshes the current Kite position snapshot with upsert semantics, so the same day is updated instead of duplicated.</p>
+        <div class="table-wrap pnl-table-scroll"><table id="pnl-ledger-table" class="ipo-table" data-default-sort-col="0" data-default-sort-dir="desc">
+          <thead><tr><th class="sort-header" data-sort-col="0">Date</th><th>Account</th><th>Strategy / Theme</th><th>Asset</th><th>Underlying / Symbol</th><th class="sort-header" data-sort-col="5">Realised</th><th class="sort-header" data-sort-col="6">Unrealised</th><th>Charges</th><th class="sort-header" data-sort-col="8">Net</th><th class="sort-header" data-sort-col="9">Capital</th><th class="sort-header" data-sort-col="10">ROI</th><th>Source</th></tr></thead>
+          <tbody>{detail_rows}</tbody>
+        </table></div>
+      </section>
+      {f'<section class="panel alert ok">Export saved: {html.escape(state.pnl_export_path)}</section>' if state.pnl_export_path else ''}
+      {render_collapsed_console(state.console_log)}
+    </form>"""
+
+
 def env_hidden_fields_for_render() -> str:
     return (
         f'<input type="hidden" name="kite_profile" value="{html.escape(selected_kite_profile_name(), quote=True)}">'
@@ -32599,6 +32971,7 @@ def render_page(state: PageState) -> bytes:
     dhan_it_tab_class = "active" if state.active_tab == "dhan-it" else ""
     ai52_tab_class = "active" if state.active_tab == "52w-ai-call-spread" else ""
     sector_income_tab_class = "active" if state.active_tab == "sector-income" else ""
+    pnl_tab_class = "active" if state.active_tab == "pnl" else ""
     nifty_income_tab_class = "active" if state.active_tab == "nifty-income" else ""
     nifty_grow_tab_class = "active" if state.active_tab == "nifty-grow" else ""
     place_panel_style = "" if state.active_tab == "place" else ' style="display:none"'
@@ -34325,7 +34698,7 @@ def render_page(state: PageState) -> bytes:
     .pe-rank-card p {{ margin: 9px 0 0; font-size: 12px; color: #475569; }}
     .pe-rank-card em {{ display: block; margin-top: 8px; font-style: normal; font-weight: 800; color: #047857; }}
     .income-growth-prompt-modal {{
-      width: min(980px, calc(100vw - 32px));
+      width: min(1470px, calc(100vw - 32px));
     }}
     .income-growth-prompt-modal textarea {{
       min-height: 360px;
@@ -34373,7 +34746,7 @@ def render_page(state: PageState) -> bytes:
       line-height: 1.25;
       opacity: 0.95;
     }}
-    .income-equity-modal-card {{ width: min(680px, calc(100vw - 24px)); }}
+    .income-equity-modal-card {{ width: min(1020px, calc(100vw - 24px)); }}
     .equity-hero {{
       display: flex; align-items: center; justify-content: space-between; gap: 16px;
       border-left: 5px solid #0284c7; background: linear-gradient(120deg, #eff6ff, #ecfdf5);
@@ -34392,7 +34765,7 @@ def render_page(state: PageState) -> bytes:
     .equity-holding-stock {{ border: 0; padding: 0; background: transparent; box-shadow: none; color: #047857; text-align: left; cursor: pointer; }}
     .equity-holding-stock:hover strong {{ text-decoration: underline; }}
     .equity-holding-stock strong, .equity-holding-stock span {{ display: block; }}
-    .equity-order-modal-card {{ width: min(700px, calc(100vw - 24px)); }}
+    .equity-order-modal-card {{ width: min(1050px, calc(100vw - 24px)); }}
     .equity-order-breath {{ display: none; }}
     .equity-order-breath.active {{ display: block; }}
     .equity-price-gap {{ padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: #f8fafc; }}
@@ -34844,14 +35217,14 @@ def render_page(state: PageState) -> bytes:
     .income-equity-breath {{ display: none; }}
     .income-equity-breath.active {{ display: block; }}
     .income-pe-order-modal-card {{
-      width: min(680px, calc(100vw - 24px));
+      width: min(1020px, calc(100vw - 24px));
       max-height: calc(100vh - 32px);
       overflow-y: auto;
       overscroll-behavior: contain;
       scrollbar-gutter: stable;
     }}
     #ce-sell-order-modal .income-pe-order-modal-card {{
-      width: min(760px, calc(100vw - 28px));
+      width: min(1140px, calc(100vw - 28px));
       text-align: left;
     }}
     #ce-sell-order-modal h2,
@@ -34909,7 +35282,7 @@ def render_page(state: PageState) -> bytes:
       overflow-y: auto;
     }}
     .nifty-position-action-modal-card {{
-      width: min(760px, calc(100vw - 24px));
+      width: min(1140px, calc(100vw - 24px));
       text-align: center;
     }}
     .nifty-position-action-modal-card h2 {{
@@ -36339,7 +36712,7 @@ def render_page(state: PageState) -> bytes:
       cursor: pointer;
     }}
     .dhan-config-modal-card {{
-      width: min(1380px, calc(100vw - 24px));
+      width: min(1600px, calc(100vw - 24px));
       max-height: calc(100vh - 36px);
       padding: 18px;
       overflow-y: auto;
@@ -36430,12 +36803,12 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
     .dhan-order-modal-card {{
-      width: min(980px, calc(100vw - 32px));
+      width: min(1470px, calc(100vw - 32px));
       max-height: calc(100vh - 36px);
       overflow-y: auto;
     }}
     .sector-income-score-modal {{
-      width: min(1380px, calc(100vw - 24px));
+      width: min(1600px, calc(100vw - 24px));
       max-height: calc(100vh - 20px);
       text-align: left;
     }}
@@ -36444,7 +36817,7 @@ def render_page(state: PageState) -> bytes:
       text-align: center;
     }}
     .sector-income-config-modal {{
-      width: min(1500px, calc(100vw - 24px));
+      width: min(1680px, calc(100vw - 24px));
       max-height: calc(100vh - 20px);
       text-align: left;
     }}
@@ -36786,7 +37159,7 @@ def render_page(state: PageState) -> bytes:
       color: #64748b;
     }}
     .ai52-detail-modal-card {{
-      width: min(900px, calc(100vw - 28px));
+      width: min(1350px, calc(100vw - 28px));
     }}
     .ai52-detail-grid {{
       display: grid;
@@ -37852,7 +38225,7 @@ def render_page(state: PageState) -> bytes:
       white-space: pre;
     }}
     .gpt-response-modal {{
-      width: min(860px, calc(100vw - 32px));
+      width: min(1290px, calc(100vw - 32px));
     }}
     .gpt-response-modal textarea {{
       min-height: 320px;
@@ -37874,7 +38247,7 @@ def render_page(state: PageState) -> bytes:
       display: flex;
     }}
     .kite-response-card {{
-      width: min(720px, calc(100vw - 32px));
+      width: min(1080px, calc(100vw - 32px));
       max-height: calc(100vh - 40px);
       overflow-y: auto;
     }}
@@ -37937,13 +38310,29 @@ def render_page(state: PageState) -> bytes:
       cursor: wait;
     }}
     .live-modal {{
-      width: min(520px, 100%);
+      width: min(780px, calc(100vw - 24px));
+      max-width: calc(100vw - 24px);
+      max-height: calc(100vh - 24px);
+      overflow: auto;
+      scrollbar-gutter: stable;
       border-radius: 8px;
       background: #ffffff;
       border: 1px solid var(--line);
       box-shadow: 0 24px 80px rgba(15, 23, 42, 0.3);
       padding: 20px;
       text-align: center;
+      overflow-wrap: anywhere;
+    }}
+    .live-modal .table-wrap {{
+      max-width: 100%;
+      overflow-x: auto;
+    }}
+    .live-modal table {{
+      width: 100%;
+    }}
+    .live-modal th,
+    .live-modal td {{
+      vertical-align: top;
     }}
     .breath-circle {{
       width: 118px;
@@ -39385,6 +39774,99 @@ def render_page(state: PageState) -> bytes:
     tbody tr:hover td {{
       background: rgba(236, 254, 255, 0.46);
     }}
+    .pnl-hero {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+    }}
+    .pnl-card-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 12px;
+      margin: 14px 0;
+    }}
+    .pnl-card {{
+      border: 1px solid #c7ddff;
+      border-radius: 16px;
+      padding: 14px;
+      background: linear-gradient(135deg, #f8fbff, #ffffff);
+      box-shadow: 0 12px 26px rgba(15, 23, 42, 0.06);
+    }}
+    .pnl-card span {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }}
+    .pnl-card strong {{
+      display: block;
+      margin-top: 6px;
+      color: #0f172a;
+      font-size: 22px;
+      font-weight: 950;
+    }}
+    .pnl-card small {{
+      display: block;
+      margin-top: 4px;
+      color: #475569;
+      font-weight: 750;
+    }}
+    .pnl-analytics-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 14px;
+    }}
+    .pnl-calendar {{
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+      gap: 8px;
+    }}
+    .pnl-day {{
+      min-height: 58px;
+      border: 1px solid #dbeafe;
+      border-radius: 12px;
+      padding: 8px;
+      background: #f8fafc;
+    }}
+    .pnl-day span {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 900;
+    }}
+    .pnl-day strong {{
+      display: block;
+      margin-top: 6px;
+      color: #0f172a;
+      font-size: 13px;
+      font-weight: 950;
+    }}
+    .metric-positive {{ color: #007a5a !important; }}
+    .metric-negative {{ color: #a73700 !important; }}
+    .metric-neutral {{ color: #334155 !important; }}
+    .pnl-day.metric-positive {{
+      background: #dcfce7;
+      border-color: #86efac;
+    }}
+    .pnl-day.metric-negative {{
+      background: #fee2e2;
+      border-color: #fca5a5;
+    }}
+    .pnl-table-scroll {{
+      max-height: 520px;
+      overflow: auto;
+    }}
+    .pnl-subpanel table small,
+    #pnl-ledger-table small {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 750;
+    }}
     @media (max-width: 820px) {{
       .rule-strip {{ grid-template-columns: 1fr; }}
       .expiry-strip {{ grid-template-columns: 1fr; }}
@@ -39528,6 +40010,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {dhan_it_tab_class}" type="button" data-tab="dhan-it">DHAN-IT</button>
       <button class="tab-button utility-action {ai52_tab_class}" type="button" data-tab="52w-ai-call-spread">52W AI Call Spread</button>
       <button class="tab-button utility-action {sector_income_tab_class}" type="button" data-tab="sector-income">SECTOR-Income</button>
+      <button class="tab-button utility-action {pnl_tab_class}" type="button" data-tab="pnl">P&amp;L</button>
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
       {f'<button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>' if nifty_income_enabled else ''}
@@ -39673,6 +40156,7 @@ def render_page(state: PageState) -> bytes:
     {render_dhan_it_panel(state)}
     {render_ai52_call_spread_panel(state)}
     {render_sector_income_panel(state)}
+    {render_pnl_panel(state)}
     {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
   </main>
@@ -39901,6 +40385,10 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(document.getElementById('ai52-preview-table'));
     enableTableSorting(document.getElementById('sector-income-ranking-table'));
     enableTableSorting(document.getElementById('sector-income-opportunity-table'));
+    enableTableSorting(document.getElementById('pnl-ledger-table'));
+    for (const table of document.querySelectorAll('.pnl-sortable-table')) {{
+      enableTableSorting(table);
+    }}
     enableTableSorting(document.getElementById('value-stock-comparison-table'));
     enableTableSorting(document.getElementById('equity-holdings-table'));
     enableTableSorting(document.getElementById('ipo-listed-table'));
@@ -39998,6 +40486,7 @@ def render_page(state: PageState) -> bytes:
       document.getElementById('dhan-it-panel').style.display = active === 'dhan-it' ? '' : 'none';
       document.getElementById('ai52-call-spread-panel').style.display = active === '52w-ai-call-spread' ? '' : 'none';
       document.getElementById('sector-income-panel').style.display = active === 'sector-income' ? '' : 'none';
+      document.getElementById('pnl-panel').style.display = active === 'pnl' ? '' : 'none';
       document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
       document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
       for (const item of document.querySelectorAll('.tab-button')) {{
@@ -40030,6 +40519,7 @@ def render_page(state: PageState) -> bytes:
           'dhan-it': '/dhan-it',
           '52w-ai-call-spread': '/52w-ai-call-spread',
           'sector-income': '/sector-income',
+          pnl: '/pnl',
           'income-growth': '/income-growth',
           commodity: '/commodity',
           'order-management': '/orders',
@@ -42476,6 +42966,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.error = f"{friendly_external_error(exc, 'SECTOR-Income')}\n\n{traceback.format_exc()}"
             self.send_page(state)
             return
+        if parsed_url.path == "/pnl":
+            state = PageState(active_tab="pnl")
+            try:
+                load_pnl_state(state)
+            except Exception as exc:
+                state.error = f"{friendly_external_error(exc, 'P&L')}\n\n{traceback.format_exc()}"
+            self.send_page(state)
+            return
         if parsed_url.path == "/income":
             state = PageState(active_tab="income")
             try:
@@ -42844,6 +43342,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/dhan-it")
                 else "sector-income"
                 if request_path.startswith("/sector-income")
+                else "pnl"
+                if request_path.startswith("/pnl")
                 else "income-growth"
                 if request_path.startswith("/income-growth")
                 else "income"
@@ -43041,8 +43541,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             sector_income_generated_at=first(form, "sector_income_generated_at") or first(form, "dhan_it_opportunities_generated_at"),
             sector_income_show_rank_modal=checked(form, "sector_income_show_rank_modal"),
             sector_income_show_config_modal=checked(form, "sector_income_show_config_modal"),
+            sector_income_show_cards_modal=checked(form, "sector_income_show_cards_modal"),
             sector_income_selected_sectors=_dhan_json_loads(first(form, "sector_income_selected_sectors_json"), None),
             sector_income_sector_company_selection=_dhan_json_loads(first(form, "sector_income_sector_company_selection_json"), None),
+            sector_income_buy_limit_discount_pct=max(0.0, min(float(first(form, "sector_income_buy_limit_discount_pct", str(DEFAULT_BUY_LIMIT_DISCOUNT_PCT)) or DEFAULT_BUY_LIMIT_DISCOUNT_PCT), 50.0)),
+            sector_income_sell_limit_markup_pct=max(0.0, min(float(first(form, "sector_income_sell_limit_markup_pct", str(DEFAULT_SELL_LIMIT_MARKUP_PCT)) or DEFAULT_SELL_LIMIT_MARKUP_PCT), 100.0)),
             sector_income_score=_dhan_json_loads(first(form, "sector_income_score_json"), None),
             sector_income_ranking=_dhan_json_loads(first(form, "sector_income_ranking_json"), None),
             sector_income_pending_fii_snapshot=_dhan_json_loads(first(form, "sector_income_pending_fii_snapshot_json"), None),
@@ -43064,6 +43567,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             ),
             ai52_confirm_order=checked(form, "ai52_confirm_order"),
             ai52_source_status=first(form, "ai52_source_status"),
+            pnl_period=first(form, "pnl_period", "This Month"),
+            pnl_year=int(float(first(form, "pnl_year", str(datetime.now().year)) or datetime.now().year)),
+            pnl_from_date=first(form, "pnl_from_date"),
+            pnl_to_date=first(form, "pnl_to_date"),
+            pnl_account=first(form, "pnl_account", "ALL"),
+            pnl_strategy=first(form, "pnl_strategy", "ALL"),
+            pnl_theme=first(form, "pnl_theme", "ALL"),
+            pnl_asset_class=first(form, "pnl_asset_class", "ALL"),
+            pnl_underlying=first(form, "pnl_underlying"),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -44657,6 +45169,21 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 load_dhan_state(state)
                 state.message = f"Cleared DHAN Pair Order Monitor locally: {deleted.get('pair_orders_deleted', 0)} pair row(s) removed. Kite orders were not changed."
+            elif request_path == "/pnl/load":
+                load_pnl_state(state)
+                state.message = f"Loaded {len(state.pnl_rows or [])} P&L ledger row(s) for the selected filters."
+            elif request_path == "/pnl/sync-today":
+                synced = sync_today_pnl_from_kite(state)
+                load_pnl_state(state)
+                state.message = (
+                    f"Synced today's P&L from Kite positions for {synced} row(s). "
+                    "Existing rows for the same date/account/symbol were updated, not duplicated."
+                )
+            elif request_path == "/pnl/export-csv":
+                load_pnl_state(state)
+                export_path = PnlRepository(APP_DB_PATH).export_csv(state.pnl_rows or [], APP_ROOT / "pnl_exports")
+                state.pnl_export_path = str(export_path)
+                state.message = f"Exported {len(state.pnl_rows or [])} P&L row(s) to {export_path}."
             elif request_path == "/sector-income/config-open":
                 load_sector_income_state(state)
                 state.sector_income_show_config_modal = True
@@ -44708,11 +45235,31 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 load_sector_income_state(state)
                 total_symbols = len(sector_income_selected_symbols(saved_config["selected_sectors"], saved_config["sector_companies"]))
                 state.message = f"Saved SECTOR-Income scope: {len(saved_config['selected_sectors'])} sector(s), {total_symbols} company candidate(s). Cards, holdings and opportunity table refreshed."
+            elif request_path == "/sector-income/cards-detail":
+                load_sector_income_state(state)
+                state.sector_income_show_cards_modal = True
+                state.message = "Opened unblocked SECTOR-Income call-spread card details."
+            elif request_path == "/sector-income/cards-detail-close":
+                load_sector_income_state(state)
+                state.sector_income_show_cards_modal = False
+                state.message = "Closed SECTOR-Income call-spread card details."
             elif request_path in {"/sector-income/load", "/sector-income/evaluate"}:
+                requested_sector = first(form, "sector_income_sector")
+                if request_path == "/sector-income/evaluate" and requested_sector:
+                    selected_sector = normalize_sector_key(requested_sector)
+                    saved_config = SectorIncomeConfigRepository(APP_DB_PATH).save(
+                        [selected_sector],
+                        {selected_sector: configured_sector_symbols(selected_sector)[:4]},
+                        source="TOP3_SECTOR_BUTTON_REFRESH",
+                    )
+                    state.sector_income_selected_sectors = saved_config["selected_sectors"]
+                    state.sector_income_sector_company_selection = saved_config["sector_companies"]
+                    state.sector_income_sector = selected_sector
+                    state.sector_income_selected_index = ""
                 load_sector_income_state(state)
                 state.message = (
                     f"Scanned {SECTOR_LABELS.get(state.sector_income_sector, state.sector_income_sector)} "
-                    f"and ranked {len(state.sector_income_rows or [])} sector candidate(s)."
+                    f"and refreshed {len(state.sector_income_holding_positions or [])} Kite option holding/status row(s) for the active sector scope."
                 )
             elif request_path == "/sector-income/open-symbol":
                 selected_symbol = str(first(form, "sector_income_open_symbol") or "").strip().upper()
@@ -44815,11 +45362,18 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         f"Activated uploaded FII snapshot and applied {SECTOR_LABELS.get(apply_sector, apply_sector)}."
                     )
                 state.sector_income_sector = apply_sector
+                saved_config = SectorIncomeConfigRepository(APP_DB_PATH).save(
+                    [apply_sector],
+                    {apply_sector: configured_sector_symbols(apply_sector)[:4]},
+                    source="RANKING_DETAIL_APPLY_SECTOR",
+                )
+                state.sector_income_selected_sectors = saved_config["selected_sectors"]
+                state.sector_income_sector_company_selection = saved_config["sector_companies"]
                 state.sector_income_show_rank_modal = False
                 state.sector_income_selected_index = ""
                 load_sector_income_state(state)
                 save_sector_income_score_state(state, "SECTOR_APPLIED")
-                state.message = f"Applied {SECTOR_LABELS.get(apply_sector, apply_sector)} to SECTOR-Income and refreshed top companies."
+                state.message = f"Applied {SECTOR_LABELS.get(apply_sector, apply_sector)} to SECTOR-Income and refreshed cards plus Kite option holdings/status for its top companies."
             elif request_path == "/sector-income/rank-close":
                 popup_score = dict(state.sector_income_score or {})
                 popup_ranking = dict(state.sector_income_ranking or {})
@@ -44849,6 +45403,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
                 try:
                     selected_opportunity = apply_dhan_result_date_guard(dict(state.sector_income_opportunities[selected_idx]))
+                    selected_opportunity = apply_sector_income_limit_controls(
+                        selected_opportunity,
+                        buy_limit_discount_pct=state.sector_income_buy_limit_discount_pct,
+                        sell_limit_markup_pct=state.sector_income_sell_limit_markup_pct,
+                    )
                     if bool(selected_opportunity.get("result_date_near")):
                         raise ValueError(str(selected_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))
                     strict_orderable = dhan_pair_is_defined_risk_orderable(

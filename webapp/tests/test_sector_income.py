@@ -242,6 +242,31 @@ def test_sector_income_config_repository_persists_three_sector_four_company_scop
     ]
 
 
+def test_sector_income_limit_controls_discount_buy_and_park_sell_at_markup() -> None:
+    preview = {
+        "sell_leg_premium": 42.0,
+        "buy_leg_premium": 12.0,
+        "sell_strike": 3400,
+        "buy_strike": 3600,
+        "quantity": 225,
+    }
+
+    adjusted = app.apply_sector_income_limit_controls(
+        preview,
+        buy_limit_discount_pct=5,
+        sell_limit_markup_pct=10,
+    )
+
+    assert adjusted["buy_limit_price"] == 11.4
+    assert adjusted["sell_limit_price"] == 42.0
+    assert adjusted["sell_initial_limit_price"] == 46.2
+    assert adjusted["net_credit"] == 30.6
+    assert adjusted["max_gain"] == 6885.0
+    assert adjusted["max_loss"] == 38115.0
+    assert adjusted["buy_limit_discount_pct"] == 5
+    assert adjusted["sell_limit_markup_pct"] == 10
+
+
 def test_sector_income_scorecard_weights_and_default_sector_are_deterministic() -> None:
     assert sum(SECTOR_SCORE_WEIGHTS.values()) == 100
 
@@ -448,6 +473,9 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
         },
         sector_income_show_rank_modal=True,
         sector_income_show_config_modal=True,
+        sector_income_show_cards_modal=True,
+        sector_income_buy_limit_discount_pct=7.5,
+        sector_income_sell_limit_markup_pct=12.5,
         sector_income_selected_sectors=["INFORMATION_TECHNOLOGY", "HEALTHCARE_PHARMA", "AUTOMOBILE_AUTO_COMPONENTS"],
         sector_income_sector_company_selection={
             "INFORMATION_TECHNOLOGY": ["TCS", "INFY", "HCLTECH", "TECHM"],
@@ -463,7 +491,31 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
             "rows": [row.to_dict() for row in FiiSectorPdfParser().parse_text(FII_FIXTURE_TEXT, source_filename="fii.pdf").rows],
         },
         sector_income_fii_upload_message="Extracted 14 valid FII sector row(s).",
-        sector_income_cards=[],
+        sector_income_cards=[
+            {
+                "symbol": "TCS",
+                "label": "Tata Consultancy Services",
+                "status": "GREEN",
+                "decision": "BUILD CE PAIR",
+                "price": 3200,
+                "day_change_pct": 2.25,
+                "trend": "BEARISH_RALLY",
+                "nifty_it_regime": "BEARISH_RALLY",
+                "distance_50_pct": -3.03,
+                "distance_200_pct": -5.88,
+                "risk_bucket": "MODERATE",
+                "target_short_otm_pct": 8,
+                "target_hedge_otm_pct": 13,
+                "reasons": ["controlled rise suitable for review"],
+            },
+            {
+                "symbol": "REDONLY",
+                "label": "Blocked candidate",
+                "status": "RED",
+                "decision": "BLOCKED",
+                "price": 100,
+            },
+        ],
         sector_income_holding_positions=[],
         sector_income_opportunities=[opportunity],
         sector_income_selected_index="0",
@@ -495,6 +547,15 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
     assert 'name="sector_income_config_sectors" value="HEALTHCARE_PHARMA"' in html
     assert 'name="sector_income_config_company_INFORMATION_TECHNOLOGY" value="TCS"' in html
     assert "Configured Sector Call-Spread Cards" in html
+    assert 'name="sector_income_buy_limit_discount_pct"' in html
+    assert 'name="sector_income_sell_limit_markup_pct"' in html
+    assert "SELL CE PARKED" in html
+    assert "Parked LIMIT" in html
+    assert 'formaction="/sector-income/cards-detail"' in html
+    assert 'id="sector-income-cards-detail-modal"' in html
+    assert "Unblocked SECTOR-Income Call-Spread Details" in html
+    assert "Tata Consultancy Services" in html
+    assert "REDONLY" not in html
     assert 'formaction="/sector-income/monitor-run"' in html
     assert 'formaction="/sector-income/scheduler-start"' in html
     assert 'formaction="/sector-income/scheduler-stop"' in html
