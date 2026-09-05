@@ -638,9 +638,13 @@ def test_dhan_it_holding_position_table_renders_below_call_watch():
     assert "BUY CE Hedge Holdings" in html
     assert "<th>CMP</th>" in html
     assert '<button type="button" class="sort-header" data-sort-col="2">% Change</button>' in html
+    assert '<button type="button" class="sort-header" data-sort-col="3">% from 52W High</button>' in html
+    assert '<button type="button" class="sort-header" data-sort-col="10">DMA Zone</button>' in html
+    assert '<button type="button" class="sort-header" data-sort-col="11">RSI</button>' in html
+    assert '<button type="button" class="sort-header" data-sort-col="12">Signal Confidence</button>' in html
     assert "3200.00" in html
     assert '<td class="dhan-it-change-cell pnl-negative" data-sort-value="-1.250000"><strong>-1.25%</strong></td>' in html
-    assert '<button type="button" class="sort-header" data-sort-col="3">P&amp;L</button>' in html
+    assert '<button type="button" class="sort-header" data-sort-col="4">P&amp;L</button>' in html
     assert 'class="dhan-position-pnl-cell pnl-positive" data-sort-value="20000.000000">20000.00</td>' in html
     assert 'formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol" value="INFY"' in html
 
@@ -663,25 +667,46 @@ def test_dhan_it_pair_status_cmp_uses_live_call_watch_card_when_no_equity_holdin
             "action": "BUY_HEDGE",
         }
     ]
-    cards = [{"symbol": "TCS", "price": 3344.25, "day_change_pct": 2.45}]
+    cards = [
+        {
+            "symbol": "TCS",
+            "price": 3344.25,
+            "day_change_pct": 2.45,
+            "pct_to_52_high": -4.25,
+            "yearly_high": 3492.63,
+            "stock_regime": "SELL_ZONE",
+            "dma_50": 3301.5,
+            "dma_200": 3190.25,
+            "rsi": 62.4,
+            "rsi_direction": "RISING",
+            "confidence": 78,
+            "signal_status": "SELL_ON_RISE",
+            "decision_reason": "Below resistance with weak rebound.",
+        }
+    ]
 
     enriched = app.enrich_dhan_it_holding_positions_with_call_watch_cmp(rows, cards)
-    html = app.render_dhan_it_panel(
-        app.PageState(
-            active_tab="dhan-it",
-            dhan_it_rows=dhan_it_universe_rows(),
-            dhan_it_call_watch_cards=cards,
-            dhan_it_holding_positions=rows,
-        )
-    )
+    html = app.render_dhan_it_holding_positions(enriched)
 
     assert enriched[0]["cmp"] == 3344.25
     assert enriched[0]["day_change_pct"] == 2.45
+    assert enriched[0]["pct_to_52_high"] == -4.25
+    assert enriched[0]["yearly_high"] == 3492.63
+    assert enriched[0]["stock_regime"] == "SELL_ZONE"
+    assert enriched[0]["dma_50"] == 3301.5
+    assert enriched[0]["rsi"] == 62.4
+    assert enriched[0]["confidence"] == 78
     assert enriched[0]["cmp_source"] == "DHAN-IT live card"
     assert "<th>CMP</th>" in html
     assert '<button type="button" class="sort-header" data-sort-col="2">% Change</button>' in html
+    assert '<button type="button" class="sort-header" data-sort-col="3">% from 52W High</button>' in html
     assert "3344.25" in html
     assert "2.45%" in html
+    assert "4.25% below" in html
+    assert "SELL_ZONE" in html
+    assert "50 DMA 3301.50" in html
+    assert "62.4" in html
+    assert "78%" in html
 
 
 def test_dhan_it_pair_status_day_change_falls_back_to_current_stock_list_row():
@@ -703,7 +728,21 @@ def test_dhan_it_pair_status_day_change_falls_back_to_current_stock_list_row():
         }
     ]
     cards = [{"symbol": "TECHM"}]
-    stock_rows = [{"symbol": "TECHM", "cmp": 1643.0, "day_change_pct": 3.21}]
+    stock_rows = [
+        {
+            "symbol": "TECHM",
+            "cmp": 1643.0,
+            "day_change_pct": 3.21,
+            "pct_to_52_high": -9.75,
+            "yearly_high": 1820.45,
+            "stock_regime": "NIFTY IT MIXED",
+            "dma_50": 1497.25,
+            "dma_200": 1469.33,
+            "rsi": 55.5,
+            "confidence": 64,
+            "signal_status": "WATCH",
+        }
+    ]
 
     enriched = app.enrich_dhan_it_holding_positions_with_call_watch_cmp(rows, cards, stock_rows)
     html = app.render_dhan_it_holding_positions(enriched)
@@ -712,8 +751,45 @@ def test_dhan_it_pair_status_day_change_falls_back_to_current_stock_list_row():
     assert enriched[0]["cmp_source"] == "DHAN-IT stock list"
     assert enriched[0]["day_change_pct"] == 3.21
     assert enriched[0]["day_change_source"] == "DHAN-IT stock list"
+    assert enriched[0]["pct_to_52_high"] == -9.75
+    assert enriched[0]["pct_to_52_high_source"] == "DHAN-IT stock list"
+    assert enriched[0]["stock_regime"] == "NIFTY IT MIXED"
+    assert enriched[0]["rsi"] == 55.5
+    assert enriched[0]["confidence"] == 64
     assert "1643.00" in html
     assert "3.21%" in html
+    assert "9.75% below" in html
+    assert "52W high 1820.45" in html
+    assert "NIFTY IT MIXED" in html
+    assert "55.5" in html
+
+
+def test_dhan_it_pair_status_52w_high_uses_fallback_when_kite_omits_field(monkeypatch):
+    rows = [
+        {
+            "symbol": "TCS",
+            "cmp": "",
+            "last_price": "",
+            "sell_count": 0,
+            "buy_count": 0,
+            "sell_symbols": "",
+            "buy_symbols": "",
+            "pair_status": "NO CE PAIR",
+            "suggestion": "Build CE SELL + BUY hedge pair from DHAN-IT popup.",
+            "action": "BUILD_PAIR",
+        }
+    ]
+    cards = [{"symbol": "TCS", "price": 900.0}]
+    monkeypatch.setattr(app, "investing_52_week_levels", lambda code: {"high": 1000.0, "low": 700.0})
+
+    enriched = app.enrich_dhan_it_holding_positions_with_call_watch_cmp(rows, cards)
+    html = app.render_dhan_it_holding_positions(enriched)
+
+    assert enriched[0]["yearly_high"] == 1000.0
+    assert enriched[0]["pct_to_52_high"] == -10.0
+    assert enriched[0]["pct_to_52_high_source"] == "Yahoo 52W fallback"
+    assert "10.00% below" in html
+    assert "52W high 1000.00" in html
 
 
 def test_dhan_it_holding_position_table_offers_repair_for_incomplete_pair():
@@ -1436,6 +1512,24 @@ def test_dhan_it_limit_prices_are_rounded_to_zerodha_tick_size(tmp_path):
 
     assert monitor_result["modified"] == 1
     assert broker.modified == [("regular", "MOCK-2", {"order_type": "LIMIT", "price": 11.95})]
+
+
+def test_dhan_it_submit_uses_preview_configured_sell_initial_limit(tmp_path):
+    repo = DhanItPairRepository(tmp_path / "dhan_it.db")
+    broker = MockBroker()
+    preview = approved_preview()
+    preview["sell_limit_price"] = 20.0
+    preview["sell_initial_limit_price"] = 23.0
+    preview["sell_limit_markup_pct"] = 15
+
+    result = submit_dhan_it_pair(preview, repo, broker, user_confirmed=True, mode="PAPER")
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.placed[1]["price"] == 23.0
+    assert payload["sell_cmp_limit_price"] == 20.0
+    assert payload["sell_initial_limit_price"] == 23.0
 
 
 def test_monitor_blocks_sell_when_refreshed_liquidity_turns_red(tmp_path):

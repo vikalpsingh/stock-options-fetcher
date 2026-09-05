@@ -61,6 +61,20 @@ def _float_or_none(value: Any) -> float | None:
     return number if number > 0 else None
 
 
+def _signed_float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value not in {None, ""}:
+            return value
+    return None
+
+
 def calculate_moving_averages(
     closes: Iterable[Any],
     min_sessions: int | None = None,
@@ -449,6 +463,15 @@ def build_dhan_it_card_view_model(
         {
             "label": label,
             "day_change_pct": _float_or_none(market_data.get("day_change_pct")),
+            "previous_close": _float_or_none(market_data.get("previous_close")),
+            "yearly_high": _float_or_none(market_data.get("yearly_high") or market_data.get("high_52w")),
+            "pct_to_52_high": _signed_float_or_none(
+                _first_present(
+                    market_data.get("pct_to_52_high"),
+                    market_data.get("drawdown_from_52w_high_pct"),
+                    market_data.get("week_52"),
+                )
+            ),
             "event_risk": market_data.get("event_risk"),
             "signal": signal.to_dict(),
             "signal_status": "DATA_UNAVAILABLE" if is_sector and gate.get("status") == "RED" else signal.signal_status if not is_sector else "SECTOR_FILTER",

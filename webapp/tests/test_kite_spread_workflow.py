@@ -531,7 +531,8 @@ def test_dhan_stock_rows_have_simple_pe_ce_evaluation_actions(tmp_path, monkeypa
     assert 'id="dhan-watchlist-table"' in html
     assert '<th class="sort-header" data-sort-col="0">Select</th>' in html
     assert '<th class="sort-header" data-sort-col="2">CMP / Day</th>' in html
-    assert html.index('data-sort-col="4">Actions</th>') < html.index('data-sort-col="5">52W High Gap</th>')
+    assert html.index('data-sort-col="4">Actions</th>') < html.index('data-sort-col="5">% distance from 52W high</th>')
+    assert html.index('data-sort-col="5">% distance from 52W high</th>') < html.index('data-sort-col="6">Far from 52W low</th>')
     assert "Run Analysis" in html
     assert "Select All" in html
     assert "Clear Selection" in html
@@ -603,7 +604,8 @@ def test_dhan_stock_rows_show_52_week_high_gap(tmp_path, monkeypatch):
 
     html = app.render_kite_spreads_panel(app.PageState(active_tab="kite-spreads"))
 
-    assert "52W High Gap" in html
+    assert "% distance from 52W high" in html
+    assert "Far from 52W low" in html
     assert "21.25% below" in html
     assert "dhan-52w-far" in html
 

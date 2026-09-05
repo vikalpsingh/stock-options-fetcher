@@ -171,15 +171,15 @@ class DhanItPairRepository:
             conn.execute(
                 """
                 INSERT INTO dhan_it_pair_orders(
-                    pair_id, strategy_type, symbol, expiry, lots, lot_size, quantity,
+                    pair_id, screen_name, strategy_type, symbol, expiry, lots, lot_size, quantity,
                     sell_leg_tradingsymbol, buy_leg_tradingsymbol, sell_leg_status, buy_leg_status,
                     pair_status, net_credit_expected, net_credit_actual, max_gain, max_loss,
                     breakeven, pop_estimate, risk_decision, user_confirmed, mode, execution_mode,
                     payload_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    pair_id, preview["strategy_type"], preview["symbol"], preview["expiry"],
+                    pair_id, str(preview.get("screen_name") or "DHAN-IT"), preview["strategy_type"], preview["symbol"], preview["expiry"],
                     int(preview.get("selected_lots") or preview.get("lots") or 1),
                     int(preview.get("lot_size") or 0), int(preview.get("quantity") or 0),
                     preview.get("sell_leg_tradingsymbol"), preview.get("buy_leg_tradingsymbol"),
@@ -218,10 +218,24 @@ class DhanItPairRepository:
         with self.connect() as conn:
             conn.execute("INSERT INTO dhan_it_execution_log(pair_id, action, detail, created_at) VALUES (?, ?, ?, ?)", (pair_id, action, detail, now_text()))
 
-    def clear_pair_monitor(self) -> dict[str, int]:
+    def clear_pair_monitor(self, screen_name: str | None = None) -> dict[str, int]:
+        clean_screen = str(screen_name or "").strip()
         with self.connect() as conn:
-            order_cur = conn.execute("DELETE FROM dhan_it_pair_orders")
-            log_cur = conn.execute("DELETE FROM dhan_it_execution_log")
+            if clean_screen:
+                pair_rows = conn.execute(
+                    "SELECT pair_id FROM dhan_it_pair_orders WHERE UPPER(screen_name)=UPPER(?)",
+                    (clean_screen,),
+                ).fetchall()
+                pair_ids = [str(row["pair_id"]) for row in pair_rows]
+                if pair_ids:
+                    placeholders = ",".join("?" for _ in pair_ids)
+                    log_cur = conn.execute(f"DELETE FROM dhan_it_execution_log WHERE pair_id IN ({placeholders})", pair_ids)
+                else:
+                    log_cur = conn.execute("DELETE FROM dhan_it_execution_log WHERE 1=0")
+                order_cur = conn.execute("DELETE FROM dhan_it_pair_orders WHERE UPPER(screen_name)=UPPER(?)", (clean_screen,))
+            else:
+                order_cur = conn.execute("DELETE FROM dhan_it_pair_orders")
+                log_cur = conn.execute("DELETE FROM dhan_it_execution_log")
         return {
             "pair_orders_deleted": int(order_cur.rowcount or 0),
             "execution_logs_deleted": int(log_cur.rowcount or 0),
@@ -331,7 +345,14 @@ def submit_dhan_it_pair(preview: dict[str, Any], repository: DhanItPairRepositor
     tag = pair_id[-20:]
     buy_payload = build_kite_order_payload(preview["buy_leg_tradingsymbol"], "BUY", preview["quantity"], preview["buy_limit_price"], tag)
     sell_cmp_limit_price = round_limit_price_to_tick(float(preview["sell_limit_price"]))
-    sell_initial_limit_price = dhan_initial_sell_limit_price(sell_cmp_limit_price)
+    sell_initial_limit_price = round_limit_price_to_tick(float(preview.get("sell_initial_limit_price") or 0))
+    if sell_initial_limit_price <= 0:
+        markup_pct = _float_value(preview.get("sell_limit_markup_pct"))
+        sell_initial_limit_price = (
+            round_limit_price_to_tick(sell_cmp_limit_price * (1 + markup_pct / 100))
+            if markup_pct > 0
+            else dhan_initial_sell_limit_price(sell_cmp_limit_price)
+        )
     sell_payload = build_kite_order_payload(preview["sell_leg_tradingsymbol"], "SELL", preview["quantity"], sell_initial_limit_price, tag)
     buy_result = broker.place_order(buy_payload)
     sell_result = broker.place_order(sell_payload)

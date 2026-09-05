@@ -150,15 +150,32 @@ from sector_income import (
     DEFAULT_SECTOR_PRIORITY,
     SECTOR_LABELS,
     SECTOR_SCORE_WEIGHTS,
+    SectorIncomeConfigRepository,
     calculate_sector_sell_on_rise_score,
     fii_rows_to_snapshot_map,
     configured_sector_symbols,
+    default_sector_income_selection,
     rank_all_sectors,
     load_fii_sector_snapshot,
     normalize_sector_key,
+    normalize_sector_income_selection,
     rank_sector_candidates,
     sector_options,
+    sector_income_company_master_rows,
+    sector_income_selected_symbols,
     validate_sector_fno_symbols,
+)
+from fifty_two_week_ai_call_spread import (
+    CSV_EXPORT_URL as AI52_CSV_EXPORT_URL,
+    DEFAULT_BUY_LIMIT_DISCOUNT_PCT,
+    DEFAULT_SELL_LIMIT_MARKUP_PCT,
+    FiftyTwoWeekAiRepository,
+    ScreenerClient,
+    ScreenerManualExportRequired,
+    SellOnRiseEvaluator,
+    build_52w_ai_call_spread_preview,
+    normalize_screener_csv,
+    rank_sell_on_rise_evaluations,
 )
 
 # Compatibility aliases for the DHAN page wiring. These point to Kite-specific
@@ -7651,10 +7668,24 @@ class PageState:
     sector_income_selected_index: str = ""
     sector_income_generated_at: str = ""
     sector_income_show_rank_modal: bool = False
+    sector_income_show_config_modal: bool = False
+    sector_income_selected_sectors: list[str] | None = None
+    sector_income_sector_company_selection: dict[str, list[str]] | None = None
     sector_income_pending_fii_snapshot: dict[str, Any] | None = None
     sector_income_active_fii_snapshot: dict[str, Any] | None = None
     sector_income_fii_upload_message: str = ""
     sector_income_score_snapshot: dict[str, Any] | None = None
+    ai52_candidates: list[dict[str, Any]] | None = None
+    ai52_evaluations: list[dict[str, Any]] | None = None
+    ai52_previews: list[dict[str, Any]] | None = None
+    ai52_selected_index: str = ""
+    ai52_selected_preview: dict[str, Any] | None = None
+    ai52_lots: int = 1
+    ai52_buy_limit_discount_pct: float = DEFAULT_BUY_LIMIT_DISCOUNT_PCT
+    ai52_sell_limit_markup_pct: float = DEFAULT_SELL_LIMIT_MARKUP_PCT
+    ai52_paper_trading: bool = True
+    ai52_confirm_order: bool = False
+    ai52_source_status: str = ""
 
 
 def mask_secret(value: str | None) -> str:
@@ -7884,6 +7915,7 @@ def is_app_page_request(path: str) -> bool:
         "/value-stock",
         "/kite-spreads",
         "/dhan-it",
+        "/52w-ai-call-spread",
         "/sector-income",
         "/income-growth",
         "/commodity",
@@ -21386,7 +21418,9 @@ def refresh_dhan_watchlist_quotes(watchlist: list[dict[str, Any]] | None) -> Non
             row["day_change_pct"] = quote.get("day_change_pct")
             row["previous_close"] = quote.get("previous_close")
             row["yearly_high"] = quote.get("yearly_high")
+            row["yearly_low"] = quote.get("yearly_low")
             row["pct_to_52_high"] = quote.get("pct_to_52_high")
+            row["pct_from_52_low"] = quote.get("pct_from_52_low")
             row["quote_source"] = "Fresh Kite, no cache"
 
 
@@ -23250,6 +23284,44 @@ def render_kite_spreads_panel(state: PageState) -> str:
         detail = f"52W high {money(high_value)}" if high_value > 0 else "Income Growth / Kite 52W reference"
         return label, detail, css_class
 
+    def dhan_52w_low_gap(row: dict[str, Any]) -> tuple[str, str, str]:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        sheet = income_growth_by_symbol.get(symbol) or {}
+        pct_value: float | None = None
+        for key in ("pct_from_52_low", "distance_from_52w_low_pct", "from_52w_low_pct"):
+            raw = row.get(key, sheet.get(key))
+            try:
+                pct_value = float(raw)
+                break
+            except (TypeError, ValueError):
+                continue
+        if pct_value is None:
+            low_raw = row.get("yearly_low") or row.get("low_52w") or sheet.get("low_52w")
+            cmp_raw = row.get("cmp") or row.get("last_price") or row.get("price")
+            try:
+                low_value_for_calc = float(low_raw or 0)
+                cmp_value_for_calc = float(cmp_raw or 0)
+            except (TypeError, ValueError):
+                low_value_for_calc = 0.0
+                cmp_value_for_calc = 0.0
+            if low_value_for_calc > 0 and cmp_value_for_calc > 0:
+                pct_value = round(((cmp_value_for_calc - low_value_for_calc) / low_value_for_calc) * 100, 2)
+        if pct_value is None:
+            return "-", "52W low unavailable", "dhan-52w-unknown"
+        try:
+            low_value = float(row.get("yearly_low") or row.get("low_52w") or sheet.get("low_52w") or 0)
+        except (TypeError, ValueError):
+            low_value = 0.0
+        if pct_value >= 40:
+            css_class = "dhan-52w-far"
+        elif pct_value >= 15:
+            css_class = "dhan-52w-mid"
+        else:
+            css_class = "dhan-52w-near"
+        label = f"{pct_value:.2f}% above"
+        detail = f"52W low {money(low_value)}" if low_value > 0 else "Income Growth / Kite 52W reference"
+        return label, detail, css_class
+
     watch_rows = []
     for row in watchlist:
         active = "YES" if int(row.get("active") or 0) else "NO"
@@ -23263,6 +23335,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
         coverage_note = text_value(row.get("coverage_note"), "")
         event_risk = bool(int(row.get("event_risk_flag") or 0))
         gap_label, gap_detail, gap_class = dhan_52w_gap(row)
+        low_gap_label, low_gap_detail, low_gap_class = dhan_52w_low_gap(row)
         try:
             row_day_change = float(row.get("day_change_pct") or 0)
         except (TypeError, ValueError):
@@ -23318,6 +23391,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
             f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-muted\" formaction=\"/kite-spreads/deactivate\" name=\"dhan_watchlist_id\" value=\"{html.escape(str(row.get('id') or ''), quote=True)}\"{remove_disabled}{remove_title}>Hide</button>"
             "</td>"
             f"<td class=\"dhan-52w-cell {gap_class}\"><strong>{html.escape(gap_label)}</strong><small>{html.escape(gap_detail)}</small></td>"
+            f"<td class=\"dhan-52w-cell {low_gap_class}\"><strong>{html.escape(low_gap_label)}</strong><small>{html.escape(low_gap_detail)}</small></td>"
             f"<td class=\"dhan-fno-parent-cell\"><strong>#{html.escape(text_value(fno_detail.get('rank')))}</strong><small><span class=\"ipo-badge good\">{html.escape(fno_strategy_badge)} SELL</span></small></td>"
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('spot_price_sheet'))}<small>Kite {money(fno_detail.get('cmp_kite'))}</small></td>"
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('sheet_strike'))}<small>{money(fno_detail.get('sheet_premium'))} prem | {money(fno_detail.get('sheet_total_premium'))} total</small></td>"
@@ -23330,7 +23404,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
             "</tr>"
         )
     if not watch_rows:
-        watch_rows.append('<tr><td colspan="15" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
+        watch_rows.append('<tr><td colspan="16" class="muted-cell">No DHAN watchlist rows yet. Add a stock or sync holdings.</td></tr>')
 
     active_config_rows = []
     for row in watchlist:
@@ -23970,7 +24044,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
           <button type="button" class="secondary dhan-watch-filter" data-dhan-watch-filter="CE">CE only</button>
           <button type="button" class="secondary dhan-watch-filter" data-dhan-watch-filter="PE">PE only</button>
         </div>
-        <div class="table-wrap dhan-watchlist-scroll"><table id="dhan-watchlist-table" class="ipo-table dhan-watchlist-table"><thead><tr><th class="sort-header" data-sort-col="0">Select</th><th class="sort-header" data-sort-col="1">Symbol</th><th class="sort-header" data-sort-col="2">CMP / Day</th><th class="sort-header" data-sort-col="3">DMA Zone</th><th class="sort-header" data-sort-col="4">Actions</th><th class="sort-header" data-sort-col="5">52W High Gap</th><th class="sort-header" data-sort-col="6">Rank / Trade</th><th class="sort-header" data-sort-col="7">Spot</th><th class="sort-header" data-sort-col="8">Strike / Premium</th><th class="sort-header" data-sort-col="9">OTM / Expiry</th><th class="sort-header" data-sort-col="10">Liquidity</th><th class="sort-header" data-sort-col="11">Scores</th><th class="sort-header" data-sort-col="12">Gain / Loss</th><th class="sort-header" data-sort-col="13">POP / RoR</th><th class="sort-header" data-sort-col="14">Live Status / Risk Reason</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
+        <div class="table-wrap dhan-watchlist-scroll"><table id="dhan-watchlist-table" class="ipo-table dhan-watchlist-table"><thead><tr><th class="sort-header" data-sort-col="0">Select</th><th class="sort-header" data-sort-col="1">Symbol</th><th class="sort-header" data-sort-col="2">CMP / Day</th><th class="sort-header" data-sort-col="3">DMA Zone</th><th class="sort-header" data-sort-col="4">Actions</th><th class="sort-header" data-sort-col="5">% distance from 52W high</th><th class="sort-header" data-sort-col="6">Far from 52W low</th><th class="sort-header" data-sort-col="7">Rank / Trade</th><th class="sort-header" data-sort-col="8">Spot</th><th class="sort-header" data-sort-col="9">Strike / Premium</th><th class="sort-header" data-sort-col="10">OTM / Expiry</th><th class="sort-header" data-sort-col="11">Liquidity</th><th class="sort-header" data-sort-col="12">Scores</th><th class="sort-header" data-sort-col="13">Gain / Loss</th><th class="sort-header" data-sort-col="14">POP / RoR</th><th class="sort-header" data-sort-col="15">Live Status / Risk Reason</th></tr></thead><tbody>{''.join(watch_rows)}</tbody></table></div>
       </section>
       <section class="panel dhan-ready-panel">
         <div class="panel-title">READY for TRADE - Pre-Validated DHAN Pairs</div>
@@ -24214,14 +24288,21 @@ def enrich_dhan_it_holding_positions_with_call_watch_cmp(
 
     card_by_symbol = {str(card.get("symbol") or "").strip().upper(): card for card in cards or []}
     stock_by_symbol = {str(row.get("symbol") or "").strip().upper(): row for row in stock_rows or []}
+
+    def first_present(*values: Any) -> Any:
+        for value in values:
+            if value not in {None, ""}:
+                return value
+        return None
+
     enriched: list[dict[str, Any]] = []
     for row in rows or []:
         next_row = dict(row)
         symbol = str(next_row.get("symbol") or "").strip().upper()
         card = card_by_symbol.get(symbol) or {}
         stock = stock_by_symbol.get(symbol) or {}
-        card_cmp = _dhan_metric_float(card.get("price") or card.get("cmp"))
-        stock_cmp = _dhan_metric_float(stock.get("cmp") or stock.get("price"))
+        card_cmp = _dhan_metric_float(first_present(card.get("price"), card.get("cmp")))
+        stock_cmp = _dhan_metric_float(first_present(stock.get("cmp"), stock.get("price")))
         if card_cmp > 0:
             next_row["cmp"] = card_cmp
             next_row["cmp_source"] = "DHAN-IT live card"
@@ -24236,6 +24317,46 @@ def enrich_dhan_it_holding_positions_with_call_watch_cmp(
         elif stock_change not in {None, ""}:
             next_row["day_change_pct"] = stock_change
             next_row["day_change_source"] = "DHAN-IT stock list"
+        card_52w_gap = first_present(card.get("pct_to_52_high"), card.get("drawdown_from_52w_high_pct"), card.get("week_52"))
+        stock_52w_gap = first_present(stock.get("pct_to_52_high"), stock.get("drawdown_from_52w_high_pct"), stock.get("week_52"))
+        if card_52w_gap not in {None, ""}:
+            next_row["pct_to_52_high"] = card_52w_gap
+            next_row["yearly_high"] = first_present(card.get("yearly_high"), card.get("high_52w"), next_row.get("yearly_high"))
+            next_row["pct_to_52_high_source"] = "DHAN-IT live card"
+        elif stock_52w_gap not in {None, ""}:
+            next_row["pct_to_52_high"] = stock_52w_gap
+            next_row["yearly_high"] = first_present(stock.get("yearly_high"), stock.get("high_52w"), next_row.get("yearly_high"))
+            next_row["pct_to_52_high_source"] = "DHAN-IT stock list"
+        elif symbol and _dhan_metric_float(next_row.get("cmp")) > 0:
+            try:
+                levels = investing_52_week_levels(f"NSE:{symbol}") or {}
+                high_value = _dhan_metric_float(levels.get("high"))
+                if high_value > 0:
+                    cmp_value = _dhan_metric_float(next_row.get("cmp"))
+                    next_row["yearly_high"] = high_value
+                    next_row["pct_to_52_high"] = round(((cmp_value - high_value) / high_value) * 100, 2)
+                    next_row["pct_to_52_high_source"] = "Yahoo 52W fallback"
+            except Exception as exc:
+                next_row["pct_to_52_high_error"] = friendly_external_error(exc, "DHAN-IT 52W fallback")
+        for field in (
+            "stock_regime",
+            "trend_view",
+            "signal_status",
+            "recommended_strategy",
+            "confidence",
+            "decision_reason",
+            "rsi",
+            "rsi_direction",
+            "dma_50",
+            "dma_200",
+        ):
+            value = first_present(card.get(field), stock.get(field), next_row.get(field))
+            if value not in {None, ""}:
+                next_row[field] = value
+        if next_row.get("stock_regime") in {None, ""} and next_row.get("trend_view") not in {None, ""}:
+            next_row["stock_regime"] = next_row.get("trend_view")
+        if next_row.get("trend_view") in {None, ""} and next_row.get("stock_regime") not in {None, ""}:
+            next_row["trend_view"] = next_row.get("stock_regime")
         enriched.append(next_row)
     return enriched
 
@@ -24266,6 +24387,89 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
 
     def sort_header(label: str, col: int) -> str:
         return f'<button type="button" class="sort-header" data-sort-col="{col}">{html.escape(label)}</button>'
+
+    def high_52w_gap(row: dict[str, Any]) -> tuple[str, str, str]:
+        pct_value: float | None = None
+        for key in ("pct_to_52_high", "drawdown_from_52w_high_pct", "week_52"):
+            raw = row.get(key)
+            try:
+                pct_value = float(raw)
+                break
+            except (TypeError, ValueError):
+                continue
+        if pct_value is None:
+            return "-", "52W high unavailable", "dhan-52w-unknown"
+        try:
+            high_value = float(row.get("yearly_high") or row.get("high_52w") or 0)
+        except (TypeError, ValueError):
+            high_value = 0.0
+        if pct_value < 0:
+            label = f"{abs(pct_value):.2f}% below"
+            css_class = "dhan-52w-far" if pct_value <= -20 else "dhan-52w-mid" if pct_value <= -8 else "dhan-52w-near"
+        elif pct_value == 0:
+            label = "At 52W high"
+            css_class = "dhan-52w-near"
+        else:
+            label = f"{pct_value:.2f}% above"
+            css_class = "dhan-52w-near"
+        detail = f"52W high {money(high_value)}" if high_value > 0 else text_value(row.get("pct_to_52_high_source"), "Kite 52W reference")
+        return label, detail, css_class
+
+    def technical_cell(row: dict[str, Any]) -> str:
+        zone = text_value(row.get("stock_regime") or row.get("trend_view"), "UNKNOWN").upper()
+        dma_parts: list[str] = []
+        dma_50 = money(row.get("dma_50"))
+        dma_200 = money(row.get("dma_200"))
+        if dma_50 != "-":
+            dma_parts.append(f"50 DMA {dma_50}")
+        if dma_200 != "-":
+            dma_parts.append(f"200 DMA {dma_200}")
+        detail = " | ".join(dma_parts) if dma_parts else "DMA unavailable"
+        if "SELL" in zone or "BEAR" in zone:
+            css_class = "dhan-zone-sell"
+        elif "BUY" in zone or "BULL" in zone:
+            css_class = "dhan-zone-buy"
+        elif "NEUTRAL" in zone or "MIXED" in zone:
+            css_class = "dhan-zone-neutral"
+        else:
+            css_class = "dhan-zone-unknown"
+        return (
+            f'<div class="dhan-it-tech-pill {css_class}"><strong>{html.escape(zone)}</strong>'
+            f'<small>{html.escape(detail)}</small></div>'
+        )
+
+    def rsi_cell(row: dict[str, Any]) -> str:
+        rsi_value = _dhan_metric_float(row.get("rsi"))
+        if rsi_value <= 0:
+            return '<span class="muted-cell">-</span><small>RSI unavailable</small>'
+        direction = text_value(row.get("rsi_direction"), "RSI").upper()
+        if rsi_value >= 70:
+            css_class = "dhan-rsi-hot"
+        elif rsi_value <= 35:
+            css_class = "dhan-rsi-cool"
+        else:
+            css_class = "dhan-rsi-mid"
+        return (
+            f'<span class="dhan-it-rsi-pill {css_class}">{rsi_value:.1f}</span>'
+            f'<small>{html.escape(direction)}</small>'
+        )
+
+    def signal_confidence_cell(row: dict[str, Any]) -> str:
+        confidence = _dhan_metric_float(row.get("confidence"))
+        confidence_label = f"{confidence:.0f}%" if confidence > 0 else "-"
+        signal = text_value(row.get("signal_status") or row.get("recommended_strategy"), "NO SIGNAL").upper()
+        reason = text_value(row.get("decision_reason"), "")
+        if confidence >= 70:
+            css_class = "good"
+        elif confidence >= 50:
+            css_class = "neutral"
+        else:
+            css_class = "bad"
+        detail = f"{signal}" + (f" | {reason}" if reason and reason != "-" else "")
+        return (
+            f'<span class="ipo-badge {css_class}">{html.escape(confidence_label)}</span>'
+            f'<small>{html.escape(detail)}</small>'
+        )
 
     def option_chips(options: Any, side: str, fallback_symbol_text: str, fallback_qty: Any) -> str:
         option_rows = options if isinstance(options, list) else []
@@ -24321,27 +24525,32 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             button = '<button type="button" class="dhan-action-btn dhan-action-muted" disabled>Monitor</button>'
         day_change_value = _dhan_metric_float(row.get("day_change_pct"))
         day_change_class = "pnl-positive" if day_change_value >= 0 else "pnl-negative"
+        high_gap_label, high_gap_detail, high_gap_class = high_52w_gap(row)
         rendered_rows.append(
             "<tr>"
             f"<td><strong>{html.escape(symbol)}</strong></td>"
             f"<td class=\"dhan-it-cmp-cell\"><strong>{money(row.get('cmp') or row.get('last_price'))}</strong></td>"
             f"<td class=\"dhan-it-change-cell {day_change_class}\" data-sort-value=\"{sort_number(row.get('day_change_pct'))}\"><strong>{money(row.get('day_change_pct'))}%</strong></td>"
+            f"<td class=\"dhan-52w-cell {high_gap_class}\" data-sort-value=\"{sort_number(row.get('pct_to_52_high'))}\"><strong>{html.escape(high_gap_label)}</strong><small>{html.escape(high_gap_detail)}</small></td>"
             f"<td class=\"dhan-position-pnl-cell {pnl_class(row.get('option_pnl'))}\" data-sort-value=\"{sort_number(row.get('option_pnl'))}\">{money(row.get('option_pnl'))}</td>"
             f"<td>{option_chips(row.get('sell_options'), 'SELL', str(row.get('sell_symbols') or ''), row.get('sell_qty_abs'))}</td>"
             f"<td>{option_chips(row.get('buy_options'), 'BUY', str(row.get('buy_symbols') or ''), row.get('buy_qty_abs'))}</td>"
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(pair_status)}</span></td>"
-            f"<td>{html.escape(text_value(row.get('suggestion')))}</td>"
-            f"<td>{button}</td>"
+            f"<td class=\"dhan-pair-suggestion-cell\">{html.escape(text_value(row.get('suggestion')))}</td>"
+            f"<td class=\"dhan-pair-action-cell\">{button}</td>"
+            f"<td class=\"dhan-it-technical-cell\" data-sort-value=\"{html.escape(text_value(row.get('stock_regime') or row.get('trend_view')))}\">{technical_cell(row)}</td>"
+            f"<td class=\"dhan-it-rsi-cell\" data-sort-value=\"{sort_number(row.get('rsi'))}\">{rsi_cell(row)}</td>"
+            f"<td class=\"dhan-it-signal-cell\" data-sort-value=\"{sort_number(row.get('confidence'))}\">{signal_confidence_cell(row)}</td>"
             "</tr>"
         )
     if not rendered_rows:
-        rendered_rows.append('<tr><td colspan="9" class="muted-cell">No DHAN-IT Kite option-position data loaded.</td></tr>')
+        rendered_rows.append('<tr><td colspan="13" class="muted-cell">No DHAN-IT Kite option-position data loaded.</td></tr>')
     return (
         '<section class="panel dhan-it-position-panel">'
         '<div class="panel-title">Current Kite Option Holdings / CE Pair Status</div>'
         f'<p class="status">Scope locked to {html.escape(dhan_it_symbol_list_text())}. Equity holdings are intentionally hidden here; SELL CE is red and BUY hedge CE is green.</p>'
         '<div class="table-wrap"><table id="dhan-it-position-table" class="ipo-table dhan-it-position-table">'
-        f'<thead><tr><th>Stock</th><th>CMP</th><th>{sort_header("% Change", 2)}</th><th>{sort_header("P&L", 3)}</th><th>SELL CE Option Holdings</th><th>BUY CE Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th><th>Action</th></tr></thead>'
+        f'<thead><tr><th>Stock</th><th>CMP</th><th>{sort_header("% Change", 2)}</th><th>{sort_header("% from 52W High", 3)}</th><th>{sort_header("P&L", 4)}</th><th>SELL CE Option Holdings</th><th>BUY CE Hedge Holdings</th><th>Pair Status</th><th>Suggestion</th><th>Action</th><th>{sort_header("DMA Zone", 10)}</th><th>{sort_header("RSI", 11)}</th><th>{sort_header("Signal Confidence", 12)}</th></tr></thead>'
         f'<tbody>{"".join(rendered_rows)}</tbody></table></div></section>'
     )
 
@@ -24675,6 +24884,13 @@ def load_dhan_it_call_watch_cards(
                 change_pct = _dhan_it_quote_change_pct(quote_payload)
                 if change_pct is not None:
                     row["day_change_pct"] = change_pct
+                yearly_high = _dhan_metric_float(quote_payload.get("yearly_high") or quote_payload.get("high_52w"))
+                if yearly_high <= 0:
+                    yearly_high = _dhan_metric_float((quote_payload.get("ohlc") or {}).get("yearly_high"))
+                if yearly_high > 0:
+                    row["yearly_high"] = yearly_high
+                    if ltp > 0:
+                        row["pct_to_52_high"] = round(((ltp - yearly_high) / yearly_high) * 100, 2)
                 row["quote_timestamp"] = datetime.now(INDIA_TIME_ZONE).isoformat(timespec="seconds")
     except Exception as exc:
         for row in enriched_rows:
@@ -24953,17 +25169,76 @@ def build_dhan_it_opportunities(state: PageState) -> tuple[list[dict[str, Any]],
     return opportunities, notes
 
 
-def build_sector_income_rows(sector_key: str) -> list[dict[str, Any]]:
+def sector_income_config_for_state(
+    state: PageState,
+    ranking: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if state.sector_income_selected_sectors and state.sector_income_sector_company_selection:
+        selected, company_map = normalize_sector_income_selection(
+            state.sector_income_selected_sectors,
+            state.sector_income_sector_company_selection,
+        )
+        state.sector_income_selected_sectors = selected
+        state.sector_income_sector_company_selection = company_map
+        return {
+            "selected_sectors": selected,
+            "sector_companies": company_map,
+            "updated_at": "",
+            "source": "FORM_STATE",
+        }
+    repo = SectorIncomeConfigRepository(APP_DB_PATH)
+    config = repo.load(ranking)
+    selected, company_map = normalize_sector_income_selection(
+        state.sector_income_selected_sectors or config.get("selected_sectors"),
+        state.sector_income_sector_company_selection or config.get("sector_companies"),
+    )
+    state.sector_income_selected_sectors = selected
+    state.sector_income_sector_company_selection = company_map
+    return {
+        **config,
+        "selected_sectors": selected,
+        "sector_companies": company_map,
+    }
+
+
+def build_sector_income_rows(
+    sector_key: str,
+    selected_symbols: list[str] | None = None,
+    sector_company_selection: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
     key = normalize_sector_key(sector_key)
     rows = []
-    for item in validate_sector_fno_symbols(key):
+    sector_for_symbol: dict[str, str] = {}
+    for sector, symbols in (sector_company_selection or {}).items():
+        for symbol in symbols:
+            sector_for_symbol[str(symbol or "").strip().upper()] = normalize_sector_key(sector)
+    if selected_symbols:
+        fno_items = []
+        for symbol in selected_symbols:
+            row_sector = sector_for_symbol.get(str(symbol or "").strip().upper(), key)
+            item = next(
+                (candidate for candidate in validate_sector_fno_symbols(row_sector) if candidate.get("symbol") == symbol),
+                {"symbol": symbol, "fno_eligible": True, "status": "F&O ELIGIBLE"},
+            )
+            fno_items.append({**item, "sector_key": row_sector})
+    else:
+        fno_items = validate_sector_fno_symbols(key)
+    for item in fno_items:
         symbol = str(item.get("symbol") or "").strip().upper()
+        row_sector_key = normalize_sector_key(item.get("sector_key") or sector_for_symbol.get(symbol) or key)
         rows.append(
             {
                 **item,
-                "sector_key": key,
-                "sector_label": SECTOR_LABELS.get(key, key.replace("_", " ").title()),
-                "company_name": symbol,
+                "sector_key": row_sector_key,
+                "sector_label": SECTOR_LABELS.get(row_sector_key, row_sector_key.replace("_", " ").title()),
+                "company_name": next(
+                    (
+                        master.get("company_name")
+                        for master in sector_income_company_master_rows()
+                        if master.get("symbol") == symbol
+                    ),
+                    symbol,
+                ),
                 "risk_bucket": "MODERATE",
                 "target_short_otm_pct": 8.0,
                 "target_hedge_otm_pct": 13.0,
@@ -25042,6 +25317,7 @@ def build_sector_income_score_ranking(
     )
     for rank, item in enumerate(ranking["all_sectors"], start=1):
         item["rank"] = rank
+        item["score"] = item.get("sector_score", item.get("score"))
     ranking["top_sectors"] = ranking["all_sectors"][:3]
     ranking["selected_sector"] = normalize_sector_key(selected_sector)
     return score, ranking
@@ -25073,16 +25349,32 @@ def load_sector_income_state(state: PageState) -> None:
         fii_snapshot_rows=sector_income_pending_or_active_snapshot_rows(state),
         fii_snapshot_status=sector_income_snapshot_status_for_score(state),
     )
+    config = sector_income_config_for_state(state, ranking)
+    selected_symbols = sector_income_selected_symbols(
+        config.get("selected_sectors"),
+        config.get("sector_companies"),
+    )
     requested_key = str(state.sector_income_sector or "").strip().upper()
     saved_key = str((saved_score_snapshot or {}).get("selected_sector") or ((saved_score_snapshot or {}).get("ranking") or {}).get("selected_sector") or "")
-    key = normalize_sector_key(requested_key or saved_key or ranking.get("selected_sector"))
-    rows = build_sector_income_rows(key)
+    key = normalize_sector_key(requested_key or saved_key or (config.get("selected_sectors") or [""])[0] or ranking.get("selected_sector"))
+    if key not in set(config.get("selected_sectors") or []):
+        state.sector_income_selected_sectors, state.sector_income_sector_company_selection = normalize_sector_income_selection(
+            [key, *(config.get("selected_sectors") or [])],
+            config.get("sector_companies"),
+        )
+        config["selected_sectors"] = state.sector_income_selected_sectors
+        config["sector_companies"] = state.sector_income_sector_company_selection
+        selected_symbols = sector_income_selected_symbols(config.get("selected_sectors"), config.get("sector_companies"))
+    rows = build_sector_income_rows(key, selected_symbols, config.get("sector_companies"))
     symbols = [str(row.get("symbol") or "").strip().upper() for row in rows]
     spot_by_symbol = _dhan_json_number_map(state.dhan_spot_json)
     contracts_by_symbol = _dhan_json_contract_map(state.dhan_contracts_json)
     _, notes, fresh_quotes = enrich_dhan_market_data_from_kite(symbols, spot_by_symbol, contracts_by_symbol)
     available_from_contracts = set(contracts_by_symbol)
-    fno_rows = {row["symbol"]: row for row in validate_sector_fno_symbols(key, available_from_contracts)}
+    fno_rows: dict[str, dict[str, Any]] = {}
+    for sector in config.get("selected_sectors") or [key]:
+        for item in validate_sector_fno_symbols(sector, available_from_contracts):
+            fno_rows[item["symbol"]] = item
     for row in rows:
         symbol = str(row.get("symbol") or "").strip().upper()
         row.update(fno_rows.get(symbol, {}))
@@ -25123,7 +25415,24 @@ def load_sector_income_state(state: PageState) -> None:
             sector_score = saved_score
             ranking = saved_ranking
             ranking["selected_sector"] = key
-    ranked = rank_sector_candidates(rows, sector_score, top_n=4)
+            for item in list(ranking.get("all_sectors") or []) + list(ranking.get("top_sectors") or []):
+                item["score"] = item.get("sector_score", item.get("score"))
+    sector_score_by_key = {
+        normalize_sector_key(item.get("sector_key") or item.get("sector")): item
+        for item in ranking.get("all_sectors", [])
+    }
+    for row in rows:
+        row_sector = normalize_sector_key(row.get("sector_key") or key)
+        row_sector_score = sector_score if row_sector == key else sector_score_by_key.get(row_sector) or calculate_sector_sell_on_rise_score(
+            row_sector,
+            valid_fno_count=len([candidate for candidate in rows if normalize_sector_key(candidate.get("sector_key")) == row_sector]),
+            fii_snapshot_rows=sector_income_pending_or_active_snapshot_rows(state),
+            fii_snapshot_status=sector_income_snapshot_status_for_score(state),
+        )
+        row["sector_score_detail"] = row_sector_score
+        row["sector_score"] = row_sector_score.get("sector_score")
+        row["fii_regime"] = row_sector_score.get("fii_regime")
+    ranked = rank_sector_candidates(rows, sector_score, top_n=max(4, len(selected_symbols)))
     sector_regime = str(sector_score.get("sector_regime") or "DATA_UNAVAILABLE")
     opportunities, notes = build_sector_income_opportunities(state, ranked, sector_score)
     pair_by_symbol = _dhan_it_best_ce_preview_by_symbol(opportunities)
@@ -25138,8 +25447,9 @@ def load_sector_income_state(state: PageState) -> None:
         for row in ranked
     ]
     for card, row in zip(cards, ranked):
-        card["sector_label"] = sector_score.get("sector_label")
-        card["fii_regime"] = sector_score.get("fii_regime")
+        row_sector_score = row.get("sector_score_detail") or sector_score
+        card["sector_label"] = row_sector_score.get("sector_label")
+        card["fii_regime"] = row_sector_score.get("fii_regime")
         card["stock_score"] = row.get("stock_score")
         card["decision"] = row.get("final_decision") if row.get("final_decision") != "ALLOWED" else card.get("decision")
         card["reasons"] = row.get("reasons") or card.get("reasons") or []
@@ -25173,6 +25483,8 @@ def build_sector_income_opportunities(
         symbol = str(row.get("symbol") or "").strip().upper()
         if not row.get("fno_eligible", True):
             continue
+        row_sector_key = normalize_sector_key(row.get("sector_key") or state.sector_income_sector)
+        row_sector_score = row.get("sector_score_detail") or sector_score or {}
         preview = build_dhan_it_spread(
             symbol=symbol,
             strategy_type="BEAR_CALL_SPREAD",
@@ -25197,13 +25509,13 @@ def build_sector_income_opportunities(
             {
                 "screen_name": "SECTOR-Income",
                 "rank": rank,
-                "sector_key": normalize_sector_key(state.sector_income_sector),
-                "sector_label": SECTOR_LABELS.get(normalize_sector_key(state.sector_income_sector), state.sector_income_sector),
+                "sector_key": row_sector_key,
+                "sector_label": row_sector_score.get("sector_label") or SECTOR_LABELS.get(row_sector_key, row_sector_key),
                 "cmp": spot_by_symbol.get(symbol) or row.get("cmp"),
                 "day_change_pct": quote.get("day_change_pct", row.get("day_change_pct")),
                 "stock_score": row.get("stock_score"),
-                "sector_score": sector_score.get("sector_score"),
-                "fii_regime": sector_score.get("fii_regime"),
+                "sector_score": row_sector_score.get("sector_score", sector_score.get("sector_score")),
+                "fii_regime": row_sector_score.get("fii_regime", sector_score.get("fii_regime")),
                 "option_quote_generated_at": datetime.now(INDIA_TIME_ZONE).astimezone(timezone.utc).isoformat(timespec="seconds"),
             }
         )
@@ -25241,7 +25553,12 @@ def render_sector_income_panel(state: PageState) -> str:
         selected = " selected" if str(current or "").upper() == value else ""
         return f'<option value="{html.escape(value, quote=True)}"{selected}>{html.escape(label)}</option>'
 
+    ranking = state.sector_income_ranking or rank_all_sectors()
     sector_select = "".join(option(item["key"], item["label"], sector_key) for item in sector_options())
+    current_config = sector_income_config_for_state(state, ranking)
+    selected_sector_keys = list(current_config.get("selected_sectors") or [])
+    selected_company_map = dict(current_config.get("sector_companies") or {})
+    configured_symbols = sector_income_selected_symbols(selected_sector_keys, selected_company_map)
     metric_cards = "".join(
         f"<article><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></article>"
         for label, value in [
@@ -25253,7 +25570,74 @@ def render_sector_income_panel(state: PageState) -> str:
             ("Decision", text_value(score.get("decision"))),
         ]
     )
-    ranking = state.sector_income_ranking or rank_all_sectors()
+    def render_sector_config_modal() -> str:
+        if not state.sector_income_show_config_modal:
+            return ""
+        selected_set = set(selected_sector_keys)
+        sector_checkboxes = []
+        company_blocks = []
+        for item in sector_options():
+            sector = item["key"]
+            label = item["label"]
+            sector_checked = " checked" if sector in selected_set else ""
+            sector_checkboxes.append(
+                f"""
+                <label class="sector-income-config-chip">
+                  <input type="checkbox" name="sector_income_config_sectors" value="{html.escape(sector, quote=True)}"{sector_checked}>
+                  <strong>{html.escape(label)}</strong>
+                  <small>{len(configured_sector_symbols(sector))} F&O names</small>
+                </label>
+                """
+            )
+            company_options = []
+            selected_symbols_for_sector = set(selected_company_map.get(sector) or configured_sector_symbols(sector)[:4])
+            disabled_class = "" if sector in selected_set else " muted"
+            for symbol in configured_sector_symbols(sector):
+                checked_attr = " checked" if symbol in selected_symbols_for_sector else ""
+                company = next(
+                    (row.get("company_name") for row in sector_income_company_master_rows() if row.get("symbol") == symbol),
+                    symbol,
+                )
+                company_options.append(
+                    f"""
+                    <label class="sector-income-company-choice">
+                      <input type="checkbox" name="sector_income_config_company_{html.escape(sector, quote=True)}" value="{html.escape(symbol, quote=True)}"{checked_attr}>
+                      <strong>{html.escape(symbol)}</strong><small>{html.escape(str(company))}</small>
+                    </label>
+                    """
+                )
+            company_blocks.append(
+                f"""
+                <details class="sector-income-company-block"{' open' if sector in selected_set else ''}>
+                  <summary>{html.escape(label)} <span>{html.escape(', '.join(selected_company_map.get(sector, configured_sector_symbols(sector)[:4])[:4]))}</span></summary>
+                  <div class="sector-income-company-grid{disabled_class}">{''.join(company_options)}</div>
+                </details>
+                """
+            )
+        return f"""
+        <div class="live-modal-backdrop visible" id="sector-income-config-modal"><div class="live-modal dhan-order-modal-card sector-income-config-modal">
+          <h2>Configure SECTOR-Income Sectors & Companies</h2>
+          <p class="status">Select up to 3 sectors and up to 4 F&O companies per sector. This saved scope drives Sector Call-Spread Cards, opportunity rows, holdings/pair status and order-ticket entry.</p>
+          <section class="panel">
+            <div class="panel-title">1. Select Top 3 Sectors</div>
+            <div class="sector-income-sector-grid">{''.join(sector_checkboxes)}</div>
+          </section>
+          <section class="panel">
+            <div class="panel-title">2. Select Top 4 Companies per Selected Sector</div>
+            <p class="status">Company names come from the static SECTOR-Income F&O master seeded from the attached design prompt. Runtime quotes/options still come from the existing Kite/DHAN-IT flow.</p>
+            <div class="sector-income-company-scroll">{''.join(company_blocks)}</div>
+          </section>
+          <div class="income-equity-order-summary">
+            Current saved scope: {html.escape(', '.join(configured_symbols) or '-')}<br>
+            Last updated: {html.escape(text_value(current_config.get('updated_at'), 'not saved yet'))} | Source: {html.escape(text_value(current_config.get('source')))}
+          </div>
+          <div class="modal-actions">
+            <button type="submit" class="secondary" formaction="/sector-income/config-close">Close</button>
+            <button type="submit" class="secondary" formaction="/sector-income/config-refresh">Refresh Static List</button>
+            <button type="submit" formaction="/sector-income/config-save">Save & Populate Cards</button>
+          </div>
+        </div></div>
+        """
 
     def render_top_sector_cards() -> str:
         cards_html: list[str] = []
@@ -25262,6 +25646,7 @@ def render_sector_income_panel(state: PageState) -> str:
             status = str(item.get("status") or "RED").upper()
             badge_class = "good" if status == "GREEN" else "neutral" if status == "AMBER" else "bad"
             selected = sector == sector_key
+            display_score = item.get("sector_score") if item.get("sector_score") not in {None, ""} else item.get("score")
             button = (
                 f'<button type="submit" formaction="/sector-income/evaluate" name="sector_income_sector" value="{html.escape(sector, quote=True)}" class="commodity-buy-button">{"Selected - Load Top 4" if selected else "Select Sector"}</button>'
                 if status in {"GREEN", "AMBER"}
@@ -25271,7 +25656,7 @@ def render_sector_income_panel(state: PageState) -> str:
                 f"""
                 <article class="commodity-card dhan-it-watch-card dhan-it-watch-card-compact">
                   <div class="dhan-it-watch-top"><div><strong>#{html.escape(text_value(item.get('rank')))} {html.escape(text_value(item.get('display_name') or item.get('sector_label')))}</strong><span>{html.escape(text_value(item.get('fii_regime')))}</span></div><span class="ipo-badge {badge_class}">{html.escape(status)}</span></div>
-                  <div class="dhan-it-watch-price-row"><div class="commodity-price">{money(item.get('score') or item.get('sector_score'))}</div><div class="commodity-change up">{html.escape(text_value(item.get('confidence')))}</div></div>
+                  <div class="dhan-it-watch-price-row"><div class="commodity-price">{money(display_score)}</div><div class="commodity-change up">{html.escape(text_value(item.get('confidence')))}</div></div>
                   <div class="dhan-it-watch-decision">{html.escape(text_value(item.get('decision')))}</div>
                   <div class="dhan-it-watch-plan"><span>Liquidity {html.escape(text_value(item.get('liquidity_status')))}</span><span>Rebound {html.escape(text_value(item.get('rebound_risk')))}</span><span>F&O {html.escape(text_value(item.get('valid_fno_count')))}</span></div>
                   <small class="status dhan-it-watch-note">{html.escape('; '.join(str(reason) for reason in (item.get('reasons') or [])[:2]))}</small>
@@ -25330,11 +25715,12 @@ def render_sector_income_panel(state: PageState) -> str:
             status = str(item.get("status") or "RED").upper()
             badge_class = "good" if status == "GREEN" else "neutral" if status == "AMBER" else "bad"
             disabled = " disabled" if status == "RED" else ""
+            display_score = item.get("sector_score") if item.get("sector_score") not in {None, ""} else item.get("score")
             top_cards.append(
                 f"""
                 <article class="commodity-card dhan-it-watch-card dhan-it-watch-card-compact">
                   <div class="dhan-it-watch-top"><div><strong>#{html.escape(text_value(item.get('rank')))} {html.escape(text_value(item.get('display_name') or item.get('sector_label')))}</strong><span>{html.escape(text_value(item.get('fii_regime')))}</span></div><span class="ipo-badge {badge_class}">{html.escape(status)}</span></div>
-                  <div class="dhan-it-watch-price-row"><div class="commodity-price">{money(item.get('score') or item.get('sector_score'))}</div><div class="commodity-change up">{html.escape(text_value(item.get('confidence')))}</div></div>
+                  <div class="dhan-it-watch-price-row"><div class="commodity-price">{money(display_score)}</div><div class="commodity-change up">{html.escape(text_value(item.get('confidence')))}</div></div>
                   <div class="dhan-it-watch-plan"><span>Regime {html.escape(text_value(item.get('regime') or item.get('sector_regime')))}</span><span>Liquidity {html.escape(text_value(item.get('liquidity_status')))}</span><span>Rebound {html.escape(text_value(item.get('rebound_risk')))}</span></div>
                   <small class="status dhan-it-watch-note">{html.escape('; '.join(str(reason) for reason in (item.get('reasons') or [])[:3]))}</small>
                   <button type="submit" formaction="/sector-income/apply-sector" name="sector_income_sector" value="{html.escape(sector, quote=True)}"{disabled}>Apply This Sector</button>
@@ -25413,11 +25799,11 @@ def render_sector_income_panel(state: PageState) -> str:
     if cards:
         card_html = (
             render_dhan_it_call_watch(cards)
-            .replace("DHAN-IT Call Spread Watch", "Top 4 Sector Call-Spread Cards")
+            .replace("DHAN-IT Call Spread Watch", "Configured Sector Call-Spread Cards")
             .replace('formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol"', 'formaction="/sector-income/open-symbol" name="sector_income_open_symbol"')
         )
     else:
-        card_html = '<section class="panel"><div class="panel-title">Top 4 Sector Call-Spread Cards</div><p class="status">Run sector scan to build cards.</p></section>'
+        card_html = '<section class="panel"><div class="panel-title">Configured Sector Call-Spread Cards</div><p class="status">Run sector scan to build cards.</p></section>'
     holding_html = render_dhan_it_holding_positions(state.sector_income_holding_positions or []).replace(
         f"Scope locked to {html.escape(dhan_it_symbol_list_text())}.",
         f"Scope locked to {html.escape(SECTOR_LABELS.get(sector_key, sector_key))}.",
@@ -25460,6 +25846,8 @@ def render_sector_income_panel(state: PageState) -> str:
     score_json = html.escape(json.dumps(state.sector_income_score or {}, default=str), quote=True)
     ranking_json = html.escape(json.dumps(state.sector_income_ranking or {}, default=str), quote=True)
     score_snapshot_json = html.escape(json.dumps(state.sector_income_score_snapshot or {}, default=str), quote=True)
+    selected_sectors_json = html.escape(json.dumps(selected_sector_keys, default=str), quote=True)
+    sector_companies_json = html.escape(json.dumps(selected_company_map, default=str), quote=True)
     opportunities_json = html.escape(json.dumps(opportunities, default=str), quote=True)
     selected_preview = ""
     selected_idx = int(float(state.sector_income_selected_index)) if str(state.sector_income_selected_index or "").isdigit() else -1
@@ -25506,7 +25894,7 @@ def render_sector_income_panel(state: PageState) -> str:
           </div>
         </div></div>
         """
-    sector_symbols = set(configured_sector_symbols(sector_key))
+    sector_symbols = set(configured_symbols or configured_sector_symbols(sector_key))
     pair_orders = [
         row
         for row in (state.dhan_it_pair_orders or [])
@@ -25541,6 +25929,8 @@ def render_sector_income_panel(state: PageState) -> str:
       <input type="hidden" name="sector_income_score_json" value="{score_json}">
       <input type="hidden" name="sector_income_ranking_json" value="{ranking_json}">
       <input type="hidden" name="sector_income_score_snapshot_json" value="{score_snapshot_json}">
+      <input type="hidden" name="sector_income_selected_sectors_json" value="{selected_sectors_json}">
+      <input type="hidden" name="sector_income_sector_company_selection_json" value="{sector_companies_json}">
       <input type="hidden" name="sector_income_fii_upload_message" value="{html.escape(state.sector_income_fii_upload_message, quote=True)}">
       <input type="hidden" name="dhan_it_opportunities_json" value="{opportunities_json}">
       <input type="hidden" name="dhan_it_opportunities_generated_at" value="{html.escape(state.sector_income_generated_at, quote=True)}">
@@ -25553,14 +25943,16 @@ def render_sector_income_panel(state: PageState) -> str:
         <label><span>Lots</span><input name="dhan_it_lots" value="{html.escape(str(state.dhan_it_lots), quote=True)}"></label>
         <label><span>Mode</span><select name="dhan_it_trade_mode">{option("PAPER", "Paper", "PAPER" if state.dhan_it_paper_trading else "LIVE")}{option("LIVE", "Live", "PAPER" if state.dhan_it_paper_trading else "LIVE")}</select></label>
         <button type="submit" formaction="/sector-income/evaluate">Scan Selected Sector</button>
+        <button type="submit" class="secondary" formaction="/sector-income/config-open">Configure Sectors / Companies</button>
         <button type="submit" class="secondary" formaction="/sector-income/rank-detail" name="sector_income_show_rank_modal" value="1">Sector Score Details</button>
-      </div><p class="status">FII snapshot: {html.escape(snapshot.snapshot_date)} | {html.escape(snapshot.source_label)} | {html.escape(snapshot.freshness_status)}. Default priority: {html.escape(', '.join(SECTOR_LABELS.get(item, item) for item in DEFAULT_SECTOR_PRIORITY))}.</p></section>
+      </div><p class="status">Configured scope: {html.escape(', '.join(SECTOR_LABELS.get(item, item) for item in selected_sector_keys))} | Symbols: {html.escape(', '.join(configured_symbols) or '-')}. FII snapshot: {html.escape(snapshot.snapshot_date)} | {html.escape(snapshot.source_label)} | {html.escape(snapshot.freshness_status)}.</p></section>
       {render_top_sector_cards()}
       {render_sector_rank_modal()}
+      {render_sector_config_modal()}
       <section class="panel"><div class="panel-title">Sector Decision & FII Flow</div><div class="dhan-ticket-summary">{metric_cards}</div><p class="status">{html.escape('; '.join(str(item) for item in (score.get('reasons') or [])))}</p></section>
       {card_html}
       {holding_html}
-      <section class="panel"><div class="panel-title">Top Four Stock Ranking</div><div class="table-wrap"><table id="sector-income-ranking-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Score</th><th>Symbol</th><th class="sort-header" data-sort-col="2">CMP / Day</th><th>Regime</th><th>50 DMA</th><th>200 DMA</th><th>50D Dist</th><th>200D Dist</th><th>F&O</th><th>Decision</th><th>Reasons</th></tr></thead><tbody>{''.join(row_html)}</tbody></table></div></section>
+      <section class="panel"><div class="panel-title">Configured Stock Ranking</div><div class="table-wrap"><table id="sector-income-ranking-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Score</th><th>Symbol</th><th class="sort-header" data-sort-col="2">CMP / Day</th><th>Regime</th><th>50 DMA</th><th>200 DMA</th><th>50D Dist</th><th>200D Dist</th><th>F&O</th><th>Decision</th><th>Reasons</th></tr></thead><tbody>{''.join(row_html)}</tbody></table></div></section>
       <section class="panel"><div class="panel-title">Opportunity Table</div><p class="status">Only defined-risk CE pairs are shown. Click a symbol to open the existing hedge-first DHAN-IT ticket with 10-second review.</p><div class="table-wrap"><table id="sector-income-opportunity-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Rank</th><th>Symbol</th><th class="sort-header" data-sort-col="2">Sector Score</th><th class="sort-header" data-sort-col="3">Stock Score</th><th>FII Regime</th><th class="sort-header" data-sort-col="5">CMP</th><th class="sort-header" data-sort-col="6">Today %</th><th>Expiry</th><th>Short CE</th><th>Hedge CE</th><th>Sell Prem</th><th>Hedge Prem</th><th>Net Credit</th><th class="sort-header" data-sort-col="13">Max Profit</th><th class="sort-header" data-sort-col="14">Max Loss</th><th class="sort-header" data-sort-col="15">POP</th><th class="sort-header" data-sort-col="16">RoR</th><th>Liquidity</th><th>Decision</th><th>Reasons</th></tr></thead><tbody>{''.join(opp_rows)}</tbody></table></div></section>
       {selected_preview}
       <section class="panel dhan-monitor-panel">
@@ -25581,6 +25973,314 @@ def render_sector_income_panel(state: PageState) -> str:
       </section>
     </form>
     """
+
+
+def load_ai52_state(state: PageState) -> None:
+    repository = FiftyTwoWeekAiRepository(APP_DB_PATH)
+    snapshot = repository.latest_candidate_snapshot()
+    if snapshot and not state.ai52_candidates:
+        state.ai52_candidates = list(snapshot.get("rows") or [])
+        state.ai52_source_status = str(snapshot.get("source_status") or "")
+    state.ai52_evaluations = repository.latest_evaluations()
+    evaluation_by_symbol = {
+        str(item.get("symbol") or "").strip().upper(): item
+        for item in state.ai52_evaluations or []
+    }
+    if state.ai52_candidates:
+        enriched_candidates: list[dict[str, Any]] = []
+        for candidate in state.ai52_candidates:
+            next_candidate = dict(candidate)
+            evaluation = evaluation_by_symbol.get(str(candidate.get("symbol") or "").strip().upper())
+            if evaluation:
+                next_candidate["evaluation"] = evaluation
+                next_candidate["fno_eligible"] = evaluation.get("fno_eligible")
+                next_candidate["option_expiry"] = evaluation.get("option_expiry") or next_candidate.get("option_expiry")
+            enriched_candidates.append(next_candidate)
+        state.ai52_candidates = sorted(
+            enriched_candidates,
+            key=lambda row: (
+                0 if str(((row.get("evaluation") or {}).get("decision") or "")).upper() in {"", "BLOCKED", "DATA_ERROR"} else 1,
+                _dhan_metric_float((row.get("evaluation") or {}).get("call_sell_score") or row.get("rank_score")),
+                _dhan_metric_float((row.get("evaluation") or {}).get("rejection_score")),
+                _dhan_metric_float((row.get("evaluation") or {}).get("option_quality_score")),
+            ),
+            reverse=True,
+        )
+    state.ai52_previews = repository.latest_previews()
+    state.dhan_it_pair_orders = DhanItPairRepository(APP_DB_PATH).list_pairs()
+
+
+def _ai52_candidate_option_data(symbol: str, screener_cmp: Any) -> tuple[Any | None, float, list[dict[str, Any]], list[str]]:
+    spot_by_symbol = {symbol: _dhan_metric_float(screener_cmp)}
+    contracts_by_symbol: dict[str, list[dict[str, Any]]] = {symbol: []}
+    broker, notes, fresh_quotes = enrich_dhan_market_data_from_kite([symbol], spot_by_symbol, contracts_by_symbol)
+    quote = fresh_quotes.get(symbol) if isinstance(fresh_quotes, dict) else {}
+    spot = _dhan_metric_float((quote or {}).get("ltp") or spot_by_symbol.get(symbol))
+    return broker, spot, contracts_by_symbol.get(symbol, []), notes
+
+
+def evaluate_ai52_candidate(candidate: dict[str, Any], adapter: Any | None = None) -> dict[str, Any]:
+    """Evaluate one 52W AI candidate using Kite quote/history/NFO data, not Screener CMP."""
+
+    broker = adapter or DhanBrokerAdapter(paper_trading=True)
+    evaluator = SellOnRiseEvaluator(broker, today=datetime.now(INDIA_TIME_ZONE).date())
+    symbol = str(candidate.get("symbol") or "").strip().upper()
+    evaluation = evaluator.evaluate(symbol, candidate)
+    payload = evaluation.to_dict()
+    FiftyTwoWeekAiRepository(APP_DB_PATH).save_evaluation(payload)
+    return payload
+
+
+def evaluate_ai52_candidates(candidates: list[dict[str, Any]], adapter: Any | None = None) -> list[dict[str, Any]]:
+    """Evaluate and rank all imported 52W AI candidates with a shared Kite adapter/cache."""
+
+    broker = adapter or DhanBrokerAdapter(paper_trading=True)
+    evaluator = SellOnRiseEvaluator(broker, today=datetime.now(INDIA_TIME_ZONE).date())
+    ranked = evaluator.evaluate_many(candidates)
+    payloads = [row.to_dict() for row in ranked]
+    FiftyTwoWeekAiRepository(APP_DB_PATH).save_evaluations(payloads)
+    return payloads
+
+
+def render_ai52_call_spread_panel(state: PageState) -> str:
+    if state.active_tab == "52w-ai-call-spread" and state.ai52_candidates is None:
+        load_ai52_state(state)
+    panel_style = "" if state.active_tab == "52w-ai-call-spread" else ' style="display:none"'
+    candidates = state.ai52_candidates or []
+    evaluations = state.ai52_evaluations or []
+    previews = state.ai52_previews or []
+    hidden_candidates = html.escape(json.dumps(candidates, default=str), quote=True)
+    hidden_evaluations = html.escape(json.dumps(evaluations, default=str), quote=True)
+    hidden_preview = html.escape(json.dumps(state.ai52_selected_preview or {}, default=str), quote=True)
+    hidden_previews = html.escape(json.dumps(previews, default=str), quote=True)
+
+    def money(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return "-"
+
+    def ai52_call_spread_perspective(row: dict[str, Any]) -> str:
+        evaluation = row.get("evaluation") if isinstance(row.get("evaluation"), dict) else {}
+        distance = _dhan_metric_float(row.get("distance_from_52w_high_pct"))
+        sales_growth = _dhan_metric_float(row.get("sales_growth_3y_pct"))
+        pat = _dhan_metric_float(row.get("pat"))
+        positives: list[str] = []
+        watchouts: list[str] = []
+        if 0 < distance <= 5:
+            positives.append("Very close to 52W high: useful for sell-on-rise CE spread review if price shows rejection near resistance.")
+        elif 5 < distance <= 12:
+            positives.append("Within a tradable distance from 52W high: can be reviewed for an OTM CE spread after live option credit check.")
+        elif distance > 12:
+            watchouts.append("Far from 52W high: resistance thesis is weaker; prefer fresh chart confirmation before selling CE spread.")
+        else:
+            watchouts.append("52W-high distance is missing; do not treat this as a resistance candidate without chart confirmation.")
+        if sales_growth >= 15:
+            positives.append("Healthy 3Y sales growth supports liquidity/market interest, but can also create breakout risk.")
+        elif sales_growth > 0:
+            positives.append("Positive sales growth, but not strong enough by itself to justify the spread.")
+        else:
+            watchouts.append("3Y sales growth missing/weak; rely more on live trend and option-chain liquidity.")
+        if pat > 0:
+            positives.append("Company is profitable on Screener data, reducing low-quality/news-shock risk.")
+        else:
+            watchouts.append("PAT is missing/non-positive in imported data; check fundamentals before placing risk.")
+        if row.get("fno_eligible") is True:
+            positives.append("F&O eligibility was confirmed from live option contracts.")
+        elif row.get("fno_eligible") is False:
+            watchouts.append("F&O option contracts were not resolved yet; ticket creation may stay blocked.")
+        else:
+            watchouts.append("F&O eligibility is unknown until the Create Call Spread action fetches Kite NFO instruments.")
+        positive_html = "".join(f"<li>{html.escape(item)}</li>" for item in positives) or "<li>Load live Kite option data before deciding.</li>"
+        watchout_html = "".join(f"<li>{html.escape(item)}</li>" for item in watchouts) or "<li>No major Screener-data watch-out found; still verify live trend, result date, and liquidity.</li>"
+        extras = row.get("extra_fields") if isinstance(row.get("extra_fields"), dict) else {}
+        extra_rows = "".join(
+            f"<tr><th>{html.escape(str(key).replace('_', ' ').title())}</th><td>{html.escape(str(value))}</td></tr>"
+            for key, value in sorted(extras.items())
+            if str(value or "").strip()
+        ) or '<tr><td colspan="2" class="muted-cell">No extra Screener fields available.</td></tr>'
+        return (
+            '<div class="ai52-detail-grid">'
+            f'<article><span>Symbol</span><strong>{html.escape(str(row.get("symbol") or "-"))}</strong><small>{html.escape(str(row.get("company") or "-"))}</small></article>'
+            f'<article><span>Screener CMP</span><strong>{money(row.get("screener_cmp"))}</strong><small>Execution uses live Kite CMP</small></article>'
+            f'<article><span>Live CMP</span><strong>{money(evaluation.get("live_cmp"))}</strong><small>Source: Kite quote</small></article>'
+            f'<article><span>52W high gap</span><strong>{money(row.get("distance_from_52w_high_pct"))}%</strong><small>Lower gap means closer to resistance</small></article>'
+            f'<article><span>52W State</span><strong>{html.escape(str(evaluation.get("state") or "NOT_EVALUATED"))}</strong><small>{html.escape(str(evaluation.get("decision") or "Click Evaluate"))}</small></article>'
+            f'<article><span>SELL Score</span><strong>{money(evaluation.get("call_sell_score"))}</strong><small>Rejection {money(evaluation.get("rejection_score"))} | Option {money(evaluation.get("option_quality_score"))}</small></article>'
+            f'<article><span>Growth / PAT</span><strong>{money(row.get("sales_growth_3y_pct"))}% / {money(row.get("pat"))}</strong><small>Fundamental context only</small></article>'
+            "</div>"
+            '<div class="ai52-perspective-columns">'
+            f'<section><h3>Good for CE spread if</h3><ul>{positive_html}</ul></section>'
+            f'<section><h3>Watch before selling calls</h3><ul>{watchout_html}</ul></section>'
+            "</div>"
+            '<h3 class="ai52-detail-subtitle">Imported Screener fields</h3>'
+            f'<div class="table-wrap ai52-extra-table"><table class="ipo-table"><tbody>{extra_rows}</tbody></table></div>'
+        )
+
+    candidate_rows: list[str] = []
+    if candidates:
+        for idx, row in enumerate(candidates):
+            symbol = str(row.get("symbol") or "").strip().upper()
+            evaluation = row.get("evaluation") if isinstance(row.get("evaluation"), dict) else {}
+            decision = str(evaluation.get("decision") or "NOT_EVALUATED").upper()
+            decision_class = "good" if decision in {"A+ SELL", "A SELL"} else "neutral" if decision in {"WATCH FOR REJECTION", "WAIT", "NOT_EVALUATED", "AVOID"} else "bad"
+            fno_label = "YES" if row.get("fno_eligible") is True else "NO" if row.get("fno_eligible") is False else "UNKNOWN"
+            candidate_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(evaluation.get('sell_rank') or idx + 1))}</td>"
+                f"<td><button type=\"submit\" class=\"mini-link button-link ai52-symbol-ticket-link\" formaction=\"/52w-ai-call-spread/preview\" name=\"ai52_selected_index\" value=\"{idx}\" title=\"Open 52W AI order ticket with fresh Kite evaluation\"><strong>{html.escape(symbol or '-')}</strong><small>Open order ticket</small></button></td>"
+                f"<td><strong>{html.escape(str(row.get('company') or '-'))}</strong><br><small>Score {money(row.get('rank_score'))}</small></td>"
+                f"<td>{money(evaluation.get('live_cmp'))}<br><small>Kite live</small></td>"
+                f"<td>{money(row.get('screener_cmp'))}<br><small>Screener CMP</small></td>"
+                f"<td>{money(evaluation.get('previous_52w_high'))}</td>"
+                f"<td>{money(evaluation.get('distance_high_pct') if evaluation else row.get('distance_from_52w_high_pct'))}%</td>"
+                f"<td><span class=\"ipo-badge {decision_class}\">{html.escape(str(evaluation.get('state') or 'NOT_EVALUATED'))}</span></td>"
+                f"<td>{money(evaluation.get('rsi'))}<br><small>{money(evaluation.get('rsi_slope'))}</small></td>"
+                f"<td>{money(evaluation.get('adx'))}</td>"
+                f"<td>{money(evaluation.get('volume_ratio'))}x</td>"
+                f"<td>{money(evaluation.get('rejection_score'))}</td>"
+                f"<td>{money(evaluation.get('breakout_strength_score'))}</td>"
+                f"<td>{money(evaluation.get('option_quality_score'))}</td>"
+                f"<td><strong>{money(evaluation.get('call_sell_score'))}</strong></td>"
+                f"<td><span class=\"ipo-badge {decision_class}\">{html.escape(decision)}</span><small>{html.escape('; '.join(str(item) for item in (evaluation.get('block_reasons') or [])[:2]))}</small></td>"
+                f"<td>{html.escape(fno_label)}</td>"
+                f"<td>{html.escape(str(row.get('option_expiry') or '-'))}</td>"
+                f"<td>{html.escape(str(evaluation.get('evaluation_timestamp') or row.get('data_timestamp') or '-'))}<br><small>{html.escape(str(row.get('source_status') or '-'))}</small></td>"
+                "</tr>"
+            )
+    else:
+        candidate_rows.append('<tr><td colspan="19" class="muted-cell">No 52W AI candidates loaded yet. Upload the Screener CSV export or use Refresh Screener when configured.</td></tr>')
+
+    preview_rows: list[str] = []
+    for item in previews[:10]:
+        preview = item.get("preview") if isinstance(item.get("preview"), dict) else {}
+        preview_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(item.get('updated_at') or '-'))}</td>"
+            f"<td>{html.escape(str(item.get('symbol') or '-'))}</td>"
+            f"<td>{html.escape(str(item.get('expiry') or '-'))}</td>"
+            f"<td>{html.escape(str(preview.get('sell_leg_tradingsymbol') or '-'))}</td>"
+            f"<td>{html.escape(str(preview.get('buy_leg_tradingsymbol') or '-'))}</td>"
+            f"<td>{money(preview.get('net_credit'))}</td>"
+            f"<td>{money(preview.get('max_gain'))}</td>"
+            f"<td>{money(preview.get('max_loss'))}</td>"
+            f"<td><span class=\"ipo-badge {('good' if str(preview.get('risk_decision')).upper() == 'APPROVED' else 'bad')}\">{html.escape(str(preview.get('risk_decision') or '-'))}</span></td>"
+            "</tr>"
+        )
+    if not preview_rows:
+        preview_rows.append('<tr><td colspan="9" class="muted-cell">No saved 52W AI previews yet.</td></tr>')
+
+    selected = state.ai52_selected_preview or {}
+    selected_html = ""
+    if selected:
+        is_orderable = str(selected.get("risk_decision") or "").upper() == "APPROVED"
+        max_loss_value = money(selected.get("max_loss"))
+        submit_class = "danger" if not state.ai52_paper_trading else "secondary"
+        submit_disabled = "" if is_orderable else " disabled"
+        hedge_label = "BUY CE hedge fallback" if selected.get("hedge_fallback_used") else "BUY CE hedge +20%"
+        selected_html = f"""
+        <div class="live-modal-backdrop visible" id="ai52-order-modal"><div class="live-modal dhan-order-modal-card">
+          <h2>52W AI Order Ticket - {html.escape(str(selected.get('symbol') or '-'))}</h2>
+          <p class="status">Defined-risk CE credit spread. BUY +20% OTM hedge first, then SELL +5% OTM CE through the shared Pair Order Monitor.</p>
+          <div class="dhan-it-execution-leg-grid">
+            <article class="dhan-it-execution-leg"><span>Live CMP / Expiry</span><strong>{money(selected.get('cmp') or selected.get('spot'))} / {html.escape(str(selected.get('expiry') or '-'))}</strong><small>DTE {html.escape(str(selected.get('dte') or '-'))} | Lots {html.escape(str(selected.get('selected_lots') or 1))} | Qty {html.escape(str(selected.get('quantity') or 0))}</small></article>
+            <article class="dhan-it-execution-leg"><span>Selected lots profit / risk</span><strong>{money(selected.get('max_gain'))} / {money(selected.get('max_loss'))}</strong><small>Net credit {money(selected.get('net_credit'))} | RoR {money(selected.get('return_on_risk_pct'))}%</small></article>
+          </div>
+          <div class="dhan-it-execution-leg-grid">
+            <article class="dhan-it-execution-leg sell"><span>SELL CE +5%</span><strong>{html.escape(str(selected.get('sell_leg_tradingsymbol') or '-'))}</strong><small>Strike {money(selected.get('sell_strike'))} | Expected LIMIT/CMP {money(selected.get('sell_limit_price'))} | Parked order {money(selected.get('sell_initial_limit_price'))} (+{money(selected.get('sell_limit_markup_pct'))}%)</small><small>Bid/Ask/LTP {money(selected.get('sell_bid'))}/{money(selected.get('sell_ask'))}/{money(selected.get('sell_ltp'))} | OI {html.escape(str(selected.get('sell_oi') or 0))} | Vol {html.escape(str(selected.get('sell_volume') or 0))}</small></article>
+            <article class="dhan-it-execution-leg buy"><span>{html.escape(hedge_label)}</span><strong>{html.escape(str(selected.get('buy_leg_tradingsymbol') or '-'))}</strong><small>Strike {money(selected.get('buy_strike'))} | BUY reference {money(selected.get('buy_reference_price'))} | Limit {money(selected.get('buy_limit_price'))} (-{money(selected.get('buy_limit_discount_pct'))}%)</small><small>Bid/Ask/LTP {money(selected.get('buy_bid'))}/{money(selected.get('buy_ask'))}/{money(selected.get('buy_ltp'))} | OI {html.escape(str(selected.get('buy_oi') or 0))} | Vol {html.escape(str(selected.get('buy_volume') or 0))}</small></article>
+          </div>
+          <div class="dhan-it-execution-leg buy"><span>Risk contract</span><strong>{html.escape(str(selected.get('risk_decision') or '-'))}</strong><small>Width {money(selected.get('width'))} | Breakeven {money(selected.get('breakeven'))} | Quote age {html.escape(str(selected.get('quote_age_seconds') or 0))}s | {html.escape(str(selected.get('risk_reason') or selected.get('reason') or '-'))}</small></div>
+          <label class="inline-check"><input id="ai52-confirm-order" type="checkbox" name="ai52_confirm_order" value="1" data-orderable="{'1' if is_orderable else '0'}"{' checked' if state.ai52_confirm_order else ''}> I UNDERSTAND the RISK of MAX LOSS ₹{html.escape(max_loss_value)} for this 52W AI paired order.</label>
+          <div class="breath-circle income-pe-breath" id="ai52-breath"></div>
+          <div class="breath-text" id="ai52-breath-text">Tick max-loss acknowledgement to start 10s review</div>
+          <div class="countdown" id="ai52-countdown">10</div>
+          <div class="actions center-actions">
+            <button type="submit" class="secondary" formaction="/52w-ai-call-spread/close-popup">Cancel</button>
+            <button id="ai52-review" type="button" class="secondary" disabled>Start 10s Review</button>
+            <button id="ai52-place-order" type="submit" class="{submit_class}" formaction="/52w-ai-call-spread/submit"{submit_disabled}>Place Order</button>
+          </div>
+        </div></div>"""
+
+    pair_rows = []
+    for pair in state.dhan_it_pair_orders or []:
+        if str(pair.get("screen_name") or "").upper() != "52W AI CALL SPREAD":
+            continue
+        pair_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(pair.get('pair_id') or '-'))}</td>"
+            f"<td>{html.escape(str(pair.get('symbol') or '-'))}</td>"
+            f"<td>{html.escape(str(pair.get('expiry') or '-'))}</td>"
+            f"<td>{html.escape(str(pair.get('buy_leg_order_id') or '-'))}<br><small>{html.escape(str(pair.get('buy_leg_status') or '-'))}</small></td>"
+            f"<td>{html.escape(str(pair.get('sell_leg_order_id') or '-'))}<br><small>{html.escape(str(pair.get('sell_leg_status') or '-'))}</small></td>"
+            f"<td>{html.escape(str(pair.get('pair_status') or '-'))}</td>"
+            f"<td>{money(pair.get('net_credit_expected'))}</td>"
+            f"<td>{html.escape(str(pair.get('last_checked_at') or '-'))}</td>"
+            "</tr>"
+        )
+    if not pair_rows:
+        pair_rows.append('<tr><td colspan="8" class="muted-cell">No 52W AI pair orders yet.</td></tr>')
+
+    return f"""
+    <form id="ai52-call-spread-panel" method="post" action="/52w-ai-call-spread/load"{panel_style} enctype="multipart/form-data">
+      {env_hidden_fields_for_render()}
+      <input type="hidden" name="ai52_candidates_json" value="{hidden_candidates}">
+      <input type="hidden" name="ai52_evaluations_json" value="{hidden_evaluations}">
+      <input type="hidden" name="ai52_selected_preview_json" value="{hidden_preview}">
+      <input type="hidden" name="ai52_previews_json" value="{hidden_previews}">
+      <input type="hidden" name="ai52_source_status" value="{html.escape(state.ai52_source_status or '', quote=True)}">
+      <section class="panel dhan-hero dhan-it-compact-hero"><div><div class="panel-title">52W AI Call Spread</div><p class="status">Screener 52-week-high candidates converted into defined-risk +5% SELL CE / +20% BUY CE hedge tickets.</p></div></section>
+      <section class="panel">
+        <div class="panel-title">Connect / Refresh Screener</div>
+        <p class="status">Source: <a href="{html.escape(AI52_CSV_EXPORT_URL, quote=True)}" target="_blank" rel="noopener">Screener saved screen CSV/export</a>. If Screener asks for CAPTCHA/OTP, export CSV manually and upload here.</p>
+        <div class="compact-grid">
+          {render_number_input("ai52_lots", "Lots", state.ai52_lots, "1")}
+          {render_number_input("ai52_buy_limit_discount_pct", "BUY limit discount %", state.ai52_buy_limit_discount_pct, "0.05")}
+          {render_number_input("ai52_sell_limit_markup_pct", "SELL parked markup %", state.ai52_sell_limit_markup_pct, "0.05")}
+          <label><span>Execution mode</span><select name="ai52_trade_mode"><option value="PAPER"{' selected' if state.ai52_paper_trading else ''}>Paper order</option><option value="LIVE"{'' if state.ai52_paper_trading else ' selected'}>LIVE order</option></select></label>
+          <label><span>Screener CSV upload</span><input type="file" name="ai52_csv" accept=".csv,text/csv"></label>
+        </div>
+        <p class="status">52W AI order ticket uses selected lots. BUY hedge is sent first at live hedge reference minus the configured discount; SELL leg is parked at live SELL reference plus configured markup, then monitor can reprice after hedge fill. All option LIMIT prices are rounded to ₹0.05.</p>
+        <div class="actions">
+          <button type="submit" formaction="/52w-ai-call-spread/refresh-screener" class="secondary">Refresh Screener</button>
+          <button type="submit" formaction="/52w-ai-call-spread/upload-csv">Upload CSV</button>
+          <button type="submit" formaction="/52w-ai-call-spread/logout" class="secondary">Log out / Clear session</button>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">Imported Screener Candidates</div>
+        <p class="status">Uses Screener data for idea discovery only. Execution CMP, option chain, and limit prices are reloaded from Kite before ticket creation.</p>
+        <div class="actions"><button type="submit" formaction="/52w-ai-call-spread/evaluate-all" class="success">Evaluate &amp; Rank All</button></div>
+        <div class="table-wrap"><table id="ai52-candidate-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Rank</th><th>Symbol</th><th>Company</th><th class="sort-header" data-sort-col="3">Live CMP</th><th>Screener CMP</th><th>52W High</th><th class="sort-header" data-sort-col="6">52W Gap %</th><th>52W State</th><th class="sort-header" data-sort-col="8">RSI</th><th class="sort-header" data-sort-col="9">ADX</th><th class="sort-header" data-sort-col="10">Vol Ratio</th><th class="sort-header" data-sort-col="11">Rejection</th><th class="sort-header" data-sort-col="12">Breakout</th><th class="sort-header" data-sort-col="13">Option Quality</th><th class="sort-header" data-sort-col="14">SELL Score</th><th>Decision</th><th>F&amp;O</th><th>Expiry</th><th>Updated</th></tr></thead><tbody>{''.join(candidate_rows)}</tbody></table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">Saved 52W AI Previews</div>
+        <div class="actions">
+          <button type="submit" formaction="/52w-ai-call-spread/clear-previews" class="secondary danger-link" onclick="return confirm('Clean only Saved 52W AI Previews? Imported candidates, pair monitor rows, and Kite orders will not be changed.');">Clean Saved 52W AI Previews</button>
+        </div>
+        <div class="table-wrap"><table id="ai52-preview-table" class="ipo-table"><thead><tr><th>Updated</th><th>Symbol</th><th>Expiry</th><th>Sell Leg</th><th>Buy Hedge</th><th>Credit</th><th>Max Gain</th><th>Max Loss</th><th>Status</th></tr></thead><tbody>{''.join(preview_rows)}</tbody></table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">Pair Order Monitor</div>
+        <div class="actions">
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-run" class="secondary">Run Scheduler Now</button>
+          <button type="submit" formaction="/52w-ai-call-spread/scheduler-start" class="secondary">Start Scheduler</button>
+          <button type="submit" formaction="/52w-ai-call-spread/scheduler-stop" class="secondary">Stop Scheduler</button>
+          <button type="submit" formaction="/52w-ai-call-spread/load" class="secondary">Refresh Order Book</button>
+          <button type="submit" formaction="/52w-ai-call-spread/clear-pair-monitor" class="secondary danger-link" onclick="return confirm('Clear only local 52W AI Pair Order Monitor history? This will NOT cancel or modify any Kite orders.');">Clear Pair Order Monitor</button>
+        </div>
+        <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Pair ID</th><th>Symbol</th><th>Expiry</th><th>BUY hedge</th><th>SELL leg</th><th>Status</th><th>Credit</th><th>Last Checked</th></tr></thead><tbody>{''.join(pair_rows)}</tbody></table></div>
+      </section>
+      <div class="live-modal-backdrop" id="ai52-detail-modal"><div class="live-modal dhan-order-modal-card ai52-detail-modal-card">
+        <h2 id="ai52-detail-title">52W AI candidate details</h2>
+        <p class="status">Screener data is only an idea filter. Place orders only after the live Kite spread ticket confirms credit, hedge, liquidity, and max loss.</p>
+        <div id="ai52-detail-body"></div>
+        <div class="actions center-actions">
+          <button type="button" class="secondary" id="ai52-detail-close">Close</button>
+        </div>
+      </div></div>
+      {selected_html}
+    </form>"""
 
 
 def render_dhan_it_panel(state: PageState) -> str:
@@ -31897,6 +32597,7 @@ def render_page(state: PageState) -> bytes:
     value_stock_tab_class = "active" if state.active_tab == "value-stock" else ""
     dhan_tab_class = "active" if state.active_tab == "kite-spreads" else ""
     dhan_it_tab_class = "active" if state.active_tab == "dhan-it" else ""
+    ai52_tab_class = "active" if state.active_tab == "52w-ai-call-spread" else ""
     sector_income_tab_class = "active" if state.active_tab == "sector-income" else ""
     nifty_income_tab_class = "active" if state.active_tab == "nifty-income" else ""
     nifty_grow_tab_class = "active" if state.active_tab == "nifty-grow" else ""
@@ -35742,6 +36443,84 @@ def render_page(state: PageState) -> bytes:
     .sector-income-score-modal .modal-actions {{
       text-align: center;
     }}
+    .sector-income-config-modal {{
+      width: min(1500px, calc(100vw - 24px));
+      max-height: calc(100vh - 20px);
+      text-align: left;
+    }}
+    .sector-income-config-modal h2,
+    .sector-income-config-modal .modal-actions {{
+      text-align: center;
+    }}
+    .sector-income-sector-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 10px;
+    }}
+    .sector-income-config-chip,
+    .sector-income-company-choice {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid #bbf7d0;
+      border-radius: 999px;
+      padding: 8px 10px;
+      background: linear-gradient(135deg, #f8fafc, #ecfdf5);
+      box-shadow: 0 6px 16px rgba(15, 118, 110, 0.06);
+      color: #0f172a;
+    }}
+    .sector-income-config-chip small,
+    .sector-income-company-choice small {{
+      color: #64748b;
+      font-size: 11px;
+    }}
+    .sector-income-company-scroll {{
+      max-height: min(55vh, 560px);
+      overflow-y: auto;
+      padding-right: 6px;
+    }}
+    .sector-income-company-block {{
+      border: 1px solid #bfdbfe;
+      border-radius: 16px;
+      padding: 10px;
+      margin-bottom: 10px;
+      background: #ffffff;
+    }}
+    .sector-income-company-block summary {{
+      cursor: pointer;
+      font-weight: 800;
+      color: #0f766e;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .sector-income-company-block summary span {{
+      color: #475569;
+      font-weight: 700;
+      font-size: 12px;
+    }}
+    .sector-income-company-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .sector-income-company-grid.muted {{
+      opacity: 0.72;
+    }}
+    @media (max-width: 720px) {{
+      .sector-income-config-modal {{
+        width: calc(100vw - 12px);
+        padding: 12px;
+      }}
+      .sector-income-sector-grid,
+      .sector-income-company-grid {{
+        grid-template-columns: 1fr;
+      }}
+      .sector-income-company-block summary {{
+        display: block;
+      }}
+    }}
     .dhan-ticket-header {{
       display: flex;
       justify-content: space-between;
@@ -36006,6 +36785,63 @@ def render_page(state: PageState) -> bytes:
     .ipo-table td.dhan-watch-pick-cell small {{
       color: #64748b;
     }}
+    .ai52-detail-modal-card {{
+      width: min(900px, calc(100vw - 28px));
+    }}
+    .ai52-detail-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px;
+      margin: 12px 0;
+    }}
+    .ai52-detail-grid article {{
+      border: 1px solid #bde8e3;
+      border-radius: 14px;
+      padding: 12px;
+      background: linear-gradient(135deg, #ffffff, #f0fdfa);
+    }}
+    .ai52-detail-grid span,
+    .ai52-detail-grid small {{
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 900;
+    }}
+    .ai52-detail-grid strong {{
+      display: block;
+      color: #0f172a;
+      font-size: 18px;
+      margin: 4px 0;
+    }}
+    .ai52-perspective-columns {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      margin: 12px 0;
+    }}
+    .ai52-perspective-columns section {{
+      border: 1px solid #bfdbfe;
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: #f8fbff;
+    }}
+    .ai52-perspective-columns h3,
+    .ai52-detail-subtitle {{
+      margin: 0 0 8px;
+      color: #0f766e;
+      font-size: 14px;
+    }}
+    .ai52-perspective-columns ul {{
+      margin: 0;
+      padding-left: 18px;
+      color: #334155;
+      line-height: 1.35;
+      font-size: 13px;
+    }}
+    .ai52-extra-table {{
+      max-height: 260px;
+      overflow: auto;
+    }}
     .dhan-it-call-pair-indicator {{
       display: inline-block;
       margin-top: 4px;
@@ -36176,6 +37012,88 @@ def render_page(state: PageState) -> bytes:
       white-space: nowrap;
       font-size: 13px;
       font-weight: 950;
+    }}
+    .dhan-it-position-table .dhan-52w-cell {{
+      min-width: 104px;
+      max-width: 124px;
+      text-align: center;
+      white-space: nowrap;
+    }}
+    .dhan-it-position-table .dhan-it-technical-cell {{
+      min-width: 118px;
+      max-width: 150px;
+      text-align: center;
+      white-space: normal;
+    }}
+    .dhan-it-position-table .dhan-it-rsi-cell {{
+      min-width: 76px;
+      max-width: 92px;
+      text-align: center;
+      white-space: normal;
+    }}
+    .dhan-it-position-table .dhan-it-signal-cell {{
+      min-width: 130px;
+      max-width: 180px;
+      text-align: center;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }}
+    .dhan-it-tech-pill {{
+      display: inline-flex;
+      flex-direction: column;
+      gap: 2px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 12px;
+      padding: 5px 7px;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      color: #334155;
+      font-size: 10px;
+      line-height: 1.15;
+      max-width: 140px;
+    }}
+    .dhan-it-tech-pill.dhan-zone-sell {{
+      border-color: #bbf7d0;
+      background: #dcfce7;
+      color: #047857;
+    }}
+    .dhan-it-tech-pill.dhan-zone-buy {{
+      border-color: #fecaca;
+      background: #fee2e2;
+      color: #991b1b;
+    }}
+    .dhan-it-tech-pill.dhan-zone-neutral {{
+      border-color: #bfdbfe;
+      background: #eff6ff;
+      color: #1e3a8a;
+    }}
+    .dhan-it-rsi-pill {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 48px;
+      border-radius: 999px;
+      padding: 4px 7px;
+      font-size: 11px;
+      font-weight: 900;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+    }}
+    .dhan-it-rsi-pill.dhan-rsi-hot {{
+      border-color: #fecaca;
+      background: #fee2e2;
+      color: #991b1b;
+    }}
+    .dhan-it-rsi-pill.dhan-rsi-cool {{
+      border-color: #bbf7d0;
+      background: #dcfce7;
+      color: #047857;
+    }}
+    .dhan-it-rsi-pill.dhan-rsi-mid {{
+      border-color: #bfdbfe;
+      background: #eff6ff;
+      color: #1e3a8a;
     }}
     .dhan-it-position-table .dhan-pair-action-cell .dhan-action-btn {{
       padding: 6px 8px;
@@ -38608,6 +39526,7 @@ def render_page(state: PageState) -> bytes:
       <button class="tab-button utility-action {value_stock_tab_class}" type="button" data-tab="value-stock">Value-Stock</button>
       <button class="tab-button utility-action {dhan_tab_class}" type="button" data-tab="kite-spreads">DHAN</button>
       <button class="tab-button utility-action {dhan_it_tab_class}" type="button" data-tab="dhan-it">DHAN-IT</button>
+      <button class="tab-button utility-action {ai52_tab_class}" type="button" data-tab="52w-ai-call-spread">52W AI Call Spread</button>
       <button class="tab-button utility-action {sector_income_tab_class}" type="button" data-tab="sector-income">SECTOR-Income</button>
       <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
       <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
@@ -38752,6 +39671,7 @@ def render_page(state: PageState) -> bytes:
     {render_value_stock_panel(state)}
     {render_kite_spreads_panel(state)}
     {render_dhan_it_panel(state)}
+    {render_ai52_call_spread_panel(state)}
     {render_sector_income_panel(state)}
     {render_income_growth_panel(state)}
     {render_commodity_panel(state)}
@@ -38977,6 +39897,8 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(document.getElementById('dhan-it-opportunity-table'));
     enableTableSorting(document.getElementById('dhan-it-comparison-table'));
     enableTableSorting(document.getElementById('dhan-it-position-table'));
+    enableTableSorting(document.getElementById('ai52-candidate-table'));
+    enableTableSorting(document.getElementById('ai52-preview-table'));
     enableTableSorting(document.getElementById('sector-income-ranking-table'));
     enableTableSorting(document.getElementById('sector-income-opportunity-table'));
     enableTableSorting(document.getElementById('value-stock-comparison-table'));
@@ -39074,6 +39996,7 @@ def render_page(state: PageState) -> bytes:
       document.getElementById('value-stock-panel').style.display = active === 'value-stock' ? '' : 'none';
       document.getElementById('kite-spreads-panel').style.display = active === 'kite-spreads' ? '' : 'none';
       document.getElementById('dhan-it-panel').style.display = active === 'dhan-it' ? '' : 'none';
+      document.getElementById('ai52-call-spread-panel').style.display = active === '52w-ai-call-spread' ? '' : 'none';
       document.getElementById('sector-income-panel').style.display = active === 'sector-income' ? '' : 'none';
       document.getElementById('income-growth-panel').style.display = active === 'income-growth' ? '' : 'none';
       document.getElementById('commodity-panel').style.display = active === 'commodity' ? '' : 'none';
@@ -39105,6 +40028,7 @@ def render_page(state: PageState) -> bytes:
           'value-stock': '/value-stock',
           'kite-spreads': '/kite-spreads',
           'dhan-it': '/dhan-it',
+          '52w-ai-call-spread': '/52w-ai-call-spread',
           'sector-income': '/sector-income',
           'income-growth': '/income-growth',
           commodity: '/commodity',
@@ -39398,6 +40322,17 @@ def render_page(state: PageState) -> bytes:
     const dhanItBreath = document.getElementById('dhan-it-breath');
     const dhanItBreathText = document.getElementById('dhan-it-breath-text');
     const dhanItCountdown = document.getElementById('dhan-it-countdown');
+    const ai52Modal = document.getElementById('ai52-order-modal');
+    const ai52DetailModal = document.getElementById('ai52-detail-modal');
+    const ai52DetailTitle = document.getElementById('ai52-detail-title');
+    const ai52DetailBody = document.getElementById('ai52-detail-body');
+    const ai52DetailClose = document.getElementById('ai52-detail-close');
+    const ai52Confirm = document.getElementById('ai52-confirm-order');
+    const ai52Review = document.getElementById('ai52-review');
+    const ai52Go = document.getElementById('ai52-place-order');
+    const ai52Breath = document.getElementById('ai52-breath');
+    const ai52BreathText = document.getElementById('ai52-breath-text');
+    const ai52Countdown = document.getElementById('ai52-countdown');
     const dhanItRepairModal = document.getElementById('dhan-it-repair-modal');
     const dhanItRepairConfirm = document.getElementById('dhan-it-repair-confirm');
     const dhanItRepairReview = document.getElementById('dhan-it-repair-review');
@@ -39481,6 +40416,7 @@ def render_page(state: PageState) -> bytes:
     let dhanPairCountdownTimer = null;
     let dhanRepairCountdownTimer = null;
     let dhanItCountdownTimer = null;
+    let ai52CountdownTimer = null;
     let dhanItRepairCountdownTimer = null;
     let ceSellCountdownTimer = null;
     let equityOrderCountdownTimer = null;
@@ -39733,6 +40669,56 @@ def render_page(state: PageState) -> bytes:
     dhanItGo && dhanItGo.addEventListener('click', (event) => {{
       submitOrderModal(event, dhanItModal, dhanItReview, dhanItGo);
     }});
+    function resetAi52Confirmation() {{
+      if (ai52CountdownTimer) clearInterval(ai52CountdownTimer);
+      ai52CountdownTimer = null;
+      const orderable = Boolean(ai52Confirm && ai52Confirm.dataset.orderable === '1');
+      const acknowledged = Boolean(ai52Confirm && ai52Confirm.checked);
+      if (ai52Go) ai52Go.disabled = true;
+      if (ai52Review) ai52Review.disabled = !(orderable && acknowledged);
+      if (ai52Countdown) ai52Countdown.textContent = '10';
+      if (ai52BreathText) ai52BreathText.textContent = acknowledged ? 'Click Start 10s Breathe Review' : 'Tick max-loss acknowledgement to start 10s review';
+      if (ai52Breath) ai52Breath.classList.remove('active');
+    }}
+    function startAi52Countdown() {{
+      resetAi52Confirmation();
+      let remaining = 10;
+      if (ai52Review) ai52Review.disabled = true;
+      if (ai52Breath) ai52Breath.classList.add('active');
+      if (ai52BreathText) ai52BreathText.textContent = 'Breathe in';
+      if (ai52Countdown) ai52Countdown.textContent = String(remaining);
+      ai52CountdownTimer = setInterval(() => {{
+        remaining -= 1;
+        if (ai52Countdown) ai52Countdown.textContent = String(Math.max(remaining, 0));
+        if (ai52BreathText) ai52BreathText.textContent = remaining % 2 === 0 ? 'Breathe in' : 'Breathe out';
+        if (remaining <= 0) {{
+          clearInterval(ai52CountdownTimer);
+          ai52CountdownTimer = null;
+          if (ai52BreathText) ai52BreathText.textContent = 'Ready. Cancel or GO.';
+          if (ai52Go) ai52Go.disabled = false;
+        }}
+      }}, 1000);
+    }}
+    ai52Confirm && ai52Confirm.addEventListener('change', resetAi52Confirmation);
+    ai52Review && ai52Review.addEventListener('click', startAi52Countdown);
+    ai52Go && ai52Go.addEventListener('click', (event) => {{
+      submitOrderModal(event, ai52Modal, ai52Review, ai52Go);
+    }});
+    for (const button of document.querySelectorAll('.ai52-detail-button')) {{
+      button.addEventListener('click', () => {{
+        if (!ai52DetailModal || !ai52DetailBody) return;
+        if (ai52DetailTitle) ai52DetailTitle.textContent = button.dataset.ai52Title || '52W AI candidate details';
+        ai52DetailBody.innerHTML = button.dataset.ai52Html || '<p class="status">No details available.</p>';
+        ai52DetailModal.style.display = 'flex';
+        ai52DetailModal.classList.add('visible');
+      }});
+    }}
+    ai52DetailClose && ai52DetailClose.addEventListener('click', () => {{
+      if (ai52DetailModal) {{
+        ai52DetailModal.classList.remove('visible');
+        ai52DetailModal.style.display = 'none';
+      }}
+    }});
     function resetDhanItRepairConfirmation() {{
       if (dhanItRepairCountdownTimer) clearInterval(dhanItRepairCountdownTimer);
       dhanItRepairCountdownTimer = null;
@@ -39770,6 +40756,7 @@ def render_page(state: PageState) -> bytes:
     resetDhanRepairConfirmation();
     resetDhanItRepairConfirmation();
     resetDhanItConfirmation();
+    resetAi52Confirmation();
     document.querySelectorAll('input[data-expiry-preview-action]').forEach((input) => {{
       input.addEventListener('change', () => {{
         if (!input.checked || input.disabled || !input.form) return;
@@ -41473,6 +42460,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.error = f"{friendly_external_error(exc, 'DHAN-IT')}\n\n{traceback.format_exc()}"
             self.send_page(state)
             return
+        if parsed_url.path == "/52w-ai-call-spread":
+            state = PageState(active_tab="52w-ai-call-spread")
+            try:
+                load_ai52_state(state)
+            except Exception as exc:
+                state.error = f"{friendly_external_error(exc, '52W AI Call Spread')}\n\n{traceback.format_exc()}"
+            self.send_page(state)
+            return
         if parsed_url.path == "/sector-income":
             state = PageState(active_tab="sector-income")
             try:
@@ -41843,6 +42838,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if request_path.startswith("/value-stock")
                 else "kite-spreads"
                 if request_path.startswith("/kite-spreads")
+                else "52w-ai-call-spread"
+                if request_path.startswith("/52w-ai-call-spread")
                 else "dhan-it"
                 if request_path.startswith("/dhan-it")
                 else "sector-income"
@@ -42043,12 +43040,30 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             sector_income_opportunities=_dhan_json_loads(first(form, "sector_income_opportunities_json") or first(form, "dhan_it_opportunities_json"), []),
             sector_income_generated_at=first(form, "sector_income_generated_at") or first(form, "dhan_it_opportunities_generated_at"),
             sector_income_show_rank_modal=checked(form, "sector_income_show_rank_modal"),
+            sector_income_show_config_modal=checked(form, "sector_income_show_config_modal"),
+            sector_income_selected_sectors=_dhan_json_loads(first(form, "sector_income_selected_sectors_json"), None),
+            sector_income_sector_company_selection=_dhan_json_loads(first(form, "sector_income_sector_company_selection_json"), None),
             sector_income_score=_dhan_json_loads(first(form, "sector_income_score_json"), None),
             sector_income_ranking=_dhan_json_loads(first(form, "sector_income_ranking_json"), None),
             sector_income_pending_fii_snapshot=_dhan_json_loads(first(form, "sector_income_pending_fii_snapshot_json"), None),
             sector_income_active_fii_snapshot=_dhan_json_loads(first(form, "sector_income_active_fii_snapshot_json"), None),
             sector_income_fii_upload_message=first(form, "sector_income_fii_upload_message"),
             sector_income_score_snapshot=_dhan_json_loads(first(form, "sector_income_score_snapshot_json"), None),
+            ai52_candidates=_dhan_json_loads(first(form, "ai52_candidates_json"), []),
+            ai52_evaluations=_dhan_json_loads(first(form, "ai52_evaluations_json"), []),
+            ai52_previews=_dhan_json_loads(first(form, "ai52_previews_json"), []),
+            ai52_selected_index=first(form, "ai52_selected_index"),
+            ai52_selected_preview=_dhan_json_loads(first(form, "ai52_selected_preview_json"), None),
+            ai52_lots=max(1, int(float(first(form, "ai52_lots", "1") or 1))),
+            ai52_buy_limit_discount_pct=max(0.0, min(float(first(form, "ai52_buy_limit_discount_pct", str(DEFAULT_BUY_LIMIT_DISCOUNT_PCT)) or DEFAULT_BUY_LIMIT_DISCOUNT_PCT), 50.0)),
+            ai52_sell_limit_markup_pct=max(0.0, min(float(first(form, "ai52_sell_limit_markup_pct", str(DEFAULT_SELL_LIMIT_MARKUP_PCT)) or DEFAULT_SELL_LIMIT_MARKUP_PCT), 100.0)),
+            ai52_paper_trading=(
+                str(first(form, "ai52_trade_mode") or "").strip().upper() != "LIVE"
+                if "ai52_trade_mode" in form
+                else checked(form, "ai52_paper_trading", True)
+            ),
+            ai52_confirm_order=checked(form, "ai52_confirm_order"),
+            ai52_source_status=first(form, "ai52_source_status"),
             analytics_symbol=first(form, "analytics_symbol"),
             kite_request_token=first(form, "kite_request_token"),
             etf_buy_amount=float(first(form, "etf_buy_amount", str(etf_buy_amount_setting())) or etf_buy_amount_setting()),
@@ -43642,6 +44657,57 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 load_dhan_state(state)
                 state.message = f"Cleared DHAN Pair Order Monitor locally: {deleted.get('pair_orders_deleted', 0)} pair row(s) removed. Kite orders were not changed."
+            elif request_path == "/sector-income/config-open":
+                load_sector_income_state(state)
+                state.sector_income_show_config_modal = True
+                state.message = "Opened SECTOR-Income configurable sector/company scope."
+            elif request_path == "/sector-income/config-close":
+                load_sector_income_state(state)
+                state.sector_income_show_config_modal = False
+                state.message = "Closed SECTOR-Income configuration."
+            elif request_path == "/sector-income/config-refresh":
+                default_sectors, default_companies = default_sector_income_selection(state.sector_income_ranking)
+                saved_config = SectorIncomeConfigRepository(APP_DB_PATH).save(
+                    default_sectors,
+                    default_companies,
+                    source="REFRESHED_FROM_STATIC_MASTER",
+                )
+                state.sector_income_selected_sectors = saved_config["selected_sectors"]
+                state.sector_income_sector_company_selection = saved_config["sector_companies"]
+                state.sector_income_sector = saved_config["selected_sectors"][0]
+                state.sector_income_show_config_modal = True
+                load_sector_income_state(state)
+                state.sector_income_show_config_modal = True
+                state.message = "Refreshed SECTOR-Income config from the static sector/company master."
+            elif request_path == "/sector-income/config-save":
+                selected_sectors = [
+                    normalize_sector_key(item)
+                    for item in form.get("sector_income_config_sectors", [])
+                    if str(item or "").strip()
+                ]
+                selected_sectors = selected_sectors[:3]
+                if not selected_sectors:
+                    raise ValueError("Select at least one sector for SECTOR-Income.")
+                selected_companies: dict[str, list[str]] = {}
+                for sector in selected_sectors:
+                    selected_companies[sector] = [
+                        str(symbol or "").strip().upper()
+                        for symbol in form.get(f"sector_income_config_company_{sector}", [])
+                        if str(symbol or "").strip().upper() in set(configured_sector_symbols(sector))
+                    ][:4]
+                saved_config = SectorIncomeConfigRepository(APP_DB_PATH).save(
+                    selected_sectors,
+                    selected_companies,
+                    source="USER_CONFIGURED",
+                )
+                state.sector_income_selected_sectors = saved_config["selected_sectors"]
+                state.sector_income_sector_company_selection = saved_config["sector_companies"]
+                state.sector_income_sector = saved_config["selected_sectors"][0]
+                state.sector_income_show_config_modal = False
+                state.sector_income_selected_index = ""
+                load_sector_income_state(state)
+                total_symbols = len(sector_income_selected_symbols(saved_config["selected_sectors"], saved_config["sector_companies"]))
+                state.message = f"Saved SECTOR-Income scope: {len(saved_config['selected_sectors'])} sector(s), {total_symbols} company candidate(s). Cards, holdings and opportunity table refreshed."
             elif request_path in {"/sector-income/load", "/sector-income/evaluate"}:
                 load_sector_income_state(state)
                 state.message = (
@@ -43650,7 +44716,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             elif request_path == "/sector-income/open-symbol":
                 selected_symbol = str(first(form, "sector_income_open_symbol") or "").strip().upper()
-                if selected_symbol not in set(configured_sector_symbols(state.sector_income_sector)):
+                config = sector_income_config_for_state(state)
+                allowed_scope = set(sector_income_selected_symbols(config.get("selected_sectors"), config.get("sector_companies")))
+                if selected_symbol not in allowed_scope:
                     raise ValueError("Choose one valid stock from the selected SECTOR-Income universe.")
                 load_sector_income_state(state)
                 selected_idx = next(
@@ -43842,6 +44910,226 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 repository.export_outputs(state.sector_income_opportunities)
                 load_sector_income_state(state)
                 state.message = f"Cleared shared SECTOR/DHAN-IT Pair Order Monitor locally: {deleted.get('pair_orders_deleted', 0)} pair row(s) removed. Kite orders were not changed."
+            elif request_path == "/52w-ai-call-spread/load":
+                load_ai52_state(state)
+                state.message = "Loaded 52W AI Call Spread candidates and monitor."
+            elif request_path == "/52w-ai-call-spread/refresh-screener":
+                try:
+                    rows = ScreenerClient().fetch_screen()
+                    repository = FiftyTwoWeekAiRepository(APP_DB_PATH)
+                    repository.save_candidate_snapshot(rows, "SCREENER_CSV_EXPORT")
+                    state.ai52_candidates = rows
+                    state.ai52_source_status = "SCREENER_CSV_EXPORT"
+                    state.message = f"Imported {len(rows)} 52W AI Screener candidate row(s)."
+                except ScreenerManualExportRequired:
+                    state.message = "Manual login/export required. Download the Screener CSV export and upload it here."
+                load_ai52_state(state)
+            elif request_path == "/52w-ai-call-spread/upload-csv":
+                upload = uploaded_files.get("ai52_csv") or {}
+                content = upload.get("content") or b""
+                if not content:
+                    raise ValueError("Upload the Screener CSV export before importing 52W AI candidates.")
+                csv_text = content.decode("utf-8-sig", errors="replace")
+                rows = normalize_screener_csv(csv_text, source_status=f"CSV_UPLOAD:{upload.get('filename') or 'screener.csv'}")
+                if not rows:
+                    raise ValueError("No valid rows were found in the uploaded Screener CSV.")
+                repository = FiftyTwoWeekAiRepository(APP_DB_PATH)
+                repository.save_candidate_snapshot(rows, f"CSV_UPLOAD:{upload.get('filename') or 'screener.csv'}")
+                state.ai52_candidates = rows
+                state.ai52_source_status = f"CSV_UPLOAD:{upload.get('filename') or 'screener.csv'}"
+                load_ai52_state(state)
+                state.message = f"Uploaded and normalized {len(rows)} 52W AI candidate row(s)."
+            elif request_path == "/52w-ai-call-spread/evaluate-one":
+                if not state.ai52_candidates:
+                    load_ai52_state(state)
+                selected_idx = int(float(state.ai52_selected_index or "-1"))
+                if selected_idx < 0 or selected_idx >= len(state.ai52_candidates or []):
+                    raise ValueError("Select one imported Screener candidate to evaluate.")
+                candidate = dict((state.ai52_candidates or [])[selected_idx])
+                evaluation = evaluate_ai52_candidate(candidate)
+                candidate["evaluation"] = evaluation
+                candidate["fno_eligible"] = evaluation.get("fno_eligible")
+                candidate["option_expiry"] = evaluation.get("option_expiry") or candidate.get("option_expiry")
+                state.ai52_candidates[selected_idx] = candidate
+                load_ai52_state(state)
+                state.message = (
+                    f"Evaluated {evaluation.get('symbol')} from live Kite data: "
+                    f"{evaluation.get('decision')} | score {evaluation.get('call_sell_score')} | state {evaluation.get('state')}."
+                )
+            elif request_path == "/52w-ai-call-spread/evaluate-all":
+                if not state.ai52_candidates:
+                    load_ai52_state(state)
+                if not state.ai52_candidates:
+                    raise ValueError("Upload or load Screener candidates before running 52W AI evaluation.")
+                evaluations = evaluate_ai52_candidates(list(state.ai52_candidates or []))
+                evaluation_by_symbol = {str(row.get("symbol") or "").strip().upper(): row for row in evaluations}
+                enriched_candidates = []
+                for candidate in state.ai52_candidates or []:
+                    next_candidate = dict(candidate)
+                    evaluation = evaluation_by_symbol.get(str(candidate.get("symbol") or "").strip().upper())
+                    if evaluation:
+                        next_candidate["evaluation"] = evaluation
+                        next_candidate["fno_eligible"] = evaluation.get("fno_eligible")
+                        next_candidate["option_expiry"] = evaluation.get("option_expiry") or next_candidate.get("option_expiry")
+                    enriched_candidates.append(next_candidate)
+                state.ai52_candidates = enriched_candidates
+                load_ai52_state(state)
+                tradable = sum(1 for row in evaluations if str(row.get("decision") or "").upper() in {"A+ SELL", "A SELL", "WATCH FOR REJECTION"})
+                state.message = f"Evaluated and ranked {len(evaluations)} 52W AI candidate(s) from Kite data. {tradable} candidate(s) are not hard-blocked."
+            elif request_path == "/52w-ai-call-spread/logout":
+                state.ai52_selected_preview = None
+                state.ai52_selected_index = ""
+                load_ai52_state(state)
+                state.message = "Cleared 52W AI Screener session state. No credentials or cookies are stored by the app."
+            elif request_path == "/52w-ai-call-spread/preview":
+                if not state.ai52_candidates:
+                    load_ai52_state(state)
+                selected_idx = int(float(state.ai52_selected_index or "-1"))
+                if selected_idx < 0 or selected_idx >= len(state.ai52_candidates or []):
+                    raise ValueError("Select one 52W AI candidate before creating a call spread.")
+                candidate = (state.ai52_candidates or [])[selected_idx]
+                symbol = str(candidate.get("symbol") or "").strip().upper()
+                if not symbol:
+                    raise ValueError("Selected 52W AI row does not have a valid NSE symbol.")
+                evaluation = candidate.get("evaluation") if isinstance(candidate.get("evaluation"), dict) else {}
+                if not evaluation:
+                    latest_eval = FiftyTwoWeekAiRepository(APP_DB_PATH).latest_evaluation_by_symbol().get(symbol)
+                    evaluation = latest_eval or {}
+                if not evaluation:
+                    evaluation = evaluate_ai52_candidate(candidate)
+                    candidate["evaluation"] = evaluation
+                    candidate["fno_eligible"] = evaluation.get("fno_eligible")
+                    candidate["option_expiry"] = evaluation.get("option_expiry") or candidate.get("option_expiry")
+                    if 0 <= selected_idx < len(state.ai52_candidates or []):
+                        state.ai52_candidates[selected_idx] = candidate
+                if str(evaluation.get("decision") or "").upper() in {"BLOCKED", "DATA_ERROR"} or evaluation.get("block_reasons"):
+                    raise ValueError(
+                        "Blocked by 52W evaluation: "
+                        + ("; ".join(str(item) for item in evaluation.get("block_reasons") or []) or str(evaluation.get("decision") or "BLOCKED"))
+                    )
+                broker, spot, contracts, notes = _ai52_candidate_option_data(symbol, candidate.get("screener_cmp"))
+                preview = build_52w_ai_call_spread_preview(
+                    symbol=symbol,
+                    spot=spot,
+                    lots=state.ai52_lots,
+                    option_chain_data=contracts,
+                    kite_adapter=broker,
+                    buy_limit_discount_pct=state.ai52_buy_limit_discount_pct,
+                    sell_limit_markup_pct=state.ai52_sell_limit_markup_pct,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                candidate = dict(candidate)
+                candidate["fno_eligible"] = bool(contracts and _dhan_metric_float(preview.get("lot_size")) > 0)
+                candidate["option_expiry"] = preview.get("expiry") or ""
+                if 0 <= selected_idx < len(state.ai52_candidates or []):
+                    state.ai52_candidates[selected_idx] = candidate
+                preview["candidate"] = candidate
+                repository = FiftyTwoWeekAiRepository(APP_DB_PATH)
+                repository.save_preview(preview)
+                state.ai52_selected_preview = preview
+                state.ai52_selected_index = str(selected_idx)
+                load_ai52_state(state)
+                note_text = f" {' '.join(notes)}" if notes else ""
+                state.message = f"Prepared 52W AI +5%/+20% CE spread ticket for {symbol}.{note_text}"
+            elif request_path == "/52w-ai-call-spread/close-popup":
+                state.ai52_selected_preview = None
+                state.ai52_selected_index = ""
+                state.ai52_confirm_order = False
+                load_ai52_state(state)
+                state.message = "Closed 52W AI order ticket."
+            elif request_path == "/52w-ai-call-spread/clear-previews":
+                repository = FiftyTwoWeekAiRepository(APP_DB_PATH)
+                deleted = repository.clear_previews()
+                state.ai52_previews = []
+                state.ai52_selected_preview = None
+                state.ai52_selected_index = ""
+                state.ai52_confirm_order = False
+                load_ai52_state(state)
+                state.message = (
+                    f"Cleared {deleted} saved 52W AI preview row(s). "
+                    "Imported Screener candidates, Pair Order Monitor, and Kite orders were not changed."
+                )
+            elif request_path == "/52w-ai-call-spread/submit":
+                if not state.ai52_selected_preview:
+                    raise ValueError("Open a 52W AI order ticket before placing an order.")
+                stale_preview = dict(state.ai52_selected_preview)
+                candidate = stale_preview.get("candidate") if isinstance(stale_preview.get("candidate"), dict) else {}
+                symbol = str(stale_preview.get("symbol") or candidate.get("symbol") or "").strip().upper()
+                broker_for_data, spot, contracts, notes = _ai52_candidate_option_data(symbol, candidate.get("screener_cmp") or stale_preview.get("cmp"))
+                refreshed_preview = build_52w_ai_call_spread_preview(
+                    symbol=symbol,
+                    spot=spot,
+                    lots=int(stale_preview.get("selected_lots") or state.ai52_lots or 1),
+                    option_chain_data=contracts,
+                    kite_adapter=broker_for_data,
+                    expiry=stale_preview.get("expiry"),
+                    buy_limit_discount_pct=float(stale_preview.get("buy_limit_discount_pct") or state.ai52_buy_limit_discount_pct),
+                    sell_limit_markup_pct=float(stale_preview.get("sell_limit_markup_pct") or state.ai52_sell_limit_markup_pct),
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                refreshed_preview["candidate"] = candidate
+                repository = DhanItPairRepository(APP_DB_PATH)
+                active_duplicates = [
+                    row for row in repository.list_pairs(include_closed=False)
+                    if str(row.get("symbol") or "").strip().upper() == symbol
+                    and str(row.get("expiry") or "") == str(refreshed_preview.get("expiry") or "")
+                    and str(row.get("strategy_type") or "").upper() == "BEAR_CALL_SPREAD"
+                ]
+                if active_duplicates:
+                    raise ValueError(
+                        f"Duplicate pending/open BEAR_CALL_SPREAD exists for {symbol} expiry {refreshed_preview.get('expiry')}. Use Pair Order Monitor before creating another one."
+                    )
+                if str(refreshed_preview.get("risk_decision") or "").upper() != "APPROVED":
+                    raise ValueError(f"52W AI pair is blocked: {refreshed_preview.get('risk_reason') or refreshed_preview.get('reason')}")
+                submit_mode = "PAPER" if state.ai52_paper_trading else "LIVE"
+                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
+                outcome = submit_dhan_it_pair(
+                    refreshed_preview,
+                    repository,
+                    broker,
+                    user_confirmed=state.ai52_confirm_order,
+                    mode=submit_mode,
+                )
+                FiftyTwoWeekAiRepository(APP_DB_PATH).save_preview(refreshed_preview, status="SUBMITTED")
+                state.console_log = (
+                    "52W AI hedge-first order log\n"
+                    f"Pair ID: {outcome.get('pair_id')}\n"
+                    f"BUY hedge order: {outcome.get('buy_leg_order_id') or '-'}\n"
+                    f"SELL short order: {outcome.get('sell_leg_order_id') or 'waiting for monitor after hedge fill'}\n"
+                    f"Mode: {outcome.get('mode')}\n"
+                    f"Revalidation notes: {' '.join(notes)}\n"
+                )
+                state.ai52_selected_preview = None
+                state.ai52_selected_index = ""
+                state.ai52_confirm_order = False
+                load_ai52_state(state)
+                state.message = f"Submitted 52W AI paired spread {outcome.get('pair_id')} in {submit_mode.lower()} mode. BUY hedge is protected first."
+            elif request_path == "/52w-ai-call-spread/monitor-run":
+                result = run_dhan_it_scheduler_now(paper_trading=state.ai52_paper_trading)
+                load_ai52_state(state)
+                state.message = (
+                    f"52W AI shared scheduler checked {result.get('checked')} pair(s), modified {result.get('modified', 0)}, placed {result.get('placed')} SELL leg(s), "
+                    f"failed {result.get('failed')}, exit-required {result.get('exit_required')}, both-filled {result.get('both_filled')}."
+                )
+            elif request_path == "/52w-ai-call-spread/scheduler-start":
+                started = start_dhan_it_scheduler(paper_trading=state.ai52_paper_trading)
+                load_ai52_state(state)
+                state.message = "Started shared 52W AI/DHAN-IT scheduler." if started else "Shared scheduler is already running."
+            elif request_path == "/52w-ai-call-spread/scheduler-stop":
+                stopped = stop_dhan_it_scheduler()
+                load_ai52_state(state)
+                state.message = "Stopped shared 52W AI/DHAN-IT scheduler." if stopped else "Shared scheduler was not running."
+            elif request_path == "/52w-ai-call-spread/clear-pair-monitor":
+                repository = DhanItPairRepository(APP_DB_PATH)
+                deleted = repository.clear_pair_monitor(screen_name="52W AI Call Spread")
+                state.ai52_selected_preview = None
+                state.ai52_selected_index = ""
+                state.ai52_confirm_order = False
+                load_ai52_state(state)
+                state.message = (
+                    f"Cleared local 52W AI Pair Order Monitor history: {deleted.get('pair_orders_deleted', 0)} pair row(s) "
+                    f"and {deleted.get('execution_logs_deleted', 0)} log row(s) removed. Kite orders were not changed."
+                )
             elif request_path == "/dhan-it/load":
                 load_dhan_it_state(state)
                 state.message = "Loaded DHAN-IT universe and pair monitor."

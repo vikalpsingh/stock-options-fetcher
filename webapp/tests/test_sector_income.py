@@ -13,10 +13,12 @@ from fii_sector_repository import FiiSectorSnapshotRepository
 from sector_income import (
     SECTOR_SCORE_WEIGHTS,
     SECTOR_INCOME_UNIVERSE,
+    SectorIncomeConfigRepository,
     calculate_sector_sell_on_rise_score,
     choose_default_sector,
     classify_fii_flow_regime,
     configured_sector_symbols,
+    sector_income_selected_symbols,
     rank_all_sectors,
     rank_sector_candidates,
     sector_options,
@@ -216,6 +218,30 @@ def test_sector_income_selector_contains_configured_sectors() -> None:
     assert configured_sector_symbols("HEALTHCARE_PHARMA")[:3] == ["SUNPHARMA", "DRREDDY", "CIPLA"]
 
 
+def test_sector_income_config_repository_persists_three_sector_four_company_scope(tmp_path) -> None:
+    repo = SectorIncomeConfigRepository(tmp_path / "sector.db")
+
+    saved = repo.save(
+        ["INFORMATION_TECHNOLOGY", "HEALTHCARE_PHARMA", "AUTOMOBILE_AUTO_COMPONENTS", "BANKING"],
+        {
+            "INFORMATION_TECHNOLOGY": ["TCS", "INFY", "HCLTECH", "TECHM", "WIPRO"],
+            "HEALTHCARE_PHARMA": ["SUNPHARMA", "DRREDDY"],
+            "AUTOMOBILE_AUTO_COMPONENTS": ["MARUTI", "M&M", "TATAMOTORS", "EICHERMOT"],
+        },
+    )
+    loaded = repo.load()
+
+    assert loaded["selected_sectors"] == ["INFORMATION_TECHNOLOGY", "HEALTHCARE_PHARMA", "AUTOMOBILE_AUTO_COMPONENTS"]
+    assert loaded["sector_companies"]["INFORMATION_TECHNOLOGY"] == ["TCS", "INFY", "HCLTECH", "TECHM"]
+    assert saved["source"] == "USER_CONFIGURED"
+    assert sector_income_selected_symbols(loaded["selected_sectors"], loaded["sector_companies"])[:4] == [
+        "TCS",
+        "INFY",
+        "HCLTECH",
+        "TECHM",
+    ]
+
+
 def test_sector_income_scorecard_weights_and_default_sector_are_deterministic() -> None:
     assert sum(SECTOR_SCORE_WEIGHTS.values()) == 100
 
@@ -377,6 +403,7 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
                     "rank": 1,
                     "sector_key": "INFORMATION_TECHNOLOGY",
                     "sector_label": "Information Technology",
+                    "score": 56.0,
                     "sector_score": 72.5,
                     "status": "GREEN",
                     "confidence": "HIGH",
@@ -420,6 +447,13 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
             "generated_at": "2026-08-30T10:00:00+00:00",
         },
         sector_income_show_rank_modal=True,
+        sector_income_show_config_modal=True,
+        sector_income_selected_sectors=["INFORMATION_TECHNOLOGY", "HEALTHCARE_PHARMA", "AUTOMOBILE_AUTO_COMPONENTS"],
+        sector_income_sector_company_selection={
+            "INFORMATION_TECHNOLOGY": ["TCS", "INFY", "HCLTECH", "TECHM"],
+            "HEALTHCARE_PHARMA": ["SUNPHARMA", "DRREDDY", "CIPLA", "LUPIN"],
+            "AUTOMOBILE_AUTO_COMPONENTS": ["MARUTI", "M&M", "TATAMOTORS", "EICHERMOT"],
+        },
         sector_income_pending_fii_snapshot={
             "snapshot_id": 99,
             "report_date": "2026-08-30",
@@ -441,6 +475,7 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
     assert 'id="sector-income-panel"' in html
     assert "SECTOR-Income" in app.render_page(state).decode("utf-8")
     assert "Information Technology" in html
+    assert "72.50" in html
     assert "Top 3 Sector Ranking" in html
     assert 'id="sector-income-rank-modal"' in html
     assert "SECTOR-Income - FII Upload & Sector Score Details" in html
@@ -455,6 +490,11 @@ def test_sector_income_page_renders_tab_selector_tables_and_execution_link() -> 
     assert "Sector Decision & FII Flow" in html
     assert "Current Kite Option Holdings / CE Pair Status" in html
     assert "Pair Order Monitor" in html
+    assert "Configure SECTOR-Income Sectors & Companies" in html
+    assert 'formaction="/sector-income/config-save"' in html
+    assert 'name="sector_income_config_sectors" value="HEALTHCARE_PHARMA"' in html
+    assert 'name="sector_income_config_company_INFORMATION_TECHNOLOGY" value="TCS"' in html
+    assert "Configured Sector Call-Spread Cards" in html
     assert 'formaction="/sector-income/monitor-run"' in html
     assert 'formaction="/sector-income/scheduler-start"' in html
     assert 'formaction="/sector-income/scheduler-stop"' in html

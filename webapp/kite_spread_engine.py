@@ -40,7 +40,18 @@ def fetch_fresh_equity_quotes_from_kite(adapter: Any, symbols: list[str]) -> dic
     try:
         data = adapter.get_quote(instruments)
     except Exception:
-        return {symbol: {"ltp": None, "day_change_pct": None, "previous_close": None, "yearly_high": None, "pct_to_52_high": None} for symbol in clean_symbols}
+        return {
+            symbol: {
+                "ltp": None,
+                "day_change_pct": None,
+                "previous_close": None,
+                "yearly_high": None,
+                "yearly_low": None,
+                "pct_to_52_high": None,
+                "pct_from_52_low": None,
+            }
+            for symbol in clean_symbols
+        }
     out: dict[str, dict[str, float | None]] = {}
     for symbol in clean_symbols:
         key = f"NSE:{symbol}"
@@ -53,14 +64,23 @@ def fetch_fresh_equity_quotes_from_kite(adapter: Any, symbols: list[str]) -> dic
             or quote.get("fifty_two_week_high")
             or (quote.get("ohlc") or {}).get("yearly_high")
         ) or None
+        yearly_low = _num(
+            quote.get("yearly_low")
+            or quote.get("52_week_low")
+            or quote.get("fifty_two_week_low")
+            or (quote.get("ohlc") or {}).get("yearly_low")
+        ) or None
         day_change_pct = round((ltp - close) / close * 100, 2) if ltp and close else None
         pct_to_52_high = round((ltp - yearly_high) / yearly_high * 100, 2) if ltp and yearly_high else None
+        pct_from_52_low = round((ltp - yearly_low) / yearly_low * 100, 2) if ltp and yearly_low else None
         out[symbol] = {
             "ltp": ltp,
             "day_change_pct": day_change_pct,
             "previous_close": close,
             "yearly_high": yearly_high,
+            "yearly_low": yearly_low,
             "pct_to_52_high": pct_to_52_high,
+            "pct_from_52_low": pct_from_52_low,
         }
     return out
 

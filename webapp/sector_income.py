@@ -7,8 +7,11 @@ the UI layer.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable
 
 
@@ -47,6 +50,96 @@ SECTOR_LABELS: dict[str, str] = {
     "REALTY": "Realty",
     "CONSTRUCTION_MATERIALS": "Construction Materials / Cement",
     "CONSUMER_SERVICES": "Consumer Services",
+}
+
+SECTOR_INCOME_COMPANY_NAMES: dict[str, str] = {
+    "TCS": "Tata Consultancy Services",
+    "INFY": "Infosys",
+    "HCLTECH": "HCL Technologies",
+    "TECHM": "Tech Mahindra",
+    "WIPRO": "Wipro",
+    "LTM": "LTIMindtree",
+    "BAJFINANCE": "Bajaj Finance",
+    "BAJAJFINSV": "Bajaj Finserv",
+    "SHRIRAMFIN": "Shriram Finance",
+    "CHOLAFIN": "Cholamandalam Investment and Finance",
+    "SBICARD": "SBI Cards and Payment Services",
+    "JIOFIN": "Jio Financial Services",
+    "HDFCBANK": "HDFC Bank",
+    "ICICIBANK": "ICICI Bank",
+    "AXISBANK": "Axis Bank",
+    "SBIN": "State Bank of India",
+    "KOTAKBANK": "Kotak Mahindra Bank",
+    "INDUSINDBK": "IndusInd Bank",
+    "MARUTI": "Maruti Suzuki India",
+    "M&M": "Mahindra & Mahindra",
+    "TATAMOTORS": "Tata Motors",
+    "EICHERMOT": "Eicher Motors",
+    "BAJAJ-AUTO": "Bajaj Auto",
+    "HEROMOTOCO": "Hero MotoCorp",
+    "SUNPHARMA": "Sun Pharmaceutical Industries",
+    "DRREDDY": "Dr. Reddy's Laboratories",
+    "CIPLA": "Cipla",
+    "LUPIN": "Lupin",
+    "AUROPHARMA": "Aurobindo Pharma",
+    "DIVISLAB": "Divi's Laboratories",
+    "HINDALCO": "Hindalco Industries",
+    "TATASTEEL": "Tata Steel",
+    "JSWSTEEL": "JSW Steel",
+    "VEDL": "Vedanta",
+    "NATIONALUM": "National Aluminium",
+    "SAIL": "Steel Authority of India",
+    "RELIANCE": "Reliance Industries",
+    "ONGC": "Oil and Natural Gas Corporation",
+    "IOC": "Indian Oil Corporation",
+    "BPCL": "Bharat Petroleum Corporation",
+    "GAIL": "GAIL India",
+    "OIL": "Oil India",
+    "HINDUNILVR": "Hindustan Unilever",
+    "ITC": "ITC",
+    "NESTLEIND": "Nestle India",
+    "BRITANNIA": "Britannia Industries",
+    "DABUR": "Dabur India",
+    "MARICO": "Marico",
+    "NTPC": "NTPC",
+    "POWERGRID": "Power Grid Corporation of India",
+    "TATAPOWER": "Tata Power",
+    "ADANIPOWER": "Adani Power",
+    "JSWENERGY": "JSW Energy",
+    "NHPC": "NHPC",
+    "LT": "Larsen & Toubro",
+    "SIEMENS": "Siemens",
+    "ABB": "ABB India",
+    "BHEL": "Bharat Heavy Electricals",
+    "BEL": "Bharat Electronics",
+    "CUMMINSIND": "Cummins India",
+    "BHARTIARTL": "Bharti Airtel",
+    "INDUSTOWER": "Indus Towers",
+    "TATACOMM": "Tata Communications",
+    "IDEA": "Vodafone Idea",
+    "TITAN": "Titan Company",
+    "HAVELLS": "Havells India",
+    "VOLTAS": "Voltas",
+    "DIXON": "Dixon Technologies",
+    "CROMPTON": "Crompton Greaves Consumer Electricals",
+    "BLUESTARCO": "Blue Star",
+    "DLF": "DLF",
+    "GODREJPROP": "Godrej Properties",
+    "LODHA": "Macrotech Developers",
+    "OBEROIRLTY": "Oberoi Realty",
+    "PRESTIGE": "Prestige Estates Projects",
+    "ULTRACEMCO": "UltraTech Cement",
+    "GRASIM": "Grasim Industries",
+    "AMBUJACEM": "Ambuja Cements",
+    "ACC": "ACC",
+    "SHREECEM": "Shree Cement",
+    "DALBHARAT": "Dalmia Bharat",
+    "ETERNAL": "Eternal",
+    "INDHOTEL": "Indian Hotels Company",
+    "IRCTC": "Indian Railway Catering and Tourism Corporation",
+    "TRENT": "Trent",
+    "NAUKRI": "Info Edge India",
+    "DMART": "Avenue Supermarts",
 }
 
 
@@ -128,6 +221,160 @@ def normalize_sector_key(value: str | None) -> str:
 
 def configured_sector_symbols(sector_key: str) -> list[str]:
     return list(SECTOR_INCOME_UNIVERSE.get(normalize_sector_key(sector_key), []))
+
+
+def sector_income_company_master_rows() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for sector_key, symbols in SECTOR_INCOME_UNIVERSE.items():
+        for symbol in symbols:
+            rows.append(
+                {
+                    "sector_key": sector_key,
+                    "sector_label": SECTOR_LABELS.get(sector_key, sector_key.replace("_", " ").title()),
+                    "symbol": symbol,
+                    "company_name": SECTOR_INCOME_COMPANY_NAMES.get(symbol, symbol),
+                    "source": "STATIC_SECTOR_INCOME_MASTER",
+                }
+            )
+    return rows
+
+
+def default_sector_income_selection(
+    ranked_sectors: dict[str, Any] | None = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    top_rows = list((ranked_sectors or {}).get("top_sectors") or [])
+    selected = [
+        normalize_sector_key(row.get("sector_key") or row.get("sector"))
+        for row in top_rows
+        if row.get("sector_key") or row.get("sector")
+    ]
+    if not selected:
+        selected = list(DEFAULT_SECTOR_PRIORITY[:3])
+    selected = selected[:3]
+    company_map = {sector: configured_sector_symbols(sector)[:4] for sector in selected}
+    return selected, company_map
+
+
+def normalize_sector_income_selection(
+    selected_sectors: Iterable[str] | None,
+    sector_companies: dict[str, Iterable[str]] | None = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    sectors: list[str] = []
+    for raw_sector in selected_sectors or []:
+        sector = normalize_sector_key(str(raw_sector))
+        if sector not in sectors:
+            sectors.append(sector)
+        if len(sectors) >= 3:
+            break
+    if not sectors:
+        sectors = list(DEFAULT_SECTOR_PRIORITY[:3])
+    normalized_companies: dict[str, list[str]] = {}
+    incoming = sector_companies or {}
+    for sector in sectors:
+        allowed = configured_sector_symbols(sector)
+        allowed_set = set(allowed)
+        selected_symbols: list[str] = []
+        for raw_symbol in incoming.get(sector, []) or []:
+            symbol = str(raw_symbol or "").strip().upper()
+            if symbol in allowed_set and symbol not in selected_symbols:
+                selected_symbols.append(symbol)
+            if len(selected_symbols) >= 4:
+                break
+        normalized_companies[sector] = selected_symbols or allowed[:4]
+    return sectors, normalized_companies
+
+
+def sector_income_selected_symbols(
+    selected_sectors: Iterable[str] | None,
+    sector_companies: dict[str, Iterable[str]] | None = None,
+) -> list[str]:
+    sectors, company_map = normalize_sector_income_selection(selected_sectors, sector_companies)
+    symbols: list[str] = []
+    for sector in sectors:
+        for symbol in company_map.get(sector, []):
+            if symbol not in symbols:
+                symbols.append(symbol)
+    return symbols
+
+
+class SectorIncomeConfigRepository:
+    """Persists the user-selected SECTOR-Income sectors and company scope."""
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sector_income_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                selected_sectors_json TEXT NOT NULL,
+                sector_companies_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                source TEXT NOT NULL
+            )
+            """
+        )
+        return conn
+
+    def load(self, ranked_sectors: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM sector_income_config WHERE id = 1").fetchone()
+        if row:
+            selected, company_map = normalize_sector_income_selection(
+                json.loads(row["selected_sectors_json"] or "[]"),
+                json.loads(row["sector_companies_json"] or "{}"),
+            )
+            return {
+                "selected_sectors": selected,
+                "sector_companies": company_map,
+                "updated_at": row["updated_at"],
+                "source": row["source"],
+            }
+        selected, company_map = default_sector_income_selection(ranked_sectors)
+        return {
+            "selected_sectors": selected,
+            "sector_companies": company_map,
+            "updated_at": "",
+            "source": "DEFAULT_TOP_RANKED_STATIC",
+        }
+
+    def save(
+        self,
+        selected_sectors: Iterable[str],
+        sector_companies: dict[str, Iterable[str]],
+        *,
+        source: str = "USER_CONFIGURED",
+    ) -> dict[str, Any]:
+        selected, company_map = normalize_sector_income_selection(selected_sectors, sector_companies)
+        updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sector_income_config (
+                    id, selected_sectors_json, sector_companies_json, updated_at, source
+                ) VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    selected_sectors_json = excluded.selected_sectors_json,
+                    sector_companies_json = excluded.sector_companies_json,
+                    updated_at = excluded.updated_at,
+                    source = excluded.source
+                """,
+                (
+                    json.dumps(selected),
+                    json.dumps(company_map),
+                    updated_at,
+                    source,
+                ),
+            )
+        return {
+            "selected_sectors": selected,
+            "sector_companies": company_map,
+            "updated_at": updated_at,
+            "source": source,
+        }
 
 
 def load_fii_sector_snapshot() -> SectorIncomeSnapshot:
