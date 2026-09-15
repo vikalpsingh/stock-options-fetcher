@@ -1957,6 +1957,56 @@ def test_dhan_pair_limit_prices_are_rounded_to_zerodha_tick_size(tmp_path):
     ]
 
 
+def test_dhan_pair_uses_strategy_control_limit_adjustments(tmp_path):
+    repo = KiteSpreadRepository(tmp_path / "kite.db")
+    broker = MockKiteAdapter()
+    preview = approved_preview()
+    preview["buy_limit_price"] = 5.03
+    preview["buy_leg_premium"] = 5.03
+    preview["sell_limit_price"] = 11.94
+    preview["sell_leg_premium"] = 11.94
+
+    result = app.submit_pair_order(
+        preview,
+        repo,
+        broker,
+        user_confirmed=True,
+        paper_trading=True,
+        buy_limit_discount_pct=5,
+        sell_limit_markup_pct=12.5,
+    )
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[0]["price"] == 4.8
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.placed[1]["price"] == 13.45
+    assert payload["buy_limit_discount_pct"] == 5
+    assert payload["sell_limit_markup_pct"] == 12.5
+    assert payload["sell_cmp_limit_price"] == 11.95
+    assert payload["sell_initial_limit_price"] == 13.45
+
+
+def test_dhan_repair_sell_uses_configured_markup_and_tick_rounding():
+    preview = {
+        "transaction_type": "SELL",
+        "tradingsymbol": "RELIANCE26SEP1100CE",
+        "quantity": 250,
+        "limit_price": 11.94,
+    }
+    adjusted = app.apply_single_leg_limit_price_controls(
+        preview,
+        buy_limit_discount_pct=5,
+        sell_limit_markup_pct=10,
+        source="TEST",
+    )
+
+    assert adjusted["reference_price"] == 11.95
+    assert adjusted["limit_price"] == 13.15
+    assert adjusted["sell_limit_markup_pct"] == 10
+
+
 def test_simultaneous_mode_modifies_sibling_when_one_leg_complete(tmp_path):
     repo = KiteSpreadRepository(tmp_path / "kite.db")
     broker = MockKiteAdapter()

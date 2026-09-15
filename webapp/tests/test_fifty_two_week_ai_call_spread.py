@@ -215,6 +215,36 @@ def test_build_52w_preview_allows_configured_limit_price_offsets():
     assert preview["max_loss"] == 12450
 
 
+def test_build_52w_preview_allows_configured_otm_strikes():
+    instruments = [
+        contract("TEST26SEP1080CE", 1080),
+        contract("TEST26SEP1090CE", 1090),
+        contract("TEST26SEP1150CE", 1150),
+    ]
+    adapter = MockKiteAdapter(
+        {
+            "NFO:TEST26SEP1080CE": quote(22, 21.5, 22.5),
+            "NFO:TEST26SEP1150CE": quote(8, 7.8, 8.2),
+        }
+    )
+
+    preview = build_52w_ai_call_spread_preview(
+        symbol="TEST",
+        spot=1000,
+        lots=1,
+        option_chain_data=instruments,
+        kite_adapter=adapter,
+        sell_otm_pct=8,
+        hedge_otm_pct=15,
+        today=date(2026, 9, 4),
+    )
+
+    assert preview["sell_otm_pct"] == 8
+    assert preview["hedge_otm_pct"] == 15
+    assert preview["sell_leg_tradingsymbol"] == "TEST26SEP1080CE"
+    assert preview["buy_leg_tradingsymbol"] == "TEST26SEP1150CE"
+
+
 def test_build_52w_preview_blocks_when_credit_is_not_positive():
     instruments = [contract("TEST26SEP1050CE", 1050), contract("TEST26SEP1200CE", 1200)]
     adapter = MockKiteAdapter(

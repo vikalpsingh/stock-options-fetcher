@@ -958,6 +958,8 @@ def build_52w_ai_call_spread_preview(
     expiry: str | date | None = None,
     buy_limit_discount_pct: float = DEFAULT_BUY_LIMIT_DISCOUNT_PCT,
     sell_limit_markup_pct: float = DEFAULT_SELL_LIMIT_MARKUP_PCT,
+    sell_otm_pct: float = DEFAULT_SELL_OTM_PCT,
+    hedge_otm_pct: float = DEFAULT_HEDGE_OTM_PCT,
     today: date | None = None,
 ) -> dict[str, Any]:
     clean_symbol = str(symbol or "").strip().upper()
@@ -973,15 +975,15 @@ def build_52w_ai_call_spread_preview(
         "cmp": clean_spot,
         "selected_lots": clean_lots,
         "lots": clean_lots,
-        "sell_otm_pct": DEFAULT_SELL_OTM_PCT,
-        "hedge_otm_pct": DEFAULT_HEDGE_OTM_PCT,
+        "sell_otm_pct": float(sell_otm_pct or DEFAULT_SELL_OTM_PCT),
+        "hedge_otm_pct": float(hedge_otm_pct or DEFAULT_HEDGE_OTM_PCT),
         "risk_decision": "BLOCKED",
     }
     if not clean_symbol or clean_spot <= 0 or selected_expiry is None:
         return {**base_preview, "risk_reason": "CMP_UNAVAILABLE_OR_EXPIRY_MISSING"}
     spot_decimal = Decimal(str(clean_spot))
-    sell_target = spot_decimal * Decimal("1.05")
-    hedge_target = spot_decimal * Decimal("1.20")
+    sell_target = spot_decimal * (Decimal("1") + Decimal(str(base_preview["sell_otm_pct"])) / Decimal("100"))
+    hedge_target = spot_decimal * (Decimal("1") + Decimal(str(base_preview["hedge_otm_pct"])) / Decimal("100"))
     sell_contract = _ceiling_contract(resolver, clean_symbol, selected_expiry, float(sell_target))
     if not sell_contract:
         return {**base_preview, "expiry": _expiry_text(selected_expiry), "risk_reason": "CONTRACT_UNRESOLVED"}

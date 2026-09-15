@@ -177,6 +177,19 @@ from fifty_two_week_ai_call_spread import (
     normalize_screener_csv,
     rank_sell_on_rise_evaluations,
 )
+from sell_on_rise_monitor import (
+    SellOnRiseMonitorConfig,
+    SellOnRiseMonitorRepository,
+    QuoteObservation,
+    build_completed_candles_from_quotes,
+    build_monitor_rows,
+    evaluate_pattern,
+    validate_monitor_config,
+    now_ist as sell_on_rise_now_ist,
+)
+
+DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT = 0.0
+DHAN_DEFAULT_SELL_LIMIT_MARKUP_PCT = 10.0
 from pnl_service import (
     PnlFilters,
     PnlRepository,
@@ -7627,6 +7640,8 @@ class PageState:
     dhan_product_type: str = "MARGIN"
     dhan_order_type: str = "LIMIT"
     dhan_paper_trading: bool = True
+    dhan_buy_limit_discount_pct: float = DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT
+    dhan_sell_limit_markup_pct: float = DHAN_DEFAULT_SELL_LIMIT_MARKUP_PCT
     dhan_spot_json: str = ""
     dhan_contracts_json: str = ""
     dhan_selected_index: str = ""
@@ -7662,6 +7677,8 @@ class PageState:
     dhan_it_hedge_otm_pct: float = 10.0
     dhan_it_lots: int = 1
     dhan_it_paper_trading: bool = True
+    dhan_it_buy_limit_discount_pct: float = DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT
+    dhan_it_sell_limit_markup_pct: float = DHAN_DEFAULT_SELL_LIMIT_MARKUP_PCT
     dhan_it_selected_index: str = ""
     dhan_it_confirm_order: bool = False
     dhan_it_repair_preview: dict[str, Any] | None = None
@@ -7698,6 +7715,11 @@ class PageState:
     ai52_paper_trading: bool = True
     ai52_confirm_order: bool = False
     ai52_source_status: str = ""
+    ai52_monitor_config: dict[str, Any] | None = None
+    ai52_monitor_session: dict[str, Any] | None = None
+    ai52_monitor_rows: list[dict[str, Any]] | None = None
+    ai52_monitor_audit_rows: list[dict[str, Any]] | None = None
+    ai52_monitor_show_audit: bool = False
     pnl_period: str = "This Month"
     pnl_year: int = field(default_factory=lambda: datetime.now().year)
     pnl_from_date: str = ""
@@ -21800,8 +21822,16 @@ def submit_pair_order(
     broker: KiteBrokerAdapter,
     user_confirmed: bool,
     paper_trading: bool = True,
+    buy_limit_discount_pct: float = DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT,
+    sell_limit_markup_pct: float = DHAN_DEFAULT_SELL_LIMIT_MARKUP_PCT,
 ) -> dict[str, Any]:
-    clean_opportunity = apply_dhan_result_date_guard(dict(opportunity))
+    clean_opportunity = apply_pair_limit_price_controls(
+        dict(opportunity),
+        buy_limit_discount_pct=buy_limit_discount_pct,
+        sell_limit_markup_pct=sell_limit_markup_pct,
+        source="DHAN_SUBMIT_STRATEGY_CONTROLS",
+    )
+    clean_opportunity = apply_dhan_result_date_guard(clean_opportunity)
     if bool(clean_opportunity.get("result_date_near")):
         raise ValueError(str(clean_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))
     if str(clean_opportunity.get("risk_decision") or "").upper() != "APPROVED" and user_confirmed:
@@ -22646,6 +22676,9 @@ def build_dhan_opportunities_for_symbols(
         order_type=state.dhan_order_type,
     )
     for row in rows:
+        adjusted_row = apply_limit_controls_to_expiry_variants(row, lambda item: apply_dhan_limit_controls_to_preview(item, state))
+        row.clear()
+        row.update(adjusted_row)
         quote = fresh_quotes.get(str(row.get("symbol") or "").upper()) or {}
         if quote:
             row["day_change_pct"] = quote.get("day_change_pct")
@@ -23215,7 +23248,7 @@ def render_dhan_repair_modal(state: PageState) -> str:
           <article class="dhan-it-execution-leg {leg_class}">
             <span>{html.escape(leg_label)}</span>
             <strong>{html.escape(str(preview.get('tradingsymbol') or ''))}</strong>
-            <small>Qty {html.escape(str(preview.get('quantity') or '-'))} | LIMIT/CMP {money(preview.get('limit_price'))} | Expiry {html.escape(str(preview.get('expiry') or '-'))}</small>
+            <small>Qty {html.escape(str(preview.get('quantity') or '-'))} | Ref {money(preview.get('reference_price') or preview.get('limit_price'))} | LIMIT {money(preview.get('limit_price'))} | BUY -{money(preview.get('buy_limit_discount_pct'))}% / SELL +{money(preview.get('sell_limit_markup_pct'))}% | Expiry {html.escape(str(preview.get('expiry') or '-'))}</small>
           </article>
           <article class="dhan-it-execution-leg buy">
             <span>Trader Context</span>
@@ -23741,6 +23774,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
         except Exception:
             selected = original_selected
         selected = merge_result_date_fields_from_source(selected, original_selected)
+        selected = apply_dhan_limit_controls_to_preview(selected, state)
         selected = apply_dhan_result_date_guard(selected)
         is_approved = str(selected.get("risk_decision") or "").upper() == "APPROVED"
         existing_pair_row = dhan_existing_option_position_for_pair(selected, state.dhan_holding_positions)
@@ -23884,7 +23918,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
               <div>
                 <div class="leg-kicker">DHAN paired execution ticket</div>
                 <h2>{html.escape(text_value(selected.get('symbol')))} - {html.escape(strategy_label)}</h2>
-                <p class="status">5% OTM SELL + 10% OTM BUY hedge. Kite LIMIT prices use evaluated option CMP/LTP. Hedge BUY is placed first.</p>
+                <p class="status">Hedge BUY is placed first. BUY and SELL LIMIT prices use Strategy Controls and are rounded to Zerodha ₹0.05 tick.</p>
               </div>
               <span class="ipo-badge {risk_badge}">{html.escape(ticket_decision_label)}</span>
             </div>
@@ -23914,7 +23948,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
               <article class="dhan-ticket-card">
                 <span>Max gain</span>
                 <strong>{money(selected.get('max_gain'))}</strong>
-                <small>LIMIT at option CMP</small>
+                <small>Risk uses option CMP/LTP credit</small>
               </article>
               <article class="dhan-ticket-card dhan-risk-card">
                 <span>{html.escape(loss_label)}</span>
@@ -23943,13 +23977,13 @@ def render_kite_spreads_panel(state: PageState) -> str:
                 <div class="leg-kicker">SELL 5% OTM</div>
                 <strong>{html.escape(text_value(selected.get('sell_leg_tradingsymbol')))}</strong>
                 <small>Raw target {money(selected.get('raw_sell_target_strike'))} | nearest Kite target {money(selected.get('sell_target_strike'))} | resolved {money(selected.get('sell_strike'))}</small>
-                <div class="dhan-leg-price"><span>SELL limit</span><strong>{money(selected.get('sell_limit_price'))}</strong><small>premium {money(selected.get('sell_leg_premium'))}</small></div>
+                <div class="dhan-leg-price"><span>SELL parked limit</span><strong>{money(selected.get('sell_initial_limit_price') or selected.get('sell_limit_price'))}</strong><small>CMP ref {money(selected.get('sell_reference_price') or selected.get('sell_limit_price'))} | +{money(selected.get('sell_limit_markup_pct'))}%</small></div>
               </section>
               <section class="nifty-pair-leg-section dhan-leg-card buy-leg">
                 <div class="leg-kicker">BUY 10% OTM HEDGE</div>
                 <strong>{html.escape(text_value(selected.get('buy_leg_tradingsymbol')))}</strong>
                 <small>Raw target {money(selected.get('raw_hedge_target_strike'))} | nearest Kite target {money(selected.get('hedge_target_strike'))} | resolved {money(selected.get('hedge_strike'))}</small>
-                <div class="dhan-leg-price"><span>BUY limit</span><strong>{money(selected.get('buy_limit_price'))}</strong><small>premium {money(selected.get('buy_leg_premium'))}</small></div>
+                <div class="dhan-leg-price"><span>BUY limit</span><strong>{money(selected.get('buy_limit_price'))}</strong><small>Ref {money(selected.get('buy_reference_price') or selected.get('buy_leg_premium'))} | -{money(selected.get('buy_limit_discount_pct'))}%</small></div>
               </section>
             </div>
             {render_pair_liquidity_section(selected, paper_mode=state.dhan_paper_trading)}
@@ -24061,6 +24095,12 @@ def render_kite_spreads_panel(state: PageState) -> str:
       {configure_stocks_html}
       {render_dhan_holding_positions(state.dhan_holding_positions)}
       {render_dhan_repair_modal(state)}
+      <section class="panel"><div class="panel-title">Strategy Controls</div><div class="compact-grid">
+        <label><span>Strategy</span><select name="dhan_strategy">{strategy_options}</select></label>
+        <label><span>Lots</span><input name="dhan_lots" value="{html.escape(str(state.dhan_lots), quote=True)}"></label>
+        <label><span>BUY limit discount %</span><input name="dhan_buy_limit_discount_pct" value="{html.escape(str(state.dhan_buy_limit_discount_pct), quote=True)}"></label>
+        <label><span>SELL limit markup %</span><input name="dhan_sell_limit_markup_pct" value="{html.escape(str(state.dhan_sell_limit_markup_pct), quote=True)}"></label>
+      </div><p class="status">Order price controls apply to new DHAN pairs and Repair orders. BUY limit = option CMP/LTP minus configured %, SELL limit = option CMP/LTP plus configured %, then rounded to Zerodha ₹0.05 tick.</p></section>
       <section class="panel dhan-watchlist-panel">
         <div class="panel-title">Current F&O Stock List - Select PE or CE</div>
         <p class="status">Choose Evaluate PE or Evaluate CE for one stock, or tick selected actions and run focused analysis. Stock names open Screener for business-quality review; app action buttons stay inside DHAN. Analysis results are saved locally and remain visible after refresh until you recalculate.</p>
@@ -24161,6 +24201,12 @@ def load_dhan_it_state(state: PageState) -> None:
         state.dhan_it_holding_positions,
         state.dhan_it_call_watch_cards,
         rows,
+    )
+    order_rows, order_error = load_dhan_it_kite_order_rows()
+    state.dhan_it_holding_positions = enrich_dhan_it_holding_positions_with_kite_orders(
+        state.dhan_it_holding_positions,
+        order_rows,
+        order_error=order_error,
     )
 
 
@@ -24303,6 +24349,87 @@ def load_dhan_it_holding_position_rows() -> list[dict[str, Any]]:
             }
             for symbol in IT_FNO_SYMBOLS
         ]
+
+
+def _dhan_it_order_underlying(order: dict[str, Any]) -> str:
+    tradingsymbol = str(order.get("tradingsymbol") or order.get("symbol") or "").strip().upper()
+    if tradingsymbol in set(IT_FNO_SYMBOLS):
+        return tradingsymbol
+    underlying = str(order.get("underlying") or order.get("name") or "").strip().upper()
+    if underlying in set(IT_FNO_SYMBOLS):
+        return underlying
+    parsed = underlying_for_symbol(tradingsymbol)
+    if parsed in set(IT_FNO_SYMBOLS):
+        return parsed
+    for symbol in IT_FNO_SYMBOLS:
+        if tradingsymbol.startswith(symbol):
+            return symbol
+    return ""
+
+
+def load_dhan_it_kite_order_rows() -> tuple[list[dict[str, Any]], str]:
+    """Load current Kite order book rows scoped to DHAN-IT symbols.
+
+    This is read-only and intentionally does not cancel/modify broker orders.
+    It is called from the DHAN-IT refresh/load path so the pair status table can
+    show placed/pending/recent orders beside the action buttons.
+    """
+
+    try:
+        if kite_orders is None:
+            raise RuntimeError(f"Could not import kite_place_order.py: {IMPORT_ERROR}")
+        kite = kite_orders.kite_client()
+        raw_orders = list(kite.orders() or [])
+    except Exception as exc:
+        return [], friendly_external_error(exc, "DHAN-IT Kite orders")
+    scoped: list[dict[str, Any]] = []
+    today_ist = datetime.now(INDIA_TIME_ZONE).date().isoformat()
+    for order in raw_orders:
+        row = dict(order or {})
+        symbol = _dhan_it_order_underlying(row)
+        if not symbol:
+            continue
+        timestamp = str(
+            row.get("order_timestamp")
+            or row.get("exchange_timestamp")
+            or row.get("created_at")
+            or row.get("updated_at")
+            or ""
+        )
+        status = str(row.get("status") or "").strip().upper()
+        is_open_like = status not in {"CANCELLED", "COMPLETE", "REJECTED"}
+        is_today = not timestamp or timestamp[:10] == today_ist
+        if not (is_open_like or is_today):
+            continue
+        row["dhan_it_underlying"] = symbol
+        row["dhan_it_order_timestamp"] = timestamp
+        scoped.append(row)
+    scoped.sort(key=lambda item: str(item.get("dhan_it_order_timestamp") or ""), reverse=True)
+    return scoped, ""
+
+
+def enrich_dhan_it_holding_positions_with_kite_orders(
+    rows: list[dict[str, Any]] | None,
+    orders: list[dict[str, Any]] | None,
+    *,
+    order_error: str = "",
+) -> list[dict[str, Any]]:
+    by_symbol: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in IT_FNO_SYMBOLS}
+    for order in orders or []:
+        symbol = _dhan_it_order_underlying(order)
+        if symbol in by_symbol:
+            by_symbol[symbol].append(dict(order))
+    enriched: list[dict[str, Any]] = []
+    for row in rows or []:
+        next_row = dict(row)
+        symbol = str(next_row.get("symbol") or "").strip().upper()
+        next_row["kite_order_details"] = by_symbol.get(symbol, [])[:4]
+        if order_error:
+            next_row["kite_order_error"] = order_error
+        elif next_row["kite_order_details"]:
+            next_row["kite_order_summary"] = f"{len(next_row['kite_order_details'])} Kite order(s)"
+        enriched.append(next_row)
+    return enriched
 
 
 def enrich_dhan_it_holding_positions_with_call_watch_cmp(
@@ -24534,6 +24661,49 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             )
         return "".join(chips)
 
+    def kite_order_details_cell(row: dict[str, Any]) -> str:
+        error = text_value(row.get("kite_order_error"), "")
+        if error and error != "-":
+            return f'<div class="dhan-it-order-compact"><span class="ipo-badge bad">Orders N/A</span><small>{html.escape(error)}</small></div>'
+        orders = row.get("kite_order_details") if isinstance(row.get("kite_order_details"), list) else []
+        if not orders:
+            return ""
+        latest = orders[0]
+        latest_status = text_value(latest.get("status"), "-").upper()
+        latest_side = text_value(latest.get("transaction_type"), "-").upper()
+        latest_symbol = text_value(latest.get("tradingsymbol") or latest.get("symbol"), "-")
+        latest_qty = int(_dhan_metric_float(latest.get("quantity")))
+        latest_filled = int(_dhan_metric_float(latest.get("filled_quantity")))
+        latest_price = _dhan_metric_float(latest.get("price") or latest.get("trigger_price"))
+        latest_badge = "good" if latest_status == "COMPLETE" else "bad" if latest_status == "REJECTED" else "neutral"
+        details: list[str] = []
+        for order in orders[:3]:
+            side = text_value(order.get("transaction_type"), "-").upper()
+            status = text_value(order.get("status"), "-").upper()
+            tradingsymbol = text_value(order.get("tradingsymbol") or order.get("symbol"), "-")
+            quantity = int(_dhan_metric_float(order.get("quantity")))
+            filled = int(_dhan_metric_float(order.get("filled_quantity")))
+            pending = int(_dhan_metric_float(order.get("pending_quantity")))
+            price = _dhan_metric_float(order.get("price") or order.get("trigger_price"))
+            avg_price = _dhan_metric_float(order.get("average_price"))
+            timestamp = text_value(order.get("dhan_it_order_timestamp") or order.get("order_timestamp"), "-")
+            details.append(
+                '<div class="dhan-it-order-line">'
+                f'<strong>{html.escape(side)} {html.escape(tradingsymbol)}</strong>'
+                f'<small>{html.escape(status)} | Qty {filled}/{quantity}' + (f" | Pend {pending}" if pending else "") + f" | Lmt {money(price)} | Avg {money(avg_price)} | {html.escape(timestamp)}</small>"
+                "</div>"
+            )
+        extra_count = max(0, len(orders) - 3)
+        extra_text = f"<small>+{extra_count} more order(s)</small>" if extra_count else ""
+        return (
+            '<details class="dhan-it-order-compact">'
+            f'<summary><span class="ipo-badge {latest_badge}">{html.escape(latest_status)}</span> '
+            f'<strong>{html.escape(latest_side)} {html.escape(latest_symbol)}</strong>'
+            f'<small>Qty {latest_filled}/{latest_qty} | Lmt {money(latest_price)} | click</small></summary>'
+            f'{"".join(details)}{extra_text}'
+            "</details>"
+        )
+
     rendered_rows: list[str] = []
     for row in rows or []:
         symbol = str(row.get("symbol") or "").strip().upper()
@@ -24555,6 +24725,7 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
                 )
         else:
             button = '<button type="button" class="dhan-action-btn dhan-action-muted" disabled>Monitor</button>'
+        button_with_orders = f"{button}{kite_order_details_cell(row)}"
         day_change_value = _dhan_metric_float(row.get("day_change_pct"))
         day_change_class = "pnl-positive" if day_change_value >= 0 else "pnl-negative"
         high_gap_label, high_gap_detail, high_gap_class = high_52w_gap(row)
@@ -24569,7 +24740,7 @@ def render_dhan_it_holding_positions(rows: list[dict[str, Any]] | None) -> str:
             f"<td>{option_chips(row.get('buy_options'), 'BUY', str(row.get('buy_symbols') or ''), row.get('buy_qty_abs'))}</td>"
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(pair_status)}</span></td>"
             f"<td class=\"dhan-pair-suggestion-cell\">{html.escape(text_value(row.get('suggestion')))}</td>"
-            f"<td class=\"dhan-pair-action-cell\">{button}</td>"
+            f"<td class=\"dhan-pair-action-cell\">{button_with_orders}</td>"
             f"<td class=\"dhan-it-technical-cell\" data-sort-value=\"{html.escape(text_value(row.get('stock_regime') or row.get('trend_view')))}\">{technical_cell(row)}</td>"
             f"<td class=\"dhan-it-rsi-cell\" data-sort-value=\"{sort_number(row.get('rsi'))}\">{rsi_cell(row)}</td>"
             f"<td class=\"dhan-it-signal-cell\" data-sort-value=\"{sort_number(row.get('confidence'))}\">{signal_confidence_cell(row)}</td>"
@@ -24808,7 +24979,7 @@ def render_dhan_it_repair_modal(state: PageState) -> str:
           <article class="dhan-it-execution-leg {leg_class}">
             <span>{html.escape(leg_label)}</span>
             <strong>{html.escape(str(preview.get('tradingsymbol') or ''))}</strong>
-            <small>Qty {html.escape(str(preview.get('quantity') or '-'))} | LIMIT/CMP {money(preview.get('limit_price'))} | Expiry {html.escape(str(preview.get('expiry') or '-'))}</small>
+            <small>Qty {html.escape(str(preview.get('quantity') or '-'))} | Ref {money(preview.get('reference_price') or preview.get('limit_price'))} | LIMIT {money(preview.get('limit_price'))} | BUY -{money(preview.get('buy_limit_discount_pct'))}% / SELL +{money(preview.get('sell_limit_markup_pct'))}% | Expiry {html.escape(str(preview.get('expiry') or '-'))}</small>
           </article>
           <article class="dhan-it-execution-leg buy">
             <span>Trader Context</span>
@@ -25170,6 +25341,7 @@ def build_dhan_it_opportunities(state: PageState) -> tuple[list[dict[str, Any]],
                 }
             )
             preview = apply_dhan_it_evaluation_expiry_mode(preview, state.dhan_it_expiry_mode)
+            preview = apply_limit_controls_to_expiry_variants(preview, lambda item: apply_dhan_it_limit_controls_to_preview(item, state))
             opportunities.append(preview)
     try:
         state.dhan_it_call_watch_cards = load_dhan_it_call_watch_cards(rows, opportunities)
@@ -25355,11 +25527,13 @@ def build_sector_income_score_ranking(
     return score, ranking
 
 
-def apply_sector_income_limit_controls(
+def apply_pair_limit_price_controls(
     preview: dict[str, Any],
     *,
     buy_limit_discount_pct: float,
     sell_limit_markup_pct: float,
+    source: str = "PAIR_PRICE_CONTROLS",
+    recalculate_risk_metrics: bool = False,
 ) -> dict[str, Any]:
     adjusted = dict(preview or {})
     buy_discount = max(0.0, min(float(buy_limit_discount_pct or 0), 50.0))
@@ -25388,7 +25562,7 @@ def apply_sector_income_limit_controls(
         adjusted["sell_initial_limit_price"] = sell_initial
     adjusted["buy_limit_discount_pct"] = buy_discount
     adjusted["sell_limit_markup_pct"] = sell_markup
-    if buy_limit > 0 and sell_cmp_limit > 0:
+    if recalculate_risk_metrics and buy_limit > 0 and sell_cmp_limit > 0:
         net_credit = round_limit_price_to_tick(sell_cmp_limit - buy_limit)
         adjusted["net_credit"] = net_credit
         quantity = _dhan_metric_float(adjusted.get("quantity"))
@@ -25399,7 +25573,93 @@ def apply_sector_income_limit_controls(
                 adjusted["max_loss"] = round(max(0.0, (width - net_credit) * quantity), 2)
             if _dhan_metric_float(adjusted.get("max_loss")) > 0:
                 adjusted["return_on_risk_pct"] = round((adjusted["max_gain"] / float(adjusted["max_loss"])) * 100, 2)
-    adjusted["limit_control_source"] = "SECTOR_INCOME_PRICE_CONTROLS"
+    adjusted["limit_control_source"] = source
+    return adjusted
+
+
+def apply_single_leg_limit_price_controls(
+    preview: dict[str, Any],
+    *,
+    buy_limit_discount_pct: float,
+    sell_limit_markup_pct: float,
+    source: str = "REPAIR_PRICE_CONTROLS",
+) -> dict[str, Any]:
+    adjusted = dict(preview or {})
+    transaction_type = str(adjusted.get("transaction_type") or "").strip().upper()
+    reference = _dhan_metric_float(
+        adjusted.get("reference_price")
+        or adjusted.get("option_ltp")
+        or adjusted.get("ltp")
+        or adjusted.get("limit_price")
+    )
+    if reference <= 0:
+        return adjusted
+    buy_discount = max(0.0, min(float(buy_limit_discount_pct or 0), 50.0))
+    sell_markup = max(0.0, min(float(sell_limit_markup_pct or 0), 100.0))
+    if transaction_type == "BUY":
+        limit_price = round_limit_price_to_tick(reference * (1 - buy_discount / 100))
+    elif transaction_type == "SELL":
+        limit_price = round_limit_price_to_tick(reference * (1 + sell_markup / 100))
+    else:
+        limit_price = round_limit_price_to_tick(reference)
+    adjusted["reference_price"] = round_limit_price_to_tick(reference)
+    adjusted["limit_price"] = limit_price
+    adjusted["buy_limit_discount_pct"] = buy_discount
+    adjusted["sell_limit_markup_pct"] = sell_markup
+    adjusted["limit_control_source"] = source
+    return adjusted
+
+
+def apply_sector_income_limit_controls(
+    preview: dict[str, Any],
+    *,
+    buy_limit_discount_pct: float,
+    sell_limit_markup_pct: float,
+) -> dict[str, Any]:
+    return apply_pair_limit_price_controls(
+        preview,
+        buy_limit_discount_pct=buy_limit_discount_pct,
+        sell_limit_markup_pct=sell_limit_markup_pct,
+        source="SECTOR_INCOME_PRICE_CONTROLS",
+        recalculate_risk_metrics=True,
+    )
+
+
+def apply_dhan_limit_controls_to_preview(preview: dict[str, Any], state: PageState) -> dict[str, Any]:
+    return apply_pair_limit_price_controls(
+        preview,
+        buy_limit_discount_pct=state.dhan_buy_limit_discount_pct,
+        sell_limit_markup_pct=state.dhan_sell_limit_markup_pct,
+        source="DHAN_STRATEGY_CONTROLS",
+    )
+
+
+def apply_dhan_it_limit_controls_to_preview(preview: dict[str, Any], state: PageState) -> dict[str, Any]:
+    return apply_pair_limit_price_controls(
+        preview,
+        buy_limit_discount_pct=state.dhan_it_buy_limit_discount_pct,
+        sell_limit_markup_pct=state.dhan_it_sell_limit_markup_pct,
+        source="DHAN_IT_STRATEGY_CONTROLS",
+    )
+
+
+def apply_limit_controls_to_expiry_variants(
+    preview: dict[str, Any],
+    adjuster: Callable[[dict[str, Any]], dict[str, Any]],
+) -> dict[str, Any]:
+    adjusted = adjuster(preview)
+    for key in ("current_month", "next_month", "calendar_hedge", "current_month_preview", "next_month_preview"):
+        variant = adjusted.get(key)
+        if isinstance(variant, dict) and variant:
+            adjusted[key] = adjuster(variant)
+    comparison = adjusted.get("comparison")
+    if isinstance(comparison, dict):
+        clean_comparison = dict(comparison)
+        for key in ("current_month", "next_month", "calendar_hedge"):
+            variant = clean_comparison.get(key)
+            if isinstance(variant, dict) and variant:
+                clean_comparison[key] = adjuster(variant)
+        adjusted["comparison"] = clean_comparison
     return adjusted
 
 
@@ -26124,6 +26384,7 @@ def render_sector_income_panel(state: PageState) -> str:
 
 def load_ai52_state(state: PageState) -> None:
     repository = FiftyTwoWeekAiRepository(APP_DB_PATH)
+    monitor_repository = SellOnRiseMonitorRepository(APP_DB_PATH)
     snapshot = repository.latest_candidate_snapshot()
     if snapshot and not state.ai52_candidates:
         state.ai52_candidates = list(snapshot.get("rows") or [])
@@ -26155,6 +26416,27 @@ def load_ai52_state(state: PageState) -> None:
         )
     state.ai52_previews = repository.latest_previews()
     state.dhan_it_pair_orders = DhanItPairRepository(APP_DB_PATH).list_pairs()
+    monitor_config = SellOnRiseMonitorConfig.from_dict(state.ai52_monitor_config or monitor_repository.load_config().to_dict())
+    if not monitor_config.selected_symbols and state.ai52_candidates:
+        approved_symbols = [
+            str((row.get("symbol") or "")).strip().upper()
+            for row in state.ai52_candidates
+            if str(((row.get("evaluation") or {}).get("decision") or "")).upper() not in {"BLOCKED", "DATA_ERROR"}
+        ]
+        monitor_config.selected_symbols = approved_symbols[:5]
+    state.ai52_monitor_config = monitor_config.to_dict()
+    state.ai52_monitor_session = monitor_repository.latest_session()
+    session_id = str((state.ai52_monitor_session or {}).get("session_id") or "")
+    monitor_states = monitor_repository.latest_pattern_states(session_id) if session_id else {}
+    monitor_latest_quotes = monitor_repository.latest_observations(session_id) if session_id else {}
+    state.ai52_monitor_rows = build_monitor_rows(
+        monitor_config,
+        state.ai52_monitor_session,
+        monitor_states,
+        evaluation_by_symbol,
+        latest_quotes=monitor_latest_quotes,
+    )
+    state.ai52_monitor_audit_rows = monitor_repository.audit_rows(20) if state.ai52_monitor_show_audit else []
 
 
 def _ai52_candidate_option_data(symbol: str, screener_cmp: Any) -> tuple[Any | None, float, list[dict[str, Any]], list[str]]:
@@ -26189,6 +26471,165 @@ def evaluate_ai52_candidates(candidates: list[dict[str, Any]], adapter: Any | No
     return payloads
 
 
+def _ai52_monitor_config_from_form(form: dict[str, list[str]], state: PageState) -> SellOnRiseMonitorConfig:
+    base = SellOnRiseMonitorConfig.from_dict(state.ai52_monitor_config or {})
+    selected = [str(item or "").strip().upper() for item in form.get("ai52_monitor_symbols", []) if str(item or "").strip()]
+    visible_symbols = {
+        str((row.get("symbol") or "")).strip().upper()
+        for row in (state.ai52_candidates or [])
+        if str((row.get("symbol") or "")).strip()
+    }
+    if selected:
+        base.selected_symbols = [symbol for symbol in selected if not visible_symbols or symbol in visible_symbols]
+    base.monitor_mode = str(first(form, "ai52_monitor_mode", base.monitor_mode) or "START_NOW").strip().upper()
+    base.monitor_start_time_ist = first(form, "ai52_monitor_start_time_ist", base.monitor_start_time_ist)
+    base.monitor_duration_minutes = int(float(first(form, "ai52_monitor_duration_minutes", str(base.monitor_duration_minutes)) or base.monitor_duration_minutes))
+    base.quote_check_interval_seconds = int(float(first(form, "ai52_monitor_quote_interval_seconds", str(base.quote_check_interval_seconds)) or base.quote_check_interval_seconds))
+    base.candle_timeframe_minutes = int(float(first(form, "ai52_monitor_candle_timeframe_minutes", str(base.candle_timeframe_minutes)) or base.candle_timeframe_minutes))
+    base.minimum_initial_decline_percent = float(first(form, "ai52_monitor_min_decline_pct", str(base.minimum_initial_decline_percent)) or base.minimum_initial_decline_percent)
+    base.minimum_rebound_percent_from_intraday_low = float(first(form, "ai52_monitor_min_rebound_pct", str(base.minimum_rebound_percent_from_intraday_low)) or base.minimum_rebound_percent_from_intraday_low)
+    base.resistance_tolerance_percent = float(first(form, "ai52_monitor_resistance_tolerance_pct", str(base.resistance_tolerance_percent)) or base.resistance_tolerance_percent)
+    base.confirmation_buffer_percent = float(first(form, "ai52_monitor_confirmation_buffer_pct", str(base.confirmation_buffer_percent)) or base.confirmation_buffer_percent)
+    base.short_call_otm_percent = float(first(form, "ai52_monitor_short_otm_pct", str(base.short_call_otm_percent)) or base.short_call_otm_percent)
+    base.protective_call_otm_percent = float(first(form, "ai52_monitor_hedge_otm_pct", str(base.protective_call_otm_percent)) or base.protective_call_otm_percent)
+    base.expiry = first(form, "ai52_monitor_expiry", base.expiry)
+    base.number_of_lots = int(float(first(form, "ai52_monitor_lots", str(base.number_of_lots)) or base.number_of_lots))
+    base.execution_mode = str(first(form, "ai52_monitor_execution_mode", base.execution_mode) or "ALERT_ONLY").strip().upper()
+    base.order_type = str(first(form, "ai52_monitor_order_type", base.order_type) or "EXECUTABLE_LIMIT").strip().upper()
+    base.max_signals_per_stock_per_day = int(float(first(form, "ai52_monitor_max_signals", str(base.max_signals_per_stock_per_day)) or base.max_signals_per_stock_per_day))
+    base.cooldown_minutes = int(float(first(form, "ai52_monitor_cooldown_minutes", str(base.cooldown_minutes)) or base.cooldown_minutes))
+    base.force_close_short_leg_time_ist = first(form, "ai52_monitor_force_close_time_ist", base.force_close_short_leg_time_ist)
+    base.auto_execute_armed = checked(form, "ai52_monitor_auto_execute_armed")
+    return SellOnRiseMonitorConfig.from_dict(base.to_dict())
+
+
+def sync_ai52_monitor_with_imported_candidates(state: PageState, source: str) -> dict[str, Any]:
+    """Stop active 52W timing monitor and align rows with the current candidate table.
+
+    Importing/evaluating a new Screener list changes the monitored universe.
+    Keeping an older running session can show stale prices and produce signals
+    for the previous list, so this creates a fresh stopped session snapshot
+    using the new visible candidate symbols.  It never cancels broker orders or
+    clears the shared pair-order monitor.
+    """
+
+    symbols = [
+        str(row.get("symbol") or "").strip().upper()
+        for row in (state.ai52_candidates or [])
+        if str(row.get("symbol") or "").strip()
+    ]
+    unique_symbols = list(dict.fromkeys(symbols))
+    repository = SellOnRiseMonitorRepository(APP_DB_PATH)
+    repository.stop_session()
+    config = SellOnRiseMonitorConfig.from_dict(state.ai52_monitor_config or repository.load_config().to_dict())
+    config.selected_symbols = unique_symbols
+    config.execution_mode = "ALERT_ONLY"
+    config.auto_execute_armed = False
+    repository.save_config(config)
+    session = {}
+    if unique_symbols:
+        session = repository.create_or_update_session(config, start_now=True, status="STOPPED_BY_USER")
+        repository.audit(
+            str(session.get("session_id") or ""),
+            "",
+            "UNIVERSE_REFRESH",
+            f"Monitor stopped and synced to {len(unique_symbols)} imported candidate(s) from {source}.",
+            {"symbols": unique_symbols, "source": source},
+        )
+    state.ai52_monitor_config = config.to_dict()
+    state.ai52_monitor_session = session
+    state.ai52_monitor_rows = []
+    return {"symbols": unique_symbols, "session_id": session.get("session_id") if session else ""}
+
+
+def run_ai52_sell_on_rise_scan(state: PageState) -> dict[str, Any]:
+    load_ai52_state(state)
+    repository = SellOnRiseMonitorRepository(APP_DB_PATH)
+    config = SellOnRiseMonitorConfig.from_dict(state.ai52_monitor_config or {})
+    errors = validate_monitor_config(config)
+    if errors:
+        raise ValueError("Sell-on-Rise monitor config error: " + "; ".join(errors))
+    session = state.ai52_monitor_session or repository.create_or_update_session(config, start_now=True)
+    session_id = str(session.get("session_id") or "")
+    if str(session.get("status") or "").upper() in {"STOPPED_BY_USER", "COMPLETED", "FAILED"}:
+        raise ValueError("Start or schedule the Sell-on-Rise monitor before scanning.")
+    broker = DhanBrokerAdapter(paper_trading=True)
+    quotes = fetch_fresh_equity_quotes_from_kite(broker, config.selected_symbols)
+    observations: list[QuoteObservation] = []
+    stamp = sell_on_rise_now_ist()
+    api_failures = 0
+    for symbol in config.selected_symbols:
+        quote = quotes.get(symbol) or {}
+        price = _dhan_metric_float(quote.get("ltp"))
+        if price > 0:
+            observations.append(
+                QuoteObservation(
+                    symbol=symbol,
+                    timestamp_ist=stamp,
+                    price=price,
+                    volume=None,
+                    day_change_pct=quote.get("day_change_pct"),
+                )
+            )
+        else:
+            api_failures += 1
+            repository.audit(session_id, symbol, "QUOTE_BLOCK", "Kite quote unavailable or stale for monitor scan.", quote)
+    repository.save_observations(session_id, observations)
+    evaluations = {
+        str(item.get("symbol") or "").strip().upper(): item
+        for item in (state.ai52_evaluations or [])
+    }
+    created_signals = 0
+    prepared_previews = 0
+    for symbol in config.selected_symbols:
+        candles = build_completed_candles_from_quotes(
+            repository.observations(session_id, symbol),
+            config.candle_timeframe_minutes,
+            now=stamp,
+        )
+        result = evaluate_pattern(
+            symbol,
+            candles,
+            config,
+            evaluation=evaluations.get(symbol),
+            existing_state={"monitor_session_id": session_id},
+            now=stamp,
+        )
+        if str((evaluations.get(symbol) or {}).get("decision") or "").upper() in {"BLOCKED", "DATA_ERROR"}:
+            result.setdefault("hard_vetoes", []).append("52W_EVALUATION_NOT_APPROVED")
+            result["decision"] = "ORDER_BLOCKED"
+        repository.save_pattern_state(session_id, symbol, result)
+        if result.get("signal_key") and repository.create_signal_once(session_id, result):
+            created_signals += 1
+            if config.execution_mode in {"PREVIEW_AND_CONFIRM", "AUTO_EXECUTE"}:
+                candidate = next(
+                    (row for row in (state.ai52_candidates or []) if str(row.get("symbol") or "").strip().upper() == symbol),
+                    {"symbol": symbol},
+                )
+                broker_for_data, spot, contracts, notes = _ai52_candidate_option_data(symbol, candidate.get("screener_cmp"))
+                preview = build_52w_ai_call_spread_preview(
+                    symbol=symbol,
+                    spot=spot,
+                    lots=config.number_of_lots,
+                    option_chain_data=contracts,
+                    kite_adapter=broker_for_data,
+                    expiry=config.expiry or None,
+                    buy_limit_discount_pct=state.ai52_buy_limit_discount_pct,
+                    sell_limit_markup_pct=state.ai52_sell_limit_markup_pct,
+                    sell_otm_pct=config.short_call_otm_percent,
+                    hedge_otm_pct=config.protective_call_otm_percent,
+                    today=datetime.now(INDIA_TIME_ZONE).date(),
+                )
+                preview["candidate"] = candidate
+                preview["sell_on_rise_signal_key"] = result.get("signal_key")
+                FiftyTwoWeekAiRepository(APP_DB_PATH).save_preview(preview)
+                repository.increment_preview(session_id)
+                prepared_previews += 1
+    repository.increment_scan(session_id, api_failures=api_failures, interval_seconds=config.quote_check_interval_seconds)
+    load_ai52_state(state)
+    return {"observations": len(observations), "api_failures": api_failures, "signals": created_signals, "previews": prepared_previews}
+
+
 def render_ai52_call_spread_panel(state: PageState) -> str:
     if state.active_tab == "52w-ai-call-spread" and state.ai52_candidates is None:
         load_ai52_state(state)
@@ -26200,6 +26641,12 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
     hidden_evaluations = html.escape(json.dumps(evaluations, default=str), quote=True)
     hidden_preview = html.escape(json.dumps(state.ai52_selected_preview or {}, default=str), quote=True)
     hidden_previews = html.escape(json.dumps(previews, default=str), quote=True)
+    monitor_config = SellOnRiseMonitorConfig.from_dict(state.ai52_monitor_config or {})
+    monitor_session = state.ai52_monitor_session or {}
+    monitor_rows = state.ai52_monitor_rows or []
+    hidden_monitor_config = html.escape(json.dumps(monitor_config.to_dict(), default=str), quote=True)
+    hidden_monitor_session = html.escape(json.dumps(monitor_session, default=str), quote=True)
+    hidden_monitor_rows = html.escape(json.dumps(monitor_rows, default=str), quote=True)
 
     def money(value: Any) -> str:
         try:
@@ -26368,6 +26815,141 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
     if not pair_rows:
         pair_rows.append('<tr><td colspan="8" class="muted-cell">No 52W AI pair orders yet.</td></tr>')
 
+    monitor_symbol_options = []
+    for row in candidates:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        checked_attr = " checked" if symbol in set(monitor_config.selected_symbols) else ""
+        eval_decision = str(((row.get("evaluation") or {}).get("decision") or "NOT_EVALUATED")).upper()
+        monitor_symbol_options.append(
+            f'<label class="inline-check ai52-monitor-symbol"><input type="checkbox" name="ai52_monitor_symbols" value="{html.escape(symbol, quote=True)}"{checked_attr}> <strong>{html.escape(symbol)}</strong><small>{html.escape(eval_decision)}</small></label>'
+        )
+    if not monitor_symbol_options:
+        monitor_symbol_options.append('<span class="muted-cell">Load and evaluate 52W AI candidates to select stocks for monitoring.</span>')
+
+    monitor_status = str(monitor_session.get("status") or "NOT_CONFIGURED")
+    active_monitor = monitor_status.upper() in {"MONITORING", "SIGNAL_DETECTED", "ORDER_PENDING_CONFIRMATION", "SCHEDULED", "WAITING_FOR_START"}
+    observing_label = "OBSERVING" if active_monitor or monitor_config.selected_symbols else html.escape(monitor_status)
+    observed_rows = [row for row in monitor_rows if _dhan_metric_float(row.get("spot")) > 0]
+    latest_observed = observed_rows[0] if observed_rows else {}
+    latest_price_label = (
+        f"{latest_observed.get('symbol')} @ {money(latest_observed.get('spot'))}"
+        if latest_observed
+        else "No Kite quote captured yet"
+    )
+    latest_quote_time = str(latest_observed.get("quote_timestamp_ist") or "-") if latest_observed else "-"
+    total_candles = sum(int(_dhan_metric_float(row.get("candle_count"))) for row in monitor_rows)
+    monitor_cards = (
+        '<div class="dhan-it-execution-leg-grid ai52-monitor-status-grid">'
+        f'<article class="dhan-it-execution-leg {"buy" if active_monitor else ""}"><span>Price movement</span><strong>{observing_label}</strong><small>{html.escape(latest_price_label)} | Quote {html.escape(latest_quote_time)}</small></article>'
+        f'<article class="dhan-it-execution-leg"><span>Start / End IST</span><strong>{html.escape(str(monitor_session.get("started_at") or monitor_config.monitor_start_time_ist))}</strong><small>End {html.escape(str(monitor_session.get("expected_end_at") or "-"))}</small></article>'
+        f'<article class="dhan-it-execution-leg"><span>Scans / API failures</span><strong>{html.escape(str(monitor_session.get("scans_completed") or 0))} / {html.escape(str(monitor_session.get("api_failures") or 0))}</strong><small>Next scan {html.escape(str(monitor_session.get("next_scan_at") or "-"))}</small></article>'
+        f'<article class="dhan-it-execution-leg"><span>Signals / Orders</span><strong>{html.escape(str(monitor_session.get("signals_generated") or 0))} / {html.escape(str(monitor_session.get("orders_submitted") or 0))}</strong><small>Mode {html.escape(monitor_config.execution_mode)}</small></article>'
+        f'<article class="dhan-it-execution-leg"><span>Completed candles</span><strong>{html.escape(str(total_candles))}</strong><small>Built from stored timestamped quote calls</small></article>'
+        "</div>"
+    )
+    monitor_table_rows: list[str] = []
+    for row in monitor_rows:
+        decision = str(row.get("decision") or "OBSERVE").upper()
+        badge_class = "good" if decision in {"SELL_SIGNAL", "PREVIEW_REQUIRED", "ORDER_ALLOWED"} else "bad" if decision in {"ORDER_BLOCKED", "INVALIDATED"} else "neutral"
+        monitor_table_rows.append(
+            "<tr>"
+            f"<td><strong>{html.escape(str(row.get('symbol') or '-'))}</strong></td>"
+            f"<td>{money(row.get('spot'))}</td>"
+            f"<td>{money(row.get('day_change_pct'))}%<br><small>Quote {html.escape(str(row.get('quote_timestamp_ist') or '-'))}</small></td>"
+            f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(str(row.get('pattern_phase') or '-'))}</span></td>"
+            f"<td>{money(row.get('initial_decline'))}%</td>"
+            f"<td>{money(row.get('rebound'))}%</td>"
+            f"<td>{html.escape(str(row.get('resistance') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('rejection') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('confirmation') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('short_ce') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('hedge_ce') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('lots') or 1))}</td>"
+            f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(decision)}</span><br><small>{html.escape(str(row.get('why') or ''))}</small></td>"
+            f"<td>{html.escape(str(row.get('last_scan') or '-'))}<br><small>{html.escape(str(row.get('candle_count') or 0))} candles</small></td>"
+            "</tr>"
+        )
+    if not monitor_table_rows:
+        monitor_table_rows.append('<tr><td colspan="14" class="muted-cell">No monitor state yet. Save configuration, start monitoring, then use Run Scan Now as fresh quotes arrive.</td></tr>')
+
+    audit_rows_html = ""
+    if state.ai52_monitor_show_audit:
+        audit_body = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('created_at') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('symbol') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('event_type') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('message') or '-'))}</td>"
+            "</tr>"
+            for row in (state.ai52_monitor_audit_rows or [])
+        ) or '<tr><td colspan="4" class="muted-cell">No monitor audit events yet.</td></tr>'
+        audit_rows_html = (
+            '<div class="actions">'
+            '<button type="submit" formaction="/52w-ai-call-spread/monitor-stop-clear-logs" class="secondary danger-link" '
+            'onclick="return confirm(\'Stop Sell-on-Rise monitoring and clear only the Created/Symbol/Type/Message audit log rows? Broker orders, pair monitor, quotes, signals, and config will not be changed.\');">'
+            'Stop &amp; Clear Logs</button>'
+            "</div>"
+            f'<div class="table-wrap"><table class="ipo-table"><thead><tr><th>Created</th><th>Symbol</th><th>Type</th><th>Message</th></tr></thead><tbody>{audit_body}</tbody></table></div>'
+        )
+
+    timeframe_options = "".join(
+        f'<option value="{minutes}"{" selected" if monitor_config.candle_timeframe_minutes == minutes else ""}>{minutes} minute</option>'
+        for minutes in (1, 3, 5, 10, 15)
+    )
+    execution_options = "".join(
+        f'<option value="{mode}"{" selected" if monitor_config.execution_mode == mode else ""}>{mode.replace("_", " ").title()}</option>'
+        for mode in ("ALERT_ONLY", "PREVIEW_AND_CONFIRM", "AUTO_EXECUTE")
+    )
+    monitor_mode_options = "".join(
+        f'<option value="{mode}"{" selected" if monitor_config.monitor_mode == mode else ""}>{label}</option>'
+        for mode, label in (("START_NOW", "Start now"), ("SCHEDULED", "Scheduled start"))
+    )
+    ai52_monitor_section = f"""
+      <section class="panel ai52-monitor-panel">
+        <div class="panel-title">Sell-on-Rise Pattern Monitor</div>
+        <p class="status">Foreground scanner for selected evaluated 52W AI F&amp;O stocks. It stores timestamped Kite quotes, builds completed candles, and waits for weakness → rebound → resistance test → rejection → break below rejection low. Monitoring requires this page/session to remain active.</p>
+        {monitor_cards}
+        <div class="ai52-monitor-symbols">{''.join(monitor_symbol_options)}</div>
+        <div class="compact-grid">
+          <label><span>Monitoring mode</span><select name="ai52_monitor_mode">{monitor_mode_options}</select></label>
+          <label><span>Start time IST</span><input type="time" name="ai52_monitor_start_time_ist" value="{html.escape(monitor_config.monitor_start_time_ist, quote=True)}"></label>
+          {render_number_input("ai52_monitor_duration_minutes", "Duration minutes", monitor_config.monitor_duration_minutes, "1")}
+          {render_number_input("ai52_monitor_quote_interval_seconds", "Quote interval sec", monitor_config.quote_check_interval_seconds, "1")}
+          <label><span>Candle timeframe</span><select name="ai52_monitor_candle_timeframe_minutes">{timeframe_options}</select></label>
+          {render_number_input("ai52_monitor_min_decline_pct", "Minimum initial decline %", monitor_config.minimum_initial_decline_percent, "0.05")}
+          {render_number_input("ai52_monitor_min_rebound_pct", "Minimum rebound %", monitor_config.minimum_rebound_percent_from_intraday_low, "0.05")}
+          {render_number_input("ai52_monitor_resistance_tolerance_pct", "Resistance tolerance %", monitor_config.resistance_tolerance_percent, "0.05")}
+          {render_number_input("ai52_monitor_confirmation_buffer_pct", "Confirmation buffer %", monitor_config.confirmation_buffer_percent, "0.01")}
+          {render_number_input("ai52_monitor_short_otm_pct", "Short CE OTM %", monitor_config.short_call_otm_percent, "0.05")}
+          {render_number_input("ai52_monitor_hedge_otm_pct", "Protective CE OTM %", monitor_config.protective_call_otm_percent, "0.05")}
+          <label><span>Expiry override</span><input name="ai52_monitor_expiry" value="{html.escape(monitor_config.expiry, quote=True)}" placeholder="Use 52W preview default"></label>
+          {render_number_input("ai52_monitor_lots", "Lots", monitor_config.number_of_lots, "1")}
+          <label><span>Execution mode</span><select name="ai52_monitor_execution_mode">{execution_options}</select></label>
+          <label><span>Order type</span><input name="ai52_monitor_order_type" value="{html.escape(monitor_config.order_type, quote=True)}" readonly></label>
+          {render_number_input("ai52_monitor_max_signals", "Max signals / stock / day", monitor_config.max_signals_per_stock_per_day, "1")}
+          {render_number_input("ai52_monitor_cooldown_minutes", "Cooldown minutes", monitor_config.cooldown_minutes, "1")}
+          <label><span>Intraday exit time IST</span><input type="time" name="ai52_monitor_force_close_time_ist" value="{html.escape(monitor_config.force_close_short_leg_time_ist, quote=True)}"></label>
+          <label class="inline-check"><input type="checkbox" name="ai52_monitor_auto_execute_armed" value="1"{' checked' if monitor_config.auto_execute_armed else ''}> Arm AUTO_EXECUTE for this session only</label>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-save" class="secondary">Save Configuration</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-start-now" class="success">Start Monitoring Now</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-schedule" class="secondary">Schedule Monitoring</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-arm-alerts" class="secondary">Arm Alerts</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-arm-auto" class="danger">Arm Auto Execution</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-stop" class="secondary">Stop Monitoring</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-reset" class="secondary danger-link" onclick="return confirm('Reset today\\'s Sell-on-Rise pattern state? This will not cancel or modify broker orders.');">Reset Today’s Pattern State</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-audit" class="secondary">View Audit Log</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-stop-clear-logs" class="secondary danger-link" onclick="return confirm('Stop Sell-on-Rise monitoring and clear only the Created/Symbol/Type/Message audit log rows? Broker orders, pair monitor, quotes, signals, and config will not be changed.');">Stop &amp; Clear Logs</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-scan" class="success">Run Scan Now</button>
+        </div>
+        <div class="table-wrap dhan-ten-row-scroll"><table id="ai52-monitor-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Stock</th><th class="sort-header" data-sort-col="1">Spot</th><th class="sort-header" data-sort-col="2">Day %</th><th>Pattern phase</th><th>Initial decline</th><th>Rebound</th><th>Resistance</th><th>Rejection</th><th>Confirmation</th><th>Short CE</th><th>Hedge CE</th><th>Lots</th><th>Decision</th><th>Last scan</th></tr></thead><tbody>{''.join(monitor_table_rows)}</tbody></table></div>
+        {audit_rows_html}
+      </section>
+    """
+
     return f"""
     <form id="ai52-call-spread-panel" method="post" action="/52w-ai-call-spread/load"{panel_style} enctype="multipart/form-data">
       {env_hidden_fields_for_render()}
@@ -26375,6 +26957,10 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
       <input type="hidden" name="ai52_evaluations_json" value="{hidden_evaluations}">
       <input type="hidden" name="ai52_selected_preview_json" value="{hidden_preview}">
       <input type="hidden" name="ai52_previews_json" value="{hidden_previews}">
+      <input type="hidden" name="ai52_monitor_config_json" value="{hidden_monitor_config}">
+      <input type="hidden" name="ai52_monitor_session_json" value="{hidden_monitor_session}">
+      <input type="hidden" name="ai52_monitor_rows_json" value="{hidden_monitor_rows}">
+      <input type="hidden" name="ai52_monitor_show_audit" value="{'1' if state.ai52_monitor_show_audit else '0'}">
       <input type="hidden" name="ai52_source_status" value="{html.escape(state.ai52_source_status or '', quote=True)}">
       <section class="panel dhan-hero dhan-it-compact-hero"><div><div class="panel-title">52W AI Call Spread</div><p class="status">Screener 52-week-high candidates converted into defined-risk +5% SELL CE / +20% BUY CE hedge tickets.</p></div></section>
       <section class="panel">
@@ -26400,6 +26986,7 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
         <div class="actions"><button type="submit" formaction="/52w-ai-call-spread/evaluate-all" class="success">Evaluate &amp; Rank All</button></div>
         <div class="table-wrap"><table id="ai52-candidate-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Rank</th><th>Symbol</th><th>Company</th><th class="sort-header" data-sort-col="3">Live CMP</th><th>Screener CMP</th><th>52W High</th><th class="sort-header" data-sort-col="6">52W Gap %</th><th>52W State</th><th class="sort-header" data-sort-col="8">RSI</th><th class="sort-header" data-sort-col="9">ADX</th><th class="sort-header" data-sort-col="10">Vol Ratio</th><th class="sort-header" data-sort-col="11">Rejection</th><th class="sort-header" data-sort-col="12">Breakout</th><th class="sort-header" data-sort-col="13">Option Quality</th><th class="sort-header" data-sort-col="14">SELL Score</th><th>Decision</th><th>F&amp;O</th><th>Expiry</th><th>Updated</th></tr></thead><tbody>{''.join(candidate_rows)}</tbody></table></div>
       </section>
+      {ai52_monitor_section}
       <section class="panel">
         <div class="panel-title">Saved 52W AI Previews</div>
         <div class="actions">
@@ -26612,6 +27199,7 @@ def render_dhan_it_panel(state: PageState) -> str:
         except Exception:
             selected = original_selected
         selected = merge_result_date_fields_from_source(selected, original_selected)
+        selected = apply_dhan_it_limit_controls_to_preview(selected, state)
         selected = apply_dhan_result_date_guard(selected)
         strict_orderable = dhan_pair_is_defined_risk_orderable(
             selected,
@@ -26697,7 +27285,7 @@ def render_dhan_it_panel(state: PageState) -> str:
         selected_preview = f"""
         <div class="live-modal-backdrop visible" id="dhan-it-order-modal"><div class="live-modal dhan-order-modal-card">
           <h2>DHAN-IT Order Ticket - {html.escape(text_value(selected.get('symbol')))}</h2>
-          <p class="status">Paired CE spread order. BUY hedge is submitted first; SELL leg is placed by the scheduler after hedge fill.</p>
+          <p class="status">Paired CE spread order. BUY hedge is submitted first; SELL parked LIMIT uses Strategy Controls and is repriced after hedge fill.</p>
           <input type="hidden" name="dhan_it_selected_index" value="{selected_idx}">
           <input type="hidden" name="dhan_it_trade_mode" value="{html.escape(submit_mode, quote=True)}">
           <div class="dhan-ticket-summary">
@@ -26710,12 +27298,12 @@ def render_dhan_it_panel(state: PageState) -> str:
             <article class="dhan-it-execution-leg sell">
               <span>SELL LEG</span>
               <strong>{html.escape(text_value(selected.get('sell_leg_tradingsymbol')))}</strong>
-              <small>Qty {html.escape(text_value(selected.get('quantity')))} | {sell_otm_value}% OTM | LIMIT/CMP {money(selected.get('sell_limit_price'))} | Expiry {html.escape(text_value(selected.get('sell_expiry') or selected.get('expiry')))}</small>
+              <small>Qty {html.escape(text_value(selected.get('quantity')))} | {sell_otm_value}% OTM | CMP ref {money(selected.get('sell_reference_price') or selected.get('sell_limit_price'))} | Parked LIMIT {money(selected.get('sell_initial_limit_price') or selected.get('sell_limit_price'))} (+{money(selected.get('sell_limit_markup_pct'))}%) | Expiry {html.escape(text_value(selected.get('sell_expiry') or selected.get('expiry')))}</small>
             </article>
             <article class="dhan-it-execution-leg buy">
               <span>BUY HEDGE</span>
               <strong>{html.escape(text_value(selected.get('buy_leg_tradingsymbol')))}</strong>
-              <small>Qty {html.escape(text_value(selected.get('quantity')))} | {hedge_otm_value}% OTM | LIMIT/CMP {money(selected.get('buy_limit_price'))} | Expiry {html.escape(text_value(selected.get('buy_expiry') or selected.get('expiry')))}</small>
+              <small>Qty {html.escape(text_value(selected.get('quantity')))} | {hedge_otm_value}% OTM | Ref {money(selected.get('buy_reference_price') or selected.get('buy_leg_premium'))} | LIMIT {money(selected.get('buy_limit_price'))} (-{money(selected.get('buy_limit_discount_pct'))}%) | Expiry {html.escape(text_value(selected.get('buy_expiry') or selected.get('expiry')))}</small>
             </article>
           </div>
           <div class="dhan-it-execution-leg-grid">
@@ -26810,10 +27398,12 @@ def render_dhan_it_panel(state: PageState) -> str:
         <label><span>Strike profile</span><select name="dhan_it_strike_mode">{option("STANDARD", "Standard OTM", state.dhan_it_strike_mode)}{option("NEAR_CMP_1PCT", "1% nearer CMP", state.dhan_it_strike_mode)}</select></label>
         <label><span>Sell leg OTM %</span><input name="dhan_it_sell_otm_pct" value="{html.escape(str(state.dhan_it_sell_otm_pct), quote=True)}"></label>
         <label><span>Hedge leg OTM %</span><input name="dhan_it_hedge_otm_pct" value="{html.escape(str(state.dhan_it_hedge_otm_pct), quote=True)}"></label>
+        <label><span>BUY limit discount %</span><input name="dhan_it_buy_limit_discount_pct" value="{html.escape(str(state.dhan_it_buy_limit_discount_pct), quote=True)}"></label>
+        <label><span>SELL limit markup %</span><input name="dhan_it_sell_limit_markup_pct" value="{html.escape(str(state.dhan_it_sell_limit_markup_pct), quote=True)}"></label>
         <label><span>Lots</span><input name="dhan_it_lots" value="{html.escape(str(state.dhan_it_lots), quote=True)}"></label>
         <label><span>Execution mode</span><select name="dhan_it_trade_mode">{option("PAPER", "Paper", trade_mode)}{option("LIVE", live_option_label, trade_mode)}</select></label>
         <button type="submit" formaction="/dhan-it/evaluate">Evaluate Selected Stocks</button>
-      </div><p class="status">Selected mode: {html.escape(trade_mode)}. Use Current + Next Month to populate both Opportunity and Compare tables, then click a row to open the exact expiry legs. Live mode submits hedge-first orders after popup confirmation and countdown; paper mode is default.</p></section>
+      </div><p class="status">Selected mode: {html.escape(trade_mode)}. Use Current + Next Month to populate both Opportunity and Compare tables, then click a row to open the exact expiry legs. BUY limit = option CMP/LTP minus configured %, SELL parked limit = option CMP/LTP plus configured %, rounded to Zerodha ₹0.05 tick. These controls apply to new DHAN-IT pairs and Repair orders.</p></section>
       <section class="panel"><div class="panel-title">Opportunity Table</div><p class="status">Click stock name or Place Order to open the popup. {html.escape(freshness_note)}</p><div class="table-wrap"><table id="dhan-it-opportunity-table" class="ipo-table"><thead><tr><th>Select</th><th class="sort-header" data-sort-col="1">Symbol</th><th class="sort-header" data-sort-col="2">Strategy</th><th class="sort-header" data-sort-col="3">CMP</th><th class="sort-header" data-sort-col="4">Expiry</th><th class="sort-header" data-sort-col="5">Sell Leg</th><th class="sort-header" data-sort-col="6">Buy Hedge Leg</th><th class="sort-header" data-sort-col="7">Sell Strike</th><th class="sort-header" data-sort-col="8">Hedge Strike</th><th class="sort-header" data-sort-col="9">Sell Premium</th><th class="sort-header" data-sort-col="10">Hedge Premium</th><th class="sort-header" data-sort-col="11">Net Credit</th><th class="sort-header" data-sort-col="12">Max Gain</th><th class="sort-header" data-sort-col="13">Max Loss</th><th class="sort-header" data-sort-col="14">Breakeven</th><th class="sort-header" data-sort-col="15">POP</th><th class="sort-header" data-sort-col="16">RoR</th><th class="sort-header" data-sort-col="17">Margin</th><th class="sort-header" data-sort-col="18">Liquidity</th><th class="sort-header" data-sort-col="19">Event Risk</th><th class="sort-header" data-sort-col="20">Risk Decision</th><th class="sort-header" data-sort-col="21">Reason</th><th class="sort-header" data-sort-col="22">Sell Buy Orders</th><th class="sort-header" data-sort-col="23">Sell Sell Orders</th><th class="sort-header" data-sort-col="24">Sell Trade Activity</th><th class="sort-header" data-sort-col="25">Sell Trade Source</th><th class="sort-header" data-sort-col="26">Sell Liquidity</th><th class="sort-header" data-sort-col="27">Hedge Buy Orders</th><th class="sort-header" data-sort-col="28">Hedge Sell Orders</th><th class="sort-header" data-sort-col="29">Hedge Trade Activity</th><th class="sort-header" data-sort-col="30">Hedge Trade Source</th><th class="sort-header" data-sort-col="31">Hedge Liquidity</th><th class="sort-header" data-sort-col="32">Pair Liquidity</th><th class="sort-header" data-sort-col="33">Liquidity Order Allowed</th><th>Action</th></tr></thead><tbody>{''.join(opportunity_rows)}</tbody></table></div></section>
       <section class="panel"><div class="panel-title">Compare POP, Gain and Risk</div><p class="status">Click the stock name to open the DHAN-IT execution popup. Best Pick turns green when that expiry has POP 80%+, max gain 10,000+, max loss 40,000 or lower, liquidity is not RED, and the legs are available for the selected lot size.</p><div class="table-wrap"><table id="dhan-it-comparison-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Symbol</th><th class="sort-header" data-sort-col="1">Strategy</th><th class="sort-header" data-sort-col="2">Expiry Type</th><th class="sort-header" data-sort-col="3">Expiry Date</th><th class="sort-header" data-sort-col="4">DTE</th><th class="sort-header" data-sort-col="5">Sell Leg</th><th class="sort-header" data-sort-col="6">Buy Hedge Leg</th><th class="sort-header" data-sort-col="7">Net Credit</th><th class="sort-header" data-sort-col="8">Max Gain</th><th class="sort-header" data-sort-col="9">Max Loss</th><th class="sort-header" data-sort-col="10">POP</th><th class="sort-header" data-sort-col="11">RoR</th><th class="sort-header" data-sort-col="12">Breakeven</th><th class="sort-header" data-sort-col="13">Margin</th><th class="sort-header" data-sort-col="14">Event Risk</th><th class="sort-header" data-sort-col="15">Liquidity</th><th class="sort-header" data-sort-col="16">Risk Decision</th><th class="sort-header" data-sort-col="17">Recommendation</th><th class="sort-header" data-sort-col="18">Best Pick</th></tr></thead><tbody>{''.join(comparison_rows)}</tbody></table></div></section>
       {selected_preview}
@@ -37342,24 +37932,24 @@ def render_page(state: PageState) -> bytes:
     }}
     .dhan-it-position-table th:nth-child(2),
     .dhan-it-position-table td:nth-child(2) {{
-      min-width: 138px;
-      max-width: 178px;
+      min-width: 74px;
+      max-width: 86px;
     }}
     .dhan-it-position-table .dhan-pair-suggestion-cell {{
-      min-width: 170px;
-      max-width: 240px;
+      min-width: 118px;
+      max-width: 150px;
       white-space: normal;
       overflow-wrap: anywhere;
-      line-height: 1.25;
+      line-height: 1.18;
       color: #0f172a;
-      font-size: 11.5px;
+      font-size: 10.5px;
     }}
     .dhan-it-position-table .dhan-pair-action-cell {{
-      width: 76px;
-      min-width: 76px;
-      max-width: 90px;
+      width: 210px;
+      min-width: 190px;
+      max-width: 230px;
       text-align: center;
-      white-space: nowrap;
+      white-space: normal;
     }}
     .dhan-it-position-table .dhan-position-pnl-cell {{
       min-width: 82px;
@@ -37370,8 +37960,8 @@ def render_page(state: PageState) -> bytes:
       font-weight: 950;
     }}
     .dhan-it-position-table .dhan-it-cmp-cell {{
-      min-width: 82px;
-      max-width: 96px;
+      min-width: 74px;
+      max-width: 86px;
       text-align: center;
       white-space: nowrap;
       color: #0f766e;
@@ -37379,8 +37969,8 @@ def render_page(state: PageState) -> bytes:
       font-weight: 950;
     }}
     .dhan-it-position-table .dhan-it-change-cell {{
-      min-width: 76px;
-      max-width: 92px;
+      min-width: 66px;
+      max-width: 78px;
       text-align: center;
       white-space: nowrap;
       font-size: 13px;
@@ -37405,8 +37995,8 @@ def render_page(state: PageState) -> bytes:
       white-space: normal;
     }}
     .dhan-it-position-table .dhan-it-signal-cell {{
-      min-width: 130px;
-      max-width: 180px;
+      min-width: 92px;
+      max-width: 118px;
       text-align: center;
       white-space: normal;
       overflow-wrap: anywhere;
@@ -37491,13 +38081,13 @@ def render_page(state: PageState) -> bytes:
       line-height: 1.2;
     }}
     .dhan-it-option-chip {{
-      border-radius: 12px;
-      padding: 6px 8px;
-      margin: 2px auto 5px;
+      border-radius: 10px;
+      padding: 5px 7px;
+      margin: 1px auto 3px;
       border: 1px solid #e2e8f0;
-      box-shadow: 0 5px 14px rgba(15, 23, 42, 0.05);
-      min-width: 150px;
-      max-width: 190px;
+      box-shadow: 0 3px 10px rgba(15, 23, 42, 0.04);
+      min-width: 142px;
+      max-width: 178px;
       text-align: center;
     }}
     .dhan-it-option-chip span {{
@@ -37508,9 +38098,9 @@ def render_page(state: PageState) -> bytes:
     }}
     .dhan-it-option-chip strong {{
       display: block;
-      font-size: 17px;
+      font-size: 15px;
       line-height: 1;
-      margin: 2px 0 3px;
+      margin: 1px 0 2px;
     }}
     .dhan-it-option-chip.sell {{
       background: linear-gradient(135deg, #fff1f2 0%, #ffffff 100%);
@@ -37536,6 +38126,44 @@ def render_page(state: PageState) -> bytes:
       color: #64748b;
       font-weight: 850;
       border: 1px dashed #cbd5e1;
+    }}
+    .dhan-it-order-compact {{
+      margin: 4px auto 0;
+      max-width: 210px;
+      border-radius: 10px;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      padding: 4px 5px;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      text-align: center;
+      font-size: 9.5px;
+    }}
+    .dhan-it-order-compact summary {{
+      cursor: pointer;
+      list-style: none;
+    }}
+    .dhan-it-order-compact summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .dhan-it-order-compact summary strong,
+    .dhan-it-order-line strong {{
+      display: block;
+      margin-top: 2px;
+      color: #0f172a;
+      font-size: 9.5px;
+      line-height: 1.15;
+    }}
+    .dhan-it-order-compact small,
+    .dhan-it-order-line small {{
+      max-width: 200px;
+      font-size: 9px;
+      line-height: 1.15;
+    }}
+    .dhan-it-order-line {{
+      border-top: 1px dashed #cbd5e1;
+      margin-top: 4px;
+      padding-top: 4px;
     }}
     .dhan-cmp-zone-cell strong {{
       display: block;
@@ -40382,6 +41010,7 @@ def render_page(state: PageState) -> bytes:
     enableTableSorting(document.getElementById('dhan-it-comparison-table'));
     enableTableSorting(document.getElementById('dhan-it-position-table'));
     enableTableSorting(document.getElementById('ai52-candidate-table'));
+    enableTableSorting(document.getElementById('ai52-monitor-table'));
     enableTableSorting(document.getElementById('ai52-preview-table'));
     enableTableSorting(document.getElementById('sector-income-ranking-table'));
     enableTableSorting(document.getElementById('sector-income-opportunity-table'));
@@ -43484,8 +44113,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             dhan_manual_bucket=first(form, "dhan_manual_bucket"),
             dhan_show_config=checked(form, "dhan_show_config"),
             dhan_expiry=first(form, "dhan_expiry"),
-            dhan_strategy=first(form, "dhan_strategy", "BOTH"),
-            dhan_lots=int(float(first(form, "dhan_lots", "1") or 1)),
+            dhan_strategy=last(form, "dhan_strategy", "BOTH"),
+            dhan_lots=int(float(last(form, "dhan_lots", "1") or 1)),
             dhan_product_type=first(form, "dhan_product_type", "MARGIN"),
             dhan_order_type=first(form, "dhan_order_type", "LIMIT"),
             dhan_paper_trading=(
@@ -43493,6 +44122,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if "dhan_trade_mode" in form
                 else checked(form, "dhan_paper_trading", True)
             ),
+            dhan_buy_limit_discount_pct=max(0.0, min(float(first(form, "dhan_buy_limit_discount_pct", str(DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT)) or DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT), 50.0)),
+            dhan_sell_limit_markup_pct=max(0.0, min(float(first(form, "dhan_sell_limit_markup_pct", str(DHAN_DEFAULT_SELL_LIMIT_MARKUP_PCT)) or DHAN_DEFAULT_SELL_LIMIT_MARKUP_PCT), 100.0)),
             dhan_spot_json=first(form, "dhan_spot_json"),
             dhan_contracts_json=first(form, "dhan_contracts_json"),
             dhan_selected_index=first(form, "dhan_selected_index"),
@@ -43529,6 +44160,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if "dhan_it_trade_mode" in form
                 else checked(form, "dhan_it_paper_trading", True)
             ),
+            dhan_it_buy_limit_discount_pct=max(0.0, min(float(first(form, "dhan_it_buy_limit_discount_pct", str(DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT)) or DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT), 50.0)),
+            dhan_it_sell_limit_markup_pct=max(0.0, min(float(first(form, "dhan_it_sell_limit_markup_pct", str(DHAN_DEFAULT_SELL_LIMIT_MARKUP_PCT)) or DHAN_DEFAULT_SELL_LIMIT_MARKUP_PCT), 100.0)),
             dhan_it_selected_index=first(form, "dhan_it_selected_index"),
             dhan_it_confirm_order=checked(form, "dhan_it_confirm_order"),
             dhan_it_repair_preview=_dhan_json_loads(first(form, "dhan_it_repair_preview_json"), None),
@@ -43567,6 +44200,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             ),
             ai52_confirm_order=checked(form, "ai52_confirm_order"),
             ai52_source_status=first(form, "ai52_source_status"),
+            ai52_monitor_config=_dhan_json_loads(first(form, "ai52_monitor_config_json"), None),
+            ai52_monitor_session=_dhan_json_loads(first(form, "ai52_monitor_session_json"), None),
+            ai52_monitor_rows=_dhan_json_loads(first(form, "ai52_monitor_rows_json"), None),
+            ai52_monitor_show_audit=checked(form, "ai52_monitor_show_audit"),
             pnl_period=first(form, "pnl_period", "This Month"),
             pnl_year=int(float(first(form, "pnl_year", str(datetime.now().year)) or datetime.now().year)),
             pnl_from_date=first(form, "pnl_from_date"),
@@ -45013,6 +45650,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     holding_row,
                     repair_action,
                 )
+                state.dhan_repair_preview = apply_single_leg_limit_price_controls(
+                    state.dhan_repair_preview,
+                    buy_limit_discount_pct=state.dhan_buy_limit_discount_pct,
+                    sell_limit_markup_pct=state.dhan_sell_limit_markup_pct,
+                    source="DHAN_REPAIR_STRATEGY_CONTROLS",
+                )
                 state.dhan_opportunities = opportunities
                 state.dhan_opportunities_generated_at = dhan_opportunity_stamp()
                 state.dhan_selected_index = ""
@@ -45034,7 +45677,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
                 try:
                     outcome = submit_dhan_repair_order(
-                        state.dhan_repair_preview,
+                        apply_single_leg_limit_price_controls(
+                            state.dhan_repair_preview,
+                            buy_limit_discount_pct=state.dhan_buy_limit_discount_pct,
+                            sell_limit_markup_pct=state.dhan_sell_limit_markup_pct,
+                            source="DHAN_REPAIR_SUBMIT_STRATEGY_CONTROLS",
+                        ),
                         broker,
                         user_confirmed=state.dhan_confirm_repair_order,
                         mode=submit_mode,
@@ -45103,6 +45751,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         (state.dhan_opportunities or [])[selected_idx],
                     )
                     selected_opportunity = apply_dhan_result_date_guard(selected_opportunity)
+                    selected_opportunity = apply_dhan_limit_controls_to_preview(selected_opportunity, state)
                     if bool(selected_opportunity.get("result_date_near")):
                         raise ValueError(str(selected_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))
                     existing_pair_row = dhan_existing_option_position_for_pair(selected_opportunity, state.dhan_holding_positions)
@@ -45120,6 +45769,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         broker,
                         user_confirmed=state.dhan_confirm_pair_order or quality_auto_clear,
                         paper_trading=state.dhan_paper_trading,
+                        buy_limit_discount_pct=state.dhan_buy_limit_discount_pct,
+                        sell_limit_markup_pct=state.dhan_sell_limit_markup_pct,
                     )
                     state.console_log = format_dhan_order_backend_log(outcome, repository, broker)
                     repository.export_outputs(state.dhan_opportunities)
@@ -45479,7 +46130,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     repository.save_candidate_snapshot(rows, "SCREENER_CSV_EXPORT")
                     state.ai52_candidates = rows
                     state.ai52_source_status = "SCREENER_CSV_EXPORT"
-                    state.message = f"Imported {len(rows)} 52W AI Screener candidate row(s)."
+                    sync = sync_ai52_monitor_with_imported_candidates(state, "SCREENER_CSV_EXPORT")
+                    state.message = (
+                        f"Imported {len(rows)} 52W AI Screener candidate row(s). "
+                        f"Stopped active Sell-on-Rise monitor and refreshed monitor table for {len(sync.get('symbols') or [])} stock(s)."
+                    )
                 except ScreenerManualExportRequired:
                     state.message = "Manual login/export required. Download the Screener CSV export and upload it here."
                 load_ai52_state(state)
@@ -45496,8 +46151,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 repository.save_candidate_snapshot(rows, f"CSV_UPLOAD:{upload.get('filename') or 'screener.csv'}")
                 state.ai52_candidates = rows
                 state.ai52_source_status = f"CSV_UPLOAD:{upload.get('filename') or 'screener.csv'}"
+                sync = sync_ai52_monitor_with_imported_candidates(state, state.ai52_source_status)
                 load_ai52_state(state)
-                state.message = f"Uploaded and normalized {len(rows)} 52W AI candidate row(s)."
+                state.message = (
+                    f"Uploaded and normalized {len(rows)} 52W AI candidate row(s). "
+                    f"Stopped active Sell-on-Rise monitor and refreshed monitor table for {len(sync.get('symbols') or [])} stock(s)."
+                )
             elif request_path == "/52w-ai-call-spread/evaluate-one":
                 if not state.ai52_candidates:
                     load_ai52_state(state)
@@ -45532,9 +46191,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         next_candidate["option_expiry"] = evaluation.get("option_expiry") or next_candidate.get("option_expiry")
                     enriched_candidates.append(next_candidate)
                 state.ai52_candidates = enriched_candidates
+                sync = sync_ai52_monitor_with_imported_candidates(state, "EVALUATE_ALL")
                 load_ai52_state(state)
                 tradable = sum(1 for row in evaluations if str(row.get("decision") or "").upper() in {"A+ SELL", "A SELL", "WATCH FOR REJECTION"})
-                state.message = f"Evaluated and ranked {len(evaluations)} 52W AI candidate(s) from Kite data. {tradable} candidate(s) are not hard-blocked."
+                state.message = (
+                    f"Evaluated and ranked {len(evaluations)} 52W AI candidate(s) from Kite data. "
+                    f"{tradable} candidate(s) are not hard-blocked. Sell-on-Rise monitor was stopped and refreshed for {len(sync.get('symbols') or [])} stock(s)."
+                )
             elif request_path == "/52w-ai-call-spread/logout":
                 state.ai52_selected_preview = None
                 state.ai52_selected_index = ""
@@ -45607,6 +46270,101 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = (
                     f"Cleared {deleted} saved 52W AI preview row(s). "
                     "Imported Screener candidates, Pair Order Monitor, and Kite orders were not changed."
+                )
+            elif request_path == "/52w-ai-call-spread/monitor-save":
+                load_ai52_state(state)
+                config = _ai52_monitor_config_from_form(form, state)
+                errors = validate_monitor_config(config)
+                if errors:
+                    raise ValueError("Sell-on-Rise monitor config error: " + "; ".join(errors))
+                SellOnRiseMonitorRepository(APP_DB_PATH).save_config(config)
+                state.ai52_monitor_config = config.to_dict()
+                load_ai52_state(state)
+                state.message = f"Saved Sell-on-Rise monitor config for {len(config.selected_symbols)} selected stock(s)."
+            elif request_path == "/52w-ai-call-spread/monitor-start-now":
+                load_ai52_state(state)
+                config = _ai52_monitor_config_from_form(form, state)
+                config.monitor_mode = "START_NOW"
+                errors = validate_monitor_config(config)
+                if errors:
+                    raise ValueError("Sell-on-Rise monitor config error: " + "; ".join(errors))
+                repo = SellOnRiseMonitorRepository(APP_DB_PATH)
+                repo.save_config(config)
+                repo.create_or_update_session(config, start_now=True, status="MONITORING")
+                state.ai52_monitor_config = config.to_dict()
+                load_ai52_state(state)
+                state.message = "Started Sell-on-Rise foreground monitor. Use Run Scan Now or refresh at the configured interval while this page remains active."
+            elif request_path == "/52w-ai-call-spread/monitor-schedule":
+                load_ai52_state(state)
+                config = _ai52_monitor_config_from_form(form, state)
+                config.monitor_mode = "SCHEDULED"
+                errors = validate_monitor_config(config)
+                if errors:
+                    raise ValueError("Sell-on-Rise monitor config error: " + "; ".join(errors))
+                repo = SellOnRiseMonitorRepository(APP_DB_PATH)
+                repo.save_config(config)
+                repo.create_or_update_session(config, start_now=False, status="SCHEDULED")
+                state.ai52_monitor_config = config.to_dict()
+                load_ai52_state(state)
+                state.message = f"Scheduled Sell-on-Rise monitor for {config.monitor_start_time_ist} IST."
+            elif request_path == "/52w-ai-call-spread/monitor-arm-alerts":
+                load_ai52_state(state)
+                config = _ai52_monitor_config_from_form(form, state)
+                config.execution_mode = "ALERT_ONLY"
+                config.auto_execute_armed = False
+                errors = validate_monitor_config(config)
+                if errors:
+                    raise ValueError("Sell-on-Rise monitor config error: " + "; ".join(errors))
+                SellOnRiseMonitorRepository(APP_DB_PATH).save_config(config)
+                state.ai52_monitor_config = config.to_dict()
+                load_ai52_state(state)
+                state.message = "Armed Sell-on-Rise alerts only. No broker order will be submitted by the scanner."
+            elif request_path == "/52w-ai-call-spread/monitor-arm-auto":
+                load_ai52_state(state)
+                config = _ai52_monitor_config_from_form(form, state)
+                config.execution_mode = "AUTO_EXECUTE"
+                config.auto_execute_armed = True
+                errors = validate_monitor_config(config)
+                if errors:
+                    raise ValueError("Sell-on-Rise monitor config error: " + "; ".join(errors))
+                SellOnRiseMonitorRepository(APP_DB_PATH).save_config(config)
+                state.ai52_monitor_config = config.to_dict()
+                load_ai52_state(state)
+                state.message = "AUTO_EXECUTE armed for this Sell-on-Rise session state only; existing protected order/risk gates still control any order."
+            elif request_path == "/52w-ai-call-spread/monitor-stop":
+                repo = SellOnRiseMonitorRepository(APP_DB_PATH)
+                repo.stop_session()
+                load_ai52_state(state)
+                state.message = "Stopped Sell-on-Rise monitor. Existing positions/orders were not cancelled or closed."
+            elif request_path == "/52w-ai-call-spread/monitor-reset":
+                deleted = SellOnRiseMonitorRepository(APP_DB_PATH).reset_today()
+                state.ai52_monitor_show_audit = True
+                load_ai52_state(state)
+                state.message = f"Reset today's Sell-on-Rise pattern state ({deleted} local monitor row(s) cleared). Broker orders were not changed."
+            elif request_path == "/52w-ai-call-spread/monitor-audit":
+                state.ai52_monitor_show_audit = True
+                load_ai52_state(state)
+                state.message = "Loaded Sell-on-Rise monitor audit log."
+            elif request_path == "/52w-ai-call-spread/monitor-stop-clear-logs":
+                repo = SellOnRiseMonitorRepository(APP_DB_PATH)
+                repo.stop_session()
+                deleted = repo.clear_audit_rows()
+                state.ai52_monitor_show_audit = True
+                load_ai52_state(state)
+                state.message = (
+                    f"Stopped Sell-on-Rise monitor and cleared {deleted} audit/log row(s). "
+                    "Broker orders, pair monitor rows, quote observations, signals, and config were not changed."
+                )
+            elif request_path == "/52w-ai-call-spread/monitor-scan":
+                load_ai52_state(state)
+                config = _ai52_monitor_config_from_form(form, state)
+                SellOnRiseMonitorRepository(APP_DB_PATH).save_config(config)
+                state.ai52_monitor_config = config.to_dict()
+                scan = run_ai52_sell_on_rise_scan(state)
+                state.message = (
+                    f"Sell-on-Rise scan completed: {scan.get('observations')} quote observation(s), "
+                    f"{scan.get('signals')} confirmed signal(s), {scan.get('previews', 0)} protected preview(s), "
+                    f"{scan.get('api_failures')} quote failure(s)."
                 )
             elif request_path == "/52w-ai-call-spread/submit":
                 if not state.ai52_selected_preview:
@@ -45798,6 +46556,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     holding_row,
                     repair_action,
                 )
+                state.dhan_it_repair_preview = apply_single_leg_limit_price_controls(
+                    state.dhan_it_repair_preview,
+                    buy_limit_discount_pct=state.dhan_it_buy_limit_discount_pct,
+                    sell_limit_markup_pct=state.dhan_it_sell_limit_markup_pct,
+                    source="DHAN_IT_REPAIR_STRATEGY_CONTROLS",
+                )
                 state.dhan_it_opportunities = opportunities
                 state.dhan_it_opportunities_generated_at = dhan_opportunity_stamp()
                 state.dhan_it_selected_index = ""
@@ -45816,7 +46580,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
                 try:
                     outcome = submit_dhan_it_repair_order(
-                        state.dhan_it_repair_preview,
+                        apply_single_leg_limit_price_controls(
+                            state.dhan_it_repair_preview,
+                            buy_limit_discount_pct=state.dhan_it_buy_limit_discount_pct,
+                            sell_limit_markup_pct=state.dhan_it_sell_limit_markup_pct,
+                            source="DHAN_IT_REPAIR_SUBMIT_STRATEGY_CONTROLS",
+                        ),
                         broker,
                         user_confirmed=state.dhan_it_confirm_repair_order,
                         mode=submit_mode,
@@ -45859,6 +46628,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         selected_opportunity,
                         (state.dhan_it_opportunities or [])[selected_idx],
                     )
+                    selected_opportunity = apply_dhan_it_limit_controls_to_preview(selected_opportunity, state)
                     selected_opportunity = apply_dhan_result_date_guard(selected_opportunity)
                     if bool(selected_opportunity.get("result_date_near")):
                         raise ValueError(str(selected_opportunity.get("result_date_message") or "Quarterly results date is nearby; trade blocked."))

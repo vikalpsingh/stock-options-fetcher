@@ -1,0 +1,3 @@
+symbol,exchange,transaction_type,lots,price_markup_percent,product,order_type,price,validity,tag
+UNITDSPR26OCT1520CE,NFO,SELL,1,0,NRML,LIMIT,12.20,DAY,covered_call
+PFC26OCT380CE,NFO,SELL,1,0,NRML,LIMIT,3.30,DAY,covered_call

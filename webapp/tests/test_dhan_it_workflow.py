@@ -649,6 +649,68 @@ def test_dhan_it_holding_position_table_renders_below_call_watch():
     assert 'formaction="/dhan-it/open-call-symbol" name="dhan_it_open_symbol" value="INFY"' in html
 
 
+def test_dhan_it_holding_position_action_column_shows_kite_orders():
+    rows = [
+        {
+            "symbol": "TECHM",
+            "equity_qty": 0,
+            "cmp": 1643.0,
+            "sell_count": 0,
+            "buy_count": 0,
+            "sell_symbols": "",
+            "buy_symbols": "",
+            "pair_status": "NO CE PAIR",
+            "suggestion": "Build CE SELL + BUY hedge pair from DHAN-IT popup.",
+            "action": "BUILD_PAIR",
+        }
+    ]
+    orders = [
+        {
+            "tradingsymbol": "TECHM26SEP1700CE",
+            "transaction_type": "SELL",
+            "status": "OPEN",
+            "quantity": 600,
+            "filled_quantity": 0,
+            "pending_quantity": 600,
+            "price": 22.9,
+            "average_price": 0,
+            "order_timestamp": "2026-09-15 10:05:01",
+        },
+        {
+            "tradingsymbol": "RELIANCE26SEP3000CE",
+            "transaction_type": "SELL",
+            "status": "OPEN",
+            "quantity": 250,
+            "price": 10,
+            "order_timestamp": "2026-09-15 10:06:01",
+        },
+    ]
+
+    enriched = app.enrich_dhan_it_holding_positions_with_kite_orders(rows, orders)
+    html = app.render_dhan_it_holding_positions(enriched)
+
+    assert enriched[0]["kite_order_summary"] == "1 Kite order(s)"
+    assert enriched[0]["kite_order_details"][0]["tradingsymbol"] == "TECHM26SEP1700CE"
+    assert 'class="dhan-it-order-compact"' in html
+    assert "SELL TECHM26SEP1700CE" in html
+    assert "Qty 0/600" in html
+    assert "Pend 600" in html
+    assert "Lmt 22.90" in html
+    assert "RELIANCE26SEP3000CE" not in html
+
+
+def test_dhan_it_holding_position_action_column_shows_order_book_error():
+    enriched = app.enrich_dhan_it_holding_positions_with_kite_orders(
+        [{"symbol": "TCS", "pair_status": "NO CE PAIR", "suggestion": "-", "action": "BUILD_PAIR"}],
+        [],
+        order_error="Kite token expired",
+    )
+    html = app.render_dhan_it_holding_positions(enriched)
+
+    assert "Orders N/A" in html
+    assert "Kite token expired" in html
+
+
 def test_dhan_it_pair_status_cmp_uses_live_call_watch_card_when_no_equity_holding():
     rows = [
         {
@@ -1530,6 +1592,54 @@ def test_dhan_it_submit_uses_preview_configured_sell_initial_limit(tmp_path):
     assert broker.placed[1]["price"] == 23.0
     assert payload["sell_cmp_limit_price"] == 20.0
     assert payload["sell_initial_limit_price"] == 23.0
+
+
+def test_dhan_it_strategy_controls_adjust_buy_and_parked_sell_limit(tmp_path):
+    repo = DhanItPairRepository(tmp_path / "dhan_it.db")
+    broker = MockBroker()
+    preview = approved_preview()
+    preview["buy_limit_price"] = 5.03
+    preview["buy_leg_premium"] = 5.03
+    preview["sell_limit_price"] = 11.94
+    preview["sell_leg_premium"] = 11.94
+    adjusted = app.apply_pair_limit_price_controls(
+        preview,
+        buy_limit_discount_pct=5,
+        sell_limit_markup_pct=12.5,
+        source="TEST",
+    )
+
+    result = submit_dhan_it_pair(adjusted, repo, broker, user_confirmed=True, mode="PAPER")
+    pair = repo.get_pair(result["pair_id"])
+    payload = json.loads(pair["payload_json"])
+
+    assert broker.placed[0]["transaction_type"] == "BUY"
+    assert broker.placed[0]["price"] == 4.8
+    assert broker.placed[1]["transaction_type"] == "SELL"
+    assert broker.placed[1]["price"] == 13.45
+    assert payload["buy_limit_discount_pct"] == 5
+    assert payload["sell_limit_markup_pct"] == 12.5
+    assert payload["sell_cmp_limit_price"] == 11.95
+    assert payload["sell_initial_limit_price"] == 13.45
+
+
+def test_dhan_it_repair_buy_uses_configured_discount_and_tick_rounding():
+    preview = {
+        "transaction_type": "BUY",
+        "tradingsymbol": "TECHM26SEP1800CE",
+        "quantity": 600,
+        "limit_price": 18.11,
+    }
+    adjusted = app.apply_single_leg_limit_price_controls(
+        preview,
+        buy_limit_discount_pct=5,
+        sell_limit_markup_pct=10,
+        source="TEST",
+    )
+
+    assert adjusted["reference_price"] == 18.1
+    assert adjusted["limit_price"] == 17.2
+    assert adjusted["buy_limit_discount_pct"] == 5
 
 
 def test_monitor_blocks_sell_when_refreshed_liquidity_turns_red(tmp_path):

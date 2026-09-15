@@ -56,7 +56,14 @@ def submit_kite_pair(preview: dict[str, Any], repository: KiteSpreadRepository, 
     tag = pair_id[-20:]
     buy_payload = build_kite_order_payload(preview["buy_leg_tradingsymbol"], "BUY", preview["quantity"], preview["buy_limit_price"], tag)
     sell_cmp_limit_price = round_limit_price_to_tick(float(preview["sell_limit_price"]))
-    sell_entry_limit_price = dhan_initial_sell_limit_price(sell_cmp_limit_price) if execution_mode == "HEDGE_FIRST" else sell_cmp_limit_price
+    configured_sell_entry = round_limit_price_to_tick(float(preview.get("sell_initial_limit_price") or 0))
+    sell_entry_limit_price = (
+        configured_sell_entry
+        if execution_mode == "HEDGE_FIRST" and configured_sell_entry > 0
+        else dhan_initial_sell_limit_price(sell_cmp_limit_price)
+        if execution_mode == "HEDGE_FIRST"
+        else sell_cmp_limit_price
+    )
     sell_payload = build_kite_order_payload(preview["sell_leg_tradingsymbol"], "SELL", preview["quantity"], sell_entry_limit_price, tag)
     if execution_mode == "HEDGE_FIRST":
         buy_result = broker.place_order(buy_payload)
