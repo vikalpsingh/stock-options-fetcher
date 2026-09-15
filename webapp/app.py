@@ -1412,6 +1412,85 @@ def profile_flag(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
+PROFILE_TAB_OPTIONS: tuple[tuple[str, str, str], ...] = (
+    ("home", "Home", "Core"),
+    ("kite-setup", "Kite Setup", "Core"),
+    ("positions", "Position", "Core"),
+    ("research", "Research", "Core"),
+    ("place", "Trading", "Core"),
+    ("order-management", "Modify / Cancel", "Core"),
+    ("kite-spreads", "DHAN", "Strategy"),
+    ("dhan-it", "DHAN-IT", "Strategy"),
+    ("52w-ai-call-spread", "52W AI Call Spread", "Strategy"),
+    ("sector-income", "SECTOR-Income", "Strategy"),
+    ("pnl", "P&L", "Reports"),
+    ("value-stock", "Value-Stock", "Investing"),
+    ("investing", "Investing", "Investing"),
+    ("equity", "Equity", "Investing"),
+    ("ipo", "IPO", "Research"),
+    ("income-growth", "Income Growth", "Strategy"),
+    ("income", "INCOME", "Strategy"),
+    ("nifty-income", "Nifty Income", "Strategy"),
+    ("nifty-grow", "NIFTYGrow", "Strategy"),
+    ("commodity", "Commodity", "Strategy"),
+    ("analytics", "Analytics", "Tools"),
+    ("gpt", "GPT", "Tools"),
+)
+PROFILE_TAB_IDS: tuple[str, ...] = tuple(tab_id for tab_id, _, _ in PROFILE_TAB_OPTIONS)
+DEFAULT_PROFILE_VISIBLE_TABS: tuple[str, ...] = (
+    "home",
+    "kite-setup",
+    "positions",
+    "research",
+    "place",
+    "order-management",
+)
+ALWAYS_VISIBLE_PROFILE_TABS: tuple[str, ...] = ("home", "kite-setup")
+
+
+def normalize_profile_visible_tabs(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_tabs = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        raw_tabs = [str(part or "").strip() for part in value]
+    else:
+        raw_tabs = []
+    allowed = set(PROFILE_TAB_IDS)
+    normalized: list[str] = []
+    for tab_id in raw_tabs:
+        if tab_id in allowed and tab_id not in normalized:
+            normalized.append(tab_id)
+    if not normalized:
+        normalized = list(DEFAULT_PROFILE_VISIBLE_TABS)
+    for required_tab in ALWAYS_VISIBLE_PROFILE_TABS:
+        if required_tab not in normalized:
+            normalized.insert(0, required_tab)
+    return [tab_id for tab_id in PROFILE_TAB_IDS if tab_id in set(normalized)]
+
+
+def kite_profile_visible_tabs(
+    profile_name: str | None = None,
+    profiles: dict[str, dict[str, Any]] | None = None,
+) -> set[str]:
+    clean_name = selected_kite_profile_name(profile_name)
+    available_profiles = profiles if profiles is not None else load_kite_profiles()
+    profile = available_profiles.get(clean_name) or blank_kite_profile(clean_name)
+    visible_tabs = set(normalize_profile_visible_tabs(profile.get("VISIBLE_TABS")))
+    if kite_profile_nifty_income_enabled(clean_name, available_profiles):
+        visible_tabs.add("nifty-income")
+    if kite_profile_nifty_grow_enabled(clean_name, available_profiles):
+        visible_tabs.add("nifty-grow")
+    return visible_tabs
+
+
+def profile_tab_visible(
+    tab_id: str,
+    profile_name: str | None = None,
+    profiles: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    return tab_id in kite_profile_visible_tabs(profile_name, profiles)
+
+
 def blank_kite_profile(profile_name: str | None = None) -> dict[str, Any]:
     return {
         "KITE_CONFIRM_LIVE_ORDER": "YES",
@@ -1420,6 +1499,7 @@ def blank_kite_profile(profile_name: str | None = None) -> dict[str, Any]:
         "KITE_ACCESS_TOKEN": "",
         "NIFTY_INCOME_ENABLED": default_nifty_income_enabled_for_profile(profile_name),
         "NIFTY_GROW_ENABLED": default_nifty_grow_enabled_for_profile(profile_name),
+        "VISIBLE_TABS": list(DEFAULT_PROFILE_VISIBLE_TABS),
     }
 
 
@@ -1433,6 +1513,7 @@ def shanti_default_kite_profile() -> dict[str, Any]:
         or DEFAULT_KITE_ENV["KITE_ACCESS_TOKEN"],
         "NIFTY_INCOME_ENABLED": False,
         "NIFTY_GROW_ENABLED": False,
+        "VISIBLE_TABS": list(DEFAULT_PROFILE_VISIBLE_TABS),
     }
 
 
@@ -1472,6 +1553,7 @@ def load_kite_profiles() -> dict[str, dict[str, Any]]:
                 saved_profile.get("NIFTY_GROW_ENABLED"),
                 default_nifty_grow_enabled_for_profile(name),
             )
+            merged["VISIBLE_TABS"] = normalize_profile_visible_tabs(saved_profile.get("VISIBLE_TABS"))
             profiles[name] = merged
     return profiles
 
@@ -1523,6 +1605,8 @@ def save_kite_profile(profile_name: str, values: dict[str, Any]) -> dict[str, An
             values.get("NIFTY_GROW_ENABLED"),
             default_nifty_grow_enabled_for_profile(clean_name),
         )
+    if "VISIBLE_TABS" in values:
+        current["VISIBLE_TABS"] = normalize_profile_visible_tabs(values.get("VISIBLE_TABS"))
     if not current.get("KITE_CONFIRM_LIVE_ORDER"):
         current["KITE_CONFIRM_LIVE_ORDER"] = "YES"
     profiles[clean_name] = current
@@ -1545,6 +1629,7 @@ def kite_profile_values_from_state(state: Any, access_token: str | None = None) 
         ).strip(),
         "NIFTY_INCOME_ENABLED": bool(state.nifty_income_enabled),
         "NIFTY_GROW_ENABLED": bool(state.nifty_grow_enabled),
+        "VISIBLE_TABS": normalize_profile_visible_tabs(getattr(state, "profile_visible_tabs", None)),
     }
 
 
@@ -7512,6 +7597,7 @@ class PageState:
     kite_profile: str = field(default_factory=selected_kite_profile_name)
     nifty_income_enabled: bool | None = None
     nifty_grow_enabled: bool | None = None
+    profile_visible_tabs: list[str] | None = None
     results: list[dict[str, Any]] | None = None
     order_book: list[dict[str, Any]] | None = None
     order_book_error: str = ""
@@ -19879,6 +19965,41 @@ def render_checkbox(name: str, label: str, is_checked: bool, hint: str = "") -> 
     return (
         f'<label class="check"><input type="checkbox" name="{name}" value="1"{attr}>'
         f"<span>{html.escape(label)}</span>{hint_html}</label>"
+    )
+
+
+def render_profile_tab_configuration(visible_tabs: set[str]) -> str:
+    groups: dict[str, list[str]] = {}
+    for tab_id, label, group in PROFILE_TAB_OPTIONS:
+        checked_attr = " checked" if tab_id in visible_tabs else ""
+        required_note = " · always visible" if tab_id in ALWAYS_VISIBLE_PROFILE_TABS else ""
+        groups.setdefault(group, []).append(
+            '<label class="profile-tab-choice">'
+            f'<input type="checkbox" name="profile_visible_tabs" value="{html.escape(tab_id, quote=True)}"{checked_attr}>'
+            f'<span>{html.escape(label)}</span>'
+            f'<small>{html.escape(group)}{html.escape(required_note)}</small>'
+            "</label>"
+        )
+    grouped_html = "".join(
+        '<div class="profile-tab-group">'
+        f'<div class="profile-tab-group-title">{html.escape(group)}</div>'
+        '<div class="profile-tab-choice-grid">'
+        + "".join(items)
+        + "</div></div>"
+        for group, items in groups.items()
+    )
+    defaults = ", ".join(
+        label for tab_id, label, _ in PROFILE_TAB_OPTIONS if tab_id in set(DEFAULT_PROFILE_VISIBLE_TABS)
+    )
+    return (
+        '<section class="panel kite-setup-card profile-tabs-card">'
+        '<div class="setup-card-kicker">07</div>'
+        '<div class="panel-title">Profile Tab Configuration</div>'
+        '<p class="status">Choose which strategy tabs appear for this Kite profile. '
+        f"Default selected tabs are {html.escape(defaults)}.</p>"
+        f"{grouped_html}"
+        '<p class="status">Home and Kite Setup remain available so a profile can always be recovered.</p>'
+        "</section>"
     )
 
 
@@ -33542,6 +33663,18 @@ def render_page(state: PageState) -> bytes:
         if state.position_orders
         else ""
     )
+    kite_profiles = load_kite_profiles()
+    active_kite_profile = selected_kite_profile_name(state.kite_profile)
+    active_kite_values = kite_profiles.get(active_kite_profile, blank_kite_profile(active_kite_profile))
+    profile_visible_tabs = kite_profile_visible_tabs(active_kite_profile, kite_profiles)
+    if state.active_tab not in profile_visible_tabs:
+        state.active_tab = "kite-setup"
+        if not state.message and not state.error:
+            state.message = (
+                "This tab is hidden for the selected Kite profile. "
+                "Update Profile Tab Configuration in Kite Setup to enable it."
+            )
+            alert += f'<div class="alert ok">{html.escape(state.message)}</div>'
     home_tab_class = "active" if state.active_tab == "home" else ""
     place_tab_class = "active" if state.active_tab == "place" else ""
     positions_tab_class = "active" if state.active_tab in {"positions", "positions-research"} else ""
@@ -33568,9 +33701,6 @@ def render_page(state: PageState) -> bytes:
     gpt_panel_style = "" if state.active_tab == "gpt" else ' style="display:none"'
     kite_setup_panel_style = "" if state.active_tab == "kite-setup" else ' style="display:none"'
     home_market_html = render_market_topper(state) if state.active_tab == "home" else ""
-    kite_profiles = load_kite_profiles()
-    active_kite_profile = selected_kite_profile_name(state.kite_profile)
-    active_kite_values = kite_profiles.get(active_kite_profile, blank_kite_profile(active_kite_profile))
     nifty_income_enabled = kite_profile_nifty_income_enabled(active_kite_profile, kite_profiles)
     active_profile_ready = all(
         str(active_kite_values.get(key) or "").strip()
@@ -33603,6 +33733,11 @@ def render_page(state: PageState) -> bytes:
                 if state.nifty_grow_enabled is not None
                 else nifty_grow_enabled
             ),
+            "VISIBLE_TABS": normalize_profile_visible_tabs(
+                state.profile_visible_tabs
+                if state.profile_visible_tabs is not None
+                else active_kite_values.get("VISIBLE_TABS")
+            ),
         }
         kite_profiles[active_kite_profile] = active_kite_values
         nifty_income_enabled = profile_flag(
@@ -33613,10 +33748,52 @@ def render_page(state: PageState) -> bytes:
             active_kite_values.get("NIFTY_GROW_ENABLED"),
             default_nifty_grow_enabled_for_profile(active_kite_profile),
         )
+        profile_visible_tabs = kite_profile_visible_tabs(active_kite_profile, kite_profiles)
     kite_profiles_json = html.escape(json.dumps(kite_profiles), quote=True)
     profile_options = "".join(
         f'<option value="{html.escape(name, quote=True)}"{" selected" if name == active_kite_profile else ""}>{html.escape(name)}</option>'
         for name in KITE_PROFILE_NAMES
+    )
+
+    def tab_button(tab_id: str, label: str, css_class: str, extra_class: str = "utility-action") -> str:
+        if tab_id not in profile_visible_tabs:
+            return ""
+        return (
+            f'<button class="tab-button {extra_class} {css_class}" type="button" '
+            f'data-tab="{html.escape(tab_id, quote=True)}">{label}</button>'
+        )
+
+    tab_buttons_html = "\n      ".join(
+        button
+        for button in (
+            tab_button("home", "Home", home_tab_class, "utility-action home-tab"),
+            tab_button("positions", "Position", positions_tab_class, "primary-action"),
+            tab_button("research", "Research", research_tab_class),
+            tab_button("place", "Trading", place_tab_class, "primary-action"),
+            tab_button("order-management", "Modify / Cancel", order_management_tab_class),
+            tab_button("investing", "Investing", investing_tab_class),
+            tab_button("equity", "Equity", equity_tab_class),
+            tab_button("ipo", "IPO", ipo_tab_class),
+            tab_button("value-stock", "Value-Stock", value_stock_tab_class),
+            tab_button("kite-spreads", "DHAN", dhan_tab_class),
+            tab_button("dhan-it", "DHAN-IT", dhan_it_tab_class),
+            tab_button("52w-ai-call-spread", "52W AI Call Spread", ai52_tab_class),
+            tab_button("sector-income", "SECTOR-Income", sector_income_tab_class),
+            tab_button("pnl", "P&amp;L", pnl_tab_class),
+            tab_button("income-growth", "Income Growth", income_growth_tab_class),
+            tab_button("income", "INCOME", income_tab_class),
+            tab_button("nifty-income", "Nifty Income", nifty_income_tab_class)
+            if nifty_income_enabled
+            else "",
+            tab_button("nifty-grow", "NIFTYGrow", nifty_grow_tab_class)
+            if nifty_grow_enabled
+            else "",
+            tab_button("commodity", "Commodity", commodity_tab_class),
+            tab_button("analytics", "Analytics", analytics_tab_class),
+            tab_button("gpt", "GPT", gpt_tab_class),
+            tab_button("kite-setup", "Kite Setup", kite_setup_tab_class),
+        )
+        if button
     )
     active_login_url = (
         "https://kite.zerodha.com/connect/login?"
@@ -33733,7 +33910,8 @@ def render_page(state: PageState) -> bytes:
             </div>
             {render_kite_ip_data(state.kite_ip_data)}
           </section>
-        </div>"""
+        </div>
+        {render_profile_tab_configuration(profile_visible_tabs)}"""
     env_hidden = env_hidden_fields_for_render()
     html_doc = f"""<!doctype html>
 <html lang="en">
@@ -38553,6 +38731,49 @@ def render_page(state: PageState) -> bytes:
       color: var(--muted);
       line-height: 1.35;
     }}
+    .profile-tabs-card {{
+      margin-top: 16px;
+      border-left: 5px solid #6366f1;
+    }}
+    .profile-tab-group {{
+      margin-top: 14px;
+    }}
+    .profile-tab-group-title {{
+      margin-bottom: 8px;
+      color: #334155;
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }}
+    .profile-tab-choice-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+      gap: 10px;
+    }}
+    .profile-tab-choice {{
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 2px 8px;
+      margin: 0;
+      padding: 10px 12px;
+      border: 1px solid #dbeafe;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #ffffff, #f8fbff);
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+    }}
+    .profile-tab-choice span {{
+      margin: 0;
+      color: #102a43;
+      font-size: 13px;
+      font-weight: 850;
+    }}
+    .profile-tab-choice small {{
+      grid-column: 2;
+      color: #64748b;
+      font-size: 11px;
+      line-height: 1.2;
+    }}
     .actions {{
       display: flex;
       flex-wrap: wrap;
@@ -40625,28 +40846,7 @@ def render_page(state: PageState) -> bytes:
     {alert}
     {render_kite_response_modal(state)}
     <div class="tabs">
-      <button class="tab-button utility-action home-tab {home_tab_class}" type="button" data-tab="home">Home</button>
-      <button class="tab-button primary-action {positions_tab_class}" type="button" data-tab="positions">Position</button>
-      <button class="tab-button utility-action {research_tab_class}" type="button" data-tab="research">Research</button>
-      <button class="tab-button primary-action {place_tab_class}" type="button" data-tab="place">Trading</button>
-      <button class="tab-button utility-action {order_management_tab_class}" type="button" data-tab="order-management">Modify / Cancel</button>
-      <button class="tab-button utility-action {investing_tab_class}" type="button" data-tab="investing">Investing</button>
-      <button class="tab-button utility-action {equity_tab_class}" type="button" data-tab="equity">Equity</button>
-      <button class="tab-button utility-action {ipo_tab_class}" type="button" data-tab="ipo">IPO</button>
-      <button class="tab-button utility-action {value_stock_tab_class}" type="button" data-tab="value-stock">Value-Stock</button>
-      <button class="tab-button utility-action {dhan_tab_class}" type="button" data-tab="kite-spreads">DHAN</button>
-      <button class="tab-button utility-action {dhan_it_tab_class}" type="button" data-tab="dhan-it">DHAN-IT</button>
-      <button class="tab-button utility-action {ai52_tab_class}" type="button" data-tab="52w-ai-call-spread">52W AI Call Spread</button>
-      <button class="tab-button utility-action {sector_income_tab_class}" type="button" data-tab="sector-income">SECTOR-Income</button>
-      <button class="tab-button utility-action {pnl_tab_class}" type="button" data-tab="pnl">P&amp;L</button>
-      <button class="tab-button utility-action {income_growth_tab_class}" type="button" data-tab="income-growth">Income Growth</button>
-      <button class="tab-button utility-action {income_tab_class}" type="button" data-tab="income">INCOME</button>
-      {f'<button class="tab-button utility-action {nifty_income_tab_class}" type="button" data-tab="nifty-income">Nifty Income</button>' if nifty_income_enabled else ''}
-      {f'<button class="tab-button utility-action {nifty_grow_tab_class}" type="button" data-tab="nifty-grow">NIFTYGrow</button>' if nifty_grow_enabled else ''}
-      <button class="tab-button utility-action {commodity_tab_class}" type="button" data-tab="commodity">Commodity</button>
-      <button class="tab-button utility-action {analytics_tab_class}" type="button" data-tab="analytics">Analytics</button>
-      <button class="tab-button utility-action {gpt_tab_class}" type="button" data-tab="gpt">GPT</button>
-      <button class="tab-button utility-action {kite_setup_tab_class}" type="button" data-tab="kite-setup">Kite Setup</button>
+      {tab_buttons_html}
     </div>
     {home_market_html}
     <form id="place-panel" method="post" action="/load"{place_panel_style}>
@@ -40885,9 +41085,10 @@ def render_page(state: PageState) -> bytes:
     const kiteProfileSelect = document.getElementById('kite-profile-select');
     const kiteLoginLink = document.getElementById('kite-login-link');
     const kiteProfileNoteName = document.getElementById('kite-profile-note-name');
-    const kiteProfileNoteStatus = document.getElementById('kite-profile-note-status');
-    const niftyIncomeEnabled = document.querySelector('input[name="nifty_income_enabled"]');
-    const niftyGrowEnabled = document.querySelector('input[name="nifty_grow_enabled"]');
+      const kiteProfileNoteStatus = document.getElementById('kite-profile-note-status');
+      const niftyIncomeEnabled = document.querySelector('input[name="nifty_income_enabled"]');
+      const niftyGrowEnabled = document.querySelector('input[name="nifty_grow_enabled"]');
+      const profileTabChoices = Array.from(document.querySelectorAll('input[name="profile_visible_tabs"]'));
     function setInputValue(id, value) {{
       const input = document.getElementById(id);
       if (input) input.value = value || '';
@@ -40917,6 +41118,12 @@ def render_page(state: PageState) -> bytes:
       }}
       if (niftyGrowEnabled) {{
         niftyGrowEnabled.checked = Boolean(profile.NIFTY_GROW_ENABLED);
+      }}
+      const visibleTabs = new Set(Array.isArray(profile.VISIBLE_TABS) ? profile.VISIBLE_TABS : []);
+      if (profile.NIFTY_INCOME_ENABLED) visibleTabs.add('nifty-income');
+      if (profile.NIFTY_GROW_ENABLED) visibleTabs.add('nifty-grow');
+      for (const checkbox of profileTabChoices) {{
+        checkbox.checked = visibleTabs.has(checkbox.value);
       }}
       updateKiteLoginLink(profile.KITE_API_KEY);
       const ready = Boolean(
@@ -44012,6 +44219,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             kite_profile=selected_kite_profile_name(first(form, "kite_profile")),
             nifty_income_enabled=checked(form, "nifty_income_enabled"),
             nifty_grow_enabled=checked(form, "nifty_grow_enabled"),
+            profile_visible_tabs=normalize_profile_visible_tabs(form.get("profile_visible_tabs")),
             position_dry_run=checked(form, "position_dry_run"),
             position_discount_percent=float(
                 first(
