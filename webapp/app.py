@@ -33750,6 +33750,8 @@ def render_page(state: PageState) -> bytes:
         )
         profile_visible_tabs = kite_profile_visible_tabs(active_kite_profile, kite_profiles)
     kite_profiles_json = html.escape(json.dumps(kite_profiles), quote=True)
+    default_profile_tabs_json = json.dumps(list(DEFAULT_PROFILE_VISIBLE_TABS))
+    always_profile_tabs_json = json.dumps(list(ALWAYS_VISIBLE_PROFILE_TABS))
     profile_options = "".join(
         f'<option value="{html.escape(name, quote=True)}"{" selected" if name == active_kite_profile else ""}>{html.escape(name)}</option>'
         for name in KITE_PROFILE_NAMES
@@ -41085,10 +41087,12 @@ def render_page(state: PageState) -> bytes:
     const kiteProfileSelect = document.getElementById('kite-profile-select');
     const kiteLoginLink = document.getElementById('kite-login-link');
     const kiteProfileNoteName = document.getElementById('kite-profile-note-name');
-      const kiteProfileNoteStatus = document.getElementById('kite-profile-note-status');
-      const niftyIncomeEnabled = document.querySelector('input[name="nifty_income_enabled"]');
-      const niftyGrowEnabled = document.querySelector('input[name="nifty_grow_enabled"]');
-      const profileTabChoices = Array.from(document.querySelectorAll('input[name="profile_visible_tabs"]'));
+    const kiteProfileNoteStatus = document.getElementById('kite-profile-note-status');
+    const niftyIncomeEnabled = document.querySelector('input[name="nifty_income_enabled"]');
+    const niftyGrowEnabled = document.querySelector('input[name="nifty_grow_enabled"]');
+    const profileTabChoices = Array.from(document.querySelectorAll('input[name="profile_visible_tabs"]'));
+    const defaultProfileVisibleTabs = {default_profile_tabs_json};
+    const alwaysProfileVisibleTabs = {always_profile_tabs_json};
     function setInputValue(id, value) {{
       const input = document.getElementById(id);
       if (input) input.value = value || '';
@@ -41119,7 +41123,13 @@ def render_page(state: PageState) -> bytes:
       if (niftyGrowEnabled) {{
         niftyGrowEnabled.checked = Boolean(profile.NIFTY_GROW_ENABLED);
       }}
-      const visibleTabs = new Set(Array.isArray(profile.VISIBLE_TABS) ? profile.VISIBLE_TABS : []);
+      const savedVisibleTabs = Array.isArray(profile.VISIBLE_TABS) && profile.VISIBLE_TABS.length
+        ? profile.VISIBLE_TABS
+        : defaultProfileVisibleTabs;
+      const visibleTabs = new Set(savedVisibleTabs);
+      for (const tabId of alwaysProfileVisibleTabs) {{
+        visibleTabs.add(tabId);
+      }}
       if (profile.NIFTY_INCOME_ENABLED) visibleTabs.add('nifty-income');
       if (profile.NIFTY_GROW_ENABLED) visibleTabs.add('nifty-grow');
       for (const checkbox of profileTabChoices) {{

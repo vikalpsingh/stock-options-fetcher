@@ -521,9 +521,9 @@
     "enabled": true,
     "end_time": "15:15",
     "interval_minutes": 15,
-    "last_run_at": "15 Sep 2026 11:45:11 IST",
-    "last_slot": "11:45",
-    "last_slot_key": "2026-09-15:11:45",
+    "last_run_at": "15 Sep 2026 12:00:12 IST",
+    "last_slot": "12:00",
+    "last_slot_key": "2026-09-15:12:00",
     "loss_limit_evaluations": [
       {
         "action": "NO_ACTION",
@@ -698,16 +698,16 @@
         "triggered": false
       }
     ],
-    "message": "No close orders placed because open option positions are outside the intraday close-order trading-DTE window. DTE-gated risk exits skipped until trading DTE <= 9: NIFTY26SEP23100PE (trading DTE 10), TCS26SEP2360CE (trading DTE 10).",
+    "message": "Intraday option close-order check authentication failed: open Kite Setup, confirm the active profile, and regenerate today's access token.",
     "order_count": 0,
     "paused_until": "",
     "pe_risk_evaluations": [],
-    "profile": "Monika",
+    "profile": "Shanti",
     "results": [],
-    "run_count_today": 9,
+    "run_count_today": 10,
     "run_date": "2026-09-15",
     "start_time": "09:30",
-    "status": "DTE_GATED"
+    "status": "ERROR"
   },
   "kite_profiles": {
     "Aanya": {
