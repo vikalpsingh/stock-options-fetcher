@@ -14,6 +14,7 @@ from sell_on_rise_monitor import (
     monitoring_window,
     summarize_quote_movement,
     build_monitor_rows,
+    build_price_tape,
     signal_idempotency_key,
     validate_monitor_config,
 )
@@ -204,6 +205,43 @@ def test_monitor_row_reports_option_movement_separately():
     assert rows[0]["option_symbol"] == "TEST26SEP105CE"
     assert rows[0]["option_ltp"] == 20.2
     assert rows[0]["option_movement"]["movement"] == "DECLINE STARTING"
+
+
+def test_price_tape_preserves_price_and_per_quote_direction():
+    quotes = [
+        {"timestamp_ist": (_ts(30) + timedelta(seconds=10 * index)).isoformat(), "price": price}
+        for index, price in enumerate([100.0, 100.2, 100.1, 100.1])
+    ]
+    tape = build_price_tape(quotes)
+    assert [point["direction"] for point in tape] == ["flat", "up", "down", "flat"]
+    assert tape[1]["change_pct"] == 0.2
+    assert tape[2]["change_pct"] == -0.1
+    assert tape[3]["price"] == 100.1
+
+
+def test_monitor_renders_full_width_price_tape_for_each_selected_stock():
+    state = app.PageState(
+        active_tab="52w-ai-call-spread",
+        ai52_candidates=[{"symbol": "GLENMARK"}, {"symbol": "WELCORP"}],
+        ai52_monitor_config=SellOnRiseMonitorConfig(selected_symbols=["GLENMARK", "WELCORP"]).to_dict(),
+        ai52_monitor_rows=[
+            {"symbol": "GLENMARK", "spot": 2464.6, "price_tape": [
+                {"time": "10:00:00", "price": 2464.6, "change_pct": None, "direction": "flat"},
+                {"time": "10:00:10", "price": 2465.0, "change_pct": 0.016, "direction": "up"},
+                {"time": "10:00:20", "price": 2464.5, "change_pct": -0.020, "direction": "down"},
+            ]},
+            {"symbol": "WELCORP", "spot": 0, "price_tape": []},
+        ],
+    )
+    page = app.render_ai52_call_spread_panel(state)
+    assert page.count('class="ai52-monitor-price-row"') == 2
+    assert "GLENMARK · 10s stock price tape" in page
+    assert "WELCORP · 10s stock price tape" in page
+    assert 'class="ai52-tape-quote up"' in page
+    assert 'class="ai52-tape-quote down"' in page
+    assert "₹2465.00" in page
+    assert "+0.016%" in page
+    assert "-0.020%" in page
 
 
 def test_clear_audit_rows_only_removes_monitor_logs(tmp_path):

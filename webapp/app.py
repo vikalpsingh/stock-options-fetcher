@@ -27010,8 +27010,21 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
         option_delta = option_movement.get("delta_pct")
         option_pullback = option_movement.get("pullback_pct")
         option_label = str(option_movement.get("movement") or "WAITING FOR QUOTES") if row.get("option_symbol") else "EVALUATE STOCK FIRST"
+        tape_items = []
+        for point in row.get("price_tape") or []:
+            direction = str(point.get("direction") or "flat")
+            direction_class = direction if direction in {"up", "down", "flat"} else "flat"
+            change = point.get("change_pct")
+            change_text = f"{float(change):+.3f}%" if change is not None else "first quote"
+            tape_items.append(
+                f'<span class="ai52-tape-quote {direction_class}" title="Kite stock quote at {html.escape(str(point.get("time") or "-"), quote=True)} IST">'
+                f'<small>{html.escape(str(point.get("time") or "-"))}</small> '
+                f'<strong>₹{money(point.get("price"))}</strong> <span class="ai52-tape-separator">|</span> '
+                f'<b>{html.escape(change_text)}</b></span>'
+            )
+        tape_html = ' <span class="ai52-tape-between">|</span> '.join(tape_items) if tape_items else '<span class="ai52-tape-empty">Waiting for the first live stock quote.</span>'
         monitor_table_rows.append(
-            "<tr>"
+            '<tr class="ai52-monitor-main-row">'
             f"<td><strong>{html.escape(str(row.get('symbol') or '-'))}</strong></td>"
             f"<td>{money(row.get('spot'))}</td>"
             f"<td>{money(row.get('day_change_pct'))}%<br><small>Quote {html.escape(str(row.get('quote_timestamp_ist') or '-'))}</small></td>"
@@ -27029,6 +27042,7 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(decision)}</span><br><small>{html.escape(str(row.get('why') or ''))}</small></td>"
             f"<td>{html.escape(str(row.get('last_scan') or '-'))}<br><small>{html.escape(str(row.get('candle_count') or 0))} candles</small></td>"
             "</tr>"
+            f'<tr class="ai52-monitor-price-row"><td colspan="16"><div class="ai52-price-tape"><span class="ai52-tape-label">{html.escape(str(row.get("symbol") or "-"))} · 10s stock price tape</span><div class="ai52-tape-items">{tape_html}</div></div></td></tr>'
         )
     if not monitor_table_rows:
         monitor_table_rows.append('<tr><td colspan="16" class="muted-cell">No monitor state yet. Save configuration and start monitoring to collect fresh Kite quotes.</td></tr>')
@@ -38024,6 +38038,39 @@ def render_page(state: PageState) -> bytes:
       max-height: 260px;
       overflow: auto;
     }}
+    .ai52-monitor-price-row td {{
+      padding: 5px 10px 9px;
+      background: #f5f9fc;
+      border-bottom: 2px solid #d6e5ee;
+    }}
+    .ai52-price-tape {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      max-width: calc(100vw - 85px);
+      font-variant-numeric: tabular-nums;
+    }}
+    .ai52-tape-label {{
+      flex: 0 0 auto;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 800;
+    }}
+    .ai52-tape-items {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      overflow-x: auto;
+      white-space: nowrap;
+      padding: 3px 0;
+    }}
+    .ai52-tape-quote {{ font-size: 12px; font-weight: 800; }}
+    .ai52-tape-quote small {{ color: #64748b; font-weight: 600; }}
+    .ai52-tape-quote.up, .ai52-tape-quote.up b {{ color: #15803d; }}
+    .ai52-tape-quote.down, .ai52-tape-quote.down b {{ color: #b42318; }}
+    .ai52-tape-quote.flat, .ai52-tape-quote.flat b {{ color: #475569; }}
+    .ai52-tape-separator, .ai52-tape-between {{ color: #94a3b8; }}
+    .ai52-tape-empty {{ color: #64748b; font-size: 12px; }}
     .dhan-it-call-pair-indicator {{
       display: inline-block;
       margin-top: 4px;
@@ -41227,6 +41274,16 @@ def render_page(state: PageState) -> bytes:
       function sortTableByColumn(column, direction) {{
         const tbody = table.tBodies[0];
         if (!tbody) return;
+        if (table.id === 'ai52-monitor-table') {{
+          const mainRows = Array.from(tbody.querySelectorAll('tr.ai52-monitor-main-row'));
+          mainRows.sort((left, right) => compareSortableCells(left.cells[column], right.cells[column], direction));
+          for (const row of mainRows) {{
+            const tapeRow = row.nextElementSibling;
+            tbody.appendChild(row);
+            if (tapeRow && tapeRow.classList.contains('ai52-monitor-price-row')) tbody.appendChild(tapeRow);
+          }}
+          return;
+        }}
         const rows = Array.from(tbody.querySelectorAll('tr'));
         rows.sort((left, right) => {{
           return compareSortableCells(left.cells[column], right.cells[column], direction);

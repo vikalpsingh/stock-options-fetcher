@@ -296,6 +296,28 @@ def summarize_quote_movement(observations: Iterable[QuoteObservation | dict[str,
     }
 
 
+def build_price_tape(observations: Iterable[dict[str, Any]], limit: int = 12) -> list[dict[str, Any]]:
+    """Return recent stock quotes with the change from the preceding observation."""
+    points: list[tuple[datetime, float]] = []
+    for item in observations:
+        stamp = parse_ist_datetime(item.get("timestamp_ist"))
+        price = _to_float(item.get("price"))
+        if stamp and price > 0:
+            points.append((stamp, price))
+    points.sort(key=lambda point: point[0])
+    result: list[dict[str, Any]] = []
+    for index, (stamp, price) in enumerate(points):
+        previous = points[index - 1][1] if index else None
+        change_pct = round((price / previous - 1) * 100, 3) if previous else None
+        result.append({
+            "time": stamp.strftime("%H:%M:%S"),
+            "price": round(price, 2),
+            "change_pct": change_pct,
+            "direction": "up" if change_pct and change_pct > 0 else "down" if change_pct and change_pct < 0 else "flat",
+        })
+    return result[-max(1, limit):]
+
+
 def _resistance_zone(candles: list[Candle], config: SellOnRiseMonitorConfig, evaluation: dict[str, Any] | None) -> dict[str, Any]:
     latest = candles[-1]
     refs: list[tuple[str, float]] = []
@@ -887,6 +909,7 @@ def build_monitor_rows(
         pattern = result.get("pattern") if isinstance(result.get("pattern"), dict) else {}
         quote = latest_quotes.get(symbol) or {}
         movement = summarize_quote_movement(quote_history.get(symbol) or [])
+        price_tape = build_price_tape(quote_history.get(symbol) or [])
         option_symbol = option_symbols.get(symbol, "")
         option_points = quote_history.get(option_symbol) or []
         option_movement = summarize_quote_movement(option_points)
@@ -905,6 +928,7 @@ def build_monitor_rows(
                 "day_change_pct": quote.get("day_change_pct"),
                 "quote_timestamp_ist": latest_quote_time,
                 **movement,
+                "price_tape": price_tape,
                 "option_symbol": option_symbol,
                 "option_ltp": option_points[-1].get("price") if option_points else None,
                 "option_movement": option_movement,
