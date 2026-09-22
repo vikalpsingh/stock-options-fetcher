@@ -186,6 +186,7 @@ from sell_on_rise_monitor import (
     evaluate_pattern,
     validate_monitor_config,
     now_ist as sell_on_rise_now_ist,
+    parse_ist_datetime as sell_on_rise_parse_ist_datetime,
 )
 
 DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT = 0.0
@@ -26550,12 +26551,22 @@ def load_ai52_state(state: PageState) -> None:
     session_id = str((state.ai52_monitor_session or {}).get("session_id") or "")
     monitor_states = monitor_repository.latest_pattern_states(session_id) if session_id else {}
     monitor_latest_quotes = monitor_repository.latest_observations(session_id) if session_id else {}
+    monitor_option_symbols = {
+        symbol: str(evaluation_by_symbol.get(symbol, {}).get("best_ce_symbol") or "").strip().upper()
+        for symbol in monitor_config.selected_symbols
+    }
+    monitor_quote_history = {
+        symbol: monitor_repository.observations(session_id, symbol)[-12:]
+        for symbol in set(monitor_config.selected_symbols) | {value for value in monitor_option_symbols.values() if value}
+    } if session_id else {}
     state.ai52_monitor_rows = build_monitor_rows(
         monitor_config,
         state.ai52_monitor_session,
         monitor_states,
         evaluation_by_symbol,
         latest_quotes=monitor_latest_quotes,
+        quote_history=monitor_quote_history,
+        option_symbols=monitor_option_symbols,
     )
     state.ai52_monitor_audit_rows = monitor_repository.audit_rows(20) if state.ai52_monitor_show_audit else []
 
@@ -26695,11 +26706,27 @@ def run_ai52_sell_on_rise_scan(state: PageState) -> dict[str, Any]:
         else:
             api_failures += 1
             repository.audit(session_id, symbol, "QUOTE_BLOCK", "Kite quote unavailable or stale for monitor scan.", quote)
-    repository.save_observations(session_id, observations)
     evaluations = {
         str(item.get("symbol") or "").strip().upper(): item
         for item in (state.ai52_evaluations or [])
     }
+    option_symbols = {
+        symbol: str(evaluations.get(symbol, {}).get("best_ce_symbol") or "").strip().upper()
+        for symbol in config.selected_symbols
+    }
+    option_keys = [f"NFO:{option}" for option in set(option_symbols.values()) if option]
+    if option_keys:
+        try:
+            option_quotes = broker.get_quote(option_keys)
+        except Exception:
+            option_quotes = {}
+        for option_key in option_keys:
+            option_quote = option_quotes.get(option_key) or {}
+            option_price = _dhan_metric_float(option_quote.get("last_price") or option_quote.get("ltp"))
+            trade_time = sell_on_rise_parse_ist_datetime(option_quote.get("last_trade_time"))
+            if option_price > 0 and (trade_time is None or 0 <= (stamp - trade_time).total_seconds() <= 30):
+                observations.append(QuoteObservation(symbol=option_key.removeprefix("NFO:"), timestamp_ist=stamp, price=option_price))
+    repository.save_observations(session_id, observations)
     created_signals = 0
     prepared_previews = 0
     for symbol in config.selected_symbols:
@@ -26974,11 +27001,22 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
     for row in monitor_rows:
         decision = str(row.get("decision") or "OBSERVE").upper()
         badge_class = "good" if decision in {"SELL_SIGNAL", "PREVIEW_REQUIRED", "ORDER_ALLOWED"} else "bad" if decision in {"ORDER_BLOCKED", "INVALIDATED"} else "neutral"
+        movement = str(row.get("movement") or "WAITING FOR QUOTES")
+        movement_class = "bad" if movement == "DECLINE STARTING" else "neutral"
+        delta = row.get("delta_pct")
+        minute = row.get("minute_pct")
+        pullback = row.get("pullback_pct")
+        option_movement = row.get("option_movement") or {}
+        option_delta = option_movement.get("delta_pct")
+        option_pullback = option_movement.get("pullback_pct")
+        option_label = str(option_movement.get("movement") or "WAITING FOR QUOTES") if row.get("option_symbol") else "EVALUATE STOCK FIRST"
         monitor_table_rows.append(
             "<tr>"
             f"<td><strong>{html.escape(str(row.get('symbol') or '-'))}</strong></td>"
             f"<td>{money(row.get('spot'))}</td>"
             f"<td>{money(row.get('day_change_pct'))}%<br><small>Quote {html.escape(str(row.get('quote_timestamp_ist') or '-'))}</small></td>"
+            f"<td><span class=\"ipo-badge {movement_class}\">{html.escape(movement)}</span><small>10s {f'{delta:+.3f}%' if delta is not None else '-'} | ~1m {f'{minute:+.3f}%' if minute is not None else '-'} | off recent peak {f'{pullback:.3f}%' if pullback is not None else '-'}</small></td>"
+            f"<td><strong>{html.escape(str(row.get('option_symbol') or '-'))}</strong><small>CE LTP {money(row.get('option_ltp'))} | {html.escape(option_label)}<br>10s {f'{option_delta:+.3f}%' if option_delta is not None else '-'} | off recent peak {f'{option_pullback:.3f}%' if option_pullback is not None else '-'}</small></td>"
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(str(row.get('pattern_phase') or '-'))}</span></td>"
             f"<td>{money(row.get('initial_decline'))}%</td>"
             f"<td>{money(row.get('rebound'))}%</td>"
@@ -26993,7 +27031,7 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
             "</tr>"
         )
     if not monitor_table_rows:
-        monitor_table_rows.append('<tr><td colspan="14" class="muted-cell">No monitor state yet. Save configuration, start monitoring, then use Run Scan Now as fresh quotes arrive.</td></tr>')
+        monitor_table_rows.append('<tr><td colspan="16" class="muted-cell">No monitor state yet. Save configuration and start monitoring to collect fresh Kite quotes.</td></tr>')
 
     audit_rows_html = ""
     if state.ai52_monitor_show_audit:
@@ -27028,9 +27066,10 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
         for mode, label in (("START_NOW", "Start now"), ("SCHEDULED", "Scheduled start"))
     )
     ai52_monitor_section = f"""
-      <section class="panel ai52-monitor-panel">
+      <section class="panel ai52-monitor-panel" id="ai52-monitor-panel" data-active="{'1' if active_monitor else '0'}" data-interval="{monitor_config.quote_check_interval_seconds}">
         <div class="panel-title">Sell-on-Rise Pattern Monitor</div>
-        <p class="status">Foreground scanner for selected evaluated 52W AI F&amp;O stocks. It stores timestamped Kite quotes, builds completed candles, and waits for weakness → rebound → resistance test → rejection → break below rejection low. Monitoring requires this page/session to remain active.</p>
+        <p class="status">Kite stock and evaluated CE quotes refresh every {monitor_config.quote_check_interval_seconds}s while this page is open. Short-term topping/decline is an early watch indicator; the completed-candle rejection and existing risk checks still decide order eligibility. Monitoring requires this page/session to remain active.</p>
+        <p class="status" id="ai52-monitor-refresh-status" aria-live="polite">{('Watching for the next quote.' if active_monitor else 'Start monitoring to collect quotes.')}</p>
         {monitor_cards}
         <div class="ai52-monitor-symbols">{''.join(monitor_symbol_options)}</div>
         <div class="compact-grid">
@@ -27066,7 +27105,7 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
           <button type="submit" formaction="/52w-ai-call-spread/monitor-stop-clear-logs" class="secondary danger-link" onclick="return confirm('Stop Sell-on-Rise monitoring and clear only the Created/Symbol/Type/Message audit log rows? Broker orders, pair monitor, quotes, signals, and config will not be changed.');">Stop &amp; Clear Logs</button>
           <button type="submit" formaction="/52w-ai-call-spread/monitor-scan" class="success">Run Scan Now</button>
         </div>
-        <div class="table-wrap dhan-ten-row-scroll"><table id="ai52-monitor-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Stock</th><th class="sort-header" data-sort-col="1">Spot</th><th class="sort-header" data-sort-col="2">Day %</th><th>Pattern phase</th><th>Initial decline</th><th>Rebound</th><th>Resistance</th><th>Rejection</th><th>Confirmation</th><th>Short CE</th><th>Hedge CE</th><th>Lots</th><th>Decision</th><th>Last scan</th></tr></thead><tbody>{''.join(monitor_table_rows)}</tbody></table></div>
+        <div class="table-wrap dhan-ten-row-scroll"><table id="ai52-monitor-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Stock</th><th class="sort-header" data-sort-col="1">Spot</th><th class="sort-header" data-sort-col="2">Day %</th><th>Stock movement</th><th>Evaluated CE movement</th><th>Pattern phase</th><th>Initial decline</th><th>Rebound</th><th>Resistance</th><th>Rejection</th><th>Confirmation</th><th>Short CE</th><th>Hedge CE</th><th>Lots</th><th>Decision</th><th>Last scan</th></tr></thead><tbody>{''.join(monitor_table_rows)}</tbody></table></div>
         {audit_rows_html}
       </section>
     """
@@ -42040,6 +42079,45 @@ def render_page(state: PageState) -> bytes:
     ai52Go && ai52Go.addEventListener('click', (event) => {{
       submitOrderModal(event, ai52Modal, ai52Review, ai52Go);
     }});
+    let ai52ScanBusy = false;
+    async function refreshAi52Monitor() {{
+      const panel = document.getElementById('ai52-monitor-panel');
+      const form = document.getElementById('ai52-call-spread-panel');
+      if (!panel || !form || panel.dataset.active !== '1' || document.hidden || ai52ScanBusy) return;
+      if (form.style.display === 'none' || document.getElementById('ai52-order-modal')) return;
+      ai52ScanBusy = true;
+      const status = document.getElementById('ai52-monitor-refresh-status');
+      if (status) status.textContent = 'Checking fresh Kite quotes…';
+      try {{
+        const data = new FormData(form);
+        data.set('ai52_auto_scan', '1');
+        const response = await fetch('/52w-ai-call-spread/monitor-scan', {{method: 'POST', body: data, credentials: 'same-origin'}});
+        if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+        const documentNext = new DOMParser().parseFromString(await response.text(), 'text/html');
+        const panelNext = documentNext.getElementById('ai52-monitor-panel');
+        if (!panelNext) throw new Error('Monitor response unavailable');
+        for (const name of ['ai52_monitor_config_json', 'ai52_monitor_session_json', 'ai52_monitor_rows_json']) {{
+          const current = form.querySelector(`input[name="${{name}}"]`);
+          const next = documentNext.querySelector(`#ai52-call-spread-panel input[name="${{name}}"]`);
+          if (current && next) current.value = next.value;
+        }}
+        panel.replaceWith(panelNext);
+        enableTableSorting(document.getElementById('ai52-monitor-table'));
+      }} catch (error) {{
+        const currentStatus = document.getElementById('ai52-monitor-refresh-status');
+        if (currentStatus) currentStatus.textContent = `Quote refresh failed: ${{error.message}}. Use Run Scan Now to retry.`;
+      }} finally {{
+        ai52ScanBusy = false;
+      }}
+    }}
+    let ai52NextScanAt = Date.now() + 1000;
+    setInterval(() => {{
+      const panel = document.getElementById('ai52-monitor-panel');
+      if (!panel || panel.dataset.active !== '1') return;
+      if (Date.now() < ai52NextScanAt) return;
+      ai52NextScanAt = Date.now() + Math.max(5, Number(panel.dataset.interval) || 10) * 1000;
+      refreshAi52Monitor();
+    }}, 1000);
     for (const button of document.querySelectorAll('.ai52-detail-button')) {{
       button.addEventListener('click', () => {{
         if (!ai52DetailModal || !ai52DetailBody) return;
@@ -46575,9 +46653,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             elif request_path == "/52w-ai-call-spread/monitor-scan":
                 load_ai52_state(state)
-                config = _ai52_monitor_config_from_form(form, state)
-                SellOnRiseMonitorRepository(APP_DB_PATH).save_config(config)
-                state.ai52_monitor_config = config.to_dict()
+                if not checked(form, "ai52_auto_scan"):
+                    config = _ai52_monitor_config_from_form(form, state)
+                    SellOnRiseMonitorRepository(APP_DB_PATH).save_config(config)
+                    state.ai52_monitor_config = config.to_dict()
                 scan = run_ai52_sell_on_rise_scan(state)
                 state.message = (
                     f"Sell-on-Rise scan completed: {scan.get('observations')} quote observation(s), "

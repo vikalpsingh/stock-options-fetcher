@@ -251,6 +251,51 @@ def build_completed_candles_from_quotes(
     return candles
 
 
+def summarize_quote_movement(observations: Iterable[QuoteObservation | dict[str, Any]], *, now: datetime | None = None) -> dict[str, Any]:
+    """Describe short-term stock movement; this is context, not an order signal."""
+    points: list[tuple[datetime, float]] = []
+    for item in observations:
+        stamp = item.timestamp_ist if isinstance(item, QuoteObservation) else parse_ist_datetime(item.get("timestamp_ist"))
+        price = item.price if isinstance(item, QuoteObservation) else _to_float(item.get("price"))
+        if stamp and price > 0:
+            points.append((stamp.astimezone(IST), price))
+    points.sort(key=lambda point: point[0])
+    current = (now or now_ist()).astimezone(IST)
+    points = [point for point in points if point[0].date() == current.date() and point[0] <= current]
+    if not points:
+        return {"movement": "WAITING FOR QUOTES", "delta_pct": None, "minute_pct": None, "pullback_pct": None, "sample_count": 0}
+    recent = points[-12:]
+    last_time, last_price = recent[-1]
+    age_seconds = max(0, (current - last_time).total_seconds())
+    previous = recent[-2][1] if len(recent) > 1 else None
+    minute_anchor = next((price for stamp, price in reversed(recent[:-1]) if stamp <= last_time - timedelta(seconds=50)), None)
+    delta_pct = (last_price / previous - 1) * 100 if previous else None
+    minute_pct = (last_price / minute_anchor - 1) * 100 if minute_anchor else None
+    peak = max(price for _, price in recent)
+    pullback_pct = (peak - last_price) / peak * 100 if peak else None
+    movement = "BUILDING HISTORY"
+    if age_seconds > 30:
+        movement = "STALE QUOTE"
+    elif len(recent) >= 4:
+        last_three = [price for _, price in recent[-3:]]
+        falling = last_three[0] > last_three[1] > last_three[2]
+        if falling and pullback_pct >= 0.15:
+            movement = "DECLINE STARTING"
+        elif falling and pullback_pct >= 0.05:
+            movement = "TOPPING WATCH"
+        elif last_three[0] < last_three[1] < last_three[2]:
+            movement = "STILL RISING"
+        else:
+            movement = "SIDEWAYS / MIXED"
+    return {
+        "movement": movement,
+        "delta_pct": round(delta_pct, 3) if delta_pct is not None else None,
+        "minute_pct": round(minute_pct, 3) if minute_pct is not None else None,
+        "pullback_pct": round(pullback_pct, 3) if pullback_pct is not None else None,
+        "sample_count": len(recent),
+    }
+
+
 def _resistance_zone(candles: list[Candle], config: SellOnRiseMonitorConfig, evaluation: dict[str, Any] | None) -> dict[str, Any]:
     latest = candles[-1]
     refs: list[tuple[str, float]] = []
@@ -830,13 +875,21 @@ def build_monitor_rows(
     states: dict[str, dict[str, Any]],
     evaluations_by_symbol: dict[str, dict[str, Any]],
     latest_quotes: dict[str, dict[str, Any]] | None = None,
+    quote_history: dict[str, list[dict[str, Any]]] | None = None,
+    option_symbols: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     latest_quotes = latest_quotes or {}
+    quote_history = quote_history or {}
+    option_symbols = option_symbols or {}
     for symbol in config.selected_symbols:
         result = states.get(symbol) or {}
         pattern = result.get("pattern") if isinstance(result.get("pattern"), dict) else {}
         quote = latest_quotes.get(symbol) or {}
+        movement = summarize_quote_movement(quote_history.get(symbol) or [])
+        option_symbol = option_symbols.get(symbol, "")
+        option_points = quote_history.get(option_symbol) or []
+        option_movement = summarize_quote_movement(option_points)
         evaluation = evaluations_by_symbol.get(symbol) or {}
         latest_price = quote.get("ltp") or evaluation.get("live_cmp") or 0
         latest_quote_time = quote.get("quote_timestamp_ist") or result.get("quote_timestamp_ist") or "-"
@@ -851,6 +904,10 @@ def build_monitor_rows(
                 "spot": latest_price,
                 "day_change_pct": quote.get("day_change_pct"),
                 "quote_timestamp_ist": latest_quote_time,
+                **movement,
+                "option_symbol": option_symbol,
+                "option_ltp": option_points[-1].get("price") if option_points else None,
+                "option_movement": option_movement,
                 "pattern_phase": phase,
                 "initial_decline": pattern.get("initial_decline_percent", 0),
                 "rebound": pattern.get("rebound_percent", 0),

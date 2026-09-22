@@ -521,9 +521,9 @@
     "enabled": true,
     "end_time": "15:15",
     "interval_minutes": 15,
-    "last_run_at": "15 Sep 2026 12:00:12 IST",
-    "last_slot": "12:00",
-    "last_slot_key": "2026-09-15:12:00",
+    "last_run_at": "15 Sep 2026 12:15:10 IST",
+    "last_slot": "12:15",
+    "last_slot_key": "2026-09-15:12:15",
     "loss_limit_evaluations": [
       {
         "action": "NO_ACTION",
@@ -704,7 +704,7 @@
     "pe_risk_evaluations": [],
     "profile": "Shanti",
     "results": [],
-    "run_count_today": 10,
+    "run_count_today": 11,
     "run_date": "2026-09-15",
     "start_time": "09:30",
     "status": "ERROR"

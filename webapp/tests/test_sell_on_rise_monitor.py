@@ -12,6 +12,8 @@ from sell_on_rise_monitor import (
     build_completed_candles_from_quotes,
     evaluate_pattern,
     monitoring_window,
+    summarize_quote_movement,
+    build_monitor_rows,
     signal_idempotency_key,
     validate_monitor_config,
 )
@@ -172,6 +174,36 @@ def test_latest_observations_return_price_from_scan_call(tmp_path):
     assert latest["TEST"]["ltp"] == 101.5
     assert latest["TEST"]["day_change_pct"] == 1.7
     assert latest["TEST"]["quote_timestamp_ist"] == "2026-09-11T09:31:00+05:30"
+
+
+def test_quote_movement_distinguishes_rise_top_and_decline():
+    now = _ts(31)
+    def observations(prices):
+        return [QuoteObservation("TEST", _ts(30) + timedelta(seconds=10 * index), price) for index, price in enumerate(prices)]
+
+    assert summarize_quote_movement(observations([100, 100.1, 100.2, 100.3]), now=now)["movement"] == "STILL RISING"
+    assert summarize_quote_movement(observations([100, 100.3, 100.24, 100.20]), now=now)["movement"] == "TOPPING WATCH"
+    decline = summarize_quote_movement(observations([100, 100.4, 100.3, 100.2]), now=now)
+    assert decline["movement"] == "DECLINE STARTING"
+    assert decline["pullback_pct"] > 0.15
+    assert summarize_quote_movement(observations([100, 100.4, 100.3, 100.2]), now=_ts(32))["movement"] == "STALE QUOTE"
+
+
+def test_monitor_row_reports_option_movement_separately():
+    now = datetime.now(IST).replace(microsecond=0)
+    option_points = [
+        {"timestamp_ist": (now - timedelta(seconds=30 - index * 10)).isoformat(), "price": price}
+        for index, price in enumerate([20.0, 20.4, 20.3, 20.2])
+    ]
+    rows = build_monitor_rows(
+        _valid_config(), None, {}, {"TEST": {"best_ce_symbol": "TEST26SEP105CE"}},
+        latest_quotes={"TEST": {"ltp": 100.0}},
+        quote_history={"TEST26SEP105CE": option_points},
+        option_symbols={"TEST": "TEST26SEP105CE"},
+    )
+    assert rows[0]["option_symbol"] == "TEST26SEP105CE"
+    assert rows[0]["option_ltp"] == 20.2
+    assert rows[0]["option_movement"]["movement"] == "DECLINE STARTING"
 
 
 def test_clear_audit_rows_only_removes_monitor_logs(tmp_path):
