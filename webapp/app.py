@@ -187,6 +187,7 @@ from sell_on_rise_monitor import (
     validate_monitor_config,
     now_ist as sell_on_rise_now_ist,
     parse_ist_datetime as sell_on_rise_parse_ist_datetime,
+    MARKET_DATA_CLEAR as SELL_ON_RISE_MARKET_DATA_CLEAR,
 )
 
 DHAN_DEFAULT_BUY_LIMIT_DISCOUNT_PCT = 0.0
@@ -7807,6 +7808,7 @@ class PageState:
     ai52_monitor_rows: list[dict[str, Any]] | None = None
     ai52_monitor_audit_rows: list[dict[str, Any]] | None = None
     ai52_monitor_show_audit: bool = False
+    ai52_monitor_storage_health: dict[str, Any] | None = None
     pnl_period: str = "This Month"
     pnl_year: int = field(default_factory=lambda: datetime.now().year)
     pnl_from_date: str = ""
@@ -26507,6 +26509,8 @@ def render_sector_income_panel(state: PageState) -> str:
 def load_ai52_state(state: PageState) -> None:
     repository = FiftyTwoWeekAiRepository(APP_DB_PATH)
     monitor_repository = SellOnRiseMonitorRepository(APP_DB_PATH)
+    monitor_repository.clear_market_data_after_close()
+    state.ai52_monitor_storage_health = monitor_repository.enforce_storage_health()
     snapshot = repository.latest_candidate_snapshot()
     if snapshot and not state.ai52_candidates:
         state.ai52_candidates = list(snapshot.get("rows") or [])
@@ -26556,7 +26560,7 @@ def load_ai52_state(state: PageState) -> None:
         for symbol in monitor_config.selected_symbols
     }
     monitor_quote_history = {
-        symbol: monitor_repository.observations(session_id, symbol)[-12:]
+        symbol: monitor_repository.observations(session_id, symbol)
         for symbol in set(monitor_config.selected_symbols) | {value for value in monitor_option_symbols.values() if value}
     } if session_id else {}
     state.ai52_monitor_rows = build_monitor_rows(
@@ -26652,7 +26656,7 @@ def sync_ai52_monitor_with_imported_candidates(state: PageState, source: str) ->
     ]
     unique_symbols = list(dict.fromkeys(symbols))
     repository = SellOnRiseMonitorRepository(APP_DB_PATH)
-    repository.stop_session()
+    cleared = repository.clear_all_market_data(status="STOPPED_UNIVERSE_REFRESH")
     config = SellOnRiseMonitorConfig.from_dict(state.ai52_monitor_config or repository.load_config().to_dict())
     config.selected_symbols = unique_symbols
     config.execution_mode = "ALERT_ONLY"
@@ -26671,7 +26675,11 @@ def sync_ai52_monitor_with_imported_candidates(state: PageState, source: str) ->
     state.ai52_monitor_config = config.to_dict()
     state.ai52_monitor_session = session
     state.ai52_monitor_rows = []
-    return {"symbols": unique_symbols, "session_id": session.get("session_id") if session else ""}
+    return {
+        "symbols": unique_symbols,
+        "session_id": session.get("session_id") if session else "",
+        "cleared_points": int(cleared.get("sell_on_rise_quote_observation", 0)),
+    }
 
 
 def run_ai52_sell_on_rise_scan(state: PageState) -> dict[str, Any]:
@@ -26685,10 +26693,15 @@ def run_ai52_sell_on_rise_scan(state: PageState) -> dict[str, Any]:
     session_id = str(session.get("session_id") or "")
     if str(session.get("status") or "").upper() in {"STOPPED_BY_USER", "COMPLETED", "FAILED"}:
         raise ValueError("Start or schedule the Sell-on-Rise monitor before scanning.")
+    scan_clock = sell_on_rise_now_ist()
+    if scan_clock.weekday() < 5 and scan_clock.time().replace(tzinfo=None) >= SELL_ON_RISE_MARKET_DATA_CLEAR:
+        repository.clear_market_data_after_close(scan_clock)
+        load_ai52_state(state)
+        raise ValueError("Trading-day monitor closed at 15:50 IST. Intraday quote and chart data were cleared; start a new session on the next trading day.")
     broker = DhanBrokerAdapter(paper_trading=True)
     quotes = fetch_fresh_equity_quotes_from_kite(broker, config.selected_symbols)
     observations: list[QuoteObservation] = []
-    stamp = sell_on_rise_now_ist()
+    stamp = scan_clock
     api_failures = 0
     for symbol in config.selected_symbols:
         quote = quotes.get(symbol) or {}
@@ -26792,6 +26805,7 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
     monitor_config = SellOnRiseMonitorConfig.from_dict(state.ai52_monitor_config or {})
     monitor_session = state.ai52_monitor_session or {}
     monitor_rows = state.ai52_monitor_rows or []
+    storage_health = state.ai52_monitor_storage_health or {}
     hidden_monitor_config = html.escape(json.dumps(monitor_config.to_dict(), default=str), quote=True)
     hidden_monitor_session = html.escape(json.dumps(monitor_session, default=str), quote=True)
     hidden_monitor_rows = html.escape(json.dumps(monitor_rows, default=str), quote=True)
@@ -26998,9 +27012,22 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
         "</div>"
     )
     monitor_table_rows: list[str] = []
+    monitor_rows = sorted(
+        monitor_rows,
+        key=lambda item: abs(_dhan_metric_float(item.get("interval_return_pct"))),
+        reverse=True,
+    )
+    default_monitor_symbol = next(
+        (str(row.get("symbol") or "") for row in monitor_rows if str(row.get("decision") or "").upper() == "SELL_SIGNAL"),
+        str((monitor_rows[0] if monitor_rows else {}).get("symbol") or ""),
+    )
+    chart_rows_json = html.escape(json.dumps(monitor_rows, default=str), quote=True)
     for row in monitor_rows:
         decision = str(row.get("decision") or "OBSERVE").upper()
+        display_signal = "READY TO SELL" if row.get("ready_to_sell") else decision
         badge_class = "good" if decision in {"SELL_SIGNAL", "PREVIEW_REQUIRED", "ORDER_ALLOWED"} else "bad" if decision in {"ORDER_BLOCKED", "INVALIDATED"} else "neutral"
+        if row.get("ready_to_sell"):
+            badge_class = "good"
         movement = str(row.get("movement") or "WAITING FOR QUOTES")
         movement_class = "bad" if movement == "DECLINE STARTING" else "neutral"
         delta = row.get("delta_pct")
@@ -27010,42 +27037,28 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
         option_delta = option_movement.get("delta_pct")
         option_pullback = option_movement.get("pullback_pct")
         option_label = str(option_movement.get("movement") or "WAITING FOR QUOTES") if row.get("option_symbol") else "EVALUATE STOCK FIRST"
-        tape_items = []
-        for point in row.get("price_tape") or []:
-            direction = str(point.get("direction") or "flat")
-            direction_class = direction if direction in {"up", "down", "flat"} else "flat"
-            change = point.get("change_pct")
-            change_text = f"{float(change):+.3f}%" if change is not None else "first quote"
-            tape_items.append(
-                f'<span class="ai52-tape-quote {direction_class}" title="Kite stock quote at {html.escape(str(point.get("time") or "-"), quote=True)} IST">'
-                f'<small>{html.escape(str(point.get("time") or "-"))}</small> '
-                f'<strong>₹{money(point.get("price"))}</strong> <span class="ai52-tape-separator">|</span> '
-                f'<b>{html.escape(change_text)}</b></span>'
-            )
-        tape_html = ' <span class="ai52-tape-between">|</span> '.join(tape_items) if tape_items else '<span class="ai52-tape-empty">Waiting for the first live stock quote.</span>'
+        interval_return = row.get("interval_return_pct")
+        minute_return = row.get("one_minute_return_pct")
+        monitor_return = row.get("monitor_return_pct")
+        peak_return = row.get("off_recent_peak_pct")
+        signed = lambda value: f"{float(value):+.3f}%" if value is not None else "-"
+        return_class = lambda value: "positive" if _dhan_metric_float(value) > 0 else "negative" if _dhan_metric_float(value) < 0 else "unavailable"
         monitor_table_rows.append(
-            '<tr class="ai52-monitor-main-row">'
-            f"<td><strong>{html.escape(str(row.get('symbol') or '-'))}</strong></td>"
+            f'<tr class="ai52-monitor-main-row" data-symbol="{html.escape(str(row.get("symbol") or ""), quote=True)}">'
+            f"<td><button type=\"button\" class=\"mini-link ai52-monitor-select\" data-symbol=\"{html.escape(str(row.get('symbol') or ''), quote=True)}\"><strong>{html.escape(str(row.get('symbol') or '-'))}</strong><small>View 1-hour chart</small></button></td>"
             f"<td>{money(row.get('spot'))}</td>"
             f"<td>{money(row.get('day_change_pct'))}%<br><small>Quote {html.escape(str(row.get('quote_timestamp_ist') or '-'))}</small></td>"
-            f"<td><span class=\"ipo-badge {movement_class}\">{html.escape(movement)}</span><small>10s {f'{delta:+.3f}%' if delta is not None else '-'} | ~1m {f'{minute:+.3f}%' if minute is not None else '-'} | off recent peak {f'{pullback:.3f}%' if pullback is not None else '-'}</small></td>"
-            f"<td><strong>{html.escape(str(row.get('option_symbol') or '-'))}</strong><small>CE LTP {money(row.get('option_ltp'))} | {html.escape(option_label)}<br>10s {f'{option_delta:+.3f}%' if option_delta is not None else '-'} | off recent peak {f'{option_pullback:.3f}%' if option_pullback is not None else '-'}</small></td>"
+            f'<td class="ai52-move {return_class(interval_return)}">{signed(interval_return)}</td>'
+            f'<td class="ai52-move {return_class(minute_return)}">{signed(minute_return)}</td>'
+            f'<td class="ai52-move {return_class(monitor_return)}">{signed(monitor_return)}</td>'
+            f'<td class="ai52-move {return_class(peak_return)}">{signed(peak_return)}</td>'
             f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(str(row.get('pattern_phase') or '-'))}</span></td>"
-            f"<td>{money(row.get('initial_decline'))}%</td>"
-            f"<td>{money(row.get('rebound'))}%</td>"
-            f"<td>{html.escape(str(row.get('resistance') or '-'))}</td>"
-            f"<td>{html.escape(str(row.get('rejection') or '-'))}</td>"
-            f"<td>{html.escape(str(row.get('confirmation') or '-'))}</td>"
-            f"<td>{html.escape(str(row.get('short_ce') or '-'))}</td>"
-            f"<td>{html.escape(str(row.get('hedge_ce') or '-'))}</td>"
-            f"<td>{html.escape(str(row.get('lots') or 1))}</td>"
-            f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(decision)}</span><br><small>{html.escape(str(row.get('why') or ''))}</small></td>"
+            f"<td><span class=\"ipo-badge {badge_class}\">{html.escape(display_signal)}</span><small>{html.escape(str(row.get('message') or ''))}{' | Order gate: ' + html.escape(decision) if row.get('ready_to_sell') else ''}</small></td>"
             f"<td>{html.escape(str(row.get('last_scan') or '-'))}<br><small>{html.escape(str(row.get('candle_count') or 0))} candles</small></td>"
             "</tr>"
-            f'<tr class="ai52-monitor-price-row"><td colspan="16"><div class="ai52-price-tape"><span class="ai52-tape-label">{html.escape(str(row.get("symbol") or "-"))} · 10s stock price tape</span><div class="ai52-tape-items">{tape_html}</div></div></td></tr>'
         )
     if not monitor_table_rows:
-        monitor_table_rows.append('<tr><td colspan="16" class="muted-cell">No monitor state yet. Save configuration and start monitoring to collect fresh Kite quotes.</td></tr>')
+        monitor_table_rows.append('<tr><td colspan="11" class="muted-cell">No monitor state yet. Save configuration and start monitoring to collect fresh Kite quotes.</td></tr>')
 
     audit_rows_html = ""
     if state.ai52_monitor_show_audit:
@@ -27084,6 +27097,8 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
         <div class="panel-title">Sell-on-Rise Pattern Monitor</div>
         <p class="status">Kite stock and evaluated CE quotes refresh every {monitor_config.quote_check_interval_seconds}s while this page is open. Short-term topping/decline is an early watch indicator; the completed-candle rejection and existing risk checks still decide order eligibility. Monitoring requires this page/session to remain active.</p>
         <p class="status" id="ai52-monitor-refresh-status" aria-live="polite">{('Watching for the next quote.' if active_monitor else 'Start monitoring to collect quotes.')}</p>
+        {f'<div class="ai52-storage-warning"><strong>⚠ Monitor storage warning</strong><span>{html.escape(str(storage_health.get("total_points") or 0))} stored points; largest symbol {html.escape(str(storage_health.get("largest_symbol") or "-"))} has {html.escape(str(storage_health.get("largest_symbol_points") or 0))}. Hard guard {html.escape(str(storage_health.get("hard_limit") or 100000))} points.</span></div>' if storage_health.get('warning') else ''}
+        {f'<div class="ai52-storage-warning"><strong>⚠ Automatic health reset completed</strong><span>Cleared {html.escape(str(storage_health.get("deleted") or 0))} monitor-only rows after the hard storage limit was reached.</span></div>' if storage_health.get('cleared') else ''}
         {monitor_cards}
         <div class="ai52-monitor-symbols">{''.join(monitor_symbol_options)}</div>
         <div class="compact-grid">
@@ -27117,9 +27132,19 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
           <button type="submit" formaction="/52w-ai-call-spread/monitor-reset" class="secondary danger-link" onclick="return confirm('Reset today\\'s Sell-on-Rise pattern state? This will not cancel or modify broker orders.');">Reset Today’s Pattern State</button>
           <button type="submit" formaction="/52w-ai-call-spread/monitor-audit" class="secondary">View Audit Log</button>
           <button type="submit" formaction="/52w-ai-call-spread/monitor-stop-clear-logs" class="secondary danger-link" onclick="return confirm('Stop Sell-on-Rise monitoring and clear only the Created/Symbol/Type/Message audit log rows? Broker orders, pair monitor, quotes, signals, and config will not be changed.');">Stop &amp; Clear Logs</button>
+          <button type="submit" formaction="/52w-ai-call-spread/monitor-clear-market-data" class="danger" onclick="if(!confirm('Clear ALL 52W monitor stock-price history, pattern state and derived signals from server and browser? Broker orders, pair monitor, credentials and strategy configuration will remain unchanged.')) return false; sessionStorage.removeItem('ai52SelectedMonitorSymbols'); sessionStorage.removeItem('ai52ChartPeriod');">Clear All Price Data</button>
           <button type="submit" formaction="/52w-ai-call-spread/monitor-scan" class="success">Run Scan Now</button>
         </div>
-        <div class="table-wrap dhan-ten-row-scroll"><table id="ai52-monitor-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Stock</th><th class="sort-header" data-sort-col="1">Spot</th><th class="sort-header" data-sort-col="2">Day %</th><th>Stock movement</th><th>Evaluated CE movement</th><th>Pattern phase</th><th>Initial decline</th><th>Rebound</th><th>Resistance</th><th>Rejection</th><th>Confirmation</th><th>Short CE</th><th>Hedge CE</th><th>Lots</th><th>Decision</th><th>Last scan</th></tr></thead><tbody>{''.join(monitor_table_rows)}</tbody></table></div>
+        <div class="ai52-chart-controls">
+          <label><span>Sort stocks by</span><select id="ai52-monitor-sort"><option value="interval">Largest latest interval movement</option><option value="minute">Largest 1-minute movement</option><option value="day">Largest day movement</option><option value="pattern">Pattern priority</option><option value="name">Stock name</option></select></label>
+          <fieldset class="ai52-chart-symbols"><legend>Stocks on chart · maximum 6</legend>{''.join(f'<label><input type="checkbox" class="ai52-chart-symbol" value="{html.escape(str(row.get("symbol") or ""), quote=True)}"{" checked" if str(row.get("symbol") or "") == default_monitor_symbol else ""}> {html.escape(str(row.get("symbol") or "-"))}</label>' for row in monitor_rows)}</fieldset>
+          <label><span>View period</span><select id="ai52-chart-period"><option value="5">Last 5 min</option><option value="15">Last 15 min</option><option value="30">Last 30 min</option><option value="60">Last 1 hour</option><option value="120">Last 2 hours</option><option value="240">Last 4 hours</option><option value="420" selected>Full trading day</option></select></label>
+          <label><span>Significant move %</span><input id="ai52-chart-threshold" type="number" min="0" step="0.01" value="0.05"></label>
+          <div class="ai52-zoom-actions"><span>Time zoom</span><button type="button" id="ai52-chart-zoom-in" class="secondary">Zoom in</button><button type="button" id="ai52-chart-zoom-out" class="secondary">Zoom out</button></div>
+        </div>
+        <div class="table-wrap dhan-ten-row-scroll"><table id="ai52-monitor-table" class="ipo-table"><thead><tr><th>Stock</th><th>Spot</th><th>Day %</th><th>Latest {monitor_config.quote_check_interval_seconds}s %</th><th>1-min %</th><th>Monitor %</th><th>Off peak %</th><th>Pattern phase</th><th>Signal</th><th>Last quote</th></tr></thead><tbody>{''.join(monitor_table_rows)}</tbody></table></div>
+        <input type="hidden" id="ai52-monitor-chart-data" value="{chart_rows_json}">
+        <section class="ai52-chart-panel"><h3 id="ai52-chart-title">{html.escape(default_monitor_symbol or 'Select monitored stocks')} · Cumulative movement comparison</h3><div id="ai52-ready-sell-message" class="ai52-ready-sell-message" aria-live="polite"></div><div id="ai52-monitor-chart" class="ai52-monitor-chart" role="img" aria-label="Selected stocks cumulative and interval movement chart"></div><p class="status">The X-axis shows actual quote time in IST at 30-minute intervals. The signed Y-axis shows percentage movement above or below each stock’s first visible quote; the emphasized 0.00% START line is the common baseline. The current trading day is retained from 09:15 IST and cleared at 15:50 IST. Server storage is capped at 5,000 observations per symbol and browser chart data at 720 points per symbol. Multiple stocks use cumulative percentage for a comparable scale. “READY TO SELL” requires at least 20 consecutive rises followed immediately by four declines; order risk checks remain separate.</p></section>
         {audit_rows_html}
       </section>
     """
@@ -27149,15 +27174,15 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
         </div>
         <p class="status">52W AI order ticket uses selected lots. BUY hedge is sent first at live hedge reference minus the configured discount; SELL leg is parked at live SELL reference plus configured markup, then monitor can reprice after hedge fill. All option LIMIT prices are rounded to ₹0.05.</p>
         <div class="actions">
-          <button type="submit" formaction="/52w-ai-call-spread/refresh-screener" class="secondary">Refresh Screener</button>
-          <button type="submit" formaction="/52w-ai-call-spread/upload-csv">Upload CSV</button>
+          <button type="submit" formaction="/52w-ai-call-spread/refresh-screener" class="secondary" onclick="sessionStorage.removeItem('ai52SelectedMonitorSymbols');sessionStorage.removeItem('ai52ChartPeriod');">Refresh Screener</button>
+          <button type="submit" formaction="/52w-ai-call-spread/upload-csv" onclick="sessionStorage.removeItem('ai52SelectedMonitorSymbols');sessionStorage.removeItem('ai52ChartPeriod');">Upload CSV</button>
           <button type="submit" formaction="/52w-ai-call-spread/logout" class="secondary">Log out / Clear session</button>
         </div>
       </section>
       <section class="panel">
         <div class="panel-title">Imported Screener Candidates</div>
         <p class="status">Uses Screener data for idea discovery only. Execution CMP, option chain, and limit prices are reloaded from Kite before ticket creation.</p>
-        <div class="actions"><button type="submit" formaction="/52w-ai-call-spread/evaluate-all" class="success">Evaluate &amp; Rank All</button></div>
+        <div class="actions"><button type="submit" formaction="/52w-ai-call-spread/evaluate-all" class="success" onclick="sessionStorage.removeItem('ai52SelectedMonitorSymbols');sessionStorage.removeItem('ai52ChartPeriod');">Evaluate &amp; Rank All</button></div>
         <div class="table-wrap"><table id="ai52-candidate-table" class="ipo-table"><thead><tr><th class="sort-header" data-sort-col="0">Rank</th><th>Symbol</th><th>Company</th><th class="sort-header" data-sort-col="3">Live CMP</th><th>Screener CMP</th><th>52W High</th><th class="sort-header" data-sort-col="6">52W Gap %</th><th>52W State</th><th class="sort-header" data-sort-col="8">RSI</th><th class="sort-header" data-sort-col="9">ADX</th><th class="sort-header" data-sort-col="10">Vol Ratio</th><th class="sort-header" data-sort-col="11">Rejection</th><th class="sort-header" data-sort-col="12">Breakout</th><th class="sort-header" data-sort-col="13">Option Quality</th><th class="sort-header" data-sort-col="14">SELL Score</th><th>Decision</th><th>F&amp;O</th><th>Expiry</th><th>Updated</th></tr></thead><tbody>{''.join(candidate_rows)}</tbody></table></div>
       </section>
       {ai52_monitor_section}
@@ -38038,39 +38063,28 @@ def render_page(state: PageState) -> bytes:
       max-height: 260px;
       overflow: auto;
     }}
-    .ai52-monitor-price-row td {{
-      padding: 5px 10px 9px;
-      background: #f5f9fc;
-      border-bottom: 2px solid #d6e5ee;
-    }}
-    .ai52-price-tape {{
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      max-width: calc(100vw - 85px);
-      font-variant-numeric: tabular-nums;
-    }}
-    .ai52-tape-label {{
-      flex: 0 0 auto;
-      color: #475569;
-      font-size: 11px;
-      font-weight: 800;
-    }}
-    .ai52-tape-items {{
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      overflow-x: auto;
-      white-space: nowrap;
-      padding: 3px 0;
-    }}
-    .ai52-tape-quote {{ font-size: 12px; font-weight: 800; }}
-    .ai52-tape-quote small {{ color: #64748b; font-weight: 600; }}
-    .ai52-tape-quote.up, .ai52-tape-quote.up b {{ color: #15803d; }}
-    .ai52-tape-quote.down, .ai52-tape-quote.down b {{ color: #b42318; }}
-    .ai52-tape-quote.flat, .ai52-tape-quote.flat b {{ color: #475569; }}
-    .ai52-tape-separator, .ai52-tape-between {{ color: #94a3b8; }}
-    .ai52-tape-empty {{ color: #64748b; font-size: 12px; }}
+    .ai52-chart-controls {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin:10px 0; }}
+    .ai52-chart-controls label span {{ display:block; color:#64748b; font-size:11px; font-weight:800; margin-bottom:4px; }}
+    .ai52-chart-symbols {{ display:flex; flex-wrap:wrap; align-items:center; gap:6px 12px; border:1px solid #cbd5e1; border-radius:10px; padding:6px 10px; margin:0; }}
+    .ai52-chart-symbols legend {{ color:#64748b; font-size:11px; font-weight:800; padding:0 4px; }}
+    .ai52-chart-symbols label {{ display:flex; align-items:center; gap:4px; font-size:12px; font-weight:750; }}
+    .ai52-zoom-actions {{ display:flex; align-items:end; gap:6px; flex-wrap:wrap; }}
+    .ai52-zoom-actions > span {{ width:100%; color:#64748b; font-size:11px; font-weight:800; }}
+    .ai52-zoom-actions button {{ padding:7px 12px; min-height:34px; }}
+    .ai52-move {{ font-weight:850; font-variant-numeric:tabular-nums; }}
+    .ai52-move.positive {{ color:#15803d; background:#ecfdf3; }}
+    .ai52-move.negative {{ color:#b42318; background:#fff1f0; }}
+    .ai52-move.unavailable {{ color:#64748b; }}
+    .ai52-monitor-main-row.selected td {{ box-shadow:inset 0 2px #0f766e,inset 0 -2px #0f766e; }}
+    .ai52-chart-panel {{ margin-top:12px; padding:12px; border:1px solid #cbd5e1; border-radius:14px; background:#fbfdff; }}
+    .ai52-chart-panel h3 {{ margin:0 0 8px; color:#0f3b67; }}
+    .ai52-monitor-chart {{ width:100%; min-height:540px; overflow:hidden; }}
+    .ai52-monitor-chart svg {{ width:100%; height:540px; display:block; }}
+    .ai52-chart-tooltip {{ font-size:11px; }}
+    .ai52-ready-sell-message {{ display:none; margin:8px 0; padding:10px 12px; border:1px solid #22c55e; border-radius:10px; background:#ecfdf3; color:#166534; font-weight:900; }}
+    .ai52-ready-sell-message.visible {{ display:block; }}
+    .ai52-storage-warning {{ display:flex; gap:10px; align-items:center; margin:8px 0; padding:9px 12px; border:1px solid #f59e0b; border-radius:10px; background:#fffbeb; color:#92400e; font-size:12px; }}
+    .ai52-storage-warning strong {{ flex:0 0 auto; }}
     .dhan-it-call-pair-indicator {{
       display: inline-block;
       margin-top: 4px;
@@ -42136,6 +42150,133 @@ def render_page(state: PageState) -> bytes:
     ai52Go && ai52Go.addEventListener('click', (event) => {{
       submitOrderModal(event, ai52Modal, ai52Review, ai52Go);
     }});
+    function initAi52MovementChart() {{
+      const dataNode = document.getElementById('ai52-monitor-chart-data');
+      const chart = document.getElementById('ai52-monitor-chart');
+      const symbolChecks = Array.from(document.querySelectorAll('.ai52-chart-symbol'));
+      const periodSelect = document.getElementById('ai52-chart-period');
+      const zoomIn = document.getElementById('ai52-chart-zoom-in');
+      const zoomOut = document.getElementById('ai52-chart-zoom-out');
+      const thresholdInput = document.getElementById('ai52-chart-threshold');
+      const sortSelect = document.getElementById('ai52-monitor-sort');
+      const table = document.getElementById('ai52-monitor-table');
+      if (!dataNode || !chart || !symbolChecks.length || !table) return;
+      let rows = [];
+      try {{ rows = JSON.parse(dataNode.value || '[]'); }} catch (_error) {{ rows = []; }}
+      let storedSymbols = [];
+      try {{ storedSymbols = JSON.parse(sessionStorage.getItem('ai52SelectedMonitorSymbols') || '[]'); }} catch (_error) {{ storedSymbols = []; }}
+      if (storedSymbols.length) for (const check of symbolChecks) check.checked = storedSymbols.includes(check.value);
+      if (!symbolChecks.some(check => check.checked)) symbolChecks[0].checked = true;
+      const storedPeriod = sessionStorage.getItem('ai52ChartPeriod');
+      if (storedPeriod && periodSelect.querySelector(`option[value="${{storedPeriod}}"]`)) periodSelect.value = storedPeriod;
+      function signed(value) {{ return value == null ? '-' : `${{Number(value) >= 0 ? '+' : ''}}${{Number(value).toFixed(3)}}%`; }}
+      function render() {{
+        let symbols = symbolChecks.filter(check => check.checked).map(check => check.value);
+        if (!symbols.length) {{ symbolChecks[0].checked = true; symbols = [symbolChecks[0].value]; }}
+        if (symbols.length > 6) {{ symbols = symbols.slice(0, 6); for (const check of symbolChecks) check.checked = symbols.includes(check.value); }}
+        sessionStorage.setItem('ai52SelectedMonitorSymbols', JSON.stringify(symbols));
+        for (const tr of table.querySelectorAll('tbody tr[data-symbol]')) tr.classList.toggle('selected', symbols.includes(tr.dataset.symbol));
+        const selectedRows = symbols.map(symbol => rows.find(item => item.symbol === symbol)).filter(Boolean);
+        const minutes = Number(periodSelect && periodSelect.value || 60);
+        sessionStorage.setItem('ai52ChartPeriod', String(minutes));
+        const series = selectedRows.map(row => {{
+          const full = Array.isArray(row.history) ? row.history : [];
+          const latestMs = full.length ? Date.parse(full[full.length - 1].timestamp_ist) : 0;
+          const points = full.filter(point => Date.parse(point.timestamp_ist) >= latestMs - minutes * 60000);
+          const start = points.length ? Number(points[0].price) : 0;
+          return {{row, points: points.map(point => ({{...point, visible_return_pct: start ? (Number(point.price) / start - 1) * 100 : 0}}))}};
+        }}).filter(item => item.points.length >= 2);
+        const title = document.getElementById('ai52-chart-title');
+        if (title) title.textContent = `${{symbols.join(' | ')}} · Cumulative movement and scan returns`;
+        const readyRows = selectedRows.filter(item => item.ready_to_sell);
+        const readyBox = document.getElementById('ai52-ready-sell-message');
+        if (readyBox) {{ readyBox.classList.toggle('visible', readyRows.length > 0); readyBox.textContent = readyRows.length ? readyRows.map(item => `${{item.symbol}}: ${{item.message}} · Order gate: ${{item.decision || 'OBSERVE'}}`).join(' | ') : ''; }}
+        if (!series.length) {{ chart.innerHTML = '<div class="muted-cell">At least two valid stored quotes are required for a selected stock.</div>'; return; }}
+        const width = Math.max(760, chart.clientWidth || 1000), height = 560, left = 64, right = 22, top = 30, priceBottom = 330, barTop = 385, bottom = 500;
+        const allPoints = series.flatMap(item => item.points);
+        const earliest = Math.min(...allPoints.map(point => Date.parse(point.timestamp_ist))), latest = Math.max(...allPoints.map(point => Date.parse(point.timestamp_ist)));
+        const returns = allPoints.map(point => Number(point.visible_return_pct));
+        let minReturn = Math.min(0, ...returns), maxReturn = Math.max(0, ...returns);
+        if (maxReturn === minReturn) {{ maxReturn += .01; minReturn -= .01; }}
+        const returnPadding = Math.max((maxReturn - minReturn) * 0.08, 0.005);
+        maxReturn += returnPadding; minReturn -= returnPadding;
+        const x = timestamp => left + (Date.parse(timestamp) - earliest) * (width - left - right) / Math.max(1, latest - earliest);
+        const halfHourMs = 30 * 60 * 1000;
+        const firstHalfHour = Math.ceil(earliest / halfHourMs) * halfHourMs;
+        const tickTimes = [];
+        for (let tick = firstHalfHour; tick <= latest; tick += halfHourMs) tickTimes.push(tick);
+        if (!tickTimes.length) tickTimes.push(earliest);
+        const timeFormatter = new Intl.DateTimeFormat('en-IN', {{
+          hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata'
+        }});
+        const timeTicks = tickTimes.map(tick => {{
+          const tickX = x(new Date(tick).toISOString());
+          const label = timeFormatter.format(new Date(tick)).toUpperCase();
+          return `<g class="ai52-time-tick"><line x1="${{tickX}}" y1="${{top}}" x2="${{tickX}}" y2="${{bottom}}" stroke="#cbd5e1" stroke-dasharray="2 5" opacity=".6"/><line x1="${{tickX}}" y1="${{bottom}}" x2="${{tickX}}" y2="${{bottom+5}}" stroke="#64748b"/><text x="${{tickX}}" y="${{bottom+22}}" text-anchor="middle" fill="#475569" font-size="11">${{label}}</text></g>`;
+        }}).join('');
+        const yReturn = value => top + (maxReturn - value) * (priceBottom - top) / (maxReturn - minReturn);
+        const cumulativeTicks = Array.from({{length: 5}}, (_, index) => maxReturn - index * (maxReturn - minReturn) / 4).map(value => {{
+          const tickY = yReturn(value);
+          const label = `${{value > 0 ? '+' : ''}}${{value.toFixed(2)}}%`;
+          const color = value > 0 ? '#15803d' : value < 0 ? '#b42318' : '#334155';
+          return `<g class="ai52-return-tick"><line x1="${{left}}" y1="${{tickY}}" x2="${{width-right}}" y2="${{tickY}}" stroke="#dbe4ea" stroke-dasharray="3 5"/><text x="${{left-8}}" y="${{tickY+4}}" text-anchor="end" fill="${{color}}" font-size="11" font-weight="700">${{label}}</text></g>`;
+        }}).join('');
+        const startBaselineY = yReturn(0);
+        const startBaseline = `<g class="ai52-start-baseline"><line x1="${{left}}" y1="${{startBaselineY}}" x2="${{width-right}}" y2="${{startBaselineY}}" stroke="#0f172a" stroke-width="1.8"/><text x="${{left+7}}" y="${{startBaselineY-6}}" fill="#0f172a" font-size="11" font-weight="800">START 0.00%</text></g>`;
+        const moves = allPoints.map(point => Number(point.interval_return_pct || 0));
+        const moveRange = Math.max(0.01, ...moves.map(Math.abs));
+        const zeroY = (barTop + bottom) / 2;
+        const yMove = move => zeroY - move * ((bottom - barTop) / 2) / moveRange;
+        const threshold = Number(thresholdInput && thresholdInput.value || 0.05);
+        const maxUp = Math.max(...moves), maxDown = Math.min(...moves);
+        const thresholdY = yMove(threshold), negativeThresholdY = yMove(-threshold);
+        const thresholdLines = `<line x1="${{left}}" y1="${{thresholdY}}" x2="${{width-right}}" y2="${{thresholdY}}" stroke="#15803d" stroke-dasharray="4 4" opacity=".45"/><line x1="${{left}}" y1="${{negativeThresholdY}}" x2="${{width-right}}" y2="${{negativeThresholdY}}" stroke="#b42318" stroke-dasharray="4 4" opacity=".45"/>`;
+        const colors = ['#0f766e','#2563eb','#9333ea','#ea580c','#0891b2','#be123c','#4d7c0f','#7c3aed'];
+        const lines = series.map((item,seriesIndex) => {{
+          const color = colors[seriesIndex % colors.length];
+          const line = item.points.map(point => `${{x(point.timestamp_ist).toFixed(1)}},${{yReturn(point.visible_return_pct).toFixed(1)}}`).join(' ');
+          const dots = item.points.map(point => `<circle cx="${{x(point.timestamp_ist)}}" cy="${{yReturn(point.visible_return_pct)}}" r="2.3" fill="${{color}}"><title>${{item.row.symbol}} | ${{point.time}} IST | ₹${{Number(point.price).toFixed(2)}} | cumulative ${{signed(point.visible_return_pct)}} | interval ${{signed(point.interval_return_pct)}}</title></circle>`).join('');
+          return `<polyline points="${{line}}" fill="none" stroke="${{color}}" stroke-width="2" vector-effect="non-scaling-stroke"/>${{dots}}<text x="${{width-right-80}}" y="${{yReturn(item.points[item.points.length-1].visible_return_pct)-4}}" fill="${{color}}" font-size="11" font-weight="700">${{item.row.symbol}}</text>`;
+        }}).join('');
+        const startMarkers = series.map((item, seriesIndex) => {{
+          const first = item.points[0], color = colors[seriesIndex % colors.length];
+          return `<circle cx="${{x(first.timestamp_ist)}}" cy="${{startBaselineY}}" r="4.5" fill="#fff" stroke="${{color}}" stroke-width="2"><title>${{item.row.symbol}} comparison starts here at 0.00%</title></circle>`;
+        }}).join('');
+        const bars = series.flatMap((item,seriesIndex) => item.points.map(point => ({{...point, symbol:item.row.symbol, seriesIndex}}))).map(point => {{
+          const move = Number(point.interval_return_pct || 0), bx = x(point.timestamp_ist) + point.seriesIndex * 3, by = yMove(move), color = move > 0 ? '#15803d' : move < 0 ? '#b42318' : '#94a3b8';
+          const opacity = Math.abs(move) >= threshold ? 1 : 0.35;
+          const marker = move === maxUp || move === maxDown ? `<circle cx="${{bx}}" cy="${{by}}" r="4" fill="${{color}}"/>` : '';
+          return `<g><rect x="${{bx-1.5}}" y="${{Math.min(by,zeroY)}}" width="3" height="${{Math.max(1,Math.abs(zeroY-by))}}" fill="${{color}}" opacity="${{opacity}}"><title>${{point.symbol}} | ${{point.time}} IST | interval ${{signed(point.interval_return_pct)}}</title></rect>${{marker}}</g>`;
+        }}).join('');
+        chart.innerHTML = `<svg viewBox="0 0 ${{width}} ${{height}}" preserveAspectRatio="none" aria-label="Selected stocks cumulative movement chart">${{timeTicks}}${{cumulativeTicks}}${{startBaseline}}<line x1="${{left}}" y1="${{priceBottom}}" x2="${{width-right}}" y2="${{priceBottom}}" stroke="#cbd5e1"/><line x1="${{left}}" y1="${{zeroY}}" x2="${{width-right}}" y2="${{zeroY}}" stroke="#64748b"/>${{thresholdLines}}<text x="8" y="${{top+10}}" fill="#475569" font-size="12">Move from start</text><text x="8" y="${{barTop+8}}" fill="#475569" font-size="12">Interval %</text>${{lines}}${{startMarkers}}${{bars}}</svg>`;
+      }}
+      function sortRows() {{
+        const mode = sortSelect ? sortSelect.value : 'interval';
+        const values = {{interval:'interval_return_pct', minute:'one_minute_return_pct', day:'day_change_pct'}};
+        const priority = {{REJECTION_CONFIRMED:6, REJECTION_CANDIDATE:5, RESISTANCE_TEST:4, REBOUND_IN_PROGRESS:3, INITIAL_MOVE_IDENTIFIED:2, OBSERVING:1, INVALIDATED:0}};
+        rows.sort((a,b) => mode === 'name' ? String(a.symbol).localeCompare(String(b.symbol)) : mode === 'pattern' ? Number(priority[b.pattern_phase] || 0) - Number(priority[a.pattern_phase] || 0) : Math.abs(Number(b[values[mode]] || 0)) - Math.abs(Number(a[values[mode]] || 0)));
+        const tbody = table.tBodies[0];
+        for (const item of rows) {{ const tr = tbody.querySelector(`tr[data-symbol="${{CSS.escape(item.symbol)}}"]`); if (tr) tbody.appendChild(tr); }}
+      }}
+      for (const button of table.querySelectorAll('.ai52-monitor-select')) button.addEventListener('click', () => {{
+        const check = symbolChecks.find(item => item.value === button.dataset.symbol);
+        if (check) check.checked = !check.checked;
+        render();
+      }});
+      for (const check of symbolChecks) check.addEventListener('change', render);
+      periodSelect && periodSelect.addEventListener('change', render); thresholdInput && thresholdInput.addEventListener('input', render);
+      const zoomPeriods = [5, 15, 30, 60, 120, 240, 420];
+      function changeZoom(direction) {{
+        const current = Number(periodSelect.value), index = Math.max(0, zoomPeriods.indexOf(current));
+        periodSelect.value = String(zoomPeriods[Math.max(0, Math.min(zoomPeriods.length - 1, index + direction))]);
+        render();
+      }}
+      zoomIn && zoomIn.addEventListener('click', () => changeZoom(-1));
+      zoomOut && zoomOut.addEventListener('click', () => changeZoom(1));
+      sortSelect && sortSelect.addEventListener('change', () => {{ sortRows(); render(); }});
+      sortRows(); render();
+    }}
+    initAi52MovementChart();
     let ai52ScanBusy = false;
     async function refreshAi52Monitor() {{
       const panel = document.getElementById('ai52-monitor-panel');
@@ -42160,6 +42301,7 @@ def render_page(state: PageState) -> bytes:
         }}
         panel.replaceWith(panelNext);
         enableTableSorting(document.getElementById('ai52-monitor-table'));
+        initAi52MovementChart();
       }} catch (error) {{
         const currentStatus = document.getElementById('ai52-monitor-refresh-status');
         if (currentStatus) currentStatus.textContent = `Quote refresh failed: ${{error.message}}. Use Run Scan Now to retry.`;
@@ -46486,7 +46628,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     sync = sync_ai52_monitor_with_imported_candidates(state, "SCREENER_CSV_EXPORT")
                     state.message = (
                         f"Imported {len(rows)} 52W AI Screener candidate row(s). "
-                        f"Stopped active Sell-on-Rise monitor and refreshed monitor table for {len(sync.get('symbols') or [])} stock(s)."
+                        f"Stopped active Sell-on-Rise monitor, cleared {sync.get('cleared_points', 0)} stored quote point(s), "
+                        f"and refreshed monitor table for {len(sync.get('symbols') or [])} stock(s)."
                     )
                 except ScreenerManualExportRequired:
                     state.message = "Manual login/export required. Download the Screener CSV export and upload it here."
@@ -46508,7 +46651,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 load_ai52_state(state)
                 state.message = (
                     f"Uploaded and normalized {len(rows)} 52W AI candidate row(s). "
-                    f"Stopped active Sell-on-Rise monitor and refreshed monitor table for {len(sync.get('symbols') or [])} stock(s)."
+                    f"Stopped active Sell-on-Rise monitor, cleared {sync.get('cleared_points', 0)} stored quote point(s), "
+                    f"and refreshed monitor table for {len(sync.get('symbols') or [])} stock(s)."
                 )
             elif request_path == "/52w-ai-call-spread/evaluate-one":
                 if not state.ai52_candidates:
@@ -46549,7 +46693,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 tradable = sum(1 for row in evaluations if str(row.get("decision") or "").upper() in {"A+ SELL", "A SELL", "WATCH FOR REJECTION"})
                 state.message = (
                     f"Evaluated and ranked {len(evaluations)} 52W AI candidate(s) from Kite data. "
-                    f"{tradable} candidate(s) are not hard-blocked. Sell-on-Rise monitor was stopped and refreshed for {len(sync.get('symbols') or [])} stock(s)."
+                    f"{tradable} candidate(s) are not hard-blocked. Sell-on-Rise monitor was stopped, "
+                    f"{sync.get('cleared_points', 0)} stored quote point(s) were cleared, and the monitor was refreshed "
+                    f"for {len(sync.get('symbols') or [])} stock(s)."
                 )
             elif request_path == "/52w-ai-call-spread/logout":
                 state.ai52_selected_preview = None
@@ -46694,6 +46840,16 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.ai52_monitor_show_audit = True
                 load_ai52_state(state)
                 state.message = f"Reset today's Sell-on-Rise pattern state ({deleted} local monitor row(s) cleared). Broker orders were not changed."
+            elif request_path == "/52w-ai-call-spread/monitor-clear-market-data":
+                deleted = SellOnRiseMonitorRepository(APP_DB_PATH).clear_all_market_data(status="STOPPED_FULL_RESET")
+                state.ai52_monitor_show_audit = False
+                load_ai52_state(state)
+                state.message = (
+                    f"Cleared all 52W monitor price data: {deleted.get('sell_on_rise_quote_observation', 0)} quote row(s), "
+                    f"{deleted.get('sell_on_rise_pattern_state', 0)} pattern row(s), and "
+                    f"{deleted.get('sell_on_rise_signal', 0)} derived signal row(s). "
+                    "Broker orders, pair monitor, credentials, and strategy configuration were preserved."
+                )
             elif request_path == "/52w-ai-call-spread/monitor-audit":
                 state.ai52_monitor_show_audit = True
                 load_ai52_state(state)

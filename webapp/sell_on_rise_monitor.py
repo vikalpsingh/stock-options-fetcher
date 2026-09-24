@@ -21,6 +21,12 @@ from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 VALID_TIMEFRAMES = {1, 3, 5, 10, 15}
+MARKET_DATA_START = time(9, 15)
+MARKET_DATA_CLEAR = time(15, 50)
+MONITOR_HISTORY_MAX_POINTS = 5000
+MONITOR_BROWSER_MAX_POINTS = 720
+MONITOR_STORAGE_WARN_POINTS = 75000
+MONITOR_STORAGE_HARD_POINTS = 100000
 MONITOR_PHASES = {
     "OBSERVING",
     "INITIAL_MOVE_IDENTIFIED",
@@ -316,6 +322,87 @@ def build_price_tape(observations: Iterable[dict[str, Any]], limit: int = 12) ->
             "direction": "up" if change_pct and change_pct > 0 else "down" if change_pct and change_pct < 0 else "flat",
         })
     return result[-max(1, limit):]
+
+
+def calculate_monitor_history(observations: Iterable[dict[str, Any]], *, max_age_seconds: int = 7 * 3600, max_points: int = MONITOR_HISTORY_MAX_POINTS) -> list[dict[str, Any]]:
+    """Normalize a bounded current-day quote series and calculate timestamp-aware returns."""
+    by_timestamp: dict[datetime, dict[str, Any]] = {}
+    for item in observations:
+        stamp = parse_ist_datetime(item.get("timestamp_ist"))
+        price = _to_float(item.get("price"))
+        if stamp and price > 0:
+            by_timestamp[stamp] = {"timestamp_ist": stamp, "price": price, "day_change_pct": item.get("day_change_pct")}
+    ordered = [by_timestamp[key] for key in sorted(by_timestamp)]
+    if not ordered:
+        return []
+    last_stamp = ordered[-1]["timestamp_ist"]
+    market_open = datetime.combine(last_stamp.date(), MARKET_DATA_START, tzinfo=IST)
+    cutoff = max(market_open, last_stamp - timedelta(seconds=max(60, int(max_age_seconds))))
+    ordered = [item for item in ordered if item["timestamp_ist"] >= cutoff and item["timestamp_ist"].date() == last_stamp.date()][-max(2, int(max_points)):]
+    first_price = ordered[0]["price"]
+    peak = 0.0
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(ordered):
+        stamp = item["timestamp_ist"]
+        price = item["price"]
+        previous = ordered[index - 1]["price"] if index else None
+        minute_anchor = next((prior["price"] for prior in reversed(ordered[:index]) if prior["timestamp_ist"] <= stamp - timedelta(seconds=60)), None)
+        peak = max(peak, price)
+        interval_pct = ((price / previous) - 1) * 100 if previous else None
+        minute_pct = ((price / minute_anchor) - 1) * 100 if minute_anchor else None
+        result.append({
+            "timestamp_ist": stamp.isoformat(timespec="seconds"),
+            "time": stamp.strftime("%H:%M:%S"),
+            "price": round(price, 2),
+            "interval_return_pct": round(interval_pct, 4) if interval_pct is not None else None,
+            "one_minute_return_pct": round(minute_pct, 4) if minute_pct is not None else None,
+            "monitor_return_pct": round(((price / first_price) - 1) * 100, 4),
+            "off_recent_peak_pct": round(((price / peak) - 1) * 100, 4),
+            "day_change_pct": item.get("day_change_pct"),
+        })
+    return result
+
+
+def downsample_monitor_history(history: list[dict[str, Any]], max_points: int = MONITOR_BROWSER_MAX_POINTS) -> list[dict[str, Any]]:
+    """Bound browser payload while preserving endpoints and local extremes."""
+    if len(history) <= max_points:
+        return list(history)
+    bucket_count = max(1, (max_points - 2) // 2)
+    middle = history[1:-1]
+    bucket_size = max(1, (len(middle) + bucket_count - 1) // bucket_count)
+    selected: list[dict[str, Any]] = [history[0]]
+    for offset in range(0, len(middle), bucket_size):
+        bucket = middle[offset : offset + bucket_size]
+        low = min(bucket, key=lambda item: _to_float(item.get("price")))
+        high = max(bucket, key=lambda item: _to_float(item.get("price")))
+        for point in sorted({low["timestamp_ist"]: low, high["timestamp_ist"]: high}.values(), key=lambda item: item["timestamp_ist"]):
+            selected.append(point)
+    selected.append(history[-1])
+    return selected[: max_points - 1] + [history[-1]] if len(selected) > max_points else selected
+
+
+def detect_rise_then_decline(history: list[dict[str, Any]], minimum_rises: int = 20, decline_points: int = 4) -> dict[str, Any]:
+    """Detect a sustained rise followed immediately by a four-observation decline."""
+    required = max(1, int(minimum_rises)) + max(1, int(decline_points)) + 1
+    if len(history) < required:
+        return {"ready_to_sell": False, "rise_count": 0, "decline_count": 0, "message": "Building rise/decline history"}
+    prices = [_to_float(point.get("price")) for point in history]
+    decline_count = 0
+    cursor = len(prices) - 1
+    while cursor > 0 and prices[cursor] < prices[cursor - 1]:
+        decline_count += 1
+        cursor -= 1
+    rise_count = 0
+    while cursor > 0 and prices[cursor] > prices[cursor - 1]:
+        rise_count += 1
+        cursor -= 1
+    ready = rise_count >= minimum_rises and decline_count >= decline_points
+    return {
+        "ready_to_sell": ready,
+        "rise_count": rise_count,
+        "decline_count": decline_count,
+        "message": f"READY TO SELL: {rise_count} consecutive rises followed by {decline_count} declines" if ready else f"Rise {rise_count}/{minimum_rises} | decline {decline_count}/{decline_points}",
+    }
 
 
 def _resistance_zone(candles: list[Candle], config: SellOnRiseMonitorConfig, evaluation: dict[str, Any] | None) -> dict[str, Any]:
@@ -729,12 +816,95 @@ class SellOnRiseMonitorRepository:
                 conn.execute("UPDATE sell_on_rise_monitor_session SET status='STOPPED_BY_USER', updated_at=? WHERE session_id=?", (ist_text(), session_id))
         return deleted
 
+    def clear_market_data_after_close(self, current: datetime | None = None) -> int:
+        """Clear current trading-day quote/pattern data at or after 15:50 IST."""
+        stamp = (current or now_ist()).astimezone(IST)
+        if stamp.weekday() >= 5 or stamp.time().replace(tzinfo=None) < MARKET_DATA_CLEAR:
+            return 0
+        trading_date = stamp.date().isoformat()
+        deleted = 0
+        with self.connect() as conn:
+            sessions = conn.execute(
+                "SELECT session_id FROM sell_on_rise_monitor_session WHERE trading_date=?",
+                (trading_date,),
+            ).fetchall()
+            for row in sessions:
+                session_id = row["session_id"]
+                for table in ("sell_on_rise_quote_observation", "sell_on_rise_pattern_state"):
+                    cursor = conn.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
+                    deleted += int(cursor.rowcount or 0)
+                conn.execute(
+                    "UPDATE sell_on_rise_monitor_session SET status='COMPLETED', next_scan_at=NULL, updated_at=? WHERE session_id=?",
+                    (stamp.isoformat(timespec="seconds"), session_id),
+                )
+        return deleted
+
+    def clear_all_market_data(self, status: str = "STOPPED_BY_USER") -> dict[str, int]:
+        """Clear only 52W monitor quote, pattern, and derived signal rows."""
+        deleted: dict[str, int] = {}
+        with self.connect() as conn:
+            for table in ("sell_on_rise_quote_observation", "sell_on_rise_pattern_state", "sell_on_rise_signal"):
+                cursor = conn.execute(f"DELETE FROM {table}")
+                deleted[table] = int(cursor.rowcount or 0)
+            conn.execute(
+                "UPDATE sell_on_rise_monitor_session SET status=?, next_scan_at=NULL, updated_at=?",
+                (status, ist_text()),
+            )
+        return deleted
+
+    def enforce_storage_health(self) -> dict[str, Any]:
+        """Bound monitor storage; hard pressure clears monitor-only runtime data."""
+        with self.connect() as conn:
+            total = int(conn.execute("SELECT COUNT(*) FROM sell_on_rise_quote_observation").fetchone()[0])
+            largest_row = conn.execute(
+                "SELECT symbol, COUNT(*) AS count FROM sell_on_rise_quote_observation GROUP BY symbol ORDER BY count DESC LIMIT 1"
+            ).fetchone()
+        largest_symbol = str(largest_row["symbol"] or "") if largest_row else ""
+        largest_count = int(largest_row["count"] or 0) if largest_row else 0
+        warning = total >= MONITOR_STORAGE_WARN_POINTS or largest_count >= int(MONITOR_HISTORY_MAX_POINTS * 0.8)
+        cleared = False
+        deleted = 0
+        if total >= MONITOR_STORAGE_HARD_POINTS:
+            result = self.clear_all_market_data(status="STOPPED_STORAGE_GUARD")
+            deleted = sum(result.values())
+            cleared = True
+            total = 0
+            largest_count = 0
+        return {
+            "total_points": total,
+            "largest_symbol": largest_symbol,
+            "largest_symbol_points": largest_count,
+            "warning": warning,
+            "hard_limit": MONITOR_STORAGE_HARD_POINTS,
+            "warning_limit": MONITOR_STORAGE_WARN_POINTS,
+            "cleared": cleared,
+            "deleted": deleted,
+        }
+
     def save_observations(self, session_id: str, observations: list[QuoteObservation]) -> int:
         count = 0
+        if observations:
+            newest = max(item.timestamp_ist.astimezone(IST) for item in observations)
+            if newest.weekday() < 5 and newest.time().replace(tzinfo=None) >= MARKET_DATA_CLEAR:
+                self.clear_market_data_after_close(newest)
+                return 0
         with self.connect() as conn:
-            for obs in observations:
+            latest_by_symbol: dict[str, datetime] = {}
+            for obs in sorted(observations, key=lambda item: item.timestamp_ist):
+                symbol = str(obs.symbol or "").strip().upper()
+                stamp = obs.timestamp_ist.astimezone(IST)
+                if not symbol or obs.price <= 0:
+                    continue
+                if symbol not in latest_by_symbol:
+                    row = conn.execute(
+                        "SELECT MAX(timestamp_ist) AS latest FROM sell_on_rise_quote_observation WHERE session_id=? AND symbol=?",
+                        (session_id, symbol),
+                    ).fetchone()
+                    latest_by_symbol[symbol] = parse_ist_datetime(row["latest"]) if row and row["latest"] else datetime.min.replace(tzinfo=IST)
+                if stamp <= latest_by_symbol[symbol]:
+                    continue
                 observation_id = hashlib.sha256(
-                    f"{session_id}|{obs.symbol}|{obs.timestamp_ist.isoformat()}|{obs.price}".encode("utf-8")
+                    f"{session_id}|{symbol}|{stamp.isoformat()}".encode("utf-8")
                 ).hexdigest()
                 cursor = conn.execute(
                     """
@@ -745,21 +915,40 @@ class SellOnRiseMonitorRepository:
                     (
                         observation_id,
                         session_id,
-                        obs.symbol,
-                        obs.timestamp_ist.astimezone(IST).isoformat(timespec="seconds"),
+                        symbol,
+                        stamp.isoformat(timespec="seconds"),
                         obs.price,
                         obs.volume,
                         obs.day_change_pct,
                     ),
                 )
                 count += int(cursor.rowcount or 0)
+                latest_by_symbol[symbol] = stamp
+            for symbol, latest in latest_by_symbol.items():
+                cutoff = datetime.combine(latest.date(), MARKET_DATA_START, tzinfo=IST).isoformat(timespec="seconds")
+                conn.execute(
+                    "DELETE FROM sell_on_rise_quote_observation WHERE session_id=? AND symbol=? AND timestamp_ist < ?",
+                    (session_id, symbol, cutoff),
+                )
+                conn.execute(
+                    """DELETE FROM sell_on_rise_quote_observation WHERE observation_id IN (
+                           SELECT observation_id FROM sell_on_rise_quote_observation
+                           WHERE session_id=? AND symbol=? ORDER BY timestamp_ist DESC LIMIT -1 OFFSET ?
+                       )""",
+                    (session_id, symbol, MONITOR_HISTORY_MAX_POINTS),
+                )
+        self.enforce_storage_health()
         return count
 
-    def observations(self, session_id: str, symbol: str) -> list[dict[str, Any]]:
+    def observations(self, session_id: str, symbol: str, limit: int = MONITOR_HISTORY_MAX_POINTS) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT symbol, timestamp_ist, price, volume, day_change_pct FROM sell_on_rise_quote_observation WHERE session_id=? AND symbol=? ORDER BY timestamp_ist",
-                (session_id, symbol.upper()),
+                """SELECT symbol, timestamp_ist, price, volume, day_change_pct FROM (
+                       SELECT symbol, timestamp_ist, price, volume, day_change_pct
+                       FROM sell_on_rise_quote_observation WHERE session_id=? AND symbol=?
+                       ORDER BY timestamp_ist DESC LIMIT ?
+                   ) ORDER BY timestamp_ist""",
+                (session_id, symbol.upper(), max(2, min(int(limit), MONITOR_HISTORY_MAX_POINTS))),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -908,8 +1097,10 @@ def build_monitor_rows(
         result = states.get(symbol) or {}
         pattern = result.get("pattern") if isinstance(result.get("pattern"), dict) else {}
         quote = latest_quotes.get(symbol) or {}
+        full_history = calculate_monitor_history(quote_history.get(symbol) or [])
+        reversal = detect_rise_then_decline(full_history)
+        history = downsample_monitor_history(full_history)
         movement = summarize_quote_movement(quote_history.get(symbol) or [])
-        price_tape = build_price_tape(quote_history.get(symbol) or [])
         option_symbol = option_symbols.get(symbol, "")
         option_points = quote_history.get(option_symbol) or []
         option_movement = summarize_quote_movement(option_points)
@@ -928,7 +1119,12 @@ def build_monitor_rows(
                 "day_change_pct": quote.get("day_change_pct"),
                 "quote_timestamp_ist": latest_quote_time,
                 **movement,
-                "price_tape": price_tape,
+                "history": history,
+                **reversal,
+                "interval_return_pct": history[-1].get("interval_return_pct") if history else None,
+                "one_minute_return_pct": history[-1].get("one_minute_return_pct") if history else None,
+                "monitor_return_pct": history[-1].get("monitor_return_pct") if history else None,
+                "off_recent_peak_pct": history[-1].get("off_recent_peak_pct") if history else None,
                 "option_symbol": option_symbol,
                 "option_ltp": option_points[-1].get("price") if option_points else None,
                 "option_movement": option_movement,
@@ -940,8 +1136,14 @@ def build_monitor_rows(
                     if pattern.get("resistance_low")
                     else "-"
                 ),
+                "resistance_low": pattern.get("resistance_low"),
+                "resistance_high": pattern.get("resistance_high"),
                 "rejection": pattern.get("rejection_type") or "-",
+                "rejection_timestamp": pattern.get("rejection_timestamp") or "",
+                "rejection_high": pattern.get("rejection_high"),
+                "rejection_low": pattern.get("rejection_low"),
                 "confirmation": pattern.get("confirmation_timestamp") or "-",
+                "confirmation_level": pattern.get("confirmation_level"),
                 "short_ce": f"{config.short_call_otm_percent:.1f}% OTM",
                 "hedge_ce": f"{config.protective_call_otm_percent:.1f}% OTM",
                 "lots": config.number_of_lots,

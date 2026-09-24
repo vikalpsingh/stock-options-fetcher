@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import app
+import sell_on_rise_monitor as monitor_module
 from sell_on_rise_monitor import (
     Candle,
     QuoteObservation,
@@ -15,6 +16,9 @@ from sell_on_rise_monitor import (
     summarize_quote_movement,
     build_monitor_rows,
     build_price_tape,
+    calculate_monitor_history,
+    detect_rise_then_decline,
+    downsample_monitor_history,
     signal_idempotency_key,
     validate_monitor_config,
 )
@@ -127,6 +131,7 @@ def test_resistance_touch_without_confirmation_does_not_signal():
 def test_duplicate_signal_is_prevented_by_database_unique_key(tmp_path):
     repo = SellOnRiseMonitorRepository(tmp_path / "monitor.sqlite3")
     cfg = _valid_config()
+    repo.save_config(cfg)
     session = repo.create_or_update_session(cfg, start_now=True)
     key = signal_idempotency_key(
         trading_date="2026-09-11",
@@ -219,29 +224,157 @@ def test_price_tape_preserves_price_and_per_quote_direction():
     assert tape[3]["price"] == 100.1
 
 
-def test_monitor_renders_full_width_price_tape_for_each_selected_stock():
+def test_monitor_renders_compact_table_and_one_hour_chart():
     state = app.PageState(
         active_tab="52w-ai-call-spread",
         ai52_candidates=[{"symbol": "GLENMARK"}, {"symbol": "WELCORP"}],
         ai52_monitor_config=SellOnRiseMonitorConfig(selected_symbols=["GLENMARK", "WELCORP"]).to_dict(),
         ai52_monitor_rows=[
-            {"symbol": "GLENMARK", "spot": 2464.6, "price_tape": [
-                {"time": "10:00:00", "price": 2464.6, "change_pct": None, "direction": "flat"},
-                {"time": "10:00:10", "price": 2465.0, "change_pct": 0.016, "direction": "up"},
-                {"time": "10:00:20", "price": 2464.5, "change_pct": -0.020, "direction": "down"},
+            {"symbol": "GLENMARK", "spot": 2464.6, "interval_return_pct": -0.02, "history": [
+                {"timestamp_ist": "2026-09-11T10:00:00+05:30", "time": "10:00:00", "price": 2464.6, "interval_return_pct": None},
+                {"timestamp_ist": "2026-09-11T10:00:10+05:30", "time": "10:00:10", "price": 2465.0, "interval_return_pct": 0.016},
+                {"timestamp_ist": "2026-09-11T10:00:20+05:30", "time": "10:00:20", "price": 2464.5, "interval_return_pct": -0.020},
             ]},
-            {"symbol": "WELCORP", "spot": 0, "price_tape": []},
+            {"symbol": "WELCORP", "spot": 0, "history": []},
         ],
     )
     page = app.render_ai52_call_spread_panel(state)
-    assert page.count('class="ai52-monitor-price-row"') == 2
-    assert "GLENMARK · 10s stock price tape" in page
-    assert "WELCORP · 10s stock price tape" in page
-    assert 'class="ai52-tape-quote up"' in page
-    assert 'class="ai52-tape-quote down"' in page
-    assert "₹2465.00" in page
-    assert "+0.016%" in page
+    assert "10s stock price tape" not in page
+    assert "Largest latest interval movement" in page
+    assert "GLENMARK · Cumulative movement comparison" in page
+    assert page.count('class="ai52-chart-symbol"') == 2
+    assert "Multiple stocks use cumulative percentage" in page
+    assert "Full trading day" in page
+    assert "cleared at 15:50 IST" in page
+    assert "browser chart data at 720 points per symbol" in page
+    assert "actual quote time in IST at 30-minute intervals" in page
+    assert "signed Y-axis shows percentage movement" in page
+    assert "0.00% START line is the common baseline" in page
+    assert "Zoom in" in page and "Zoom out" in page
     assert "-0.020%" in page
+
+
+def test_monitor_history_handles_irregular_time_dedup_and_one_hour_bound():
+    base = _ts(30)
+    quotes = [
+        {"timestamp_ist": base.isoformat(), "price": 100},
+        {"timestamp_ist": (base + timedelta(seconds=17)).isoformat(), "price": 101},
+        {"timestamp_ist": (base + timedelta(seconds=17)).isoformat(), "price": 102},
+        {"timestamp_ist": (base + timedelta(seconds=77)).isoformat(), "price": 103},
+        {"timestamp_ist": (base - timedelta(minutes=61)).isoformat(), "price": 90},
+        {"timestamp_ist": (base + timedelta(seconds=80)).isoformat(), "price": 0},
+    ]
+    history = calculate_monitor_history(quotes)
+    assert [point["price"] for point in history] == [100.0, 102.0, 103.0]
+    assert history[1]["interval_return_pct"] == 2.0
+    assert history[2]["one_minute_return_pct"] == 0.9804
+    assert history[-1]["off_recent_peak_pct"] == 0.0
+
+
+def test_repository_keeps_trading_day_and_rejects_out_of_order_quotes(tmp_path):
+    repo = SellOnRiseMonitorRepository(tmp_path / "monitor.sqlite3")
+    session = repo.create_or_update_session(_valid_config(), start_now=True)
+    base = _ts(30)
+    quotes = [QuoteObservation("TEST", base + timedelta(seconds=10 * index), 100 + index / 100) for index in range(400)]
+    assert repo.save_observations(session["session_id"], quotes) == 400
+    stored = repo.observations(session["session_id"], "TEST")
+    assert len(stored) == 400
+    assert datetime.fromisoformat(stored[-1]["timestamp_ist"]) - datetime.fromisoformat(stored[0]["timestamp_ist"]) > timedelta(hours=1)
+    assert repo.save_observations(session["session_id"], [QuoteObservation("TEST", base, 999)]) == 0
+    assert repo.save_observations(session["session_id"], [QuoteObservation("TEST", base + timedelta(seconds=4010), 0)]) == 0
+
+
+def test_browser_history_is_bounded_and_keeps_endpoints_and_extremes():
+    history = [
+        {"timestamp_ist": (_ts(30) + timedelta(seconds=index)).isoformat(), "price": 100 + (20 if index == 500 else index / 1000)}
+        for index in range(1500)
+    ]
+    sampled = downsample_monitor_history(history)
+    assert len(sampled) <= 720
+    assert sampled[0] == history[0]
+    assert sampled[-1] == history[-1]
+    assert any(point["price"] == 120 for point in sampled)
+
+
+def test_market_data_is_cleared_at_1550_without_removing_config(tmp_path):
+    repo = SellOnRiseMonitorRepository(tmp_path / "monitor.sqlite3")
+    cfg = _valid_config()
+    repo.save_config(cfg)
+    session = repo.create_or_update_session(cfg, start_now=True)
+    session_day = date.fromisoformat(session["trading_date"])
+    close = datetime.combine(session_day, datetime.strptime("15:50", "%H:%M").time(), tzinfo=IST)
+    repo.save_observations(session["session_id"], [QuoteObservation("TEST", close - timedelta(seconds=10), 100)])
+    deleted = repo.clear_market_data_after_close(close)
+    assert deleted == 1
+    assert repo.observations(session["session_id"], "TEST") == []
+    assert repo.load_config().selected_symbols == ["TEST"]
+    assert repo.latest_session()["status"] == "COMPLETED"
+
+
+def test_full_market_data_reset_preserves_config_and_audit(tmp_path):
+    repo = SellOnRiseMonitorRepository(tmp_path / "monitor.sqlite3")
+    cfg = _valid_config()
+    repo.save_config(cfg)
+    session = repo.create_or_update_session(cfg, start_now=True)
+    repo.save_observations(session["session_id"], [QuoteObservation("TEST", _ts(30), 100.0)])
+    repo.save_pattern_state(session["session_id"], "TEST", {"pattern_state": "OBSERVING"})
+    assert repo.create_signal_once(
+        session["session_id"],
+        {"symbol": "TEST", "signal_key": "test-full-reset", "decision": "SELL_SIGNAL"},
+    )
+    audit_count = len(repo.audit_rows())
+
+    deleted = repo.clear_all_market_data(status="STOPPED_FULL_RESET")
+
+    assert deleted["sell_on_rise_quote_observation"] == 1
+    assert deleted["sell_on_rise_pattern_state"] == 1
+    assert deleted["sell_on_rise_signal"] == 1
+    assert repo.observations(session["session_id"], "TEST") == []
+    assert repo.latest_pattern_states(session["session_id"]) == {}
+    assert repo.load_config().selected_symbols == ["TEST"]
+    assert len(repo.audit_rows()) == audit_count
+    assert repo.latest_session()["status"] == "STOPPED_FULL_RESET"
+
+
+def test_storage_health_warns_then_hard_clears_monitor_data(tmp_path, monkeypatch):
+    repo = SellOnRiseMonitorRepository(tmp_path / "monitor.sqlite3")
+    session = repo.create_or_update_session(_valid_config(), start_now=True)
+    monkeypatch.setattr(monitor_module, "MONITOR_STORAGE_WARN_POINTS", 2)
+    monkeypatch.setattr(monitor_module, "MONITOR_STORAGE_HARD_POINTS", 4)
+
+    repo.save_observations(
+        session["session_id"],
+        [QuoteObservation("TEST", _ts(30) + timedelta(seconds=10 * index), 100 + index) for index in range(2)],
+    )
+    warning = repo.enforce_storage_health()
+    assert warning["warning"] is True
+    assert warning["cleared"] is False
+    assert warning["total_points"] == 2
+
+    repo.save_observations(
+        session["session_id"],
+        [QuoteObservation("TEST", _ts(30) + timedelta(seconds=10 * index), 100 + index) for index in range(2, 4)],
+    )
+    health = repo.enforce_storage_health()
+    assert health["total_points"] == 0
+    assert repo.observations(session["session_id"], "TEST") == []
+    assert repo.latest_session()["status"] == "STOPPED_STORAGE_GUARD"
+
+
+def test_twenty_rises_followed_by_four_declines_is_ready_to_sell():
+    prices = [100 + index for index in range(21)] + [119.5, 119.0, 118.5, 118.0]
+    history = [{"price": price} for price in prices]
+    signal = detect_rise_then_decline(history)
+    assert signal["ready_to_sell"] is True
+    assert signal["rise_count"] == 20
+    assert signal["decline_count"] == 4
+    assert signal["message"].startswith("READY TO SELL")
+
+
+def test_reversal_signal_requires_all_four_down_observations():
+    prices = [100 + index for index in range(21)] + [119.5, 119.0, 118.5]
+    signal = detect_rise_then_decline([{"price": price} for price in prices])
+    assert signal["ready_to_sell"] is False
 
 
 def test_clear_audit_rows_only_removes_monitor_logs(tmp_path):
@@ -275,10 +408,11 @@ def test_imported_candidates_sync_stops_monitor_and_refreshes_symbols(tmp_path, 
     app.load_ai52_state(state)
 
     assert sync["symbols"] == ["DIVISLAB", "COFORGE"]
+    assert sync["cleared_points"] == 1
     assert state.ai52_monitor_config["selected_symbols"] == ["COFORGE", "DIVISLAB"]
     assert state.ai52_monitor_config["execution_mode"] == "ALERT_ONLY"
     assert state.ai52_monitor_config["auto_execute_armed"] is False
-    assert state.ai52_monitor_session["status"] == "STOPPED_BY_USER"
+    assert state.ai52_monitor_session["status"] == "STOPPED_UNIVERSE_REFRESH"
     assert [row["symbol"] for row in state.ai52_monitor_rows] == ["COFORGE", "DIVISLAB"]
     assert all(row["spot"] == 0 for row in state.ai52_monitor_rows)
 
@@ -305,4 +439,6 @@ def test_52w_ai_page_renders_sell_on_rise_monitor_section():
     assert "/52w-ai-call-spread/monitor-scan" in html
     assert "/52w-ai-call-spread/monitor-stop-clear-logs" in html
     assert "Stop &amp; Clear Logs" in html
+    assert "/52w-ai-call-spread/monitor-clear-market-data" in html
+    assert "Clear All Price Data" in html
     assert "Monitoring requires this page/session to remain active" in html
