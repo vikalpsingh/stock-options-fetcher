@@ -8135,9 +8135,10 @@ def set_kite_env(form: dict[str, list[str]]) -> None:
         os.environ["OPENAI_API_KEY"] = openai_api_key.strip()
 
 
-def kite_login_url() -> str:
-    api_key = env_value("KITE_API_KEY") or DEFAULT_KITE_ENV["KITE_API_KEY"]
-    return f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
+def kite_login_url(api_key: str | None = None) -> str:
+    """Build Zerodha's Connect login URL in its documented v3 parameter order."""
+    clean_api_key = str(api_key if api_key is not None else env_value("KITE_API_KEY") or "").strip()
+    return f"https://kite.zerodha.com/connect/login?v=3&api_key={quote_plus(clean_api_key)}"
 
 
 def extract_kite_request_token(value: str) -> str:
@@ -33875,10 +33876,7 @@ def render_page(state: PageState) -> bytes:
         )
         if button
     )
-    active_login_url = (
-        "https://kite.zerodha.com/connect/login?"
-        f"api_key={quote_plus(active_kite_values.get('KITE_API_KEY') or '')}&v=3"
-    )
+    active_login_url = kite_login_url(active_kite_values.get("KITE_API_KEY"))
     if state.auto_open_kite_login:
         alert += (
             '<div class="alert ok daily-kite-login-alert">'
@@ -41200,9 +41198,8 @@ def render_page(state: PageState) -> bytes:
     function updateKiteLoginLink(apiKey) {{
       if (!kiteLoginLink) return;
       const cleanKey = String(apiKey || '').trim();
-      kiteLoginLink.href = 'https://kite.zerodha.com/connect/login?api_key='
-        + encodeURIComponent(cleanKey)
-        + '&v=3';
+      kiteLoginLink.href = 'https://kite.zerodha.com/connect/login?v=3&api_key='
+        + encodeURIComponent(cleanKey);
     }}
     function applySelectedKiteProfile() {{
       if (!kiteProfileSelect) return;
