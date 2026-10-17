@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from calendar import monthrange
 import contextlib
 import copy
 import csv
@@ -201,6 +202,8 @@ from pnl_service import (
     month_rows as pnl_month_rows_for,
     snapshot_from_kite_positions,
 )
+from monthly_risk_control import MonthlyRiskConfig, MonthlyRiskRepository, pre_order_risk_check
+from kite_pnl_importer import KitePnlImportRepository, parse_kite_pnl_xlsx
 
 # Compatibility aliases for the DHAN page wiring. These point to Kite-specific
 # modules/tables only; the visible page name is DHAN, execution remains Kite.
@@ -289,6 +292,11 @@ INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT = 100.0
 INTRADAY_LOSS_LIMIT_LTP_DISCOUNT_PERCENT = 10.0
 CONTROL_LOSS_HARD_STOP_DISCOUNT_PERCENT = 10.0
 POSITION_CLOSE_SCHEDULE_TIME = "09:20"
+EOD_PNL_SNAPSHOT_SCHEDULE_TIME = "16:00"
+# Keep a same-day catch-up window so a short service restart at 16:00 does not
+# permanently lose that trading day's snapshot.
+EOD_PNL_SNAPSHOT_WINDOW_MINUTES = 8 * 60
+EOD_PNL_RETRY_MINUTES = 5
 POSITION_CLOSE_SCHEDULE_WINDOW_MINUTES = 10
 INCOME_GROWTH_GPT_SCHEDULE_TIME = "09:30"
 INCOME_GROWTH_GPT_SCHEDULE_WINDOW_MINUTES = 15
@@ -415,6 +423,7 @@ APP_CACHE_LOCK = threading.Lock()
 APP_CACHE_KEY_LOCKS: dict[str, threading.Lock] = {}
 SETTINGS_LOCK = threading.RLock()
 POSITION_CLOSE_SCHEDULER_LOCK = threading.Lock()
+EOD_PNL_SNAPSHOT_SCHEDULER_LOCK = threading.Lock()
 INCOME_GROWTH_GPT_SCHEDULER_LOCK = threading.Lock()
 INTRADAY_POSITION_CLOSE_SCHEDULER_LOCK = threading.Lock()
 KITE_READ_CACHE_SECONDS = 60
@@ -1344,15 +1353,52 @@ def monthly_booked_pnl_summary(day: date | None = None) -> dict[str, Any]:
     return summary
 
 
+def place_order_with_monthly_risk_gate(kite: Any, order: dict[str, Any]) -> str:
+    """Apply the persisted account loss gate immediately before a live Kite call."""
+    broker_order = dict(order)
+    risk_context = broker_order.pop("_risk_context", {})
+    if not isinstance(risk_context, dict):
+        risk_context = {}
+    account_id = str(risk_context.get("account_id") or selected_kite_profile_name())
+    current_positions = cached_kite_positions(kite, ttl_seconds=0)
+    today = datetime.now(INDIA_TIME_ZONE).date()
+    records = snapshot_from_kite_positions(
+        current_positions,
+        account_id=account_id,
+        trade_date=today,
+    )
+    pnl_repository = PnlRepository(APP_DB_PATH)
+    pnl_repository.upsert_daily_records(records, audit_event="PRE_ORDER_RISK_PNL_SYNC")
+    pnl_repository.upsert_account_daily_summary(
+        records,
+        account_id=account_id,
+        trade_date=today,
+        source="ACCOUNT_DAILY",
+    )
+    decision = pre_order_risk_check(
+        APP_DB_PATH,
+        {**broker_order, **risk_context},
+        account_id=account_id,
+        current_positions=current_positions,
+    )
+    if not decision.allowed:
+        raise RuntimeError(
+            f"MONTHLY_RISK_BLOCKED: {decision.reason} Booked P&L "
+            f"{decision.booked_pnl:.2f}; remaining loss budget "
+            f"{decision.remaining_loss_budget:.2f}."
+        )
+    return kite_orders.place_order(kite, broker_order)
+
+
 def place_order_allowing_autoslice(kite: Any, order: dict[str, Any]) -> str:
     try:
-        return kite_orders.place_order(kite, order)
+        return place_order_with_monthly_risk_gate(kite, order)
     except Exception as exc:
         message = str(exc).lower()
         if "autoslice" in order and "autoslice" in message and "unexpected" in message:
             fallback = dict(order)
             fallback.pop("autoslice", None)
-            return kite_orders.place_order(kite, fallback)
+            return place_order_with_monthly_risk_gate(kite, fallback)
         raise
 
 
@@ -16445,7 +16491,7 @@ def place_income_growth_equity_order(
         "tag": "INC_GROWTH_EQ",
     }
     kite = kite_orders.kite_client()
-    order_id = kite_orders.place_order(kite, order)
+    order_id = place_order_with_monthly_risk_gate(kite, order)
     invalidate_kite_trade_cache()
     return {
         "tradingsymbol": kite_symbol,
@@ -16601,7 +16647,7 @@ def place_equity_holding_order(
         "tag": "EQUITY_DESK",
     }
     kite = kite_orders.kite_client()
-    order_id = kite_orders.place_order(kite, order)
+    order_id = place_order_with_monthly_risk_gate(kite, order)
     invalidate_kite_trade_cache()
     ltp = float(snapshot.get("ltp") or 0)
     price_gap = ((price - ltp) / ltp * 100) if ltp else 0
@@ -16724,7 +16770,7 @@ def place_commodity_etf_order(symbol: str, allow_manual_override: bool = False) 
         "validity": "DAY",
         "tag": "ETF_BUY",
     }
-    order_id = kite_orders.place_order(kite, order)
+    order_id = place_order_with_monthly_risk_gate(kite, order)
     invalidate_kite_trade_cache()
     return {
         "tradingsymbol": clean_symbol,
@@ -16912,7 +16958,7 @@ def place_commodity_etf_sell_order(symbol: str) -> dict[str, Any]:
         "validity": "DAY",
         "tag": "ETF_BOOK",
     }
-    order_id = kite_orders.place_order(kite, order)
+    order_id = place_order_with_monthly_risk_gate(kite, order)
     invalidate_kite_trade_cache()
     return {
         "tradingsymbol": clean_symbol,
@@ -18070,7 +18116,7 @@ def modify_or_place_order_with_new_fallback(kite: Any, order: dict[str, Any]) ->
             "Similar order could not be modified; placing a new order instead. "
             f"Reason: {exc}"
         )
-        order_id = kite_orders.place_order(kite, order)
+        order_id = place_order_with_monthly_risk_gate(kite, order)
         return order_id, "placed_new_after_modify_failed"
 
 
@@ -19202,6 +19248,142 @@ def verify_scheduled_position_market_open(kite: Any, now: datetime) -> tuple[boo
     return True, f"NSE market timestamp verified at {market_stamp:%H:%M:%S} IST."
 
 
+def eod_pnl_snapshot_schedule_state() -> dict[str, Any]:
+    saved = load_app_settings().get("eod_pnl_snapshot_scheduler")
+    state = dict(saved) if isinstance(saved, dict) else {}
+    state.setdefault("enabled", True)
+    state.setdefault("schedule_time", EOD_PNL_SNAPSHOT_SCHEDULE_TIME)
+    state.setdefault("status", "WAITING")
+    state.setdefault("message", "Waiting for the next trading-day 16:00 IST P&L snapshot.")
+    state.setdefault("results", [])
+    return state
+
+
+def save_eod_pnl_snapshot_schedule_state(**updates: Any) -> dict[str, Any]:
+    state = eod_pnl_snapshot_schedule_state()
+    state.update(updates)
+    save_app_settings({"eod_pnl_snapshot_scheduler": state})
+    return state
+
+
+def run_eod_pnl_snapshot_job(
+    now: datetime | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """Persist one idempotent EOD Kite P&L snapshot and refresh monthly risk."""
+    now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
+        now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
+    )
+    schedule_state = eod_pnl_snapshot_schedule_state()
+    if not force and (
+        not schedule_state.get("enabled", True)
+        or scheduled_job_is_paused(schedule_state, now)
+        or now.weekday() >= 5
+    ):
+        return None
+    schedule_hour, schedule_minute = (
+        int(part)
+        for part in str(
+            schedule_state.get("schedule_time") or EOD_PNL_SNAPSHOT_SCHEDULE_TIME
+        ).split(":", 1)
+    )
+    scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
+    if not force and not (
+        scheduled_at <= now < scheduled_at + timedelta(minutes=EOD_PNL_SNAPSHOT_WINDOW_MINUTES)
+    ):
+        return None
+    today_key = now.date().isoformat()
+    if not force and str(schedule_state.get("last_success_date") or "") == today_key:
+        return None
+    last_attempt = parse_kite_market_timestamp(schedule_state.get("last_attempt_at"))
+    if not force and last_attempt and now - last_attempt < timedelta(minutes=EOD_PNL_RETRY_MINUTES):
+        return None
+    if not EOD_PNL_SNAPSHOT_SCHEDULER_LOCK.acquire(blocking=False):
+        return None
+    try:
+        schedule_state = eod_pnl_snapshot_schedule_state()
+        if not force and str(schedule_state.get("last_success_date") or "") == today_key:
+            return None
+        profile_name = selected_kite_profile_name()
+        attempt_at = now.isoformat(timespec="seconds")
+        save_eod_pnl_snapshot_schedule_state(
+            last_attempt_at=attempt_at,
+            last_run_at=now.strftime("%d %b %Y %H:%M:%S IST"),
+            profile=profile_name,
+            status="RUNNING",
+            message="Verifying trading day and saving the end-of-day Kite P&L snapshot.",
+            results=[],
+        )
+        try:
+            profile = load_kite_profiles().get(profile_name, blank_kite_profile())
+            apply_kite_profile_to_env(profile)
+            setup_issue = kite_setup_issue()
+            if setup_issue:
+                raise RuntimeError(setup_issue)
+            if kite_orders is None:
+                raise RuntimeError(f"Could not import Kite order module: {IMPORT_ERROR}")
+            kite = kite_orders.kite_client()
+            is_trading_day, market_message = verify_scheduled_position_market_open(kite, now)
+            if not is_trading_day:
+                return save_eod_pnl_snapshot_schedule_state(
+                    status="MARKET_CLOSED",
+                    message=f"EOD P&L not saved. {market_message}",
+                    results=[],
+                )
+            positions = cached_kite_positions(kite, ttl_seconds=0)
+            records = snapshot_from_kite_positions(
+                positions,
+                account_id=profile_name,
+                trade_date=now.date(),
+            )
+            pnl_repository = PnlRepository(APP_DB_PATH)
+            saved_count = pnl_repository.upsert_daily_records(
+                records,
+                audit_event="SCHEDULED_EOD_KITE_POSITION_SYNC",
+            )
+            daily_summary = pnl_repository.upsert_account_daily_summary(
+                records,
+                account_id=profile_name,
+                trade_date=now.date(),
+                source="ACCOUNT_DAILY",
+            )
+            risk_snapshot = MonthlyRiskRepository(APP_DB_PATH).latest_snapshot(
+                profile_name,
+                now.date(),
+            )
+            result = {
+                "account_id": profile_name,
+                "trade_date": today_key,
+                "saved_rows": saved_count,
+                "daily_realized_pnl": daily_summary["realized_pnl"],
+                "daily_unrealized_pnl": daily_summary["unrealized_pnl"],
+                "booked_mtd_pnl": float(risk_snapshot.get("booked_pnl") or 0),
+                "risk_mtd_pnl": float(risk_snapshot.get("risk_mtd_pnl") or 0),
+                "monthly_loss_limit": float(risk_snapshot.get("max_monthly_loss") or 0),
+                "remaining_loss_budget": float(risk_snapshot.get("remaining_loss_budget") or 0),
+                "risk_state": str(risk_snapshot.get("risk_state") or "UNKNOWN"),
+                "fresh_positions_blocked": bool(risk_snapshot.get("hard_locked")),
+            }
+            return save_eod_pnl_snapshot_schedule_state(
+                last_success_date=today_key,
+                status="SAVED",
+                message=(
+                    f"{market_message} Saved {saved_count} P&L row(s) for {profile_name}; "
+                    f"monthly state {result['risk_state']}; fresh positions "
+                    f"{'BLOCKED' if result['fresh_positions_blocked'] else 'allowed'}."
+                ),
+                results=[result],
+            )
+        except Exception as exc:
+            return save_eod_pnl_snapshot_schedule_state(
+                status="ERROR",
+                message=friendly_external_error(exc, "Scheduled EOD P&L snapshot"),
+                results=[],
+            )
+    finally:
+        EOD_PNL_SNAPSHOT_SCHEDULER_LOCK.release()
+
+
 def run_scheduled_position_close_job(
     now: datetime | None = None,
     force: bool = False,
@@ -19389,6 +19571,13 @@ def scheduled_job_definitions() -> dict[str, dict[str, Any]]:
             "load": intraday_position_close_schedule_state,
             "save": save_intraday_position_close_schedule_state,
         },
+        "eod_pnl_snapshot": {
+            "name": "End-of-Day P&L Snapshot",
+            "purpose": "Save the active Kite account P&L and refresh the persistent monthly loss gate.",
+            "schedule": "Trading days at 16:00 IST",
+            "load": eod_pnl_snapshot_schedule_state,
+            "save": save_eod_pnl_snapshot_schedule_state,
+        },
     }
 
 
@@ -19473,6 +19662,8 @@ def next_scheduled_job_run(
     schedule_default = (
         POSITION_CLOSE_SCHEDULE_TIME
         if job_key == "position_close_open"
+        else EOD_PNL_SNAPSHOT_SCHEDULE_TIME
+        if job_key == "eod_pnl_snapshot"
         else INCOME_GROWTH_GPT_SCHEDULE_TIME
     )
     hour, minute = (
@@ -19585,6 +19776,8 @@ def run_scheduled_job_now(job_key: str) -> dict[str, Any]:
         raise RuntimeError("All scheduler jobs are paused. Click Start All before running a job.")
     if job_key == "position_close_open":
         result = run_scheduled_position_close_job(force=True)
+    elif job_key == "eod_pnl_snapshot":
+        result = run_eod_pnl_snapshot_job(force=True)
     elif job_key == "income_growth_gpt":
         result = run_scheduled_income_growth_gpt_job(force=True)
     elif job_key == "intraday_position_close":
@@ -19932,6 +20125,12 @@ def position_close_scheduler_loop(stop_event: threading.Event) -> None:
                 print(
                     "Intraday close BUY check: "
                     f"{intraday_result.get('status')} - {intraday_result.get('message')}"
+                )
+            eod_pnl_result = run_eod_pnl_snapshot_job()
+            if eod_pnl_result:
+                print(
+                    "Scheduled EOD P&L snapshot: "
+                    f"{eod_pnl_result.get('status')} - {eod_pnl_result.get('message')}"
                 )
         except Exception as exc:
             print(f"Scheduled task error: {friendly_external_error(exc, 'Scheduler')}")
@@ -21351,7 +21550,7 @@ def dhan_scheduler_status() -> dict[str, Any]:
 
 def run_dhan_scheduler_now(paper_trading: bool = True) -> dict[str, Any]:
     repository = DhanRepository(APP_DB_PATH)
-    broker = DhanBrokerAdapter(paper_trading=paper_trading)
+    broker = DhanBrokerAdapter(paper_trading=paper_trading, account_id=selected_kite_profile_name())
     with DHAN_SCHEDULER_LOCK:
         try:
             result = run_dhan_pair_scheduler_once(repository, broker)
@@ -21420,7 +21619,7 @@ def dhan_it_scheduler_status() -> dict[str, Any]:
 
 def run_dhan_it_scheduler_now(paper_trading: bool = True) -> dict[str, Any]:
     repository = DhanItPairRepository(APP_DB_PATH)
-    broker = DhanBrokerAdapter(paper_trading=paper_trading)
+    broker = DhanBrokerAdapter(paper_trading=paper_trading, account_id=selected_kite_profile_name())
     with DHAN_IT_SCHEDULER_LOCK:
         try:
             result = run_dhan_it_pair_monitor_once(repository, broker)
@@ -21545,7 +21744,7 @@ def enrich_dhan_market_data_from_kite(
     missing_spot = [symbol for symbol in clean_symbols if not spot_by_symbol.get(symbol)]
     missing_contracts = [symbol for symbol in clean_symbols if not contracts_by_symbol.get(symbol)]
     notes: list[str] = []
-    broker = DhanBrokerAdapter(paper_trading=True)
+    broker = DhanBrokerAdapter(paper_trading=True, account_id=selected_kite_profile_name())
     fresh_quotes = fetch_fresh_equity_quotes_from_kite(broker, clean_symbols)
     for symbol, quote in fresh_quotes.items():
         if quote.get("ltp"):
@@ -21585,7 +21784,7 @@ def refresh_dhan_watchlist_quotes(watchlist: list[dict[str, Any]] | None) -> Non
     if not symbols:
         return
     try:
-        broker = DhanBrokerAdapter(paper_trading=True)
+        broker = DhanBrokerAdapter(paper_trading=True, account_id=selected_kite_profile_name())
         fresh_quotes = fetch_fresh_equity_quotes_from_kite(broker, symbols)
     except Exception:
         return
@@ -26588,7 +26787,7 @@ def _ai52_candidate_option_data(symbol: str, screener_cmp: Any) -> tuple[Any | N
 def evaluate_ai52_candidate(candidate: dict[str, Any], adapter: Any | None = None) -> dict[str, Any]:
     """Evaluate one 52W AI candidate using Kite quote/history/NFO data, not Screener CMP."""
 
-    broker = adapter or DhanBrokerAdapter(paper_trading=True)
+    broker = adapter or DhanBrokerAdapter(paper_trading=True, account_id=selected_kite_profile_name())
     evaluator = SellOnRiseEvaluator(broker, today=datetime.now(INDIA_TIME_ZONE).date())
     symbol = str(candidate.get("symbol") or "").strip().upper()
     evaluation = evaluator.evaluate(symbol, candidate)
@@ -26600,7 +26799,7 @@ def evaluate_ai52_candidate(candidate: dict[str, Any], adapter: Any | None = Non
 def evaluate_ai52_candidates(candidates: list[dict[str, Any]], adapter: Any | None = None) -> list[dict[str, Any]]:
     """Evaluate and rank all imported 52W AI candidates with a shared Kite adapter/cache."""
 
-    broker = adapter or DhanBrokerAdapter(paper_trading=True)
+    broker = adapter or DhanBrokerAdapter(paper_trading=True, account_id=selected_kite_profile_name())
     evaluator = SellOnRiseEvaluator(broker, today=datetime.now(INDIA_TIME_ZONE).date())
     ranked = evaluator.evaluate_many(candidates)
     payloads = [row.to_dict() for row in ranked]
@@ -26699,7 +26898,7 @@ def run_ai52_sell_on_rise_scan(state: PageState) -> dict[str, Any]:
         repository.clear_market_data_after_close(scan_clock)
         load_ai52_state(state)
         raise ValueError("Trading-day monitor closed at 15:50 IST. Intraday quote and chart data were cleared; start a new session on the next trading day.")
-    broker = DhanBrokerAdapter(paper_trading=True)
+    broker = DhanBrokerAdapter(paper_trading=True, account_id=selected_kite_profile_name())
     quotes = fetch_fresh_equity_quotes_from_kite(broker, config.selected_symbols)
     observations: list[QuoteObservation] = []
     stamp = scan_clock
@@ -33291,7 +33490,10 @@ def load_pnl_state(state: PageState) -> None:
     repo.ensure_schema()
     state.pnl_available_years = repo.available_years()
     state.pnl_filter_options = {
-        "accounts": repo.option_values("account_id"),
+        "accounts": sorted(set(
+            repo.option_values("account_id")
+            + KitePnlImportRepository(APP_DB_PATH).account_ids()
+        )),
         "strategies": repo.option_values("strategy"),
         "themes": repo.option_values("theme"),
         "asset_classes": repo.option_values("asset_class"),
@@ -33338,6 +33540,13 @@ def render_pnl_panel(state: PageState) -> str:
     summary = state.pnl_summary or aggregate_summary(rows)
     years = state.pnl_available_years or [datetime.now().year]
     options = state.pnl_filter_options or {"accounts": [], "strategies": [], "themes": [], "asset_classes": []}
+    risk_account = state.pnl_account if state.pnl_account and state.pnl_account != "ALL" else selected_kite_profile_name(state.kite_profile)
+    risk_repository = MonthlyRiskRepository(APP_DB_PATH)
+    risk_snapshot = risk_repository.latest_snapshot(risk_account)
+    risk_settings = risk_repository.get_config(risk_account)
+    kite_import_repository = KitePnlImportRepository(APP_DB_PATH)
+    kite_import_months = kite_import_repository.monthly_rows(risk_account)
+    kite_import_quarters = kite_import_repository.quarterly_rows(risk_account)
 
     def fmt_money(value: Any) -> str:
         try:
@@ -33452,20 +33661,115 @@ def render_pnl_panel(state: PageState) -> str:
         f'<option value="{year}"{" selected" if int(year) == int(state.pnl_year) else ""}>{year}</option>'
         for year in years
     )
+    risk_state = str(risk_snapshot.get("risk_state") or "UNKNOWN")
+    risk_state_class = "metric-negative" if risk_state == "RED" else "risk-orange" if risk_state == "ORANGE" else "risk-amber" if risk_state == "AMBER" else "metric-positive"
+    utilisation = max(0.0, min(float(risk_snapshot.get("risk_utilisation_percent") or 0), 100.0))
+    risk_history_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(row.get('month_key') or '-'))}</td>"
+        f"<td class=\"{metric_class(row.get('booked_pnl'))}\">{fmt_money(row.get('booked_pnl'))}</td>"
+        f"<td class=\"{metric_class(row.get('risk_mtd_pnl'))}\">{fmt_money(row.get('risk_mtd_pnl'))}</td>"
+        f"<td>{fmt_money(row.get('peak_month_pnl'))}</td>"
+        f"<td>{fmt_money(row.get('giveback_amount'))} ({fmt_pct(row.get('giveback_percent'))})</td>"
+        f"<td>{html.escape(str(row.get('risk_state') or '-'))}</td>"
+        f"<td>{'YES' if row.get('hard_locked') else 'NO'}</td>"
+        "</tr>"
+        for row in risk_repository.monthly_history(risk_account)
+    ) or '<tr><td colspan="7" class="muted-cell">No monthly risk history yet.</td></tr>'
+    def risk_period_rows(period: str) -> str:
+        return "".join(
+            "<tr>"
+            f"<td><strong>{html.escape(str(row.get('period') or '-'))}</strong></td>"
+            f"<td class=\"{metric_class(row.get('booked_pnl'))}\">{fmt_money(row.get('booked_pnl'))}</td>"
+            f"<td class=\"{metric_class(row.get('risk_pnl'))}\">{fmt_money(row.get('risk_pnl'))}</td>"
+            f"<td>{fmt_money(row.get('peak_month_pnl'))}</td>"
+            f"<td>{int(row.get('months') or 0)}</td>"
+            f"<td>{int(row.get('locked_months') or 0)}</td>"
+            "</tr>"
+            for row in risk_repository.period_history(risk_account, period)
+        ) or '<tr><td colspan="6" class="muted-cell">No persisted period history yet.</td></tr>'
+
+    quarter_risk_rows = risk_period_rows("quarter")
+    year_risk_rows = risk_period_rows("year")
+    kite_monthly_rows = "".join(
+        "<tr>"
+        f"<td><strong>{html.escape(str(row.get('month_key') or '-'))}</strong></td>"
+        f"<td class=\"{metric_class(row.get('gross_realized_pnl'))}\">{fmt_money(row.get('gross_realized_pnl'))}</td>"
+        f"<td>{fmt_money(row.get('charges'))}</td>"
+        f"<td>{fmt_money(row.get('other_credit_debit'))}</td>"
+        f"<td class=\"{metric_class(row.get('net_realized_pnl'))}\"><strong>{fmt_money(row.get('net_realized_pnl'))}</strong></td>"
+        f"<td>{int(row.get('row_count') or 0)}</td>"
+        f"<td>{html.escape(str(row.get('allocation_method') or '-'))}</td>"
+        "</tr>"
+        for row in kite_import_months
+    ) or '<tr><td colspan="7" class="muted-cell">No Kite P&amp;L workbook imported for this account.</td></tr>'
+    kite_quarterly_rows = "".join(
+        "<tr>"
+        f"<td><strong>{html.escape(str(row.get('quarter') or '-'))}</strong></td>"
+        f"<td class=\"{metric_class(row.get('gross_realized_pnl'))}\">{fmt_money(row.get('gross_realized_pnl'))}</td>"
+        f"<td>{fmt_money(row.get('charges'))}</td>"
+        f"<td class=\"{metric_class(row.get('net_realized_pnl'))}\"><strong>{fmt_money(row.get('net_realized_pnl'))}</strong></td>"
+        f"<td>{int(row.get('months') or 0)}</td>"
+        "</tr>"
+        for row in kite_import_quarters
+    ) or '<tr><td colspan="5" class="muted-cell">No imported quarterly P&amp;L available.</td></tr>'
 
     return f"""
-    <form id="pnl-panel" method="post" action="/pnl/load"{panel_style}>
+    <form id="pnl-panel" method="post" action="/pnl/load" enctype="multipart/form-data"{panel_style}>
       {env_hidden_fields_for_render()}
       <section class="panel pnl-hero">
         <div>
-          <div class="panel-title">P&amp;L Performance Desk</div>
-          <p class="status">One accounting screen for realised P&amp;L, unrealised P&amp;L, capital, ROI, strategy/theme attribution, and daily audit history. Sync is idempotent and does not place broker orders.</p>
+          <div class="panel-title">P&amp;L Performance Desk &amp; Risk Control</div>
+          <p class="status">Booked P&amp;L is kept separate from open-position P&amp;L. The persisted monthly hard stop protects capital across browser and server restarts. Sync is idempotent and does not place broker orders.</p>
         </div>
         <div class="actions">
           <button type="submit" formaction="/pnl/sync-today">Sync Today&apos;s P&amp;L</button>
           <button type="submit" class="secondary" formaction="/pnl/load">Refresh Historical</button>
           <button type="submit" class="secondary" formaction="/pnl/export-csv">Export CSV</button>
         </div>
+      </section>
+      <section class="panel monthly-risk-panel {risk_state.lower()}">
+        <div class="monthly-risk-heading"><div><span>{html.escape(str(risk_snapshot.get('month_key') or ''))} TRADING RISK</span><strong class="{risk_state_class}">{html.escape(risk_state)}{' · NEW RISK LOCKED' if risk_snapshot.get('hard_locked') else ''}</strong></div><div class="monthly-risk-account">Account: {html.escape(risk_account)}</div></div>
+        <div class="pnl-card-grid monthly-risk-cards">
+          {card("Booked MTD P&L", "₹" + fmt_money(risk_snapshot.get("booked_pnl")), "Closed trades in this calendar month", risk_snapshot.get("booked_pnl"))}
+          {card("Open P&L", "₹" + fmt_money(risk_snapshot.get("unrealised_pnl")), "Latest open-position snapshot", risk_snapshot.get("unrealised_pnl"))}
+          {card("Risk MTD P&L", "₹" + fmt_money(risk_snapshot.get("risk_mtd_pnl")), "Booked plus current unrealised", risk_snapshot.get("risk_mtd_pnl"))}
+          {card("Monthly Max Loss", "₹" + fmt_money(risk_snapshot.get("max_monthly_loss")), "Persisted account limit", None)}
+          {card("Loss Used", "₹" + fmt_money(risk_snapshot.get("loss_used")), "Based on booked P&L hard stop", -float(risk_snapshot.get("loss_used") or 0))}
+          {card("Loss Budget Remaining", "₹" + fmt_money(risk_snapshot.get("remaining_loss_budget")), "Never shown below zero", risk_snapshot.get("remaining_loss_budget"))}
+          {card("Peak Risk MTD", "₹" + fmt_money(risk_snapshot.get("peak_month_pnl")), "Highest persisted risk P&L this month", risk_snapshot.get("peak_month_pnl"))}
+          {card("Profit Give-back", "₹" + fmt_money(risk_snapshot.get("giveback_amount")), fmt_pct(risk_snapshot.get("giveback_percent")), -float(risk_snapshot.get("giveback_amount") or 0))}
+        </div>
+        <div class="monthly-risk-progress"><span style="width:{utilisation:.2f}%"></span></div>
+        <p class="status"><strong>{utilisation:.2f}% of monthly loss limit used.</strong> Data: {html.escape(str(risk_snapshot.get('data_status') or 'N/A'))}. If risk state is unavailable, new risk fails closed while exits and protective hedges remain available.</p>
+      </section>
+      <section class="panel monthly-risk-config">
+        <div class="panel-title">Monthly Capital-Protection Settings</div>
+        <div class="compact-grid">
+          <input type="hidden" name="risk_account_id" value="{html.escape(risk_account, quote=True)}">
+          <label><span>Monthly maximum loss ₹</span><input type="number" min="1" step="1000" name="monthly_max_loss_inr" value="{risk_settings.monthly_max_loss_inr:.2f}"></label>
+          <label><span>Warning at %</span><input type="number" min="0" max="100" step="1" name="risk_warning_percent" value="{risk_settings.warning_percent:.2f}"></label>
+          <label><span>Reduce-risk warning %</span><input type="number" min="0" max="100" step="1" name="risk_reduce_percent" value="{risk_settings.reduce_risk_percent:.2f}"></label>
+          <label><span>Hard stop %</span><input type="number" min="1" max="100" step="1" name="risk_hard_stop_percent" value="{risk_settings.hard_stop_percent:.2f}" readonly></label>
+          <label><span>Give-back warning %</span><input type="number" min="0" max="100" step="1" name="giveback_warning_percent" value="{risk_settings.giveback_warning_percent:.2f}"></label>
+          <label><span>Give-back reduce %</span><input type="number" min="0" max="100" step="1" name="giveback_reduce_percent" value="{risk_settings.giveback_reduce_percent:.2f}"></label>
+          <label><span>Give-back lock %</span><input type="number" min="0" max="100" step="1" name="giveback_lock_percent" value="{risk_settings.giveback_lock_percent:.2f}"></label>
+          <label><span>Reset cooldown minutes</span><input type="number" min="1" max="240" step="1" name="risk_cooldown_minutes" value="{risk_settings.cooldown_minutes}"></label>
+          <label><span>Administrative change reason</span><input name="risk_change_reason" maxlength="240" placeholder="Required when increasing limit during a losing month"></label>
+        </div>
+        <label class="inline-check"><input type="checkbox" name="risk_admin_confirm" value="1"> I confirm this is a data/reconciliation correction, not an attempt to recover a loss.</label>
+        <div class="actions"><button type="submit" formaction="/pnl/save-risk-config">Save Risk Controls</button></div>
+        <p class="status">The hard stop remains 100%. Increasing the loss limit during a losing month should be treated as an administrative correction and is recorded in the risk audit trail.</p>
+      </section>
+      <section class="panel pnl-import-panel">
+        <div class="panel-title">Import Kite P&amp;L Workbook</div>
+        <p class="status">Upload the Kite Console F&amp;O P&amp;L .xlsx export. Re-uploading the same file is ignored. Single-month statements are exact; wider statements use contract month and show that method in the summary.</p>
+        <div class="compact-grid">
+          <label><span>App account / profile</span><input name="pnl_import_account" value="{html.escape(risk_account, quote=True)}" required></label>
+          <label><span>Kite P&amp;L .xlsx</span><input type="file" name="pnl_kite_file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></label>
+        </div>
+        <label class="inline-check"><input type="checkbox" name="pnl_import_confirm" value="1" required> I confirm this Kite client belongs to the selected app profile and understand that overlapping profile/month totals will be replaced.</label>
+        <div class="actions"><button type="submit" formaction="/pnl/import-kite">Import and Refresh P&amp;L</button></div>
       </section>
       <section class="panel pnl-filter-panel">
         <div class="compact-grid">
@@ -33498,6 +33802,15 @@ def render_pnl_panel(state: PageState) -> str:
         {aggregate_table("Asset Class Performance", "asset_class", state.pnl_asset_rows or [])}
       </div>
       <section class="panel"><div class="panel-title">Monthly Trend</div><div class="table-wrap"><table class="ipo-table pnl-sortable-table"><thead><tr><th class="sort-header" data-sort-col="0">Month</th><th class="sort-header" data-sort-col="1">Net realised</th><th>Capital</th><th>ROI</th><th>Rows</th></tr></thead><tbody>{month_body}</tbody></table></div></section>
+      <section class="panel"><div class="panel-title">Permanent Monthly Risk Ledger</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Month</th><th>Booked P&amp;L</th><th>Risk MTD</th><th>Peak</th><th>Give-back</th><th>State</th><th>Lock triggered?</th></tr></thead><tbody>{risk_history_rows}</tbody></table></div></section>
+      <div class="pnl-analytics-grid">
+        <section class="panel"><div class="panel-title">Kite Imported Monthly P&amp;L</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Month</th><th>Gross realised</th><th>Charges</th><th>Other credit/debit</th><th>Net realised</th><th>Contracts</th><th>Method</th></tr></thead><tbody>{kite_monthly_rows}</tbody></table></div></section>
+        <section class="panel"><div class="panel-title">Kite Imported Quarterly P&amp;L</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Quarter</th><th>Gross realised</th><th>Charges</th><th>Net realised</th><th>Months</th></tr></thead><tbody>{kite_quarterly_rows}</tbody></table></div></section>
+      </div>
+      <div class="pnl-analytics-grid">
+        <section class="panel"><div class="panel-title">Quarterly Risk Summary</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Quarter</th><th>Booked P&amp;L</th><th>Risk P&amp;L</th><th>Best monthly peak</th><th>Months</th><th>Locked months</th></tr></thead><tbody>{quarter_risk_rows}</tbody></table></div></section>
+        <section class="panel"><div class="panel-title">Yearly Risk Summary</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Year</th><th>Booked P&amp;L</th><th>Risk P&amp;L</th><th>Best monthly peak</th><th>Months</th><th>Locked months</th></tr></thead><tbody>{year_risk_rows}</tbody></table></div></section>
+      </div>
       <section class="panel">
         <div class="panel-title">Daily P&amp;L Ledger</div>
         <p class="status">Historical layer is loaded from local DB. “Sync Today” refreshes the current Kite position snapshot with upsert semantics, so the same day is updated instead of duplicated.</p>
@@ -40764,6 +41077,19 @@ def render_page(state: PageState) -> bytes:
       color: #475569;
       font-weight: 750;
     }}
+    .monthly-risk-panel {{ border-width:2px; border-color:#bbf7d0; }}
+    .monthly-risk-panel.amber {{ border-color:#fcd34d; background:#fffbeb; }}
+    .monthly-risk-panel.orange {{ border-color:#fb923c; background:#fff7ed; }}
+    .monthly-risk-panel.red {{ border-color:#ef4444; background:#fff1f2; }}
+    .monthly-risk-heading {{ display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }}
+    .monthly-risk-heading span {{ display:block; color:#64748b; font-size:11px; font-weight:950; letter-spacing:.08em; }}
+    .monthly-risk-heading strong {{ display:block; margin-top:4px; font-size:22px; font-weight:950; }}
+    .monthly-risk-account {{ color:#475569; font-weight:850; }}
+    .monthly-risk-progress {{ height:14px; overflow:hidden; border-radius:999px; background:#e2e8f0; border:1px solid #cbd5e1; }}
+    .monthly-risk-progress span {{ display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,#16a34a 0%,#f59e0b 55%,#ea580c 78%,#dc2626 100%); }}
+    .risk-amber {{ color:#a16207 !important; }}
+    .risk-orange {{ color:#c2410c !important; }}
+    .execution-process-reminder {{ margin:8px 0 12px; padding:10px 12px; border:1px solid #93c5fd; border-radius:10px; background:#eff6ff; color:#1e3a8a; font-size:13px; font-weight:850; line-height:1.4; text-align:center; }}
     .pnl-analytics-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
@@ -43897,6 +44223,19 @@ def render_page(state: PageState) -> bytes:
         window.open(dailyKiteLoginUrl, '_blank', 'noopener,noreferrer');
       }}, 150);
     }}
+    const executionReminder = "The objective today is not to recover yesterday's loss. The objective is to execute the next valid setup correctly.";
+    for (const modal of document.querySelectorAll('.live-modal')) {{
+      const container = modal.closest('.live-modal-backdrop');
+      const id = String(container && container.id || '').toLowerCase();
+      if (!/(order|confirm|repair|execution|ticket)/.test(id) || modal.querySelector('.execution-process-reminder')) continue;
+      const reminder = document.createElement('div');
+      reminder.className = 'execution-process-reminder';
+      reminder.setAttribute('role', 'note');
+      reminder.textContent = executionReminder;
+      const heading = modal.querySelector('h1,h2,h3');
+      if (heading && heading.nextSibling) heading.parentNode.insertBefore(reminder, heading.nextSibling);
+      else modal.prepend(reminder);
+    }}
   </script>
 </body>
 </html>"""
@@ -45764,7 +46103,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     result = generate_dhan_top10_from_fno_sheet(
                         bytes(upload.get("content") or b""),
                         repository,
-                        DhanBrokerAdapter(paper_trading=True),
+                        DhanBrokerAdapter(paper_trading=True, account_id=selected_kite_profile_name()),
                         RiskVetoEngine(),
                         selected_tabs=selected_tabs,
                         min_wheel_score=state.dhan_fno_min_wheel_score,
@@ -46166,7 +46505,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if not state.dhan_repair_preview:
                     raise ValueError("Open one DHAN repair preview before submitting.")
                 submit_mode = "PAPER" if state.dhan_paper_trading else "LIVE"
-                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
+                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE", account_id=selected_kite_profile_name(state.kite_profile))
                 try:
                     outcome = submit_dhan_repair_order(
                         apply_single_leg_limit_price_controls(
@@ -46228,7 +46567,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if selected_idx < 0 or selected_idx >= len(state.dhan_opportunities or []):
                     raise ValueError("Select one DHAN opportunity row before submitting.")
                 repository = DhanRepository(APP_DB_PATH)
-                broker = DhanBrokerAdapter(paper_trading=state.dhan_paper_trading)
+                broker = DhanBrokerAdapter(paper_trading=state.dhan_paper_trading, account_id=selected_kite_profile_name(state.kite_profile))
                 try:
                     load_dhan_state(state)
                     selected_opportunity = apply_dhan_expiry_choice(
@@ -46322,6 +46661,75 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     f"Synced today's P&L from Kite positions for {synced} row(s). "
                     "Existing rows for the same date/account/symbol were updated, not duplicated."
                 )
+            elif request_path == "/pnl/import-kite":
+                upload = uploaded_files.get("pnl_kite_file") or {}
+                content = bytes(upload.get("content") or b"")
+                file_name = str(upload.get("filename") or "kite-pnl.xlsx")
+                if not checked(form, "pnl_import_confirm"):
+                    raise ValueError("Confirm that the Kite workbook belongs to the selected account.")
+                if not file_name.lower().endswith(".xlsx"):
+                    raise ValueError("Upload a Kite P&L workbook in .xlsx format.")
+                if not content:
+                    raise ValueError("Choose a Kite P&L .xlsx file before importing.")
+                if len(content) > 15 * 1024 * 1024:
+                    raise ValueError("Kite P&L workbook exceeds the 15 MB upload limit.")
+                parsed = parse_kite_pnl_xlsx(content)
+                requested_account = first(form, "pnl_import_account").strip().upper() or parsed.account_id
+                result = KitePnlImportRepository(APP_DB_PATH).import_workbook(
+                    parsed,
+                    file_name,
+                    requested_account,
+                )
+                for row in parsed.monthly_rows:
+                    year, month = (int(part) for part in str(row["month_key"]).split("-"))
+                    MonthlyRiskRepository(APP_DB_PATH).latest_snapshot(
+                        requested_account,
+                        date(year, month, monthrange(year, month)[1]),
+                    )
+                state.pnl_account = requested_account
+                load_pnl_state(state)
+                state.message = (
+                    f"Kite P&L file already imported; no duplicate rows added for {requested_account}."
+                    if result.get("duplicate")
+                    else f"Imported Kite client {parsed.account_id} P&L into app profile {requested_account}: {result.get('months')} month(s), "
+                         f"₹{parsed.gross_realized_pnl:,.2f} gross realised, ₹{parsed.charges:,.2f} charges. "
+                         f"Method: {parsed.allocation_method}."
+                )
+            elif request_path == "/pnl/save-risk-config":
+                account_id = first(form, "risk_account_id") or selected_kite_profile_name(state.kite_profile)
+                repository = MonthlyRiskRepository(APP_DB_PATH)
+                existing = repository.get_config(account_id)
+                snapshot = repository.latest_snapshot(account_id)
+                requested_limit = float(first(form, "monthly_max_loss_inr", str(existing.monthly_max_loss_inr)) or existing.monthly_max_loss_inr)
+                reason = first(form, "risk_change_reason").strip()
+                increasing_while_losing = requested_limit > existing.monthly_max_loss_inr and float(snapshot.get("booked_pnl") or 0) < 0
+                if increasing_while_losing and (not checked(form, "risk_admin_confirm") or len(reason) < 10):
+                    raise ValueError(
+                        "Increasing the monthly loss limit during a losing month requires administrative confirmation and a meaningful data/reconciliation reason."
+                    )
+                saved = repository.save_config(
+                    MonthlyRiskConfig(
+                        account_id=account_id,
+                        monthly_max_loss_inr=requested_limit,
+                        warning_percent=float(first(form, "risk_warning_percent", str(existing.warning_percent)) or existing.warning_percent),
+                        reduce_risk_percent=float(first(form, "risk_reduce_percent", str(existing.reduce_risk_percent)) or existing.reduce_risk_percent),
+                        hard_stop_percent=100.0,
+                        giveback_warning_percent=float(first(form, "giveback_warning_percent", str(existing.giveback_warning_percent)) or existing.giveback_warning_percent),
+                        giveback_reduce_percent=float(first(form, "giveback_reduce_percent", str(existing.giveback_reduce_percent)) or existing.giveback_reduce_percent),
+                        giveback_lock_percent=float(first(form, "giveback_lock_percent", str(existing.giveback_lock_percent)) or existing.giveback_lock_percent),
+                        loss_streak_threshold=existing.loss_streak_threshold,
+                        cooldown_minutes=max(1, min(240, int(float(first(form, "risk_cooldown_minutes", str(existing.cooldown_minutes)) or existing.cooldown_minutes)))),
+                        enabled=True,
+                    )
+                )
+                repository.log_admin_event(
+                    account_id,
+                    "MONTHLY_RISK_CONFIG_CHANGED",
+                    reason or "Routine risk threshold configuration.",
+                    {"previous_limit": existing.monthly_max_loss_inr, "new_limit": saved.monthly_max_loss_inr},
+                )
+                load_pnl_state(state)
+                state.message = f"Saved monthly capital-protection controls for {account_id}. Hard stop remains enabled at 100%."
             elif request_path == "/pnl/export-csv":
                 load_pnl_state(state)
                 export_path = PnlRepository(APP_DB_PATH).export_csv(state.pnl_rows or [], APP_ROOT / "pnl_exports")
@@ -46543,7 +46951,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     raise ValueError("Select one SECTOR-Income opportunity row before submitting.")
                 submit_mode = "PAPER" if state.dhan_it_paper_trading else "LIVE"
                 repository = DhanItPairRepository(APP_DB_PATH)
-                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
+                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE", account_id=selected_kite_profile_name(state.kite_profile))
                 try:
                     selected_opportunity = apply_dhan_result_date_guard(dict(state.sector_income_opportunities[selected_idx]))
                     selected_opportunity = apply_sector_income_limit_controls(
@@ -46906,7 +47314,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if str(refreshed_preview.get("risk_decision") or "").upper() != "APPROVED":
                     raise ValueError(f"52W AI pair is blocked: {refreshed_preview.get('risk_reason') or refreshed_preview.get('reason')}")
                 submit_mode = "PAPER" if state.ai52_paper_trading else "LIVE"
-                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
+                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE", account_id=selected_kite_profile_name(state.kite_profile))
                 outcome = submit_dhan_it_pair(
                     refreshed_preview,
                     repository,
@@ -47084,7 +47492,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if not state.dhan_it_repair_preview:
                     raise ValueError("Open one DHAN-IT repair preview before submitting.")
                 submit_mode = "PAPER" if state.dhan_it_paper_trading else "LIVE"
-                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
+                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE", account_id=selected_kite_profile_name(state.kite_profile))
                 try:
                     outcome = submit_dhan_it_repair_order(
                         apply_single_leg_limit_price_controls(
@@ -47121,7 +47529,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     raise ValueError("Select one DHAN-IT opportunity row before submitting.")
                 submit_mode = "PAPER" if state.dhan_it_paper_trading else "LIVE"
                 repository = DhanItPairRepository(APP_DB_PATH)
-                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE")
+                broker = DhanBrokerAdapter(paper_trading=submit_mode != "LIVE", account_id=selected_kite_profile_name(state.kite_profile))
                 try:
                     selected_opportunity = apply_dhan_expiry_choice(
                         (state.dhan_it_opportunities or [])[selected_idx],
@@ -47707,6 +48115,7 @@ def main() -> int:
     print("Default close-position BUY scheduler enabled for weekdays at 09:20 IST.")
     print("Intraday missing close-order guard enabled every 15 minutes from 09:30 to 15:15 IST.")
     print("Income Growth GPT CSV scheduler enabled for weekdays at 09:30 IST.")
+    print("End-of-day Kite P&L snapshot enabled for trading days at 16:00 IST.")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

@@ -412,6 +412,25 @@ class PnlRepository:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS pnl_account_daily_summary (
+                    trade_date TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    broker TEXT NOT NULL DEFAULT 'ZERODHA',
+                    source TEXT NOT NULL,
+                    realized_pnl REAL NOT NULL DEFAULT 0,
+                    unrealized_pnl REAL NOT NULL DEFAULT 0,
+                    gross_pnl REAL NOT NULL DEFAULT 0,
+                    net_realized_pnl REAL NOT NULL DEFAULT 0,
+                    position_rows INTEGER NOT NULL DEFAULT 0,
+                    snapshot_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(trade_date, account_id, broker, source)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS pnl_order_strategy_map (
                     order_id TEXT PRIMARY KEY,
                     account_id TEXT NOT NULL,
@@ -490,6 +509,56 @@ class PnlRepository:
                 (audit_event, now, account, json.dumps({"records": len(records)}, sort_keys=True)),
             )
         return len(records)
+
+    def upsert_account_daily_summary(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        account_id: str,
+        trade_date: date,
+        source: str = "SCHEDULED_EOD",
+        broker: str = "ZERODHA",
+    ) -> dict[str, Any]:
+        """Persist one explicit account/day total, including legitimate zero days."""
+        self.ensure_schema()
+        now = _now_text()
+        summary = {
+            "trade_date": trade_date.isoformat(),
+            "account_id": str(account_id or "DEFAULT"),
+            "broker": str(broker or "ZERODHA"),
+            "source": str(source or "SCHEDULED_EOD"),
+            "realized_pnl": round(sum(safe_float(row.get("realized_pnl")) for row in records), 2),
+            "unrealized_pnl": round(sum(safe_float(row.get("unrealized_pnl")) for row in records), 2),
+            "gross_pnl": round(sum(safe_float(row.get("gross_pnl")) for row in records), 2),
+            "net_realized_pnl": round(sum(safe_float(row.get("net_realized_pnl")) for row in records), 2),
+            "position_rows": len(records),
+            "snapshot_at": now,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO pnl_account_daily_summary(
+                    trade_date, account_id, broker, source, realized_pnl,
+                    unrealized_pnl, gross_pnl, net_realized_pnl, position_rows,
+                    snapshot_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, account_id, broker, source) DO UPDATE SET
+                    realized_pnl=excluded.realized_pnl,
+                    unrealized_pnl=excluded.unrealized_pnl,
+                    gross_pnl=excluded.gross_pnl,
+                    net_realized_pnl=excluded.net_realized_pnl,
+                    position_rows=excluded.position_rows,
+                    snapshot_at=excluded.snapshot_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    summary["trade_date"], summary["account_id"], summary["broker"],
+                    summary["source"], summary["realized_pnl"], summary["unrealized_pnl"],
+                    summary["gross_pnl"], summary["net_realized_pnl"],
+                    summary["position_rows"], summary["snapshot_at"], now, now,
+                ),
+            )
+        return summary
 
     def available_years(self) -> list[int]:
         self.ensure_schema()

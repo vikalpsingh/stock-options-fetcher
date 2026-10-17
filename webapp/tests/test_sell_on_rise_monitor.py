@@ -296,7 +296,9 @@ def test_browser_history_is_bounded_and_keeps_endpoints_and_extremes():
     assert any(point["price"] == 120 for point in sampled)
 
 
-def test_market_data_is_cleared_at_1550_without_removing_config(tmp_path):
+def test_market_data_is_cleared_at_1550_without_removing_config(tmp_path, monkeypatch):
+    fixed_now = datetime(2026, 9, 11, 12, 0, tzinfo=IST)
+    monkeypatch.setattr(monitor_module, "now_ist", lambda: fixed_now)
     repo = SellOnRiseMonitorRepository(tmp_path / "monitor.sqlite3")
     cfg = _valid_config()
     repo.save_config(cfg)

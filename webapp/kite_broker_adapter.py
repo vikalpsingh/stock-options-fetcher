@@ -7,9 +7,15 @@ continue to come from `KITE_API_KEY` and `KITE_ACCESS_TOKEN`.
 
 from __future__ import annotations
 
+import os
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import kite_spread_config as spread_cfg
+from monthly_risk_control import pre_order_risk_check
+from pnl_service import PnlRepository, snapshot_from_kite_positions
 
 
 class KiteBrokerError(RuntimeError):
@@ -17,10 +23,17 @@ class KiteBrokerError(RuntimeError):
 
 
 class KiteBrokerAdapter:
-    def __init__(self, kite: Any | None = None, paper_trading: bool | None = None, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        kite: Any | None = None,
+        paper_trading: bool | None = None,
+        dry_run: bool = False,
+        account_id: str | None = None,
+    ) -> None:
         self.kite = kite
         self.paper_trading = spread_cfg.PAPER_TRADING_MODE if paper_trading is None else bool(paper_trading)
         self.dry_run = bool(dry_run)
+        self.account_id = str(account_id or "").strip()
         self.call_log: list[dict[str, Any]] = []
         self._paper_order_counter = 0
 
@@ -64,8 +77,61 @@ class KiteBrokerAdapter:
             order_id = f"PAPER-KITE-{self._paper_order_counter:06d}"
             self.call_log.append({"action": "place_order", "payload": dict(order_payload), "order_id": order_id})
             return {"order_id": order_id, "status": "OPEN", "paper": True}
+        broker_payload = dict(order_payload)
+        risk_context = broker_payload.pop("_risk_context", {})
+        if not isinstance(risk_context, dict):
+            risk_context = {}
         try:
-            order_id = self._client().place_order(**order_payload)
+            client = self._client()
+            positions_response = client.positions()
+            current_positions = (
+                list(positions_response.get("net") or [])
+                if isinstance(positions_response, dict)
+                else []
+            )
+            db_path = Path(
+                os.getenv("TRADING_APP_DB_PATH")
+                or Path(__file__).resolve().parent / "vikalp_income.db"
+            )
+            account_id = str(
+                risk_context.get("account_id")
+                or self.account_id
+                or os.getenv("KITE_ACCOUNT_ID")
+                or "DEFAULT"
+            )
+            # Persist the same fresh broker positions used by the gate. This keeps
+            # booked/open P&L current during the session instead of waiting for EOD.
+            live_pnl_records = snapshot_from_kite_positions(
+                current_positions,
+                account_id=account_id,
+                trade_date=datetime.now(ZoneInfo("Asia/Kolkata")).date(),
+            )
+            pnl_repository = PnlRepository(db_path)
+            pnl_repository.upsert_daily_records(
+                live_pnl_records,
+                audit_event="PRE_ORDER_RISK_PNL_SYNC",
+            )
+            pnl_repository.upsert_account_daily_summary(
+                live_pnl_records,
+                account_id=account_id,
+                trade_date=datetime.now(ZoneInfo("Asia/Kolkata")).date(),
+                source="ACCOUNT_DAILY",
+            )
+            decision = pre_order_risk_check(
+                db_path,
+                {**broker_payload, **risk_context},
+                account_id=account_id,
+                current_positions=current_positions,
+            )
+            if not decision.allowed:
+                raise KiteBrokerError(
+                    f"MONTHLY_RISK_BLOCKED: {decision.reason} "
+                    f"Booked P&L {decision.booked_pnl:.2f}; "
+                    f"remaining loss budget {decision.remaining_loss_budget:.2f}."
+                )
+            order_id = client.place_order(**broker_payload)
+        except KiteBrokerError:
+            raise
         except Exception as exc:
             raise KiteBrokerError(self._friendly_error(str(exc))) from exc
         return {"order_id": str(order_id), "status": "OPEN", "paper": False}

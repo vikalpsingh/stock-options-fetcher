@@ -1,7 +1,7 @@
 {
   "status": "OK",
   "message": "Generated sheet-based DHAN candidates with live validation status.",
-  "generated_at": "2026-08-11T16:32:51+05:30",
+  "generated_at": "2026-10-17T17:23:42+05:30",
   "source_file_name": "uploaded.xlsx",
   "ce_rows_read": 1,
   "pe_rows_read": 0,
