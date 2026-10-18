@@ -7717,6 +7717,7 @@ class PageState:
     trade_direction_open: bool = False
     trade_chart_interval: str = "D"
     trade_chart_range: str = "1M"
+    trade_applied_suggestion: dict[str, str] | None = None
     positions_rows: list[dict[str, Any]] | None = None
     positions_summary: dict[str, Any] | None = None
     position_risk_rows: list[dict[str, Any]] | None = None
@@ -31605,7 +31606,7 @@ def render_trade_panel(state: PageState) -> str:
             f'<td>{html.escape(str(row.get("side") or "-"))} {html.escape(str(row.get("contract") or "-"))}<small>{html.escape(str(row.get("technical_structure") or ""))}<br>{html.escape(str(row.get("expiry") or ""))} · DTE {int(_dhan_metric_float(row.get("dte")))}</small></td>'
             f'<td>{_dhan_metric_float(row.get("ltp")):.2f}<small>Spread {f"{_dhan_metric_float(row.get("spread_pct")):.2f}%" if row.get("spread_pct") is not None else "Unavailable"}</small></td>'
             f'<td><span class="ipo-badge {"good" if row.get("eligible") else "bad"}">{"EXPLORE" if row.get("eligible") else "BLOCKED"}</span><small>{html.escape(str(row.get("risk_note") or row.get("error") or ""))}</small></td>'
-            f'<td><button type="submit" class="mini-link" formaction="/trade/best/select" formnovalidate name="trade_best_symbol" value="{html.escape(str(row.get("symbol") or ""), quote=True)}"{"" if row.get("eligible") else " disabled"}>Open stock</button></td>'
+            f'<td><button type="submit" class="mini-link" form="trade-terminal-panel" formmethod="post" formaction="/trade/best/select" formnovalidate data-trade-best-open name="trade_best_symbol" value="{html.escape(str(row.get("symbol") or ""), quote=True)}"{"" if row.get("eligible") else " disabled"}>Open stock</button></td>'
             "</tr>"
             for row in best_scan_rows
         ) or '<tr><td colspan="8">No configured stock produced a verified candidate. Recalculate after Kite data is available.</td></tr>'
@@ -31780,11 +31781,11 @@ def render_trade_panel(state: PageState) -> str:
         '<label><span>Expiry snapshot distance</span><select id="trade-expiry-otm-filter"><option value="0">0% ATM</option><option value="5" selected>5% OTM</option><option value="10">10% OTM</option></select></label>'
         '</div>'
     )
-    return f'''<form id="trade-terminal-panel" method="post" action="/trade/load"{style}><input type="hidden" name="kite_profile" value="{html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}">
+    return f'''<form id="trade-terminal-panel" method="post" action="/trade/load"{style}><input type="hidden" name="kite_profile" value="{html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}"><input type="hidden" name="active_tab" value="trade">
       {best_scan_modal}{modal}<section class="panel"><div class="panel-title">TRADE — Intelligent Options Execution</div><p class="status">PAPER by default. Contracts and lot sizes come only from the current Kite NFO instrument master. Naked option selling is blocked.</p>
       <div class="compact-grid"><label><span>Stock</span><select name="trade_symbol">{symbol_options}</select></label><label><span>Add NSE F&amp;O symbol</span><input name="trade_add_symbol" placeholder="e.g. RELIANCE"></label><label><span>Mode</span><select name="trade_mode"><option value="PAPER"{" selected" if state.trade_mode == "PAPER" else ""}>PAPER</option><option value="LIVE"{" selected" if state.trade_mode == "LIVE" else ""}>LIVE</option></select></label></div><div class="actions"><button type="submit" formnovalidate>Refresh Stock</button><button type="submit" class="secondary" formaction="/trade/add-stock" formnovalidate>Add / Manage Trading Stocks</button><button type="submit" class="success" formaction="/trade/best" formnovalidate data-trade-scan>Find BEST for TRADE</button><button type="submit" class="secondary" formaction="/trade/best/recalculate" formnovalidate data-trade-scan>Recalculate Best Trades</button></div><p class="status">Find BEST loads today's saved scan when available. Recalculate explicitly refreshes every configured stock from Kite and replaces today's saved ranking.</p></section>
       <section class="panel trade-market-intelligence"><div class="panel-title">Market Intelligence — CE/PE &amp; Expiry Decision Support</div><p class="status">Refreshed from the selected NSE stock quote, verified Kite NFO contracts and batched option quotes. This is decision support, not an execution approval.</p><div class="dhan-ticket-summary trade-intelligence-cards"><article><span>CMP / Day</span><strong>₹{_dhan_metric_float(market.get("cmp")):.2f}</strong><small><span class="trade-day-change {day_change_class}">{day_change_value:+.2f}%</span> · {html.escape(str(market.get("quote_at") or "Data Unavailable"))}</small></article><article><span>Trend score</span><strong>{intelligence_score:+.1f} / 10</strong><small><span class="ipo-badge {intelligence_badge}">{html.escape(intelligence_regime)}</span> {' · '.join(html.escape(str(item)) for item in intelligence.get("reasons") or [])}</small></article><article><span>CE / PE view</span><strong>{"Bullish biased" if intelligence_regime == "BULLISH" else "Bearish biased" if intelligence_regime == "BEARISH" else "Neutral / Wait"}</strong><small>{html.escape(str(intelligence.get("directional_view") or "No verified directional view."))}</small></article><article><span>Expiry preference</span><strong>{html.escape(str(intelligence.get("preferred_expiry") or "UNAVAILABLE"))}</strong><small>{html.escape(str(intelligence.get("expiry_view") or ""))}</small></article><article><span>50 / 200 DMA</span><strong>{_dhan_metric_float(market.get("dma_50")):.2f} / {_dhan_metric_float(market.get("dma_200")):.2f}</strong><small>{html.escape(str(market.get("technical_error") or market.get("source") or "Historical close calculation"))}</small></article><article class="trade-result-card"><span>Result / event risk</span><strong>{html.escape(str(result_date.get("next_result_date_display") or "Not available"))}</strong><small><span class="ipo-badge {result_badge}">{html.escape(str(result_date.get("result_date_message") or "UNKNOWN"))}</span></small></article><article><span>OHLC</span><strong>{_dhan_metric_float(ohlc.get("open")):.2f} / {_dhan_metric_float(ohlc.get("high")):.2f}</strong><small>Low {_dhan_metric_float(ohlc.get("low")):.2f} | Close {_dhan_metric_float(ohlc.get("close")):.2f}</small></article><article><span>Exposure</span><strong>{len(market.get("positions") or [])} positions</strong><small>{len(market.get("orders") or [])} recent/open orders | holdings {market.get("holding_qty") or 0}</small></article></div><div class="income-equity-order-summary">{html.escape(str(intelligence.get("directional_view") or ""))}<br>{html.escape(str(intelligence.get("expiry_view") or ""))} Verify liquidity, event risk and maximum loss in the execution review before placing any order.</div><div class="panel-title">Technical Trade Confirmation</div><div class="table-wrap"><table class="ipo-table trade-technical-table"><thead><tr><th>Check</th><th>Value</th><th>Observation</th><th>Check</th><th>Value</th><th>Observation</th></tr></thead><tbody>{technical_html}</tbody></table></div><p class="status"><strong>Opposing evidence:</strong> {html.escape(opposing_text)}</p>{tradingview_embed}<section class="trade-expiry-decision-block"><div class="panel-title">5% OTM Direction Matrix</div><p class="status">Directional suggestion combines the independently calculated trend with verified contracts in the preferred expiry. SELL choices remain blocked unless covered, cash-secured or converted to a defined-risk spread.</p><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Choice</th><th>View</th><th>Verified contract</th><th>Reason</th></tr></thead><tbody>{direction_choice_html}</tbody></table></div><div class="panel-title trade-expiry-snapshot-title">Current vs Next Expiry — ATM CE/PE Snapshot</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Month</th><th>Expiry</th><th>Contract</th><th>LTP</th><th>Bid / Ask</th><th>Spread</th><th>Volume</th><th>OI</th><th>Action</th></tr></thead><tbody>{expiry_rows}</tbody></table></div></section></section>
-      <section class="panel"><div class="panel-title">Manual Option Order</div><div class="compact-grid"><label><span>Verified contract</span><select name="trade_contract_symbol" required>{contract_options}</select></label><label><span>BUY / SELL</span><select name="trade_side"><option value="BUY"{" selected" if state.trade_side == "BUY" else ""}>BUY</option><option value="SELL"{" selected" if state.trade_side == "SELL" else ""}>SELL</option></select></label><label><span>Lots</span><input type="number" min="1" max="20" name="trade_lots" value="{state.trade_lots}"></label><label><span>Product</span><select name="trade_product"><option>NRML</option><option>MIS</option></select></label><label><span>LIMIT price</span><input type="number" min="0.05" step="0.05" name="trade_limit_price" value="{state.trade_limit_price or ''}" placeholder="Defaults to live LTP"></label></div><div class="actions"><button type="submit" formaction="/trade/review">Review Order</button><button type="submit" class="secondary" formaction="/trade/analyse-gpt">Analyse &amp; Validate with GPT</button>{tradingview_action}<a id="trade-open-gpt" class="button-link secondary" href="{TRADE_GPT_URL}" target="_blank" rel="noopener">Copy Prompt &amp; Open My Trading GPT</a></div><label><span>GPT analysis prompt / result</span><textarea id="trade-gpt-text" name="trade_gpt_analysis" class="conversation">{html.escape(state.trade_gpt_analysis or state.trade_gpt_prompt or TRADE_ANALYSIS_PROMPT)}</textarea></label></section>
+      <section class="panel" id="trade-manual-option-order"{" data-applied-suggestion=\"1\"" if state.trade_applied_suggestion else ""}><div class="panel-title">Manual Option Order</div>{f'<div class="trade-applied-suggestion"><div><span>Suggested contract</span><strong>{html.escape(str((state.trade_applied_suggestion or {}).get("contract") or ""))}</strong><small>Verified again against the active Kite NFO instrument master.</small></div><div><span>Direction</span><strong>{html.escape(str((state.trade_applied_suggestion or {}).get("side") or ""))}</strong><small>Draft selection only; Review Order and all risk controls remain mandatory.</small></div></div>' if state.trade_applied_suggestion else ''}<div class="compact-grid"><label><span>Verified contract</span><select name="trade_contract_symbol" required>{contract_options}</select></label><label><span>BUY / SELL</span><select name="trade_side"><option value="BUY"{" selected" if state.trade_side == "BUY" else ""}>BUY</option><option value="SELL"{" selected" if state.trade_side == "SELL" else ""}>SELL</option></select></label><label><span>Lots</span><input type="number" min="1" max="20" name="trade_lots" value="{state.trade_lots}"></label><label><span>Product</span><select name="trade_product"><option>NRML</option><option>MIS</option></select></label><label><span>LIMIT price</span><input type="number" min="0.05" step="0.05" name="trade_limit_price" value="{state.trade_limit_price or ''}" placeholder="Defaults to live LTP"></label></div><div class="actions"><button type="submit" formaction="/trade/review">Review Order</button><button type="submit" class="secondary" formaction="/trade/analyse-gpt">Analyse &amp; Validate with GPT</button>{tradingview_action}<a id="trade-open-gpt" class="button-link secondary" href="{TRADE_GPT_URL}" target="_blank" rel="noopener">Copy Prompt &amp; Open My Trading GPT</a></div><label><span>GPT analysis prompt / result</span><textarea id="trade-gpt-text" name="trade_gpt_analysis" class="conversation">{html.escape(state.trade_gpt_analysis or state.trade_gpt_prompt or TRADE_ANALYSIS_PROMPT)}</textarea></label></section>
       <section class="panel"><div class="panel-title">TRADE Execution Audit</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Created</th><th>Mode</th><th>Order</th><th>Qty</th><th>LIMIT</th><th>Status</th><th>Broker ID</th></tr></thead><tbody>{recent_rows}</tbody></table></div></section>
     </form>'''
 
@@ -42557,6 +42558,12 @@ def render_page(state: PageState) -> bytes:
     .trade-direction-components span,.trade-direction-components strong {{ display:block; font-size:11px; }}
     .trade-best-modal-card {{ width:min(1480px,96vw); max-width:1480px; }}
     .trade-best-modal-card td small {{ display:block; margin-top:3px; white-space:normal; line-height:1.3; color:#64748b; }}
+    .trade-applied-suggestion {{ display:grid; grid-template-columns:minmax(0,2fr) minmax(140px,1fr); gap:10px; margin:8px 0 12px; padding:11px; border:1px solid #86efac; border-radius:12px; background:#f0fdf4; }}
+    .trade-applied-suggestion > div {{ min-width:0; }}
+    .trade-applied-suggestion span,.trade-applied-suggestion strong,.trade-applied-suggestion small {{ display:block; overflow-wrap:anywhere; }}
+    .trade-applied-suggestion span {{ color:#166534; font-size:10px; font-weight:900; text-transform:uppercase; }}
+    .trade-applied-suggestion strong {{ margin:3px 0; color:#052e16; font-size:18px; }}
+    .trade-applied-suggestion small {{ color:#475569; font-size:10px; font-weight:750; }}
     [data-trade-scan].scanning {{ opacity:.72; cursor:wait; }}
     .trade-technical-table {{ table-layout:fixed; min-width:900px; }}
     .trade-technical-table th:nth-child(1),.trade-technical-table th:nth-child(4) {{ width:13%; }}
@@ -45780,10 +45787,21 @@ def render_page(state: PageState) -> bytes:
     const tradeBestModal = document.getElementById('trade-best-modal');
     const tradeBestClose = document.getElementById('trade-best-close');
     tradeBestClose && tradeBestClose.addEventListener('click', () => {{ tradeBestModal && tradeBestModal.classList.remove('visible'); }});
+    document.querySelectorAll('[data-trade-best-open]').forEach(button => button.addEventListener('click', () => {{
+      // Close immediately while allowing the normal POST to continue. The
+      // server remains authoritative for candidate, contract and direction.
+      if (tradeBestModal) tradeBestModal.classList.remove('visible');
+      button.setAttribute('aria-busy', 'true');
+      button.textContent = 'Opening…';
+    }}));
     document.querySelectorAll('[data-trade-scan]').forEach(button => button.addEventListener('click', () => {{
       button.classList.add('scanning');
       button.textContent = 'Evaluating configured stocks…';
     }}));
+    const tradeManualOrder = document.getElementById('trade-manual-option-order');
+    if (tradeManualOrder && tradeManualOrder.dataset.appliedSuggestion === '1') {{
+      window.requestAnimationFrame(() => tradeManualOrder.scrollIntoView({{behavior:'smooth', block:'start'}}));
+    }}
     const tradeChartDisclosure = document.getElementById('trade-kite-chart-disclosure');
     const tradeExpiryOtmFilter = document.getElementById('trade-expiry-otm-filter');
     const applyTradeExpiryOtmFilter = () => {{
@@ -49530,6 +49548,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 eligible_count = sum(1 for row in (state.trade_best_scan or {}).get("rows") or [] if row.get("eligible"))
                 state.message = f"BEST for TRADE {source_note}: {eligible_count} candidate(s) passed advisory scan checks."
             elif request_path == "/trade/best/select":
+                # Keep the response anchored to TRADE even if profile defaults or
+                # route selection rules change later.
+                state.active_tab = "trade"
                 selected_symbol = first(form, "trade_best_symbol").strip().upper()
                 if not selected_symbol:
                     raise ValueError("Select a scanned stock to explore.")
@@ -49561,6 +49582,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     raise ValueError("The suggested contract is no longer present in the active Kite NFO instrument master. Recalculate BEST for TRADE.")
                 state.trade_best_scan_open = False
                 state.trade_best_scan = None
+                state.trade_applied_suggestion = {
+                    "symbol": selected_symbol,
+                    "contract": state.trade_contract_symbol,
+                    "side": state.trade_side,
+                    "source": "BEST_FOR_TRADE",
+                }
                 state.message = (
                     f"Loaded {selected_symbol} from BEST for TRADE. Manual Option Order now has "
                     f"{state.trade_contract_symbol} and {state.trade_side} preselected; execution review is still required."
@@ -49607,6 +49634,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     raise ValueError("The Best Strategy BUY/SELL direction is invalid. Re-run Best strategy.")
                 state.trade_contract_symbol = suggested_symbol
                 state.trade_side = suggested_side
+                state.trade_applied_suggestion = {
+                    "symbol": state.trade_symbol,
+                    "contract": suggested_symbol,
+                    "side": suggested_side,
+                    "source": "BEST_STRATEGY",
+                }
                 state.trade_direction_result = saved_direction
                 state.trade_best_scan_open = False
                 state.trade_best_scan = None

@@ -144,6 +144,7 @@ def test_best_trade_scan_renders_saved_results_and_explicit_recalculate() -> Non
         trade_recent_orders=[],
         trade_contract_symbol="TCS26OCT3000CE",
         trade_side="SELL",
+        trade_applied_suggestion={"symbol": "TCS", "contract": "TCS26OCT3000CE", "side": "SELL", "source": "BEST_FOR_TRADE"},
         trade_best_scan_open=True,
         trade_best_scan={
             "scan_date": "2026-10-18",
@@ -164,10 +165,16 @@ def test_best_trade_scan_renders_saved_results_and_explicit_recalculate() -> Non
     assert "76.50%" in rendered
     assert 'formaction="/trade/best/recalculate"' in rendered
     assert 'formaction="/trade/best/select"' in rendered
-    assert 'formaction="/trade/best/select" formnovalidate' in rendered
+    assert 'form="trade-terminal-panel" formmethod="post" formaction="/trade/best/select" formnovalidate' in rendered
+    assert 'data-trade-best-open' in rendered
+    assert '<input type="hidden" name="active_tab" value="trade">' in rendered
     assert "Find BEST for TRADE" in rendered
     assert '<option value="TCS26OCT3000CE" selected>' in rendered
     assert '<option value="SELL" selected>SELL</option>' in rendered
+    assert "Suggested contract" in rendered
+    assert "Direction" in rendered
+    assert 'data-applied-suggestion="1"' in rendered
+    assert "scrollIntoView" in app.render_page(state).decode("utf-8")
 
 
 def test_best_strategy_result_can_default_manual_order_on_parent_page() -> None:
