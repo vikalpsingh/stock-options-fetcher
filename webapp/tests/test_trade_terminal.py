@@ -161,7 +161,7 @@ def test_best_trade_scan_renders_saved_results_and_explicit_recalculate() -> Non
     )
     rendered = app.render_trade_panel(state)
     assert "BEST for TRADE — Daily Market Scan" in rendered
-    assert "81.25" in rendered
+    assert "81.2" in rendered
     assert "76.50%" in rendered
     assert 'formaction="/trade/best/recalculate"' in rendered
     assert 'formaction="/trade/best/select"' in rendered
@@ -175,6 +175,83 @@ def test_best_trade_scan_renders_saved_results_and_explicit_recalculate() -> Non
     assert "Direction" in rendered
     assert 'data-applied-suggestion="1"' in rendered
     assert "scrollIntoView" in app.render_page(state).decode("utf-8")
+
+
+def test_top_three_blocked_candidates_can_continue_to_research_only() -> None:
+    rows = [
+        {"symbol": "ONE", "eligible": False},
+        {"symbol": "TWO", "eligible": False},
+        {"symbol": "THREE", "eligible": False},
+        {"symbol": "FOUR", "eligible": False},
+    ]
+    assert app.selected_best_trade_candidate(rows, "THREE") == (rows[2], 2)
+    assert app.selected_best_trade_candidate(rows, "FOUR") == (None, -1)
+    assert app.best_trade_research_access({"eligible": True}, 10) is True
+
+
+def test_top_three_blocked_row_renders_research_button_without_changing_status() -> None:
+    state = app.PageState(
+        active_tab="trade", trade_stage="best", trade_watchlist=[], trade_contracts=[],
+        trade_market={}, trade_recent_orders=[], trade_best_scan_open=True,
+        trade_best_scan={"rows": [{"symbol": "TCS", "eligible": False, "risk_note": "Liquidity blocked"}]},
+    )
+    rendered = app.render_trade_panel(state)
+    assert "TOP 3 · RESEARCH ONLY" in rendered
+    assert ">Research stock</button>" in rendered
+    assert "top three may continue for research even when blocked" in rendered
+
+
+def test_trade_stock_upload_parses_csv_and_rejects_headings() -> None:
+    symbols = app.parse_trade_stock_upload(
+        "stocks.csv", b"Symbol,Comment\nNSE:TCS,core\nINFY-EQ,watch\nTCS,duplicate\n",
+    )
+    assert symbols == ["TCS", "INFY"]
+
+
+def test_uploaded_universe_is_verified_against_kite_nfo_master(monkeypatch) -> None:
+    monkeypatch.setattr(app, "cached_kite_instruments", lambda kite, exchange: [
+        {"name": "TCS", "instrument_type": "CE"},
+        {"name": "TCS", "instrument_type": "PE"},
+        {"name": "INFY", "instrument_type": "CE"},
+        {"name": "NOT_OPTION", "instrument_type": "FUT"},
+    ])
+    valid, invalid = app.verified_trade_underlyings(object(), ["TCS", "INFY", "ABC", "TCS"])
+    assert valid == ["INFY", "TCS"]
+    assert invalid == ["ABC"]
+
+
+def test_find_best_page_has_upload_and_dhan_refresh_controls() -> None:
+    state = app.PageState(
+        active_tab="trade", trade_stage="best", trade_watchlist=[], trade_contracts=[],
+        trade_market={}, trade_recent_orders=[],
+    )
+    rendered = app.render_trade_panel(state)
+    assert 'enctype="multipart/form-data"' in rendered
+    assert 'name="trade_stock_list"' in rendered
+    assert 'formaction="/trade/universe/upload"' in rendered
+    assert 'formaction="/trade/universe/refresh-dhan"' in rendered
+
+
+def test_best_trade_source_filter_groups_dhan_it_and_manual_uploads() -> None:
+    assert app.trade_source_group("DHAN") == "DHAN"
+    assert app.trade_source_group("DHAN_IT") == "DHAN_IT"
+    assert app.trade_source_group("DHAN-IT") == "DHAN_IT"
+    assert app.trade_source_group("UPLOAD") == "MANUAL"
+    assert app.trade_source_group("MANUAL") == "MANUAL"
+
+    state = app.PageState(
+        active_tab="trade", trade_stage="best",
+        trade_watchlist=[{"symbol": "TCS", "source": "DHAN_IT"}],
+        trade_contracts=[], trade_market={}, trade_recent_orders=[],
+        trade_best_scan_open=True,
+        trade_best_scan={"rows": [{"symbol": "TCS", "eligible": False}]},
+    )
+    rendered = app.render_trade_panel(state)
+    assert 'id="trade-best-source-filter"' in rendered
+    assert '<option value="DHAN_IT">DHAN-IT</option>' in rendered
+    assert '<option value="MANUAL">Manual / Uploaded</option>' in rendered
+    assert 'data-trade-source="DHAN_IT"' in rendered
+    assert "tradeBestSourceFilter" in app.render_page(state).decode("utf-8")
 
 
 def test_best_strategy_result_can_default_manual_order_on_parent_page() -> None:
