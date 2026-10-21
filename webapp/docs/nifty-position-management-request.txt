@@ -1,0 +1,683 @@
+
+Act as a senior Python developer, NIFTY index options trader, and broker execution-system architect.
+
+PROJECT: Income Desk
+SCREEN: NIFTY 2.0
+FEATURE: Active NIFTY Positions — Legacy-Style Position Management
+
+OBJECTIVE:
+Enhance the "Current NIFTY Risk" / "Active NIFTY Positions" section to show all live NIFTY positions clearly and provide a Manage Position button on every row, similar to the legacy NIFTY Income screen.
+
+Reuse the existing position management, hedge repair, close-order, roll, and 10-second execution popup functionality.
+
+Do not rebuild the application or create a second execution engine.
+
+TOKEN OPTIMIZATION:
+- Inspect only NIFTY 2.0, legacy NIFTY position management, Kite position services and shared execution components.
+- Reuse existing code.
+- Do not run the complete test suite.
+- Run only focused tests for modified functions.
+- Avoid verbose documentation and unrelated refactoring.
+- No live broker orders during development or testing.
+
+====================================================
+1. CURRENT PROBLEM
+====================================================
+
+The current screen shows:
+
+BUY NIFTY26N1721700PE
+Qty +130
+Strike 21700
+Expiry 17 Nov 2026
+Status LONG_HEDGE_ONLY
+
+SELL NIFTY26N1722000PE
+Qty -195
+Strike 22000
+Expiry 17 Nov 2026
+Status UNHEDGED_SHORT
+
+BUY NIFTY26N1724000CE
+Qty +260
+Strike 24000
+Expiry 17 Nov 2026
+Status LONG_HEDGE_ONLY
+
+Problem:
+
+The first long PE may already protect part of the existing short PE.
+
+Assuming no prior hedge allocation:
+- Short PE quantity = 195
+- Available compatible long PE = 130
+- Hedged quantity = 130
+- Unhedged quantity = 65
+
+The correct status should be PARTIALLY_HEDGED rather than treating the short as completely unhedged and the matching long as unrelated.
+
+The existing Sell Against Long popup must not propose an additional SELL of the 22000 PE against long quantity already allocated to the short.
+
+====================================================
+2. NEW CURRENT POSITIONS SECTION
+====================================================
+
+Rename:
+
+"Current NIFTY Risk"
+
+to:
+
+"NIFTY Active Positions & Management"
+
+Show top summary:
+
+Active Positions
+Open Strategies
+Current MTM P&L
+Fully Hedged Qty
+Unhedged Short Qty
+Available Long Qty
+Current Defined Max Risk
+₹60,000 Risk Cap
+Next Expiry
+
+Use actual live values from Kite.
+
+Below this, provide two views:
+
+A. GROUPED STRATEGIES
+B. ALL POSITIONS
+
+Default to ALL POSITIONS for easy management.
+
+====================================================
+3. LEGACY-STYLE POSITION TABLE
+====================================================
+
+Show a clean table:
+
+Symbol
+Side
+Qty
+Lots
+Avg
+LTP
+Day %
+P&L
+Expiry
+DTE
+Hedge Status
+Available Qty
+Action
+
+Color code:
+- Profit green
+- Loss red
+- Hedged green
+- Partially hedged amber
+- Unhedged short red
+- Unallocated long neutral
+
+Use the same -80% to +100% daily-change color scale already implemented in NIFTY 2.0.
+
+Do not make users scroll horizontally through excessive columns.
+
+On small screens, keep Symbol, Side, Qty, P&L, Hedge Status and Manage visible.
+
+====================================================
+4. ADD MANAGE POSITION BUTTON
+====================================================
+
+For every position row add:
+
+[Manage]
+
+Clicking opens the existing execution popup with the selected position preloaded.
+
+The popup title:
+
+"Manage NIFTY Position"
+
+Show:
+
+Symbol
+BUY / SELL
+Current Qty
+Average Price
+LTP
+Day Change
+P&L
+Strike
+Expiry
+DTE
+Current Hedge Status
+
+Below, display context-appropriate actions.
+
+For SHORT positions:
+
+[Buy Close]
+[Add Hedge]
+[Manage Spread]
+[Roll]
+[Profit Close Order]
+
+For LONG positions:
+
+[Sell Close]
+[Sell Against Available Long]
+[Roll + Sell]
+[Keep as Hedge]
+
+Only show valid actions for that position.
+
+Avoid creating six separate popups.
+
+Reuse one modal with an action selector.
+
+====================================================
+5. FIX HEDGE ALLOCATION ENGINE
+====================================================
+
+Implement:
+
+reconcile_nifty_hedge_allocations(positions, strategy_records)
+
+Rules:
+
+For a short PE:
+Compatible long hedge must have:
+- same NIFTY underlying
+- same account
+- same expiry
+- same PE type
+- lower strike
+- positive available quantity
+
+For a short CE:
+Compatible long hedge must have:
+- same underlying/account/expiry
+- same CE type
+- higher strike
+- positive available quantity
+
+Use persisted strategy allocations first.
+
+Do not automatically reassign hedges already reserved by another open strategy.
+
+If a long appears compatible but was not originally linked to a strategy:
+- show "Suggested Hedge Match"
+- allow confirmation
+- persist allocation only after reconciliation
+
+Never allocate the same hedge quantity twice.
+
+Calculate:
+
+matched_hedge_qty
+unmatched_short_qty
+allocated_long_qty
+free_long_qty
+
+Statuses:
+
+FULLY_HEDGED
+PARTIALLY_HEDGED
+UNHEDGED_SHORT
+LONG_ALLOCATED_AS_HEDGE
+UNALLOCATED_LONG
+HEDGE_EXPIRY_MISMATCH
+UNKNOWN
+
+Example:
+
+Short 22000 PE = 195
+Long 21700 PE = 130
+
+If the long is available:
+
+Protected Qty = 130
+Unprotected Qty = 65
+Status = PARTIALLY_HEDGED
+
+Long 21700 PE:
+
+Allocated Qty = 130
+Free Qty = 0
+Status = LONG_ALLOCATED_AS_HEDGE
+
+This is important to avoid accidentally opening extra short positions.
+
+====================================================
+6. CREATE HEDGE ACTION
+====================================================
+
+When user clicks Add Hedge:
+
+Open action mode:
+
+"Repair Short Position"
+
+Show:
+- Short symbol
+- Total short quantity
+- Existing allocated hedge quantity
+- Remaining unhedged quantity
+- Proposed BUY hedge
+- Width
+- Expiry
+- LTP / Ask
+- Estimated hedge debit
+- Max risk after repair
+
+Default:
+- Hedge width = 300 points
+- Same expiry
+- Quantity = unhedged short quantity
+
+Example:
+
+SELL 22000 PE Qty 195
+Existing BUY 21700 PE Qty 130
+
+Suggested repair:
+
+BUY 21700 PE
+Qty 65
+
+After fill:
+Total BUY hedge = 195
+Total SELL short = 195
+Matched Qty = 195
+
+If the intended repair cannot satisfy the ₹60,000 cap:
+- show the calculated projected risk
+- suggest a smaller risk-reducing action or closing part of the short
+- do not misreport the repair as full protection
+
+Hedge repairs must remain available even when new entries are blocked.
+
+====================================================
+7. SELL AGAINST LONG ACTION
+====================================================
+
+Current popup:
+"Create Income Spread From Long Option"
+
+Keep this feature but FIX hedge availability.
+
+Before enabling SELL:
+
+free_long_qty =
+total_long_qty - allocated_long_qty
+
+Only allow a newly sold option to use free confirmed long quantity.
+
+Example:
+
+BUY 21700 PE Qty 130
+Already allocated to SELL 22000 PE Qty 130
+
+Free Qty = 0
+
+Therefore:
+Disable "Sell Against Long".
+
+Show:
+"This long PE already protects 130 short PE quantity. No free hedge quantity remains. Use Manage Spread, Repair or Roll."
+
+For a genuinely unallocated BUY 24000 CE:
+
+Allow:
+SELL lower-strike CE
+same expiry
+quantity not exceeding the free long quantity
+
+Example:
+Existing BUY 24000 CE Qty 260
+Proposed SELL 23700 CE Qty 130 or 260
+
+If valid:
+Create a protected Bear Call Spread.
+
+Before order placement:
+- verify long position still exists
+- verify quantity available
+- verify same expiry
+- verify valid strike relationship
+- verify portfolio max-loss cap
+
+Cross-expiry positions must not be treated as standard fully protected vertical spreads.
+
+====================================================
+8. FIX POPUP PRICE AND P&L CALCULATIONS
+====================================================
+
+The current popup shows:
+
+SELL LIMIT ₹111.30
+Quantity 130
+Limit Cash Flow ₹14,469
+Projected P&L After Order ₹15,652
+
+This must be corrected.
+
+SELL order cash inflow is not automatically profit.
+
+For an opening SELL:
+- show estimated SELL proceeds separately
+- calculate total strategy net credit using allocated hedge cost
+- calculate theoretical max gain/loss
+- keep realised P&L unchanged until actual fills and closures occur
+
+For a closing SELL of an existing long:
+- calculate estimated realised P&L using entry cost and actual executed sale price
+
+For a short BUY close:
+- calculate estimated realised P&L using short average sell price and expected buyback price
+
+Use labels:
+
+Estimated Order Cash Flow
+Estimated Net Spread Credit
+Estimated Realised P&L on Close
+Current Open MTM
+Maximum Defined Loss
+
+Do not add opening-order cash inflow directly to current P&L.
+
+Use correct pricing defaults:
+
+BUY:
+best ask or configurable limit
+
+SELL:
+best bid or configurable limit
+
+Do not show "BUY Ask +2%" as the default price mode for a new SELL order.
+
+====================================================
+9. MANAGE EXISTING SPREAD
+====================================================
+
+For positions already linked as a protected spread, add:
+
+"Manage Spread"
+
+Popup shows both legs together:
+
+Short Option
+Long Hedge
+Qty
+Expiry
+Initial Net Credit
+Current Closing Debit
+Open P&L
+Realised P&L
+Max Loss
+Profit Captured %
+
+Actions:
+
+[Close Full Spread]
+[Close Short Only]
+[Keep Long Hedge]
+[Roll Spread]
+[Adjust Profit Order]
+
+Default close:
+BUY short first.
+Confirm short filled/closed.
+SELL protective long only when no matching short exposure remains.
+
+If short is closed and long remains:
+show LONG_HEDGE_ONLY / UNALLOCATED_LONG as appropriate.
+
+Never sell the protective hedge while its assigned short remains uncovered.
+
+====================================================
+10. PROFIT CAPTURE AND EXIT MANAGEMENT
+====================================================
+
+Reuse existing 20% short premium capture rules.
+
+For short option:
+
+Passive BUY target =
+average short entry premium × 0.80
+
+Also show:
+- Current short premium
+- Profit captured %
+- Buyback target
+- Existing open BUY close orders
+- Stop-loss state
+- DTE
+- Exit due date
+
+Buttons:
+
+[Place Profit Order]
+[Modify Profit Order]
+[Cancel Profit Order]
+[Buy Close Now]
+
+Do not create duplicate BUY close orders.
+
+Emergency close logic takes priority over passive profit capture.
+
+Reconcile existing orders before submitting.
+
+====================================================
+11. ROLL POSITION
+====================================================
+
+For both short and long positions:
+
+Add "Roll Position".
+
+User selects:
+
+Current expiry
+2-week expiry
+3-week expiry
+4-week expiry
+
+Use actual listed NIFTY expiries.
+
+Show:
+- existing closing legs
+- proposed new legs
+- net closing debit
+- new executable credit/debit
+- incremental risk
+- total projected portfolio risk
+- ₹60K cap status
+
+Require confirmation.
+
+Rolling must be treated as closing/replacing exposure, not as risk-free extra premium.
+
+For a new protected short:
+buy confirmed hedge first, then sell matching short.
+
+====================================================
+12. UNIFIED EXECUTION MODAL
+====================================================
+
+Reuse existing 10-second NIFTY Order Ticket logic.
+
+Modal layout:
+
+A. CURRENT POSITION
+Symbol, side, qty, P&L, expiry
+
+B. ACTION SELECTOR
+Close / Hedge / Sell Against Long / Roll / Manage Spread
+
+C. ORDER PREVIEW
+Action, symbol, lots, quantity, LTP, bid/ask, limit
+
+D. RISK SUMMARY
+Current risk
+Projected risk
+Max loss cap
+Cash flow
+Estimated P&L effect
+Warnings
+
+E. EXECUTION
+Refresh Details
+Review & Start 10s
+GO
+Cancel
+
+Keep GO disabled until review completes.
+
+Refresh Kite positions, open orders and quotes before execution.
+
+Recalculate hedge availability and risk before GO.
+
+Do not place new SELL exposure unless its confirmed matching hedge is available or filled first.
+
+====================================================
+13. ACTIVE POSITION SUMMARY
+====================================================
+
+For the current screenshot, target display:
+
+SHORT 22000 PE
+Qty 195
+Protected 130
+Unhedged 65
+Status PARTIAL HEDGE
+Action: Repair / Close / Manage
+
+LONG 21700 PE
+Qty 130
+Allocated 130
+Free 0
+Status HEDGE IN USE
+Action: View Linked Spread / Roll / Close When Safe
+
+LONG 24000 CE
+Qty 260
+Allocated 0 (if confirmed)
+Free 260
+Status AVAILABLE LONG
+Action: Sell Against / Roll / Close
+
+Use actual broker data and confirmed strategy allocations, not these hardcoded values.
+
+====================================================
+14. PORTFOLIO RISK
+====================================================
+
+Keep the ₹60,000 maximum loss cap.
+
+Recalculate portfolio risk from:
+- matched existing spreads
+- unmatched short exposure
+- unallocated long exposure
+- new proposed orders
+- different expiries
+
+Do not show risk = 0 when an existing short is partially/unhedged.
+
+Unknown or insufficiently bounded total risk must prevent additional live short exposure.
+
+Allow genuinely risk-reducing repairs and exits.
+
+A risk-reducing hedge repair must not be blocked just because confidence, MMI or credit quality is poor.
+
+====================================================
+15. UI SIMPLIFICATION
+====================================================
+
+Do not duplicate Active NIFTY Positions tables.
+
+Use ONE canonical positions data source.
+
+Put:
+- summary
+- all positions table
+- per-position Manage button
+- grouped spreads
+
+in the same section.
+
+Remove redundant legacy action buttons if the unified Manage button replaces them.
+
+Use expandable Advanced Details only for:
+- quote diagnostics
+- hedge reconciliation details
+- raw Kite orders
+- complete logs
+- scheduler diagnostics
+
+Keep the main interface simple.
+
+====================================================
+16. LIGHTWEIGHT TESTS
+====================================================
+
+Do not run full pytest.
+
+Run focused validation for:
+
+1. Short PE qty 195 and long PE qty 130:
+   matched 130, unhedged 65.
+
+2. Long allocated 130:
+   free quantity must be 0.
+
+3. Sell Against Long:
+   blocked when free long quantity is 0.
+
+4. Hedge repair:
+   proposes BUY 65 lower-strike PE.
+
+5. Long CE free quantity:
+   may create valid same-expiry Bear Call Spread.
+
+6. Opening SELL cash inflow:
+   not counted directly as realised P&L.
+
+7. Hedge still protecting short:
+   cannot be closed independently.
+
+8. GO:
+   refreshes allocations and does not duplicate orders.
+
+No live orders during testing.
+
+====================================================
+17. ACCEPTANCE CRITERIA
+====================================================
+
+Implementation is complete when:
+
+- NIFTY 2.0 shows a clean legacy-style positions table.
+- Every position has a Manage action.
+- Matching existing hedge quantities are recognised.
+- Partial hedge quantities are shown correctly.
+- The same hedge quantity cannot be reused.
+- Add Hedge proposes only the missing quantity.
+- Sell Against Long uses only free long quantity.
+- The execution popup uses the existing 10-second review.
+- Order cash flow is not incorrectly shown as profit.
+- The ₹60,000 risk cap remains enforced.
+- Existing live Kite order placement works.
+- No duplicate position tables or duplicate execution engines.
+- Focused tests pass.
+
+IMPLEMENT directly in the existing repository.
+
+Final Codex response:
+1. Files changed.
+2. Features completed.
+3. Focused test results.
+4. Known issues.
+
+Do not produce a lengthy report.

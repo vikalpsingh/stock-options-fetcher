@@ -122,3 +122,55 @@ def monthly_analytics(strategies, month, quotes=None):
             "scale_status": "NOT_ENOUGH_DATA" if stats["verified_completed"] < 30 else
                             "REDUCE_RISK" if (stats["expectancy"] or 0) <= 0 else "MAINTAIN_SIZE",
             "scale_reason": "No automatic sizing increase. Execution incidents, adverse-regime evidence and slippage must also be reviewed."}
+
+
+def position_close_preview(position, quote, orders=(), now=None):
+    """Estimate closing cash/P&L without changing realised results or placing orders.
+
+    Long closures are limited to reconciled free quantity. Active orders reserve
+    the contract until reconciled, including unknown broker statuses.
+    """
+    from .reconciliation import finite_number
+    qty = finite_number(position.get('quantity'))
+    average = finite_number(position.get('average_price'))
+    result = dict(side=None, quantity=0, price=None, cash_flow=None,
+                  estimated_realised_gross=None, blockers=[])
+    if qty is None or not qty or not qty.is_integer() or average is None or average < 0:
+        result['blockers'].append('Position quantity or entry cost is unavailable.')
+        return result
+    side = 'SELL' if qty>0 else 'BUY'
+    free = finite_number(position.get('free_long_qty')) if qty>0 else abs(qty)
+    quantity = min(abs(qty), max(0,free or 0))
+    if position.get('hedge_status')=='UNKNOWN':
+        quantity=0
+    result.update(side=side, quantity=quantity)
+    if not quantity:
+        result['blockers'].append('No confirmed free quantity; retain protection for existing shorts.')
+    pending = [order for order in orders
+        if order.get('tradingsymbol')==position.get('tradingsymbol')
+        and (order.get('product') or 'NRML')==(position.get('product') or 'NRML')
+        and str(order.get('status') or '').upper() not in {'COMPLETE','CANCELLED','REJECTED'}]
+    if pending:
+        result['blockers'].append('Existing orders require reconciliation before another close.')
+    depth = quote.get('depth') or {}
+    best = (depth.get('buy' if side=='SELL' else 'sell') or [{}])[0]
+    price = finite_number(best.get('price'))
+    size = finite_number(best.get('quantity'))
+    fresh=False
+    try:
+        stamp=datetime.fromisoformat(str(quote.get('timestamp')))
+        if stamp.tzinfo is None:
+            stamp=stamp.replace(tzinfo=ZoneInfo('Asia/Kolkata'))
+        fresh=now is not None and now.tzinfo is not None and 0 <= (now-stamp).total_seconds() <= 120
+    except (ValueError,TypeError):
+        pass
+    if not fresh:
+        result['blockers'].append('Refresh required for current close prices.')
+    if price is None or price <= 0 or size is None or size < quantity:
+        result['blockers'].append('Executable close depth is unavailable for this quantity.')
+    else:
+        result['price']=price
+        if quantity and fresh:
+            result['cash_flow']=quantity*price*(1 if side=='SELL' else -1)
+            result['estimated_realised_gross']=quantity*(price-average)*(1 if side=='SELL' else -1)
+    return result

@@ -8,7 +8,8 @@ NIFTY_INCOME_V2_DEFAULTS: dict[str, Any] = {
     "timezone": "Asia/Kolkata",
     "max_total_nifty_defined_loss_inr": 60000,
     "default_lots": 2,
-    "maximum_lots_per_new_trade": 2,
+    "maximum_lots_per_new_trade": 4,
+    "allowed_lots": [1, 2, 3, 4],
     "default_hedge_width_points": 300,
     "use_live_instrument_lot_size": True,
     "preferred_entry_dte_min": 21,
@@ -57,6 +58,11 @@ def income_v2_config(overrides=None):
                 raise ValueError(f"Invalid NIFTY setting: {key}") from None
     if result["max_total_nifty_defined_loss_inr"] > 60000:
         raise ValueError("NIFTY portfolio loss cap cannot exceed ₹60,000.")
+    if (not isinstance(result["allowed_lots"], list) or not result["allowed_lots"]
+            or any(type(n) is not int or n not in (1, 2, 3, 4) for n in result["allowed_lots"])
+            or result["maximum_lots_per_new_trade"] > 4
+            or result["default_lots"] not in result["allowed_lots"]):
+        raise ValueError("NIFTY lots must be selected from 1, 2, 3 and 4.")
     if result["default_lots"] > result["maximum_lots_per_new_trade"]:
         raise ValueError("Default lots exceed the configured maximum.")
     for prefix in ("preferred", "alternate"):

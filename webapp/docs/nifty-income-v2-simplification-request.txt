@@ -1,0 +1,910 @@
+
+Act as a principal Python developer, senior NIFTY options trader, and trading execution-system architect.
+
+PROJECT: Income Desk
+SCREEN: NIFTY 2.0 / NIFTY Income
+TASK: Simplify the NIFTY Order Ticket and eliminate redundant validation failures while preserving essential execution and maximum-loss protection.
+
+IMPORTANT TOKEN OPTIMIZATION:
+- Do not run the full pytest suite.
+- Do not execute unrelated integration tests.
+- Do not repeatedly inspect the entire repository.
+- Inspect only relevant NIFTY 2.0, TRADE, Kite adapter, order execution, and shared datetime/UI files.
+- Reuse existing functions, components, and services.
+- Prefer minimal edits and small reusable helpers.
+- Run Python compilation and only 5-8 focused smoke/unit tests covering changed logic.
+- Do not generate extensive test reports, screenshots, or verbose documentation.
+- Provide a concise final summary of changed files and validation results.
+- Never send actual live orders during testing.
+
+====================================================
+1. IMPLEMENTATION OBJECTIVE
+====================================================
+
+The existing NIFTY 2.0 execution screen has too many validation warnings and prevents practical position-taking.
+
+Make execution simple:
+
+OPEN NIFTY ORDER TICKET
+        ↓
+SELECT PE / CE / BOTH / BUY ONLY
+        ↓
+LOAD 4 LEGS AND CURRENT PRICES
+        ↓
+SHOW DAY % CHANGE WITH COLORS
+        ↓
+FIND NEAREST LIQUID STRIKES
+        ↓
+CALCULATE REAL EXECUTABLE CREDIT
+        ↓
+CHECK ₹60,000 TOTAL RISK CAP
+        ↓
+REVIEW FOR 10 SECONDS
+        ↓
+CLICK GO
+        ↓
+BUY HEDGE FIRST
+        ↓
+SELL PROTECTED OPTION
+        ↓
+DISPLAY EXECUTION RESULT
+
+Keep the default workflow fast and understandable.
+
+Do not add another full risk dashboard.
+
+====================================================
+2. GLOBAL TIMEZONE FIX — IST
+====================================================
+
+Existing error:
+
+"NIFTY26N1722050PE quote age: Broker quote timestamp must be within the freshness limit."
+
+Fix timezone handling across the ENTIRE application.
+
+Use:
+
+from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
+
+APP_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+Requirements:
+
+1. All user-visible timestamps must be displayed in IST.
+2. All scheduled market jobs must use Asia/Kolkata.
+3. All market session comparisons must use exchange-local IST.
+4. Keep timestamps timezone-aware internally.
+5. Prefer UTC for persistent storage and convert to IST for display.
+6. Never blindly assume a UTC timestamp is already IST.
+7. Parse timezone-naive Kite exchange quote timestamps according to their documented exchange-local time semantics.
+8. Normalize all comparable timestamps to aware datetimes.
+9. Avoid comparing timezone-naive and timezone-aware datetimes.
+10. Do not manually add 5 hours 30 minutes to existing aware timestamps.
+
+Create/reuse:
+
+app_now_ist()
+to_ist(timestamp)
+parse_kite_timestamp(value)
+get_quote_age_seconds(quote)
+is_quote_fresh(quote, max_age_seconds)
+
+Kite quotes may contain:
+- timestamp: exchange quote packet timestamp
+- last_trade_time: timestamp of last completed trade
+- local_received_at: timestamp when application received the snapshot
+
+Important:
+Use exchange quote timestamp and local fetch time to evaluate freshness.
+Do not reject a liquid option only because last_trade_time is older than the current quote.
+
+If the exchange timestamp is unavailable:
+- Mark quote timestamp quality UNKNOWN.
+- Use the local received timestamp only for measuring snapshot caching age.
+- Clearly distinguish quote age from time since last trade.
+
+Display:
+
+Quote Updated: 14:32:25 IST
+Snapshot Age: 18 seconds
+
+Apply the global change consistently to:
+- NIFTY 2.0
+- TRADE
+- Position
+- Modify / Cancel
+- P&L
+- All market schedulers
+- Broker logs and audit UI
+
+Do not change the operating system timezone.
+
+====================================================
+3. SIMPLIFY MARKET DATA FRESHNESS
+====================================================
+
+For NIFTY Order Ticket:
+
+Set maximum reviewed quote snapshot lifetime:
+
+120 seconds.
+
+Config:
+
+nifty_execution:
+  max_quote_snapshot_age_seconds: 120
+  auto_refresh_before_review: true
+  auto_refresh_before_go: true
+  require_fresh_quote_for_live: true
+
+Workflow:
+
+When ticket opens:
+- Fetch selected option quotes once.
+- Record quote snapshot ID.
+- Record application received_at UTC and display IST.
+- Display countdown of time remaining before snapshot expires.
+
+When user clicks Review:
+- Refresh all selected legs in one batched request.
+- Recalculate limit prices, credit and risk.
+- Start 10-second countdown.
+
+When user clicks GO:
+- Check snapshot lifetime.
+- If expired, refresh automatically and require review of material changes.
+- If quote remains unavailable, disable GO and show Refresh Required.
+- Do not execute from stale prices.
+
+Avoid repeated quote API calls for every intermediate validation.
+
+Do not repeatedly show the old quote-age error string.
+
+Use:
+"Quotes refreshed at HH:MM:SS IST"
+or
+"Refresh required — prices are older than 2 minutes."
+
+====================================================
+4. AUTO-SELECT NEARBY LIQUID STRIKES
+====================================================
+
+Existing error:
+
+"NIFTY26N1722050PE liquidity: Best-price depth must cover quantity and the bid/ask spread must pass."
+
+Implement nearest liquid strike selection.
+
+Create:
+
+find_nearest_liquid_nifty_strike(
+    base_strike,
+    option_type,
+    expiry,
+    transaction_type,
+    quantity,
+    spot,
+    config
+)
+
+Search order:
+
+STEP 1:
+Check originally recommended strike.
+
+STEP 2:
+Search valid nearby strikes in increments of 100 points.
+
+STEP 3:
+If no suitable option:
+Search valid nearby strikes in increments of 50 points.
+
+Search both directions within configurable permitted distance.
+
+Default maximum adjustment:
+500 points.
+
+Use actual NFO instrument master.
+Do not assume every 50-point strike is listed or tradable.
+
+For each candidate evaluate:
+- option symbol exists
+- valid expiry
+- bid
+- ask
+- LTP
+- bid quantity
+- ask quantity
+- available depth levels
+- OI and volume
+- quote freshness
+- strike OTM %
+- hedge relationship
+- realistic credit
+- projected max loss
+
+Prefer strikes with:
+1. Valid executable quote
+2. Better liquidity
+3. Lower execution slippage
+4. Safer distance from spot
+5. Acceptable actual net credit
+
+Do not move closer to ATM solely to improve premium.
+
+If a closer strike increases risk:
+- show adjusted OTM %, delta when available, max loss and credit
+- require explicit selection/acceptance
+
+Return best three candidates.
+
+Example UI:
+
+Original PE: 22050 | Illiquid
+Alternative 1: 22100 | Liquid
+Alternative 2: 22000 | Liquid
+Alternative 3: 22150 | Review
+
+Allow user to select any valid candidate.
+
+When short strike changes:
+- automatically recalculate protective BUY strike
+- preserve selected hedge width when valid
+- refresh quotes
+- recalculate entire spread risk
+
+Liquidity handling:
+
+If top-of-book quantity is smaller than required total quantity:
+- do not claim the whole order is executable at the best quote
+- estimate execution against available depth levels
+- support lot-aligned partial execution/slicing if already supported by broker adapter
+- show expected slippage and remaining unfilled quantity
+- do not assume thin depth guarantees execution
+
+If spread is wide:
+- show a warning and potential execution cost
+- allow limit price selection only when a valid quote and bounded risk exist
+- do not fabricate fills
+
+Remove the old single-line depth failure as a blanket rejection during candidate discovery.
+
+====================================================
+5. REMOVE REDUNDANT PORTFOLIO RISK ERRORS
+====================================================
+
+Existing error:
+
+"Portfolio risk: CURRENT_RISK_UNKNOWN_OR_UNHEDGED"
+
+Do not show this raw diagnostic in the new order ticket.
+
+Replace the duplicated risk engines with one authoritative risk calculator.
+
+Rules:
+
+For a NEW fully hedged spread:
+- calculate its own exact maximum loss
+- calculate the existing NIFTY portfolio exposure
+- show total projected portfolio risk
+
+Important:
+The existing screen has previously contained an unhedged NIFTY short.
+
+A new protective spread does not eliminate that pre-existing uncovered risk.
+
+If an existing unhedged short remains:
+- show one concise message:
+  "Existing short requires hedge repair or exit."
+- allow BUY hedge repair and risk-reducing orders
+- allow research, previews and ticket creation
+- do not falsely report existing risk as zero
+- do not authorize additional live short exposure when the total ₹60K loss cap cannot be established
+
+Do not run the old duplicate hedge-integrity checks three times.
+
+Use one service:
+
+evaluate_nifty_portfolio_risk()
+
+The only risk-cap decision shown in the ticket:
+
+CURRENT RISK
+NEW ORDER MAX LOSS
+PROJECTED TOTAL RISK
+CAP ₹60,000
+PASS / BLOCKED
+
+For standard same-expiry nonoverlapping Iron Condor:
+
+max_loss =
+max(PE_width, CE_width) * quantity
+- net_credit_value
+
+For a vertical:
+max_loss =
+spread_width * quantity
+- net_credit_value
+
+Use realistic executable pricing and include conservative estimated execution costs.
+
+Different expiries, unequal quantities, overlapping spreads or uncovered legs require conservative portfolio scenario calculations.
+
+Do not use available margin as the max-loss cap.
+
+====================================================
+6. SIMPLIFY NIFTY LIVE RISK GATE
+====================================================
+
+Existing errors:
+
+"Existing NIFTY data quality is not GOOD"
+"Requested lots exceed the existing confidence sizing allowance"
+"NIFTY_HEDGE_INTEGRITY_CRITICAL"
+"Selected structure differs from the existing NIFTY strategy approval"
+
+Remove these raw messages from the execution ticket.
+
+Do not reuse the previous strategy approval blindly when user changes selection.
+
+Whenever user selects:
+- PE only
+- CE only
+- both
+
+rebuild an approval for that exact ticket.
+
+Soft warnings:
+- confidence score below 70
+- missing nonessential Greeks
+- poor credit quality
+- low India VIX
+- adverse MMI
+- existing unrelated candidate rejected by scanner
+
+These are informational warnings and can require a known-risk acknowledgement.
+
+Do not automatically reduce a configured 2-lot order solely because confidence is low.
+
+Still hard-block:
+- new unhedged short exposure
+- unknown or exceeded total portfolio risk cap
+- expired/missing selected instrument
+- stale or missing executable quote
+- insufficient confirmed broker capacity
+- invalid quantity or hedge mismatch
+- applicable monthly-loss kill switch
+- failed exchange/broker execution constraints
+
+The ticket should display no more than the top two warnings, with the rest under "View Details".
+
+====================================================
+7. REMOVE REPETITIVE MARKET SESSION ERROR
+====================================================
+
+Existing error:
+
+"Market session: LIVE orders require an open exchange session."
+
+Do not show this repeatedly while building or previewing the ticket.
+
+Allow:
+- market-closed preview
+- strike selection
+- credit simulation
+- CSV generation
+- draft saving
+- order review
+
+The UI should not assume an exchange is open just because cached prices exist.
+
+At GO:
+- check the actual exchange session once
+- submit a regular live order only when permitted
+- if closed, offer Save Draft / Next Market Open
+- optionally support AMO only when the existing broker adapter confirms that order variety and instrument are supported and the user explicitly requests it
+
+Do not bypass broker or exchange trading-session restrictions.
+
+Do not automatically place a saved order at market open without a separately configured, authorized workflow.
+
+====================================================
+8. SIMPLIFY BROKER MARGIN CHECK
+====================================================
+
+Existing error:
+
+"Broker margin: Fresh verified basket margin must fit available broker funds."
+
+The user normally maintains sufficient margin.
+
+Do not repeatedly call margin API during:
+- candidate scan
+- strike selection
+- dashboard rendering
+- every input change
+
+Instead:
+
+1. Compute theoretical risk locally.
+2. Show estimated margin in the preview.
+3. At final Review/GO, calculate broker basket margin once.
+4. Include existing positions where applicable.
+5. Compare against current broker funds.
+6. If sufficient, proceed without extra warnings.
+7. If actually insufficient, show the specific shortfall and do not submit an order that cannot be funded.
+8. If broker margin service is temporarily unavailable, allow a draft or preview and a retry, not a fabricated successful check.
+
+The broker remains the final authority.
+
+Preserve support for account pledges and collateral but do not assume all available collateral is equivalent to free cash or usable margin.
+
+====================================================
+9. DAY CHANGE COLOR SCALE
+====================================================
+
+Implement a common reusable color utility.
+
+Function:
+
+get_day_change_color(change_pct)
+
+Scale:
+
+-80% = Dark Red
+-60% = Red
+-40% = Strong Red
+-20% = Light Red
+0%   = Neutral Grey
++20% = Light Green
++40% = Green
++60% = Strong Green
++80% = Deep Green
++100% = Dark Green
+
+Clamp values below -80% and above +100%.
+
+Interpolate smoothly between stops.
+
+Example palette:
+-80: #7F1D1D
+-40: #DC2626
+-20: #FCA5A5
+0:   #9CA3AF
+20:  #86EFAC
+40:  #22C55E
+80:  #15803D
+100: #14532D
+
+Use readable contrasting text.
+
+Do not rely on color alone. Display signed percentages.
+
+Use this consistently in:
+- NIFTY parent page
+- NIFTY Order Ticket
+- selected PE/CE legs
+- option scanner
+- daily change columns
+
+Calculate:
+
+day_change_pct =
+(LTP - previous_trading_close) /
+previous_trading_close * 100
+
+Previous close must come from the correct contract.
+
+Missing previous close:
+show "N/A", not 0%.
+
+Do not confuse day change with:
+- P&L percentage
+- change from average entry
+- change in bid/ask
+- implied volatility change
+
+====================================================
+10. REDESIGN NIFTY ORDER TICKET
+====================================================
+
+In the parent NIFTY 2.0 page:
+
+When user clicks:
+
+"Open NIFTY Order Ticket"
+
+open existing popup/modal.
+
+Use the selected number of lots from the parent page.
+
+Do not reset lots independently inside the modal.
+
+Example:
+
+Parent:
+Lots = 2
+
+Popup:
+Lots = 2
+
+Quantity = 2 × current instrument lot size.
+
+Show all FOUR legs:
+
+1. BUY PE Hedge
+2. SELL PE
+3. BUY CE Hedge
+4. SELL CE
+
+Display fields:
+
+Select
+BUY / SELL
+Type PE / CE
+Strike
+Expiry
+Lots
+Quantity
+LTP
+Day Change %
+Bid
+Ask
+Limit Price
+OTM %
+Hedge Width
+Status
+
+Use a compact four-row table.
+
+For PE-only strategy:
+- PE hedge and short PE selected
+- CE rows visible but disabled
+
+For CE-only strategy:
+- CE short and hedge selected
+- PE rows visible but disabled
+
+For BOTH:
+- all 4 rows selected
+
+Show color-coded day change for EACH option leg.
+
+Do not show another large set of cards below this table.
+
+Below four rows display:
+
+NET EXECUTABLE CREDIT
+EXPECTED MAX GAIN
+MAX LOSS
+TOTAL RISK AFTER ORDER
+₹60K CAP STATUS
+ESTIMATED BROKER MARGIN
+
+Show selected strategy:
+BULL_PUT_SPREAD / BEAR_CALL_SPREAD / IRON_CONDOR
+
+Show warnings in one compact line.
+
+====================================================
+11. ADD BUY-ONLY OPPORTUNITY MODE
+====================================================
+
+The user wants to identify and optionally BUY NIFTY options whose day price has fallen by at least 30%.
+
+Implement a new option inside the NIFTY Order Ticket:
+
+"BUY Opportunity"
+
+This is independent of selling protected credit spreads.
+
+Options:
+
+- BUY PE
+- BUY CE
+- BUY BOTH (optional, independent long legs)
+- BUY selected existing hedge
+
+Trigger:
+Current option day change <= -30%.
+
+Use correct previous trading close, not option entry average.
+
+For a contract down 30%:
+
+Example:
+
+Previous close = ₹100
+Current LTP = ₹70
+Day change = -30%
+
+Highlight:
+BUY OPPORTUNITY — DOWN 30%
+
+But do not assume that a 30% decline makes it a good trade.
+
+Show:
+- symbol
+- expiry
+- DTE
+- strike
+- option type
+- LTP
+- day change
+- IV if available
+- bid/ask
+- proposed quantity
+- estimated debit
+- maximum premium at risk
+- market regime
+- reason for price decline if determinable, otherwise unknown
+
+Allow configurable trigger:
+
+default = -30%
+options: -20%, -25%, -30%, -40%, -50%
+
+User must explicitly choose the contract and click Review.
+
+This is not automatic dip buying.
+
+Do not place the BUY order merely because the option crossed -30%.
+
+For standalone long options:
+maximum position loss is total debit paid plus execution costs.
+
+Include standalone option premium-at-risk conservatively in the portfolio risk budget unless the risk policy provides a separately bounded allocation.
+
+Do not treat an additional BUY as a hedge for a short automatically.
+
+Verify protective relationship, expiry and quantity if BUY is intended as a hedge.
+
+====================================================
+12. OPTIONAL PRICE WATCH FOR -30% BUY
+====================================================
+
+Add an optional watch mode:
+
+WATCH_FOR_DAY_DROP
+
+Inputs:
+- instrument
+- desired day-change threshold
+- lots
+- maximum BUY limit
+- expiry
+
+When threshold reached:
+- display READY_TO_REVIEW
+- highlight option row
+- make Review button available
+- optionally notify inside existing application
+
+Do not submit automatically.
+
+If a new quote shows the threshold is no longer met:
+- update status
+- require a fresh decision
+
+====================================================
+13. EXECUTION PRICE POLICY
+====================================================
+
+Use order-book bid/ask when available.
+
+For protective BUY:
+- use current ask as executable reference
+- optionally use a small configurable marketable limit cushion
+
+For SELL:
+- use current bid as executable reference
+- allow a user-selected better limit
+- do not count aspirational SELL markup as realised credit
+
+For opportunistic BUY:
+- user can specify limit price
+- use current ask and depth for estimated execution cost
+- display maximum debit
+- never invent a fill
+
+Round to instrument tick size from the instrument master when possible.
+
+Calculate credit and max loss using conservative executable prices and selected order limits.
+
+====================================================
+14. REVIEW AND GO
+====================================================
+
+Keep existing 10-second countdown.
+
+Workflow:
+
+1. Select PE / CE / BOTH / BUY opportunity.
+2. Select lots.
+3. Select strikes and expiries.
+4. Refresh quotes.
+5. Build order.
+6. Calculate exact risk.
+7. Show four-row ticket.
+8. Click "Review & Start 10s".
+9. Complete 10-second review.
+10. User explicitly clicks GO.
+11. Revalidate essential risk and quote conditions.
+12. Submit orders.
+
+GO must not fire automatically.
+
+For credit spreads:
+BUY hedge first.
+Wait for confirmed FILLED hedge quantity.
+SELL only the matched covered quantity.
+
+For BUY-only:
+Place only selected BUY orders.
+Do not generate SELL legs.
+
+Prevent duplicate order submission.
+
+After GO show:
+- broker order IDs
+- current state
+- filled quantities
+- pending quantities
+- average execution price
+- errors
+
+Do not label an order successful until appropriate broker status confirms execution.
+
+====================================================
+15. PREVENT PARENT/MODAL DATA MISMATCH
+====================================================
+
+Create/reuse one shared NIFTY ticket state object.
+
+Fields:
+
+account_id
+strategy_type
+selected_expiry
+selected_pe
+selected_ce
+lots
+lot_size
+hedge_width
+selected_strikes
+quotes
+day_change
+execution_limits
+market_snapshot_timestamp
+risk_snapshot
+warnings
+review_snapshot_id
+
+Parent and modal must reference the same ticket state.
+
+If user changes lots in parent:
+- modal quantity must update.
+
+If user changes strikes in modal:
+- update risk and credit immediately.
+
+If user changes from Iron Condor to PE-only:
+- remove CE order intents
+- keep CE informational rows visible but disabled.
+
+All dependent values must be recalculated consistently.
+
+====================================================
+16. SIMPLIFIED MAIN SCREEN
+====================================================
+
+Keep default NIFTY 2.0 view compact:
+
+A. MARKET SNAPSHOT
+NIFTY / VIX / MMI / Trend / Freshness
+
+B. ORDER CONFIGURATION
+PE / CE / BOTH / BUY OPPORTUNITY
+Lots
+Expiry
+Hedge width
+
+C. PROPOSED TRADE
+Short PE / Hedge PE
+Short CE / Hedge CE
+Day change colors
+Credit
+Maximum loss
+
+D. EXECUTION
+Open Ticket
+Refresh
+Review
+GO
+
+E. ACTIVE POSITIONS
+Compact grouped positions and repair/exit actions
+
+Move:
+- confidence details
+- market regime diagnostics
+- deep liquidity analysis
+- scheduler logs
+- historical risk audit
+
+under "Advanced Details".
+
+Do not duplicate information between parent page and modal.
+
+====================================================
+17. LIGHTWEIGHT VALIDATION ONLY
+====================================================
+
+To save Codex token usage:
+
+Do NOT run full pytest.
+Do NOT run unrelated app tests.
+Do NOT perform repeated whole-repository searches.
+Do NOT create extensive documentation.
+
+Implement focused validation:
+
+1. Global timezone conversion to IST.
+2. Quote freshness with correct exchange and last-trade distinction.
+3. Nearby strike selection using 100 then 50 increments.
+4. Parent lots propagate to all four modal rows.
+5. Day % color scale from -80 to +100.
+6. BUY opportunity detection at -30%.
+7. ₹60K risk-cap calculation and hedge-first order sequence.
+8. GO cannot submit unfilled hedged shorts or expired quotes.
+
+Use quick compilation and targeted tests only.
+
+If existing focused tests are available, run them instead of creating redundant tests.
+
+No actual live order placement during testing.
+
+====================================================
+18. ACCEPTANCE CRITERIA
+====================================================
+
+Implementation is complete when:
+
+- All app timestamps display consistently in IST.
+- The old misleading quote-age error is fixed.
+- NIFTY quote snapshots are valid for up to 120 seconds during the active review workflow.
+- The engine finds nearby liquid 100/50-point strikes.
+- Small top-level depth does not automatically fail candidate scanning.
+- Existing duplicate risk-gate messages are removed from the ticket.
+- Existing uncovered exposure is still correctly handled.
+- Margin validation is consolidated to final order readiness.
+- Exchange-closed preview works without repeated blocking errors.
+- All four NIFTY legs display in the Order Ticket.
+- Parent-selected lots propagate accurately.
+- Daily % change displays with dark-red to dark-green scale.
+- User can select PE spread, CE spread or both.
+- User can separately select BUY opportunities when day change <= -30%.
+- No automatic BUY is triggered merely by a -30% drop.
+- ₹60K NIFTY portfolio risk cap remains enforced.
+- All new short orders require confirmed filled hedges.
+- Review countdown and explicit GO work.
+- Existing Kite integration remains functional.
+- No unnecessary new duplicate modules are created.
+
+====================================================
+19. CODEX FINAL RESPONSE
+====================================================
+
+After implementation, provide only:
+
+1. Changed files.
+2. Main changes completed.
+3. Focused tests executed and results.
+4. Any known limitation.
+5. How to open NIFTY 2.0 and verify the changes.
+
+Avoid verbose explanation.
+
+Do not stop at analysis. Implement the changes in the existing codebase.

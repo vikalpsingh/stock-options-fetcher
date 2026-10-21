@@ -497,3 +497,144 @@ Overall NIFTY 2.0 remains incomplete; continuation automation is still needed.
 - Blocked previews render the same risk header; UNKNOWN/UNCAPPED remains explicit.
 - Five focused popup tests passed in 0.47s; syntax checked. No full suite, browser
   visual verification, live broker calls or runtime data edits performed.
+
+## 2026-10-21 lot-selection milestone (latest human update)
+- Existing selector now offers 1/2/3/4, default 2; default maximum is 4.
+  Explicit saved lower maximum settings remain respected, not silently overwritten.
+- Uses existing master lot sizes, selected leg quantities, canonical payoff risk,
+  broker margin refresh and immutable ticket selection. Popup labels each leg's lots.
+- Added risk-only get_max_safe_lots in existing risk_validator; no duplicate payoff
+  calculator. Preview shows projected loss/budget per size, recommendation and cap
+  shortfall. Does not increase selected size; all execution guards still apply.
+- Parent lot change refreshes preview and closes old unsubmitted different-lot
+  reviews with version checks. New review resets countdown. Active orders untouched.
+- Eight focused synthetic/PAPER tests passed (0.66s), covering 1-4 lots with changed
+  master size, condor width, cap failure, recommendation, stale review invalidation,
+  countdown and existing hedge-fill reconciliation. No full suite/live calls/app
+  import/runtime edits. Changed modules compile via focused checks/imports.
+- Broader attached simplification prompt remains pending: global IST audit,
+  quote snapshot lifecycle, liquid alternatives/depth, compact four-row ticket,
+  day-change colors, BUY-only opportunity mode and shared cap inclusion, consolidated
+  margin/session checks. Original remaining analytics/import/exit work also pending.
+- Previous TRADE available-margin human request still pending. Do not bypass funds.
+- Full acceptance NOT complete; continuation automation remains needed.
+
+## 2026-10-21 day-change display milestone
+- Continued latest attached request without rebuilding lot selection. Added shared
+  get_day_change_color / day_change_badge in existing UI module: smooth requested
+  red-to-green scale clamped -80..+100, contrasting black/white text, signed values.
+- Parent contract quotes and saved popup leg details use the same badge. Tickets
+  preserve reviewed LTP/previous-close fields; missing historical fields show N/A.
+  Missing/zero previous close is never presented as 0% change. No P&L substitution.
+- Five pure focused tests passed in 0.48s; changed Python sources compile. No full
+  suite, app import, runtime writes or broker calls; visual browser check pending.
+- This milestone covers NIFTY parent and ticket only. Legacy scanner adoption,
+  compact four-row popup, timezone/freshness, liquid alternatives, BUY opportunity,
+  margin consolidation and earlier analytics/exit/import acceptance remain pending.
+
+## 2026-10-21 position management request — first implementation milestone
+- Latest request saved in docs/nifty-position-management-request.txt. Scheduled
+  continuation remains PAUSED at user's request; do not restart it automatically.
+- Added pure reconcile_nifty_hedge_allocations: persisted fill allocation priority,
+  same-account/product/expiry/type/strike matching, quantity consumption once.
+  Unlinked matches are suggested/reserved only, not execution/risk authorization.
+  195 short / 130 long displays partial coverage, 65 missing, zero free long.
+- NIFTY 2.0 has one active-position table with summary, quote day colors, broker
+  P&L, quantities, hedge status, responsive core columns and Manage per row.
+  Shared order-ticket dialog displays selected position. Linked durable executions
+  reuse their existing fill reconciliation and short-first close controls.
+- Legacy candidate refresh now checks persisted and suggested hedge reservations,
+  fresh pending orders, free long/missing short quantities. Same expiry required
+  for sell-against. SELL defaults to BID. Existing max-risk server guard retained.
+- Corrected legacy cash-flow-as-profit error: opening cash flows are separate and
+  do not produce projected realised P&L; spread credit includes existing hedge cost.
+  Removed client-side cap override. No new placement engine or broker paths added.
+- Eight focused tests passed in 0.43s; module and full app source compilation passed
+  without importing app or running scheduler. No real broker calls/runtime edits.
+- NOT COMPLETE: durable user confirmation/import of unlinked hedge allocations;
+  contract close/repair/sell-against/roll/profit-order selector and review/GO for
+  unlinked broker positions; exact combined repair risk and close P&L previews;
+  full grouped strategy analytics and browser verification. Unlinked rows show
+  explicit unavailable submission rather than enabling unsafe execution.
+- Original broader NIFTY acceptance and earlier TRADE margin work remain pending.
+
+## 2026-10-21 contract borders and close P&L preview
+- New protected trade uses contract-specific day CMP versus previous close:
+  SELL PE/CE up green/down red; BUY PE/CE up red/down green; unchanged/missing
+  previous close neutral. Existing signed day-change badges remain intact.
+- Continued unfinished management analytics: shared position_close_preview in
+  analytics.py separates closing proceeds/debit from gross estimated closing P&L.
+  Long SELL uses bid minus entry cost; short BUY uses entry cost minus ask.
+  Estimates cover only free long quantity, retain reserved hedges, flag pending
+  orders, require fresh <=120s quote and sufficient quoted depth. No LTP fallback.
+- Manage popup shows the preview, its quantity and blockers. It is not a new order
+  submission path; existing linked execution controls retain final validation.
+- Six focused tests passed in 0.40s; changed sources compiled. No full tests,
+  broker calls, app import or runtime data changes. Browser verification pending.
+- Remaining management work: persisted confirmation/import, unlinked close/repair/
+  roll/sell-against/profit-order workflow and final GO, combined repair-risk preview,
+  full grouped analytics. Prior broader acceptance remains incomplete.
+- Scheduled tasks remain paused as requested.
+
+## 2026-10-21 execution simplification / quote-time milestone
+- Shared app_time.py parses naive Kite exchange timestamps as IST, converts aware
+  UTC correctly, uses packet timestamp rather than last-trade time. Adopted by
+  NIFTY ticket, service session/exit freshness, and quote display. Full application
+  scheduler/storage/time migration is NOT complete; do not globally change naive
+  app_now without auditing its consumers.
+- Preview/review omits execution-only margin/session blocks; fresh GO approval
+  still enforces them. Review expires after 120s at start. Raw unknown-risk code
+  replaced with actionable ownership/repair message; unknown exposure stays blocked.
+- Explicit manual-ticket relaxation only for four user-named legacy diagnostics:
+  quality GOOD, confidence sizing, hedge integrity diagnostic, structure mismatch.
+  They are advisory only when all reported reasons are in this allowlist. Actual
+  quote/ownership/cap/monthly/event checks remain. Missing/event gate fails closed.
+- Nearby listed pairs searched original/100 increments then 50 increments to 500;
+  same expiry/default hedge width, one batched quote request, fresh bid/ask and
+  sufficient top-level depth. Up to three explicit buttons update both legs and
+  refresh full risk; never silently move a strike. Deeper-book execution pending.
+- Four-row ticket shows selected PE/CE BUY/SELL, parent lots/quantity, contract,
+  LTP/day color, bid/ask; inactive side has zero order quantity. Order payloads
+  still contain only selected sides. Existing red/green scale retained.
+- Six final focused tests passed (0.59s), plus earlier six quote/PAPER tests (0.63s).
+  Compile passed; no full suite, broker calls, app import, runtime edits or live orders.
+- Still pending: standalone BUY opportunity order workflow for <=-30% day change,
+  full global IST migration, margin API consolidation/collateral semantics,
+  deeper-book execution and browser acceptance; prior management backlog remains.
+- Automations stay paused. No claim that all acceptance criteria are complete.
+
+## 2026-10-21 100-point contract grid
+- Latest user rule supersedes 50-point liquidity fallback: all four new-entry
+  selectors and nearby alternatives now use listed 100-point strikes only.
+- Existing off-grid PE selections move downward and CE upward on preview refresh;
+  defaults and hedges also choose a listed strike at/beyond target, never nearer
+  ATM. Example 22050PE -> 22000PE. Missing listed replacement stays unavailable.
+- Server ticket validation rejects off-grid review/GO instead of silently changing
+  a reviewed order. Existing position/exit symbols remain unchanged.
+- Six focused grid/search tests passed in 0.50s; source compilation passed.
+  No full suite, broker calls, live orders or runtime changes. Other backlog unchanged.
+
+## 2026-10-21 PAPER freshness and closer-liquid choice
+- Explicit PAPER-only exception: missing/stale quote timestamp is a warning, not
+  an entry block. Positive bid/ask, depth, risk cap and other guards remain. LIVE
+  retains freshness even during trading hours/localhost testing. Simulation warning
+  says old prices are not current executable market evidence.
+- Added nearer-to-CMP liquid pair discovery (100 grid, same expiry/width, max500,
+  still OTM, fresh executable quotes). Explicit preview forms appear on main screen
+  and blocked execution popup; no automatic strike changes or order submission.
+- P&L/position review remains available with entry risk blocked; UI explains scope.
+  Unknown/unhedged existing exposure still blocks new shorts, not P&L display.
+- Three focused tests passed in 0.39s; changed sources compile. Existing stale-quote
+  regression now explicitly tests LIVE mode. No broker calls or runtime edits.
+- Other outstanding work unchanged. Automations remain paused.
+
+## 2026-10-21 remove blanket liquidity veto
+- User explicitly requested removal of per-contract best-level/spread rejection.
+  Ticket now reports depth/spread as advisory rather than rejecting on those alone.
+- Consume visible ask/bid levels to derive conservative worst-level LIMIT for the
+  selected quantity. Credit, risk and broker margin payloads use that limit.
+- Thin depth displays requested/available/shortfall and warns orders may rest or
+  partially fill; it never fabricates fills. Missing/crossed bid/ask still blocks.
+  LIVE freshness, portfolio cap and confirmed BUY-before-SELL guards unchanged.
+- Five focused depth/price/risk/PAPER fill tests passed (0.51s). No live broker
+  calls, full suite, app import or runtime changes. Other backlog unchanged.

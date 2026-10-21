@@ -190,3 +190,76 @@ def reconcile_nifty_positions(positions):
     return {"groups": results, "shorts": shorts, "block_new_entries": blocked,
             "allow_exit_orders": True, "allow_hedge_repair_orders": True,
             "unhedged_short_symbols": [row["short_symbol"] for row in shorts if row["status"] != "OPEN_SPREAD"]}
+
+
+def reconcile_nifty_hedge_allocations(positions, strategy_records, pending_orders=None):
+    """Reserve confirmed allocations first, then suggest unused compatible hedges.
+
+    Suggested matches are DISPLAY/RESERVATION only, never proof for new SELL risk.
+    The canonical risk engine continues to require persisted ownership. Reserving
+    suggested quantities prevents an unrelated Sell Against Long reusing them.
+    """
+    allocated = allocate_nifty_positions(positions, strategy_records, pending_orders)
+    slices = [normalize_leg(row) for row in allocated['positions'] if row.get('quantity')]
+    rows, matches = {}, []
+    def identity(row):
+        return (row['account_id'], row['tradingsymbol'], row.get('product') or 'NRML')
+    for raw in positions:
+        if not raw.get('quantity'):
+            continue
+        row = normalize_leg(raw)
+        rows[identity(row)] = {**row, 'matched_hedge_qty':0, 'confirmed_hedge_qty':0,
+            'suggested_hedge_qty':0, 'allocated_long_qty':0, 'reserved_long_qty':0,
+            'free_long_qty':0, 'unmatched_short_qty':max(0, -(row['quantity'] or 0)),
+            'hedge_status':'UNKNOWN', 'suggested_matches':[]}
+    remaining = {i:abs(row['quantity']) for i,row in enumerate(slices)}
+    def compatible(short, hedge):
+        return (short['valid'] and hedge['valid'] and short['account_id']==hedge['account_id']
+            and (short.get('product') or 'NRML')==(hedge.get('product') or 'NRML')
+            and short['expiry']==hedge['expiry'] and short['option_type']==hedge['option_type']
+            and (hedge['strike']-short['strike'])*(1 if short['option_type']=='CE' else -1)>0)
+    # Each positive/negative slice is consumed at most once, deterministically.
+    for confirmed in (True, False):
+        for i,short in enumerate(slices):
+            if short['quantity'] >= 0 or not short['valid']:
+                continue
+            for j,hedge in sorted(enumerate(slices), key=lambda pair:abs((pair[1]['strike'] or 0)-(short['strike'] or 0))):
+                if hedge['quantity'] <= 0 or not compatible(short,hedge):
+                    continue
+                if confirmed:
+                    if not short['strategy_id'] or short['strategy_id'] != hedge['strategy_id']:
+                        continue
+                elif hedge['strategy_id']:
+                    continue  # Never take another strategy's reserved long slice.
+                qty = min(remaining[i], remaining[j])
+                if qty <= 0:
+                    continue
+                remaining[i] -= qty; remaining[j] -= qty
+                target, source = rows[identity(short)], rows[identity(hedge)]
+                target['matched_hedge_qty'] += qty
+                target['confirmed_hedge_qty' if confirmed else 'suggested_hedge_qty'] += qty
+                source['allocated_long_qty' if confirmed else 'reserved_long_qty'] += qty
+                match = dict(short_symbol=short['tradingsymbol'], long_symbol=hedge['tradingsymbol'],
+                    quantity=qty, confirmed=confirmed, account_id=short['account_id'],
+                    expiry=short['expiry'], strategy_id=short['strategy_id'])
+                matches.append(match)
+                if not confirmed:
+                    target['suggested_matches'].append(match)
+                    source['suggested_matches'].append(match)
+    for key,row in rows.items():
+        members = [(i,s) for i,s in enumerate(slices) if identity(s)==key]
+        if not row['valid'] or any(not s['valid'] for _,s in members):
+            continue
+        if row['quantity'] < 0:
+            row['unmatched_short_qty'] = abs(row['quantity'])-row['matched_hedge_qty']
+            row['hedge_status'] = ('FULLY_HEDGED' if not row['unmatched_short_qty'] else
+                'PARTIALLY_HEDGED' if row['matched_hedge_qty'] else 'UNHEDGED_SHORT')
+        else:
+            # Even unmatched owned long slices remain reserved to their strategy.
+            owned_unused = sum(remaining[i] for i,s in members if s['strategy_id'])
+            row['reserved_long_qty'] += owned_unused
+            row['free_long_qty'] = max(0,row['quantity']-row['allocated_long_qty']-row['reserved_long_qty'])
+            row['hedge_status'] = ('LONG_ALLOCATED_AS_HEDGE' if row['allocated_long_qty'] else
+                'SUGGESTED_HEDGE_MATCH' if row['reserved_long_qty'] else 'UNALLOCATED_LONG')
+    return dict(positions=list(rows.values()), matches=matches, errors=allocated['errors'],
+                confirmation_required=any(not m['confirmed'] for m in matches))

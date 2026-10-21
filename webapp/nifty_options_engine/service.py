@@ -1,10 +1,11 @@
 """Connect NIFTY tickets/ledger to the shared durable execution service."""
 from copy import deepcopy
+from app_time import to_ist, is_quote_fresh
 
 from .ledger import NiftyStrategyRepository
 from .reconciliation import allocate_nifty_positions
 from .risk_validator import calculate_nifty_portfolio_risk
-from .ticket import build_ticket, number, quote_values
+from .ticket import build_ticket, number, quote_values, nearby_spread_candidates
 from trade_protected_execution import ProtectedExecutionRepository, basket_remaining
 
 
@@ -16,6 +17,7 @@ def load_market_context(kite, account, db_path, selection, config, now, instrume
     from monthly_risk_control import MonthlyRiskRepository
     from pnl_service import PnlRepository, snapshot_from_kite_positions
 
+    now = to_ist(now)
     ledger = NiftyStrategyRepository(db_path)
     ledger.ensure_schema()
     master = {row["tradingsymbol"]: row for row in instruments if row.get("name") == "NIFTY"}
@@ -47,23 +49,21 @@ def load_market_context(kite, account, db_path, selection, config, now, instrume
             positions.append({**row, "account_id": account, "strike": instrument.get("strike"),
                               "expiry": str(instrument.get("expiry") or "")[:10],
                               "option_type": instrument.get("instrument_type"),
+                              "lot_size": instrument.get("lot_size"),
                               "instrument_token": instrument.get("instrument_token")})
         orders = [{**row, "account_id": account} for row in kite.orders()
                   if str(row.get("tradingsymbol") or "").startswith("NIFTY")]
     symbols = {str(selection.get(key) or "") for key in ("short_pe", "hedge_pe", "short_ce", "hedge_ce")}
     symbols.update(row["tradingsymbol"] for row in positions)
+    for pairs in nearby_spread_candidates(selection, instruments, config['default_hedge_width_points']).values():
+        for pair in pairs:
+            symbols.update(row['tradingsymbol'] for row in pair)
     keys = ["NFO:" + symbol for symbol in symbols if symbol] + ["NSE:NIFTY 50", "NSE:INDIA VIX"]
     quotes = kite.quote(keys)
     spot_quote = quotes.get("NSE:NIFTY 50") or {}
     market_open = False
-    try:
-        stamp = datetime.fromisoformat(str(spot_quote.get("timestamp")))
-        if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=now.tzinfo)
-        market_open = (now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) < (15, 30)
-                       and 0 <= (now - stamp).total_seconds() <= 120)
-    except (ValueError, TypeError):
-        pass
+    market_open = (now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) < (15, 30)
+                   and is_quote_fresh(spot_quote, 120, now))
     # Reuse the existing monthly ledger and its actual-position P&L snapshot.
     pnl = PnlRepository(db_path)
     daily = snapshot_from_kite_positions(raw_positions, account_id=account, trade_date=now.date())
@@ -207,14 +207,7 @@ def approve_exit(record, context, close_hedges=False):
             direction = 1 if payload["transaction_type"] == "BUY" else -1
             if direction * owned < remaining:
                 raise PermissionError("Exit exceeds this strategy's remaining allocated fills.")
-        from datetime import datetime
-        try:
-            stamp = datetime.fromisoformat(str(quote["timestamp"]))
-            if stamp.tzinfo is None:
-                stamp = stamp.replace(tzinfo=context["now"].tzinfo)
-            fresh = 0 <= (context["now"] - stamp).total_seconds() <= 120
-        except (ValueError, TypeError):
-            fresh = False
+        fresh = is_quote_fresh(quote, 120, context['now'])
         qty = sum(row["quantity"] for row in context["positions"] if row["tradingsymbol"] == symbol
                   and row.get("product") == "NRML")
         sign = 1 if payload["transaction_type"] == "BUY" else -1

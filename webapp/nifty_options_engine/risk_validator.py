@@ -219,3 +219,33 @@ def validate_nifty_strategy(
         "credit_pct_of_spread_width": credit_pct,
         "portfolio_risk": portfolio,
     }
+
+
+def get_max_safe_lots(existing_positions, proposed_spread, allowed_lots=(1, 2, 3, 4),
+                      risk_cap=60000, *, config=None, strategy_allocations=None, pending_orders=None):
+    """Risk-only sizing advice using the canonical payoff engine; never changes selection.
+
+    Broker margin, quote freshness and liquidity must still pass at review/GO.
+    Lot sizes must come from the current instrument master, never inferred from qty.
+    """
+    settings = {**(config or {}), "max_total_nifty_defined_loss_inr": risk_cap}
+    passed, rejected, projected, remaining = [], {}, {}, {}
+    for lots in allowed_lots:
+        legs = proposed_spread.get("legs", [])
+        if (type(lots) is not int or lots not in (1, 2, 3, 4) or not legs
+                or any(not isinstance(leg.get("lot_size"), int) or leg["lot_size"] <= 0 for leg in legs)):
+            rejected[lots] = ["VERIFIED_LOT_SIZE_OR_SELECTION_MISSING"]
+            projected[lots] = remaining[lots] = None
+            continue
+        candidate = {**proposed_spread, "legs": [{**leg, "quantity": lots * leg["lot_size"]} for leg in legs]}
+        risk = calculate_nifty_portfolio_risk(existing_positions, candidate, config=settings,
+                    strategy_allocations=strategy_allocations, pending_orders=pending_orders)
+        projected[lots] = risk["projected_portfolio_max_loss"]
+        remaining[lots] = risk["risk_remaining"]
+        if risk["risk_status"] == "PASS":
+            passed.append(lots)
+        else:
+            rejected[lots] = risk["hard_block_reasons"]
+    return dict(allowed_lots=passed, recommended_lots=max(passed) if passed else None,
+                rejected_lots_with_reasons=rejected, projected_max_loss_by_lots=projected,
+                remaining_risk_budget=remaining)

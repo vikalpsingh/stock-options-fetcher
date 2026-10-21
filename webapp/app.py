@@ -4747,16 +4747,14 @@ def _nifty_position_action_pnl_projection(
 ) -> dict[str, Any]:
     current_pnl = _nifty_leg_float(source_position, "pnl")
     cash_flow = float(limit_cash_flow or 0.0)
-    projected_pnl = current_pnl + cash_flow
     return {
         "current_pnl": current_pnl,
         "limit_cash_flow": cash_flow,
-        "projected_pnl_after_limit": projected_pnl,
+        "projected_pnl_after_limit": None,
         "candidate_max_loss": candidate_max_loss,
         "pnl_projection_note": (
-            "Projected P&L uses current open-position P&L plus the LIMIT order cash-flow estimate. It is a decision estimate, not broker-booked realized P&L."
-            if str(action_type or "").upper() != "CREATE_HEDGE"
-            else "Projected P&L subtracts the protective BUY hedge LIMIT cost from current open-position P&L. It is a repair-cost estimate, not broker-booked realized P&L."
+            "Order cash flow is not profit. Opening orders leave realised P&L unchanged. "
+            "Close P&L requires entry cost, closing quantity and confirmed exit fills."
         ),
     }
 
@@ -4884,13 +4882,13 @@ def build_sell_against_long_candidate(
     if option_type not in {"PE", "CE"} or pos["quantity"] <= 0:
         raise ValueError("Sell Against Long is available only for long NIFTY PE/CE positions.")
     long_expiry = pos["expiry"]
-    if long_expiry and sell_expiry > long_expiry:
+    if not long_expiry or sell_expiry != long_expiry:
         return {
             "action_type": "SELL_AGAINST_LONG",
             "source_position": pos,
             "allowed": False,
-            "reason": "SHORT_EXPIRY_BEYOND_LONG_HEDGE_EXPIRY_USE_ROLL_SELL",
-            "warning": "Selected short expiry is beyond current long expiry. Use Roll + Sell to keep defined risk.",
+            "reason": "SHORT_AND_LONG_EXPIRY_MUST_MATCH",
+            "warning": "A standard protected vertical requires the same short and long expiry. Review a separate roll for other expiries.",
             "orders": [],
         }
     long_strike = float(pos["strike"] or 0)
@@ -4907,12 +4905,12 @@ def build_sell_against_long_candidate(
     quantity = min(max(1, int(float(qty or pos["quantity"]))), int(pos["quantity"]))
     price = _nifty_action_price_from_quote(quote, "SELL", price_mode)
     width = abs(long_strike - short_strike)
-    net_credit_value = price * quantity
+    net_credit_value = (price - float(pos["average_price"] or 0)) * quantity
     max_loss = max(width * quantity - net_credit_value, 0.0)
     pnl_projection = _nifty_position_action_pnl_projection(
         pos,
         "SELL_AGAINST_LONG",
-        net_credit_value,
+        price * quantity,
         max_loss,
     )
     return {
@@ -5183,6 +5181,31 @@ def nifty_position_action_candidate_snapshot(
         if str(item.get("name") or "").upper() == "NIFTY"
         and str(item.get("segment") or "").upper() == "NFO-OPT"
     ]
+    from nifty_options_engine.reconciliation import reconcile_nifty_hedge_allocations
+    from nifty_options_engine.ledger import NiftyStrategyRepository
+    account = selected_kite_profile_name()
+    master = {row['tradingsymbol']: row for row in instruments}
+    repository = NiftyStrategyRepository(APP_DB_PATH)
+    repository.ensure_schema()
+    managed = reconcile_nifty_hedge_allocations(
+        [{**row, **_nifty_position_from_symbol(row), 'account_id': account,
+          'instrument_token': (master.get(row['tradingsymbol']) or {}).get('instrument_token')}
+         for row in positions], repository.position_allocations(account, 'LIVE'),
+        [{**row, 'account_id': account} for row in kite.orders()
+         if str(row.get('tradingsymbol') or '').startswith('NIFTY')])
+    if managed['errors']:
+        raise PermissionError("Hedge allocations or pending orders require reconciliation.")
+    availability = next((row for row in managed['positions'] if row['tradingsymbol'] == clean_symbol), {})
+    action = str(action_type or "CREATE_HEDGE").upper()
+    if availability.get('hedge_status') == 'UNKNOWN':
+        raise PermissionError("Position metadata or hedge availability is unknown. Reconcile first.")
+    limit_qty = (availability.get('unmatched_short_qty', 0) if action == 'CREATE_HEDGE'
+                 else availability.get('free_long_qty', 0))
+    if limit_qty <= 0:
+        raise PermissionError("No unallocated quantity remains for this action. Manage the linked spread.")
+    if qty and int(float(qty)) > limit_qty:
+        raise PermissionError("Requested quantity exceeds the unallocated position quantity.")
+    qty = qty or limit_qty
     pos = _nifty_position_from_symbol(position)
     quantity = int(float(qty or abs(pos["quantity"]) or abs(int(float(position.get("quantity") or 0))) or 0))
     width = int(float(hedge_width or action_config.get("default_hedge_width_points") or NIFTY_MANUAL_PROTECTIVE_HEDGE_POINTS))
@@ -35161,8 +35184,8 @@ def render_nifty_income_panel(state: PageState) -> str:
             </div>
             <div class="income-equity-metrics nifty-position-action-metrics nifty-position-pnl-metrics">
               <div><span>Current P&amp;L</span><strong id="nifty-position-action-current-pnl">--</strong></div>
-              <div><span>LIMIT cash flow</span><strong id="nifty-position-action-cash-flow">--</strong></div>
-              <div><span>P&amp;L after hedge/order</span><strong id="nifty-position-action-projected-pnl">--</strong></div>
+              <div><span>Estimated Order Cash Flow</span><strong id="nifty-position-action-cash-flow">--</strong></div>
+              <div><span>Estimated Realised P&amp;L on Close</span><strong id="nifty-position-action-projected-pnl">--</strong></div>
               <div><span>Max loss after repair</span><strong id="nifty-position-action-max-loss">--</strong></div>
             </div>
             <p class="status nifty-position-pnl-note" id="nifty-position-action-pnl-note">Refresh details to calculate hedge-aware P&amp;L from the LIMIT price.</p>
@@ -44887,7 +44910,7 @@ def render_page(state: PageState) -> bytes:
       if (niftyPositionActionCap) niftyPositionActionCap.textContent = `${{Number(risk.cap_remaining || 0).toFixed(0)}} | ${{risk.cap_status || '--'}}`;
       const currentPnl = Number(candidate.current_pnl ?? source.pnl ?? 0);
       const cashFlow = Number(candidate.limit_cash_flow ?? 0);
-      const projectedPnl = Number(candidate.projected_pnl_after_limit ?? (currentPnl + cashFlow));
+      const projectedPnl = candidate.projected_pnl_after_limit == null ? null : Number(candidate.projected_pnl_after_limit);
       const candidateMaxLoss = Number(candidate.candidate_max_loss ?? risk.candidate_max_loss ?? 0);
       if (niftyPositionActionCurrentPnl) niftyPositionActionCurrentPnl.textContent = fmtMoney(currentPnl);
       if (niftyPositionActionCashFlow) {{
@@ -44896,9 +44919,9 @@ def render_page(state: PageState) -> bytes:
         niftyPositionActionCashFlow.classList.toggle('signal-green', cashFlow > 0);
       }}
       if (niftyPositionActionProjectedPnl) {{
-        niftyPositionActionProjectedPnl.textContent = fmtMoney(projectedPnl);
+        niftyPositionActionProjectedPnl.textContent = projectedPnl == null ? 'Not realised by opening order' : fmtMoney(projectedPnl);
         niftyPositionActionProjectedPnl.classList.toggle('signal-red', projectedPnl < 0);
-        niftyPositionActionProjectedPnl.classList.toggle('signal-green', projectedPnl >= 0);
+        niftyPositionActionProjectedPnl.classList.toggle('signal-green', projectedPnl != null && projectedPnl >= 0);
       }}
       if (niftyPositionActionMaxLoss) {{
         niftyPositionActionMaxLoss.textContent = Number.isFinite(candidateMaxLoss) && candidateMaxLoss > 0 ? candidateMaxLoss.toFixed(0) : '--';
@@ -44915,7 +44938,7 @@ def render_page(state: PageState) -> bytes:
           ? orders.map((order, index) => `<tr><td>${{index + 1}}</td><td>${{escapeHtml(order.transaction_type || '')}}</td><td><strong>${{escapeHtml(order.tradingsymbol || '')}}</strong></td><td>${{escapeHtml(String(order.quantity || 0))}}</td><td>${{Number(order.price || 0).toFixed(2)}}</td><td>${{escapeHtml(order.tag || order.hedge_mode || '')}}</td></tr>`).join('')
           : '<tr><td colspan="6">No order can be created for this selection.</td></tr>';
       }}
-      const riskOverrideAllowed = actionType === 'SELL_AGAINST_LONG' && candidate.hedge_validity === 'SAME_EXPIRY_FULL_HEDGE';
+      const riskOverrideAllowed = false;
       const orderable = Boolean(data.ok && candidate.allowed !== false && (risk.cap_status !== 'FAIL' || riskOverrideAllowed) && orders.length > 0);
       if (niftyPositionActionAck) niftyPositionActionAck.dataset.orderable = orderable ? '1' : '0';
       resetNiftyPositionActionConfirmation();
@@ -44960,6 +44983,7 @@ def render_page(state: PageState) -> bytes:
       if (niftyPositionActionModal.parentElement !== document.body) document.body.appendChild(niftyPositionActionModal);
       if (niftyPositionActionTitle) niftyPositionActionTitle.textContent = actionType === 'CREATE_HEDGE' ? 'Create Protective Hedge' : actionType === 'ROLL_SELL' ? 'Roll + Sell Defined-Risk Spread' : 'Create Income Spread From Long Option';
       if (niftyPositionActionSubtitle) niftyPositionActionSubtitle.textContent = actionType === 'CREATE_HEDGE' ? 'Buy a protective hedge for the selected unhedged short.' : actionType === 'ROLL_SELL' ? 'Close current option first, then place the new defined-risk spread at option CMP LIMIT prices.' : 'Sell a short leg only if the current long option remains a valid hedge.';
+      if (niftyPositionActionPriceMode) niftyPositionActionPriceMode.value = actionType === 'SELL_AGAINST_LONG' ? 'BID' : 'ASK_PLUS_2_PERCENT';
       if (niftyPositionActionType) niftyPositionActionType.value = actionType;
       if (niftyPositionActionSymbolInput) niftyPositionActionSymbolInput.value = button.dataset.symbol || '';
       if (niftyPositionActionSymbol) niftyPositionActionSymbol.textContent = button.dataset.symbol || '--';

@@ -39,11 +39,14 @@ def test_ticket_executable_costs_and_master_quantity(market):
     assert [leg['quantity'] for leg in ticket['legs']] == [130, 130]
 
 
-@pytest.mark.parametrize('fault', ['stale', 'missing_ask', 'depth', 'monthly', 'margin', 'live'])
+@pytest.mark.parametrize('fault', ['stale', 'missing_ask', 'monthly', 'margin', 'live'])
 def test_ticket_blocks_missing_fresh_risk_evidence(market, fault):
     selection, context, config = market
     quote = context['quotes']['NFO:NIFTY22000PE']
     if fault == 'stale':
+        selection['mode'] = 'LIVE'
+        config['live_enabled'] = True
+        context.update(live_ack_enabled=True, session_fingerprint='test', live_risk_gate={'allowed':True})
         quote['timestamp'] = (context['now'] - timedelta(minutes=3)).isoformat()
     elif fault == 'missing_ask':
         quote['depth']['sell'] = []
