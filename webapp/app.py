@@ -65,7 +65,10 @@ from nifty_tactical import (
     validate_spread_credit_quality,
 )
 from company_research.services.company_detail_service import CompanyDetailService, company_key_from_row
-from nifty_options_engine.config import NIFTY_OPTIONS_ENGINE_CONFIG
+from nifty_options_engine.config import NIFTY_OPTIONS_ENGINE_CONFIG, income_v2_config
+from nifty_options_engine.risk_validator import calculate_nifty_portfolio_risk, strategy_risk_summary
+from nifty_options_engine.ledger import NiftyStrategyRepository
+from nifty_options_engine.reconciliation import allocate_nifty_positions
 from nifty_options_engine.workflow import (
     build_capital_router,
     build_strategy_recommendation,
@@ -212,8 +215,12 @@ from trade_opportunity_engine import (
 )
 from trade_gpt_payload_builder import build_trade_gpt_payload
 from trade_direction_engine import evaluate_technical_direction
-from trade_hedged_order_builder import build_protective_pe_spreads
-from trade_hedged_execution import execute_hedge_first
+from trade_hedged_order_builder import build_protective_spreads, protective_contracts
+from trade_protected_execution import (
+    ProtectedExecutionRepository, start_execution, reconcile_execution, confirm_short,
+)
+from trade_execution_ui import render_execution_monitor, render_hedge_selector, render_spread_summary
+from trade_environment import is_local_request, test_environment_active, execution_mode, require_test_safe_execution
 from trade_strategy_selector import compare_bullish_strategies
 from kite_pnl_importer import KitePnlImportRepository, parse_kite_pnl_xlsx
 
@@ -1492,7 +1499,8 @@ PROFILE_TAB_OPTIONS: tuple[tuple[str, str, str], ...] = (
     ("ipo", "IPO", "Research"),
     ("income-growth", "Income Growth", "Strategy"),
     ("income", "INCOME", "Strategy"),
-    ("nifty-income", "Nifty Income", "Strategy"),
+    ("nifty-income", "Nifty Income Legacy", "Strategy"),
+    ("nifty-2", "Nifty Income", "Strategy"),
     ("nifty-grow", "NIFTYGrow", "Strategy"),
     ("commodity", "Commodity", "Strategy"),
     ("analytics", "Analytics", "Tools"),
@@ -1541,6 +1549,7 @@ def kite_profile_visible_tabs(
     visible_tabs = set(normalize_profile_visible_tabs(profile.get("VISIBLE_TABS")))
     if kite_profile_nifty_income_enabled(clean_name, available_profiles):
         visible_tabs.add("nifty-income")
+        visible_tabs.add("nifty-2")
     if kite_profile_nifty_grow_enabled(clean_name, available_profiles):
         visible_tabs.add("nifty-grow")
     return visible_tabs
@@ -1967,6 +1976,7 @@ def nifty_income_config() -> dict[str, Any]:
     config = dict(NIFTY_INCOME_DEFAULT_CONFIG)
     if isinstance(saved, dict):
         config.update(saved)
+    config["nifty_income_v2"] = income_v2_config(config.get("nifty_income_v2"))
     no_trade_saved = config.get("nifty_no_trade_regime")
     no_trade_config = dict(DEFAULT_NIFTY_NO_TRADE_REGIME)
     if isinstance(no_trade_saved, dict):
@@ -3449,23 +3459,39 @@ def parse_nifty_expiry_from_symbol(symbol: str) -> date | None:
 
 def nifty_option_positions(kite: Any) -> list[dict[str, Any]]:
     rows = []
-    for position in cached_kite_positions(kite):
+    account_id = selected_kite_profile_name()
+    master = {
+        str(item.get("tradingsymbol") or "").upper(): item
+        for item in cached_kite_instruments(kite, "NFO")
+        if str(item.get("name") or "").upper() == "NIFTY"
+    }
+    for position in cached_kite_positions(kite, ttl_seconds=0):
         symbol = str(position.get("tradingsymbol") or "").upper()
         if not symbol.startswith("NIFTY") or int(float(position.get("quantity") or 0)) == 0:
             continue
-        expiry = parse_nifty_expiry_from_symbol(symbol)
+        instrument = master.get(symbol) or {}
+        expiry = instrument.get("expiry")
         rows.append(
             {
                 **position,
                 "tradingsymbol": symbol,
                 "expiry": expiry,
+                "strike": instrument.get("strike"),
+                "option_type": instrument.get("instrument_type"),
+                "lot_size": instrument.get("lot_size"),
+                "instrument_token": instrument.get("instrument_token"),
+                "account_id": account_id,
                 "pnl": float(position.get("pnl") or 0),
                 "quantity": int(float(position.get("quantity") or 0)),
                 "average_price": float(position.get("average_price") or 0),
                 "ltp": float(position.get("last_price") or position.get("ltp") or 0),
             }
         )
-    return rows
+    repository = NiftyStrategyRepository(APP_DB_PATH)
+    repository.ensure_schema()
+    # Only persisted LIVE fill allocations may own live broker positions.
+    reconciled = allocate_nifty_positions(rows, repository.position_allocations(account_id, "LIVE"))
+    return reconciled["positions"]
 
 
 def enrich_nifty_positions_with_margin(kite: Any, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4234,191 +4260,54 @@ def calculate_nifty_defined_risk(
     lots: int = 2,
     max_loss_cap: float = 60000,
 ) -> dict[str, Any]:
-    """Calculate defined max-loss for NIFTY vertical spreads / iron condor.
+    # Legacy signature retained for callers; sizing comes only from actual legs.
+    return strategy_risk_summary(strategy, legs, max_loss_cap)
 
-    The function works with generated order legs or candidate-preview rows. For
-    Iron Condors it uses the wider side, not the sum of both side widths.
-    """
-    strategy_key = str(strategy or "IRON_CONDOR").upper()
-    lot_size = int(lot_size or 65)
-    lots = max(1, int(float(lots or 1)))
-    cap = float(max_loss_cap or 60000)
-    quantity = lot_size * lots
-    sell_legs = [
-        leg for leg in legs
-        if str(leg.get("transaction_type") or leg.get("action") or "").upper() == "SELL"
+
+def _nifty_risk_positions(current_positions):
+    """Adapt existing position metadata without inventing strategy ownership."""
+    return [
+        {**row, "strike": _nifty_leg_strike(row), "option_type": _nifty_leg_option_type(row)}
+        for row in current_positions
+        if str(row.get("tradingsymbol") or "").upper().startswith("NIFTY")
+        and (row.get("quantity") != 0 or row.get("reconciliation_error"))
     ]
-    buy_legs = [
-        leg for leg in legs
-        if str(leg.get("transaction_type") or leg.get("action") or "").upper() == "BUY"
-    ]
-    side_details: dict[str, dict[str, Any]] = {}
-    unhedged_sides: list[str] = []
-    for side in ("PE", "CE"):
-        sell = next((leg for leg in sell_legs if _nifty_leg_option_type(leg) == side), None)
-        if not sell:
-            continue
-        sell_strike = _nifty_leg_strike(sell)
-        hedge = next(
-            (
-                leg for leg in buy_legs
-                if _nifty_leg_option_type(leg) == side
-                and (
-                    (_nifty_leg_strike(leg) < sell_strike if side == "PE" else _nifty_leg_strike(leg) > sell_strike)
-                )
-            ),
-            None,
-        )
-        if hedge is None and sell.get("hedge_strike") not in (None, "", "N/A"):
-            hedge = {
-                "strike": sell.get("hedge_strike"),
-                "option_type": side,
-                "transaction_type": "BUY",
-                "price": sell.get("hedge_ltp") or 0,
-                "option_ltp": sell.get("hedge_ltp") or 0,
-            }
-        if hedge is None:
-            unhedged_sides.append(side)
-            continue
-        hedge_strike = _nifty_leg_strike(hedge)
-        width_points = abs(sell_strike - hedge_strike)
-        sell_price = _nifty_leg_float(sell, "price", "option_ltp", "ltp")
-        hedge_price = _nifty_leg_float(hedge, "price", "option_ltp", "ltp")
-        net_credit_points = max(sell_price - hedge_price, 0.0)
-        gross_risk = width_points * quantity
-        net_credit_value = net_credit_points * quantity
-        max_loss = max(gross_risk - net_credit_value, 0.0)
-        side_details[side] = {
-            "sell_strike": sell_strike,
-            "hedge_strike": hedge_strike,
-            "width_points": width_points,
-            "net_credit_points": net_credit_points,
-            "gross_risk": gross_risk,
-            "net_credit_value": net_credit_value,
-            "max_loss": max_loss,
-        }
-    pe = side_details.get("PE")
-    ce = side_details.get("CE")
-    if strategy_key == "BULL_PUT_SPREAD":
-        active = [pe] if pe else []
-    elif strategy_key == "BEAR_CALL_SPREAD":
-        active = [ce] if ce else []
-    else:
-        active = [item for item in (pe, ce) if item]
-        strategy_key = "IRON_CONDOR" if len(active) > 1 else ("BULL_PUT_SPREAD" if pe else "BEAR_CALL_SPREAD")
-    gross_risk = max((float(item.get("gross_risk") or 0) for item in active), default=0.0)
-    net_credit_value = sum(float(item.get("net_credit_value") or 0) for item in active)
-    if strategy_key == "IRON_CONDOR":
-        max_width = max((float(item.get("width_points") or 0) for item in active), default=0.0)
-        gross_risk = max_width * quantity
-        max_loss = max(gross_risk - net_credit_value, 0.0)
-    else:
-        max_loss = max((float(item.get("max_loss") or 0) for item in active), default=0.0)
-    defined_risk = bool(active) and not unhedged_sides
+
+
+def calculate_current_nifty_defined_risk(current_positions):
+    result = calculate_nifty_portfolio_risk(_nifty_risk_positions(current_positions))
+    reconciliation = result["reconciliation"]
     return {
-        "strategy": strategy_key,
-        "lot_size": lot_size,
-        "lots": lots,
-        "quantity": quantity,
-        "gross_risk": gross_risk,
-        "net_credit_value": net_credit_value,
-        "net_credit_points": net_credit_value / quantity if quantity else 0.0,
-        "max_loss": max_loss if defined_risk else None,
-        "max_loss_cap": cap,
-        "cap_remaining": cap - max_loss if defined_risk else cap,
-        "cap_status": "PASS" if defined_risk and max_loss <= cap else "FAIL",
-        "defined_risk": defined_risk,
-        "unhedged_sides": unhedged_sides,
-        "side_details": side_details,
+        "current_defined_risk": result["current_defined_max_loss"],
+        "current_unhedged_risk_flag": result["uncapped_risk_present"],
+        "unhedged_short_symbols": reconciliation["unhedged_short_symbols"],
+        "missing_hedge_count": len(reconciliation["unhedged_short_symbols"]),
+        "active_nifty_positions_count": sum(len(group["legs"]) for group in reconciliation["groups"]),
+        "reconciliation": reconciliation,
     }
 
 
-def calculate_current_nifty_defined_risk(
-    current_positions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    short_legs: list[dict[str, Any]] = []
-    long_legs: list[dict[str, Any]] = []
-    for position in current_positions:
-        symbol = str(position.get("tradingsymbol") or "").upper()
-        if not symbol.startswith("NIFTY"):
-            continue
-        quantity = int(float(position.get("quantity") or 0))
-        if quantity == 0:
-            continue
-        leg = dict(position)
-        leg["strike"] = _nifty_leg_strike(leg)
-        leg["option_type"] = _nifty_leg_option_type(leg)
-        leg["price"] = _nifty_leg_float(leg, "average_price", "avg", "price")
-        leg["quantity_abs"] = abs(quantity)
-        if quantity < 0:
-            leg["transaction_type"] = "SELL"
-            short_legs.append(leg)
-        else:
-            leg["transaction_type"] = "BUY"
-            long_legs.append(leg)
-    side_risks: list[float] = []
-    unhedged: list[str] = []
-    for short in short_legs:
-        side = _nifty_leg_option_type(short)
-        short_strike = _nifty_leg_strike(short)
-        short_qty = int(short.get("quantity_abs") or 0)
-        hedge = next(
-            (
-                leg for leg in long_legs
-                if _nifty_leg_option_type(leg) == side
-                and int(leg.get("quantity_abs") or 0) >= short_qty
-                and ((_nifty_leg_strike(leg) < short_strike) if side == "PE" else (_nifty_leg_strike(leg) > short_strike))
-            ),
-            None,
-        )
-        if hedge is None:
-            unhedged.append(str(short.get("tradingsymbol") or side))
-            continue
-        width = abs(short_strike - _nifty_leg_strike(hedge))
-        net_credit = max(_nifty_leg_float(short, "price") - _nifty_leg_float(hedge, "price"), 0.0)
-        side_risks.append(max(width * short_qty - net_credit * short_qty, 0.0))
-    return {
-        "current_defined_risk": max(side_risks) if side_risks else 0.0,
-        "current_unhedged_risk_flag": bool(unhedged),
-        "unhedged_short_symbols": unhedged,
-        "missing_hedge_count": len(unhedged),
-        "active_nifty_positions_count": len(short_legs) + len(long_legs),
-    }
-
-
-def calculate_total_nifty_risk_after_order(
-    current_positions: list[dict[str, Any]],
-    new_order_candidate: dict[str, Any],
-    cap: float = 60000,
-) -> dict[str, Any]:
+def calculate_total_nifty_risk_after_order(current_positions, new_order_candidate, cap=60000):
     current = calculate_current_nifty_defined_risk(current_positions)
-    new_risk = new_order_candidate.get("risk") if isinstance(new_order_candidate.get("risk"), dict) else {}
-    if not new_risk:
-        new_risk = calculate_nifty_defined_risk(
-            str(new_order_candidate.get("strategy") or "IRON_CONDOR"),
-            list(new_order_candidate.get("legs") or []),
-            int(new_order_candidate.get("lot_size") or 65),
-            int(new_order_candidate.get("lots") or 2),
-            cap,
-        )
-    new_order_max_loss = float(new_risk.get("max_loss") or 0) if new_risk.get("defined_risk") else float("inf")
-    current_defined_risk = float(current.get("current_defined_risk") or 0)
-    total_projected = current_defined_risk + new_order_max_loss
-    cap_remaining = float(cap) - total_projected
+    result = calculate_nifty_portfolio_risk(
+        _nifty_risk_positions(current_positions), new_order_candidate,
+        config={"max_total_nifty_defined_loss_inr": cap,
+                "estimated_execution_costs_inr": new_order_candidate.get("estimated_execution_costs_inr", 0)},
+    )
     return {
         **current,
-        "new_order_max_loss": new_order_max_loss,
-        "new_order_defined_risk": bool(new_risk.get("defined_risk")),
-        "total_projected_max_loss": total_projected,
-        "cap_remaining_after_order": cap_remaining,
-        "max_loss_cap": float(cap),
-        "cap_status": "PASS" if total_projected <= float(cap) and bool(new_risk.get("defined_risk")) else "FAIL",
-        "hard_block_reasons": [
-            *([] if bool(new_risk.get("defined_risk")) else ["NEW_ORDER_NOT_HEDGED"]),
-            *([] if total_projected <= float(cap) else ["MAX_LOSS_CAP_BREACH"]),
-            *(["CURRENT_UNHEDGED_SHORT"] if current.get("current_unhedged_risk_flag") else []),
-        ],
+        "new_order_max_loss": result["new_strategy_max_loss"],
+        "new_order_defined_risk": result["new_strategy_max_loss"] is not None,
+        "total_projected_max_loss": result["projected_portfolio_max_loss"],
+        "cap_remaining_after_order": result["risk_remaining"],
+        "max_loss_cap": result["risk_cap"],
+        "cap_status": "PASS" if result["risk_status"] == "PASS" else "FAIL",
+        "hard_block_reasons": result["hard_block_reasons"],
     }
+
+
+def format_nifty_risk(value):
+    return "UNKNOWN / UNCAPPED" if value is None else format_buy_amount(value)
 
 
 def nifty_order_preview_sequence(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -5231,21 +5120,37 @@ def validate_nifty_risk_cap_after_repair_or_new_spread(
     cap: float = 60000,
 ) -> dict[str, Any]:
     current = calculate_current_nifty_defined_risk(current_positions)
-    candidate_loss = float(candidate.get("candidate_max_loss") or 0)
+    try:
+        candidate_loss = float(candidate.get("candidate_max_loss"))
+        if not math.isfinite(candidate_loss) or candidate_loss < 0:
+            candidate_loss = None
+    except (TypeError, ValueError):
+        candidate_loss = None
     action_type = str(candidate.get("action_type") or "").upper()
     risk_reduction = action_type == "CREATE_HEDGE"
-    total_projected = float(current.get("current_defined_risk") or 0) if risk_reduction else float(current.get("current_defined_risk") or 0) + candidate_loss
-    cap_remaining = float(cap) - total_projected
+    current_loss = current.get("current_defined_risk")
+    total_projected = (
+        None if current_loss is None or (candidate_loss is None and not risk_reduction)
+        else current_loss + (0 if risk_reduction else candidate_loss)
+    )
+    cap = min(float(cap), 60000)
+    cap_remaining = None if total_projected is None else cap - total_projected
     fully_hedged = str(candidate.get("hedge_validity") or "").upper() == "SAME_EXPIRY_FULL_HEDGE"
-    calendar = str(candidate.get("hedge_validity") or "").upper() == "CALENDAR_HEDGE_REDUCES_RISK"
-    allowed = total_projected <= float(cap) and (fully_hedged or risk_reduction or calendar)
+    # Unknown existing exposure blocks new risk, but never an actual BUY-only
+    # hedge repair already validated by the position-action candidate builder.
+    repair_orders = candidate.get("orders") or []
+    repair_only = risk_reduction and bool(repair_orders) and all(
+        str(order.get("transaction_type") or "").upper() == "BUY" for order in repair_orders
+    )
+    within_cap = total_projected is not None and total_projected <= cap
+    allowed = repair_only or (within_cap and fully_hedged and not current.get("current_unhedged_risk_flag"))
     return {
         **current,
         "candidate_max_loss": candidate_loss,
         "total_projected_max_loss": total_projected,
         "cap_remaining": cap_remaining,
         "max_loss_cap": float(cap),
-        "cap_status": "PASS" if total_projected <= float(cap) else "FAIL",
+        "cap_status": "PASS" if within_cap else "UNKNOWN" if total_projected is None else "FAIL",
         "allowed": allowed,
         "warning": "Existing short remains unhedged; repair is risk-reduction and may still be allowed." if current.get("current_unhedged_risk_flag") else "",
     }
@@ -5352,11 +5257,7 @@ def place_nifty_position_action_order(
     if not orders:
         raise PermissionError("No NIFTY position action order was generated.")
     action = str(action_type or "").upper()
-    cap_override_allowed = (
-        action == "SELL_AGAINST_LONG"
-        and str(candidate.get("hedge_validity") or "").upper() == "SAME_EXPIRY_FULL_HEDGE"
-    )
-    if risk_cap.get("cap_status") == "FAIL" and not cap_override_allowed:
+    if not risk_cap.get("allowed"):
         raise PermissionError("NIFTY position action blocked by ₹60,000 max-loss cap.")
     if action == "SELL_AGAINST_LONG":
         source = candidate.get("source_position") if isinstance(candidate.get("source_position"), dict) else {}
@@ -5518,8 +5419,8 @@ def nifty_income_manual_pair_snapshot(
             option_type = str(parts.get("option_type") or "").upper()
             if option_type in {"PE", "CE"}:
                 existing_short_sides.add(option_type)
-    except Exception:
-        existing_short_sides = set()
+    except Exception as exc:
+        raise RuntimeError("Fresh NIFTY positions unavailable; entry review blocked.") from exc
     effective_include_pe = bool(include_pe) and "PE" not in existing_short_sides
     effective_include_ce = bool(include_ce) and "CE" not in existing_short_sides
     if not effective_include_pe and not effective_include_ce:
@@ -5611,6 +5512,7 @@ def nifty_income_manual_pair_snapshot(
         current_nifty_positions,
         {
             "risk": defined_risk_cap,
+                "legs": previews,
             "strategy": defined_risk_cap.get("strategy"),
             "lot_size": int(config.get("lot_size") or 65),
             "lots": requested_lots,
@@ -5707,6 +5609,7 @@ def nifty_income_manual_pair_snapshot(
             current_nifty_positions,
             {
                 "risk": defined_risk_cap,
+                "legs": previews,
                 "strategy": defined_risk_cap.get("strategy"),
                 "lot_size": int(config.get("lot_size") or 65),
                 "lots": int((orders[0].get("lots") if orders else half_lots) or half_lots),
@@ -5883,7 +5786,7 @@ def place_nifty_income_manual_pair(
         reasons = ", ".join(str(item) for item in (total_risk_cap.get("hard_block_reasons") or []) if str(item).strip())
         raise PermissionError(
             "NIFTY pair blocked by max-loss cap. "
-            f"Projected risk {format_buy_amount(total_risk_cap.get('total_projected_max_loss'))} exceeds "
+            f"Projected risk {format_nifty_risk(total_risk_cap.get('total_projected_max_loss'))} exceeds "
             f"cap {format_buy_amount(total_risk_cap.get('max_loss_cap') or 60000)}."
             + (f" Reasons: {reasons}." if reasons else "")
         )
@@ -7306,11 +7209,11 @@ def execute_nifty_orders(
     if not orders:
         return []
     mode = str(mode or "SUGGESTION_ONLY").upper()
-    if mode == "SUGGESTION_ONLY":
+    if mode in {"SUGGESTION_ONLY", "PAPER", "DRY_RUN"}:
         return [
             {
                 "tradingsymbol": order["tradingsymbol"],
-                "status": "SUGGESTION_ONLY",
+                "status": mode,
                 "detail": f"{reason}: order generated, not sent to Kite.",
             }
             for order in orders
@@ -7318,6 +7221,15 @@ def execute_nifty_orders(
     is_exit_batch = "exit" in str(reason or "").lower() or all(order.get("exit_reason") for order in orders)
     if not is_exit_batch:
         config = nifty_income_config()
+        if any(str(order.get("transaction_type") or "").upper() == "SELL" for order in orders):
+            # Legacy batch placement confirms acceptance, not hedge fills. It
+            # cannot satisfy the v2 safety contract, even with a naked override.
+            # Repair-only BUY batches and existing exit handling remain separate.
+            logger.warning("NIFTY_LEGACY_ENTRY_BLOCKED_REQUIRES_FILL_VERIFICATION")
+            raise PermissionError(
+                "NIFTY entry requires durable hedge-fill verification. "
+                "Legacy batch SELL is disabled; use preview while the protected execution workflow is connected."
+            )
         risk_check = validate_nifty_defined_risk_orders(
             orders,
             bool(config.get("allow_live_naked_nifty_sell", False)) or bool(allow_uncovered_override),
@@ -7713,8 +7625,11 @@ class PageState:
     trade_checks: list[dict[str, Any]] | None = None
     trade_recent_orders: list[dict[str, Any]] | None = None
     trade_mode: str = "PAPER"
+    trade_test_mode: bool = False
+    local_request: bool = False
     trade_side: str = "BUY"
     trade_contract_symbol: str = ""
+    trade_hedge_symbol: str = ""
     trade_lots: int = 1
     trade_product: str = "NRML"
     trade_limit_price: float = 0.0
@@ -8138,6 +8053,9 @@ def is_app_page_request(path: str) -> bool:
         "/research",
         "/trading",
         "/trade",
+        "/nifty-income",
+        "/nifty-income/legacy",
+        "/nifty-2",
         "/trade/best",
         "/trade/intelligence",
         "/trade/chart",
@@ -31601,6 +31519,7 @@ def load_trade_terminal_state(state: PageState) -> None:
 
 
 def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    state.trade_mode = execution_mode(state.trade_mode, state.trade_test_mode)
     if kite_orders is None:
         raise RuntimeError(f"Could not import Kite order module: {IMPORT_ERROR}")
     symbol = state.trade_symbol.strip().upper()
@@ -31685,15 +31604,18 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
         pop_reason += " Probability is below the preferred review range."
     checks.append(trade_validation("Probability of profit (POP)", pop_status, pop_reason))
     hedge_alternatives: list[dict[str, Any]] = []
+    hedge_candidates: list[dict[str, Any]] = []
     preferred_hedge: dict[str, Any] = {}
-    if state.trade_side == "SELL" and option_type == "PE":
-        lower_pe_contracts = [
-            row for row in state.trade_contracts or []
-            if str(row.get("instrument_type") or "").upper() == "PE"
-            and str(row.get("expiry") or "")[:10] == str(matching.get("expiry") or "")[:10]
-            and _dhan_metric_float(row.get("strike")) < _dhan_metric_float(matching.get("strike"))
-        ]
-        hedge_keys = [key] + [f"NFO:{row.get('tradingsymbol')}" for row in lower_pe_contracts]
+    if state.trade_side == "SELL" and option_type in {"PE", "CE"}:
+        hedge_candidates = protective_contracts(matching, state.trade_contracts or [])
+        if option_type == "CE" and hedge_candidates and not state.trade_hedge_symbol:
+            # Default only; this contract still passes the full spread/risk checks.
+            target_strike = _dhan_metric_float(matching.get("strike")) * 1.04
+            state.trade_hedge_symbol = min(
+                hedge_candidates,
+                key=lambda row: abs(_dhan_metric_float(row.get("strike")) - target_strike),
+            )["tradingsymbol"]
+        hedge_keys = [key] + [f"NFO:{row.get('tradingsymbol')}" for row in hedge_candidates]
         hedge_quotes = cached_kite_quote(kite, hedge_keys, ttl_seconds=0)
         max_spread_loss = max(1.0, _dhan_metric_float(os.getenv("TRADE_MAX_SPREAD_LOSS") or 40000))
         def spread_margin(order_payloads: list[dict[str, Any]]) -> dict[str, Any]:
@@ -31701,13 +31623,45 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
                 return dict(kite.basket_order_margins(order_payloads) or {})
             return {}
         try:
-            hedge_alternatives = build_protective_pe_spreads(
+            hedge_alternatives = build_protective_spreads(
                 matching, state.trade_contracts or [], hedge_quotes, quantity,
                 max_loss_cap=max_spread_loss, margin_provider=spread_margin,
+                selected_hedge_symbol=state.trade_hedge_symbol,
             )
+            for spread in hedge_alternatives:
+                pop_inputs = (
+                    _dhan_metric_float((state.trade_market or {}).get("cmp")),
+                    _dhan_metric_float(spread.get("breakeven")),
+                    _dhan_metric_float(analytics.get("dte")), _dhan_metric_float(analytics.get("iv")),
+                )
+                valid_pop_inputs = all(math.isfinite(value) and value > 0 for value in pop_inputs)
+                loss_probability = calculate_probability_expiry_itm(
+                    option_type, spot=_dhan_metric_float((state.trade_market or {}).get("cmp")),
+                    strike=spread.get("breakeven"), dte=analytics.get("dte"),
+                    iv=analytics.get("iv"), rate=0.065,
+                ) if valid_pop_inputs and spread.get("net_credit_per_share", 0) > 0 else None
+                spread["spread_pop"] = round(100 - loss_probability, 2) if loss_probability is not None else None
             preferred_hedge = next((row for row in hedge_alternatives if row.get("eligible")), {})
+            reviewed_spread = preferred_hedge or next(
+                (row for row in hedge_alternatives if row.get("hedge_symbol") == state.trade_hedge_symbol), {}
+            )
+            if reviewed_spread:
+                pop_value = reviewed_spread.get("spread_pop")
+                checks = [check for check in checks if check.get("name") != "Probability of profit (POP)"]
+                checks.append(trade_validation(
+                    "Probability of profit (POP)",
+                    "PASS" if pop_value is not None and pop_value >= pop_good else "WARNING",
+                    f"Spread model POP {pop_value:.2f}% at breakeven {reviewed_spread['breakeven']:.2f}, using current short-option IV and time to expiry; preferred {pop_good:.0f}%+."
+                    if pop_value is not None else "Spread POP unavailable: valid spot, IV and positive time to expiry are required.",
+                ))
         except Exception as exc:
             hedge_alternatives = [{"status": "BLOCK", "reason": friendly_external_error(exc, "Protective hedge builder")}]
+        if state.trade_hedge_symbol:
+            checks.append(trade_validation(
+                "Selected protective BUY", "PASS" if preferred_hedge else "BLOCK",
+                "Selected BUY hedge passed spread validation." if preferred_hedge
+                else "Selected BUY hedge failed validation. Choose another hedge and rebuild the review.",
+            ))
     if state.trade_side == "SELL":
         covered = long_contract_qty >= quantity or (option_type == "CE" and holding_qty >= quantity)
         protected = bool(preferred_hedge)
@@ -31715,7 +31669,7 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
             "Defined/covered risk", "PASS" if covered or protected else "BLOCK",
             f"Verified same-expiry protective BUY {preferred_hedge.get('hedge_symbol')} limits theoretical loss to ₹{_dhan_metric_float(preferred_hedge.get('max_loss')):,.2f}." if protected
             else "SELL reduces a long contract or is covered by sufficient equity holdings." if covered
-            else "Naked short option is blocked. No eligible lower-strike same-expiry protective PE was found.",
+            else f"Naked short option is blocked. No eligible {'higher' if option_type == 'CE' else 'lower'}-strike same-expiry protective {option_type} was found.",
         ))
     else:
         checks.append(trade_validation("Maximum loss", "PASS", f"Option BUY maximum premium risk is ₹{limit_price * quantity:,.2f}, excluding charges."))
@@ -31904,11 +31858,30 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
         "market_session": market_session,
         "quote_fresh": quote_fresh,
         "hedge_alternatives": hedge_alternatives,
+        "hedge_contract_choices": [
+            {"tradingsymbol": row["tradingsymbol"], "strike": row["strike"],
+             "expiry": str(row["expiry"])[:10], "lot_size": row["lot_size"],
+             "oi": (hedge_quotes.get(f"NFO:{row['tradingsymbol']}") or {}).get("oi"),
+             "otm_pct": (
+                 (1 if option_type == "CE" else -1)
+                 * (_dhan_metric_float(row["strike"]) / _dhan_metric_float((state.trade_market or {}).get("cmp")) - 1) * 100
+                 if _dhan_metric_float((state.trade_market or {}).get("cmp")) > 0 else None
+             )}
+            for row in hedge_candidates
+        ],
+        "selected_hedge_symbol": state.trade_hedge_symbol,
+        "reviewed_at": app_now().isoformat(timespec="seconds"),
+        "short_leg_pop": analytics.get("pop"),
     }
     if preferred_hedge:
         preview.update(preferred_hedge)
         preview["hedged_order_acknowledged"] = False
         preview["maximum_loss"] = preferred_hedge.get("max_loss")
+        preview["short_quote_timestamp"] = str(quote.get("timestamp") or "")
+        preview["hedge_quote_timestamp"] = str(
+            (hedge_quotes.get(f"NFO:{preferred_hedge['hedge_symbol']}") or {}).get("timestamp") or ""
+        )
+    preview["environment"] = "TEST" if state.trade_test_mode else "NORMAL"
     return preview, checks
 
 
@@ -31951,7 +31924,57 @@ def render_trade_stepper(state: PageState) -> str:
     return f'<section class="panel trade-wizard-head"><div class="trade-stepper">{items}</div><div class="trade-process-strip">{strip}</div><p class="status">Draft {html.escape(str(draft.get("draft_id") or "not created"))} · Kite profile {html.escape(selected_kite_profile_name(state.kite_profile))}</p>{research_warning}</section>'
 
 
+def approve_protected_short(state: PageState, record: dict[str, Any]) -> dict[str, Any]:
+    """Refresh server-side review from saved execution, never browser leg data."""
+    saved = record["preview"]
+    state.trade_symbol = saved["symbol"]
+    state.trade_contract_symbol = saved["short_symbol"]
+    state.trade_hedge_symbol = saved["hedge_symbol"]
+    state.trade_side, state.trade_mode, state.trade_product = "SELL", record["mode"], "NRML"
+    state.trade_lots = int(saved["quantity"]) // int(saved["lot_size"])
+    state.trade_limit_price = float(saved["order_payloads"][1]["price"])
+    load_trade_terminal_state(state)
+    fresh, checks = build_trade_review(state)
+    if trade_has_blocks(checks):
+        raise PermissionError("Fresh TRADE checks blocked SELL. Hedge remains held.")
+    if any(fresh.get(key) != saved.get(key) for key in
+           ("hedge_symbol", "short_symbol", "expiry", "quantity", "lot_size")):
+        raise PermissionError("Fresh verified spread differs from the authorised execution.")
+    if fresh.get("liquidity") != "PASS" or not fresh.get("eligible"):
+        raise PermissionError("Fresh spread liquidity/risk checks failed.")
+    if record["mode"] == "LIVE":
+        for key in ("short_quote_timestamp", "hedge_quote_timestamp"):
+            try:
+                stamp = datetime.fromisoformat(str(fresh.get(key) or ""))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=INDIA_TIME_ZONE)
+                age = (app_now() - stamp).total_seconds()
+                if not 0 <= age <= 120:
+                    raise ValueError("Stale quote")
+            except (ValueError, TypeError):
+                raise PermissionError("Verified quote timestamps within 120 seconds are required before SELL.")
+    margin = max(_dhan_metric_float(fresh.get("initial_margin")), _dhan_metric_float(fresh.get("final_margin")))
+    if not math.isfinite(margin) or margin <= 0 or _dhan_metric_float(fresh.get("available_funds")) < margin:
+        raise PermissionError("Verified basket margin and sufficient available funds are required.")
+    price = float(saved["order_payloads"][1]["price"])
+    ltp = _dhan_metric_float(fresh.get("ltp"))
+    if ltp <= 0 or abs(price - ltp) / ltp > .20:
+        raise PermissionError("Saved SELL limit is outside the fresh price-deviation guardrail.")
+    credit = price - float(record["hedge_average_price"])
+    width = (float(saved["hedge_strike"]) - float(saved["short_strike"])) if saved.get("strategy_type") == "BEAR_CALL_SPREAD" else (float(saved["short_strike"]) - float(saved["hedge_strike"]))
+    loss = (width - credit) * int(saved["quantity"])
+    cap = min(float(saved["max_loss"]), _dhan_metric_float(os.getenv("TRADE_MAX_SPREAD_LOSS") or 40000))
+    if not (math.isfinite(loss) and 0 < loss <= cap and credit >= float(saved["net_credit_per_share"])):
+        raise PermissionError("Actual hedge cost violates the accepted credit or maximum-loss constraint.")
+    return {"quantity": saved["quantity"], "price": price, "max_loss": loss,
+            "net_credit": credit * saved["quantity"], "margin": margin, "checks": checks}
+
+
 def render_trade_panel(state: PageState) -> str:
+    if state.active_tab == "trade" and state.trade_stage == "execution":
+        account = selected_kite_profile_name(state.kite_profile)
+        banner = '<div class="alert warning"><strong>TEST — localhost:</strong> current Kite data and normal risk checks; simulated orders only.</div>' if state.trade_test_mode else ""
+        return banner + render_execution_monitor(ProtectedExecutionRepository(APP_DB_PATH).recent(account), account)
     if state.active_tab == "trade" and state.trade_watchlist is None:
         try:
             load_trade_terminal_state(state)
@@ -32008,10 +32031,11 @@ def render_trade_panel(state: PageState) -> str:
             for index, row in enumerate(best_scan_rows)
         ) or '<tr><td colspan="14">No configured stock produced a verified candidate. Recalculate after Kite data is available.</td></tr>'
         best_scan_modal = f'''<div class="live-modal-backdrop visible" id="trade-best-modal"><div class="live-modal dhan-order-modal-card trade-best-modal-card">
-          <div class="trade-best-heading"><h2>BEST for TRADE — Daily Market Scan</h2><p class="status">Saved {html.escape(str(best_scan.get("scan_date") or app_now().date()))} · generated {html.escape(str(best_scan.get("created_at") or "unknown"))} · Advisory only</p></div>
+          <div class="trade-best-heading"><div class="trade-best-title-row"><h2>BEST for TRADE — Daily Market Scan{' · TEST' if state.trade_test_mode else ''}</h2><label class="trade-best-mode"><span>Mode</span><select id="trade-best-mode" aria-label="Trade execution mode"><option value="PAPER"{" selected" if state.trade_mode == "PAPER" else ""}>PAPER</option><option value="LIVE"{" selected" if state.trade_mode == "LIVE" else ""}{" disabled" if state.trade_test_mode else ""}>LIVE</option></select></label><a class="button-link secondary" href="/trade/execution?kite_profile={html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}">EXECUTION</a></div><p class="status">Saved {html.escape(str(best_scan.get("scan_date") or app_now().date()))} · generated {html.escape(str(best_scan.get("created_at") or "unknown"))} · Advisory only</p></div>
           <div class="income-equity-order-summary"><strong>Ranking:</strong> pre-market score uses fixed 30/20/15/15/20 component weights. Live score is separate; combined ranking appears only when mandatory data and capital/risk inputs are complete. Model OTM probability is a constant-IV lognormal estimate, not historical POP. The top three may continue for research even when blocked.</div>
           <div class="trade-best-toolbar"><div class="trade-best-view-tabs"><button type="button" data-trade-best-view="PREMARKET">PRE-MARKET</button><button type="button" data-trade-best-view="LIVE">LIVE OPPORTUNITIES</button><button type="button" data-trade-best-view="MISSED">MISSED / WAIT</button><button type="button" data-trade-best-view="ALL" class="active">ALL STOCKS</button></div><div class="trade-best-filters"><label><span>Stock source</span><select id="trade-best-source-filter"><option value="ALL">ALL</option><option value="DHAN">DHAN</option><option value="DHAN_IT">DHAN-IT</option><option value="MANUAL">Manual / Uploaded</option></select></label><span id="trade-best-source-count" class="status"></span></div></div>
           <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Stock</th><th>Source</th><th>Direction</th><th>Gap %</th><th>Prev / Live</th><th>Prev Option</th><th>Live Bid/Ask</th><th>Delta / IV</th><th>OI / Volume</th><th>Technical</th><th>Live Score</th><th>Net Credit Yield</th><th>Status</th><th>Open</th></tr></thead><tbody>{best_rows_html}</tbody></table></div>
+          <div class="trade-best-pagination"><label>Results per page <select id="trade-best-page-size"><option value="10">10</option><option value="20">20</option><option value="ALL">All</option></select></label><span id="trade-best-page-info" class="status" aria-live="polite"></span><button type="button" class="secondary" id="trade-best-prev">Previous</button><button type="button" class="secondary" id="trade-best-next">Next</button></div>
           <div class="modal-actions"><button type="button" class="secondary" id="trade-best-close">Close</button><button type="submit" class="danger" formaction="/trade/best/recalculate" formnovalidate>Recalculate pre-market</button><button type="submit" class="success" formaction="/trade/best/live" formnovalidate>Refresh live opportunities</button></div>
         </div></div>'''
     if preview:
@@ -32020,35 +32044,40 @@ def render_trade_panel(state: PageState) -> str:
         nearby_rows_html = "".join(
             '<tr class="trade-nearby-selected">' if row.get("selected") else '<tr>'
             + f'<td><strong>{float(row.get("strike") or 0):.2f}</strong></td><td>{_dhan_metric_float(row.get("ltp")):.2f}</td><td>{_dhan_metric_float(row.get("bid")):.2f}</td><td>{_dhan_metric_float(row.get("ask")):.2f}</td><td>{f"{float(row.get("pop")):.2f}%" if row.get("pop") is not None else "Unavailable"}</td><td>{int(_dhan_metric_float(row.get("volume")))}</td><td>{int(_dhan_metric_float(row.get("oi")))}</td>'
-            + (f'<td><span class="ipo-badge good">Selected</span></td>' if row.get("selected") else f'<td><button type="submit" class="mini-link" formaction="/trade/review" name="trade_alternative_contract" value="{html.escape(str(row.get("tradingsymbol") or ""), quote=True)}">Select &amp; Evaluate</button></td>')
+            + (f'<td><span class="ipo-badge good">Selected</span></td>' if row.get("selected") else f'<td><button type="submit" class="mini-link" formaction="/trade/review" formnovalidate name="trade_alternative_contract" value="{html.escape(str(row.get("tradingsymbol") or ""), quote=True)}">Select &amp; Evaluate</button></td>')
             + '</tr>'
             for row in preview.get("nearby_strikes") or []
         )
         hedge_rows_html = "".join(
-            f'<tr><td><strong>{html.escape(str(row.get("hedge_symbol") or "-"))}</strong><small>{_dhan_metric_float(row.get("hedge_strike")):.2f} PE · {html.escape(str(row.get("expiry") or ""))}</small></td>'
+            f'<tr><td><strong>{html.escape(str(row.get("hedge_symbol") or "-"))}</strong><small>{_dhan_metric_float(row.get("hedge_strike")):.2f} {html.escape(str(preview.get("option_type") or ""))} · {html.escape(str(row.get("expiry") or ""))}</small></td>'
             f'<td>₹{_dhan_metric_float(row.get("net_credit")):,.2f}</td><td>₹{_dhan_metric_float(row.get("max_profit")):,.2f}</td><td>₹{_dhan_metric_float(row.get("max_loss")):,.2f}</td>'
             f'<td>₹{_dhan_metric_float(row.get("initial_margin")):,.2f} / ₹{_dhan_metric_float(row.get("final_margin")):,.2f}</td>'
-            f'<td>{html.escape(str(row.get("liquidity") or "UNKNOWN"))}</td><td><span class="ipo-badge {"good" if row.get("eligible") else "bad"}">{html.escape(str(row.get("status") or "BLOCK"))}</span></td></tr>'
+            f'<td>{html.escape(str(row.get("liquidity") or "UNKNOWN"))}</td><td><span class="ipo-badge {"good" if row.get("eligible") else "bad"}">{html.escape(str(row.get("status") or "BLOCK"))}</span><small>{html.escape(str(row.get("reason") or ""))}</small></td></tr>'
             for row in preview.get("hedge_alternatives") or []
         )
         hedge_section = (
-            '<section class="trade-nearby-panel trade-hedge-review"><div class="panel-title">Protective PE Hedge — Same Expiry, Lower Strike</div>'
-            f'<p class="status">BUY {html.escape(str(preview.get("hedge_symbol") or ""))} before SELL {html.escape(str(preview.get("short_symbol") or preview.get("tradingsymbol") or ""))}. The short leg is fill-gated by actual hedge quantity.</p>'
-            '<div class="table-wrap"><table class="ipo-table"><thead><tr><th>BUY hedge</th><th>Net credit</th><th>Max profit</th><th>Max loss</th><th>Initial / final margin</th><th>Liquidity</th><th>Status</th></tr></thead>'
-            f'<tbody>{hedge_rows_html}</tbody></table></div><div class="income-equity-order-summary"><strong>Breakeven:</strong> {_dhan_metric_float(preview.get("breakeven")):.2f} · <strong>Selected:</strong> {html.escape(str(preview.get("hedge_symbol") or "None"))}. A hedge does not override liquidity, event, loss-budget or capital blocks.</div></section>'
-        ) if preview.get("strategy_type") == "BULL_PUT_SPREAD" else ""
-        modal = f'''<div class="live-modal-backdrop visible" id="trade-order-ticket-modal"><div class="live-modal dhan-order-modal-card">
-          <h2>TRADE Order Review — {html.escape(str(preview.get("tradingsymbol") or ""))}</h2>
+            f'<section class="trade-nearby-panel trade-hedge-review"><div class="panel-title">1. Select protective BUY · {html.escape(str(preview.get("option_type") or ""))}</div>'
+            f'{render_hedge_selector(preview)}</section>'
+            f'{render_spread_summary(preview, checks)}'
+            '<details class="trade-review-disclosure"><summary>Compare hedge alternatives</summary><div class="table-wrap"><table class="ipo-table"><thead><tr><th>BUY hedge</th><th>Net credit</th><th>Max profit</th><th>Max loss</th><th>Initial / final margin</th><th>Liquidity</th><th>Status</th></tr></thead>'
+            f'<tbody>{hedge_rows_html}</tbody></table></div></details>'
+        ) if preview.get("side") == "SELL" and preview.get("option_type") in {"PE", "CE"} else ""
+        modal = f'''<div class="live-modal-backdrop visible" id="trade-order-ticket-modal"><div class="live-modal dhan-order-modal-card trade-review-card">
+          <h2>TRADE Order Review — {html.escape(str(preview.get("tradingsymbol") or ""))}{' · TEST (simulated orders)' if state.trade_test_mode else ''}</h2>
           <p class="status">Advisory analysis never submits an order. This ticket uses the exact user-selected Kite contract.</p>
           <input type="hidden" name="trade_preview_json" value="{preview_json}"><input type="hidden" name="trade_checks_json" value="{checks_json}">
+          {hedge_section}
+          <details class="trade-review-disclosure"{"" if hedge_section else " open"}><summary>Market context &amp; short-leg analytics</summary>
           <div class="trade-decision-hero"><div><span>Overall decision score</span><strong>{score:.1f}<small>/100</small></strong><p>Recalculated for {html.escape(str(preview.get("tradingsymbol") or "the selected contract"))}. Each of the {len(checks)} checks has equal weight. POP is a dedicated factor; hard BLOCK always overrides the score.</p></div><span class="ipo-badge {score_class}">{html.escape(str(preview.get("decision") or "DO NOT PLACE"))}</span></div>
-          <div class="dhan-ticket-summary"><article><span>Stock CMP</span><strong>₹{float(preview.get("stock_cmp") or 0):.2f}</strong><small>Day {float(preview.get("day_change_pct") or 0):+.2f}%</small></article><article><span>Trend −10 to +10</span><strong class="trade-trend-{str(preview.get("trend_label") or "NEUTRAL").lower()}">{float(preview.get("trend_score") or 0):+.1f} {html.escape(str(preview.get("trend_label") or "NEUTRAL"))}</strong><small>{html.escape(" | ".join(str(item) for item in preview.get("trend_reasons") or []) or "Trend inputs unavailable")}</small></article><article><span>Action</span><strong>{html.escape(str(preview.get("side")))}</strong><small>{html.escape(str(preview.get("mode")))}</small></article><article><span>Strike / Expiry</span><strong>{preview.get("strike")} {html.escape(str(preview.get("option_type")))}</strong><small>{html.escape(str(preview.get("expiry")))}</small></article><article><span>Qty / LIMIT</span><strong>{preview.get("quantity")} / ₹{float(preview.get("limit_price") or 0):.2f}</strong><small>Premium ₹{float(preview.get("premium_value") or 0):,.2f}</small></article><article><span>POP / Delta / IV</span><strong>{f'{float(preview.get("pop")):.2f}%' if preview.get("pop") is not None else 'Unavailable'}</strong><small>Delta {preview.get("delta") if preview.get("delta") is not None else '-'} | IV {f'{float(preview.get("iv_percent")):.2f}%' if preview.get("iv_percent") is not None else '-'}</small></article></div>
-          {hedge_section}<section class="trade-nearby-panel"><div class="panel-title">Same Expiry — 3 Lower &amp; 3 Higher Strikes</div><p class="status">Live option LTP/CMP, POP and depth for the same {html.escape(str(preview.get("option_type")))} expiry. Select another row to rebuild every risk check and score.</p><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Strike</th><th>LTP/CMP</th><th>Bid</th><th>Ask</th><th>POP</th><th>Volume</th><th>OI</th><th>Evaluate</th></tr></thead><tbody>{nearby_rows_html}</tbody></table></div></section>
+          <div class="dhan-ticket-summary"><article><span>Stock CMP</span><strong>₹{float(preview.get("stock_cmp") or 0):.2f}</strong><small>Day {float(preview.get("day_change_pct") or 0):+.2f}%</small></article><article><span>Trend −10 to +10</span><strong class="trade-trend-{str(preview.get("trend_label") or "NEUTRAL").lower()}">{float(preview.get("trend_score") or 0):+.1f} {html.escape(str(preview.get("trend_label") or "NEUTRAL"))}</strong><small>{html.escape(" | ".join(str(item) for item in preview.get("trend_reasons") or []) or "Trend inputs unavailable")}</small></article><article><span>Action</span><strong>{html.escape(str(preview.get("side")))}</strong><small>{html.escape(str(preview.get("mode")))}</small></article><article><span>Strike / Expiry</span><strong>{preview.get("strike")} {html.escape(str(preview.get("option_type")))}</strong><small>{html.escape(str(preview.get("expiry")))}</small></article><article><span>Qty / LIMIT</span><strong>{preview.get("quantity")} / ₹{float(preview.get("limit_price") or 0):.2f}</strong><small>Premium ₹{float(preview.get("premium_value") or 0):,.2f}</small></article><article><span>Short-leg POP / Delta / IV</span><strong>{f'{float(preview.get("short_leg_pop", preview.get("pop"))):.2f}%' if preview.get("short_leg_pop", preview.get("pop")) is not None else 'Unavailable'}</strong><small>Delta {preview.get("delta") if preview.get("delta") is not None else '-'} | IV {f'{float(preview.get("iv_percent")):.2f}%' if preview.get("iv_percent") is not None else '-'}</small></article></div>
+          </details>
+          <details class="trade-review-disclosure"><summary>Compare nearby short strikes</summary><section class="trade-nearby-panel"><div class="panel-title">Same Expiry — 3 Lower &amp; 3 Higher Strikes</div><p class="status">Live option LTP/CMP, POP and depth for the same {html.escape(str(preview.get("option_type")))} expiry. Select another row to rebuild every risk check and score.</p><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Strike</th><th>LTP/CMP</th><th>Bid</th><th>Ask</th><th>POP</th><th>Volume</th><th>OI</th><th>Evaluate</th></tr></thead><tbody>{nearby_rows_html}</tbody></table></div></section>
+          </details>
           <details class="trade-check-disclosure"><summary><span>Show all execution checks</span><small>{len(checks)} checks · includes Verified contract through Execution mode</small></summary><div class="trade-check-grid">{checks_html}</div></details>
-          <div class="trade-risk-acknowledgements"><label class="inline-check"><input id="trade-risk-ack" name="trade_risk_ack" type="checkbox" value="1"{" disabled" if blocked else ""}> I accept the maximum defined risk and understand that this trade may lose money.</label><label class="inline-check"><input class="trade-required-ack" name="trade_not_recovery_ack" type="checkbox" value="1"{" disabled" if blocked else ""}> I am not placing this trade to recover a previous loss.</label><label class="inline-check"><input class="trade-required-ack" name="trade_invalidation_ack" type="checkbox" value="1"{" disabled" if blocked else ""}> I have reviewed evidence opposing my hypothesis and know my exit conditions.</label><label class="inline-check"><input class="trade-required-ack" name="trade_loss_acceptance" type="checkbox" value="1"{" disabled" if blocked else ""}> I have reviewed the hedge and will keep protection until the short leg is closed.</label></div>
+          <h3 class="trade-consent-title">Final review &amp; risk acceptance</h3><div class="trade-risk-acknowledgements"><label class="inline-check"><input id="trade-risk-ack" name="trade_risk_ack" type="checkbox" value="1"{" disabled" if blocked else ""}> I accept the maximum defined risk and understand that this trade may lose money.</label><label class="inline-check"><input class="trade-required-ack" name="trade_not_recovery_ack" type="checkbox" value="1"{" disabled" if blocked else ""}> I am not placing this trade to recover a previous loss.</label><label class="inline-check"><input class="trade-required-ack" name="trade_invalidation_ack" type="checkbox" value="1"{" disabled" if blocked else ""}> I have reviewed evidence opposing my hypothesis and know my exit conditions.</label><label class="inline-check"><input class="trade-required-ack" name="trade_loss_acceptance" type="checkbox" value="1"{" disabled" if blocked else ""}> I have reviewed the hedge and will keep protection until the short leg is closed.</label></div>
           <div class="breath-circle income-pe-breath" id="trade-breath"></div><div class="breath-text" id="trade-breath-text">{"Order blocked by mandatory checks" if blocked else "Tick all acknowledgements to start 10s review"}</div><p class="trade-responsibility-reminder">I do not need this particular trade to win. I need to follow my trading process consistently.</p><div class="countdown" id="trade-countdown">10</div>
           <input type="hidden" name="trade_final_confirmed" id="trade-final-confirmed" value="0">
-          <div class="modal-actions"><button type="button" class="secondary" id="trade-modal-cancel">Cancel</button><button type="button" class="secondary" id="trade-review" disabled>Start 10s Review</button><button type="submit" class="danger" id="trade-submit" formaction="/trade/submit" disabled>{"Confirm & Place Hedged Order" if preview.get("strategy_type") else "Confirm & Place Order"}</button></div>
+          <div class="modal-actions"><button type="button" class="secondary" id="trade-modal-cancel">Cancel</button><button type="button" class="secondary" id="trade-review" disabled>Start 10s Review</button><button type="submit" class="danger" id="trade-submit" formaction="/trade/submit" disabled>{"Confirm & Start Protected Execution" if preview.get("strategy_type") else "Confirm & Place Order"}</button></div>
         </div></div>'''
     recent_rows = "".join(f'<tr><td>{html.escape(str(row.get("created_at") or ""))}</td><td>{html.escape(str(row.get("mode") or ""))}</td><td>{html.escape(str(row.get("side") or ""))} {html.escape(str(row.get("contract_symbol") or ""))}</td><td>{row.get("quantity")}</td><td>{row.get("limit_price")}</td><td>{html.escape(str(row.get("status") or ""))}</td><td>{html.escape(str(row.get("broker_order_id") or ""))}</td></tr>' for row in state.trade_recent_orders or []) or '<tr><td colspan="7">No TRADE orders recorded.</td></tr>'
     ohlc = market.get("ohlc") or {}
@@ -32253,7 +32282,7 @@ def render_trade_panel(state: PageState) -> str:
         stage_navigation = f'''<section class="panel trade-discipline"><div class="panel-title">Trading Discipline — Was This a Good Decision?</div><div class="dhan-ticket-summary"><article><span>Pre-trade discipline</span><strong>{preliminary["score"]:.0f}/100</strong><small>{html.escape(preliminary["band"])}</small></article><article><span>Outcome</span><strong>PROVISIONAL</strong><small>Financial outcome remains separate.</small></article><article><span>Risk status</span><strong>{"BLOCK" if preliminary["hard_violation"] else "REVIEW REQUIRED"}</strong><small>Psychology consent cannot bypass risk.</small></article></div><label class="confirm"><input type="checkbox" name="trade_loss_acceptance"> I accept that this trade may lose. I will follow the predefined risk and exit plan rather than trying to avoid the emotional discomfort of a loss.</label><div class="actions"><a class="button-link secondary" href="/trade/chart{draft_qs}">← Back</a><button type="submit" class="secondary" formaction="/trade/workflow/no-trade" formnovalidate>Record disciplined NO TRADE</button></div></section>'''
     return f'''<form id="trade-terminal-panel" class="trade-wizard trade-stage-{html.escape(state.trade_stage, quote=True)}" method="post" action="/trade/load" enctype="multipart/form-data"{style}><input type="hidden" name="kite_profile" value="{html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}"><input type="hidden" name="active_tab" value="trade"><input type="hidden" name="trade_draft_id" value="{html.escape(state.trade_draft_id, quote=True)}">
       {render_trade_stepper(state)}{best_scan_modal}{modal}<section class="panel trade-landing-controls"><div class="panel-title">STEP 1 — Find the Best Trading Opportunities</div><p class="status">PAPER by default. Contracts and lot sizes come only from the current Kite NFO instrument master. Naked option selling is blocked.</p><p><strong>An opportunity is not an obligation. I trade only when my edge is supported by evidence.</strong></p>
-      <div class="compact-grid"><label><span>Stock</span><select name="trade_symbol">{symbol_options}</select></label><label><span>Add NSE F&amp;O symbol</span><input name="trade_add_symbol" placeholder="e.g. RELIANCE"></label><label><span>Upload evaluation universe</span><input type="file" name="trade_stock_list" accept=".csv,.txt,.xlsx,.xlsm"></label><label><span>Mode</span><select name="trade_mode"><option value="PAPER"{" selected" if state.trade_mode == "PAPER" else ""}>PAPER</option><option value="LIVE"{" selected" if state.trade_mode == "LIVE" else ""}>LIVE</option></select></label></div><div class="actions"><button type="submit" formnovalidate>Refresh Stock</button><button type="submit" class="secondary" formaction="/trade/add-stock" formnovalidate>Add / Manage Trading Stocks</button><button type="submit" class="secondary" formaction="/trade/universe/upload" formnovalidate>Upload Stock List</button><button type="submit" class="secondary" formaction="/trade/universe/refresh-dhan" formnovalidate>Refresh Stocks from DHAN</button><button type="submit" class="success" formaction="/trade/best" formnovalidate data-trade-scan>Find BEST for TRADE</button><button type="submit" class="secondary" formaction="/trade/best/recalculate" formnovalidate data-trade-scan>Recalculate Best Trades</button></div><p class="status">CSV/TXT/Excel uploads are validated against the live Kite NFO instrument master. Refresh Stocks from DHAN imports the current active DHAN list. These actions expand the evaluation universe only; they never approve or place an order.</p></section>
+      <div class="compact-grid"><label><span>Stock</span><select name="trade_symbol">{symbol_options}</select></label><label><span>Add NSE F&amp;O symbol</span><input name="trade_add_symbol" placeholder="e.g. RELIANCE"></label><label><span>Upload evaluation universe</span><input type="file" name="trade_stock_list" accept=".csv,.txt,.xlsx,.xlsm"></label><label><span>{"Mode — TEST forces PAPER" if state.trade_test_mode else "Mode"}</span><select name="trade_mode"><option value="PAPER"{" selected" if state.trade_mode == "PAPER" else ""}>PAPER</option><option value="LIVE"{" selected" if state.trade_mode == "LIVE" else ""}{" disabled" if state.trade_test_mode else ""}>LIVE</option></select></label></div><div class="actions"><button type="submit" formnovalidate>Refresh Stock</button><button type="submit" class="secondary" formaction="/trade/add-stock" formnovalidate>Add / Manage Trading Stocks</button><button type="submit" class="secondary" formaction="/trade/universe/upload" formnovalidate>Upload Stock List</button><button type="submit" class="secondary" formaction="/trade/universe/refresh-dhan" formnovalidate>Refresh Stocks from DHAN</button><button type="submit" class="success" formaction="/trade/best" formnovalidate data-trade-scan>Find BEST for TRADE</button><button type="submit" class="secondary" formaction="/trade/best/recalculate" formnovalidate data-trade-scan>Recalculate Best Trades</button></div><p class="status">CSV/TXT/Excel uploads are validated against the live Kite NFO instrument master. Refresh Stocks from DHAN imports the current active DHAN list. These actions expand the evaluation universe only; they never approve or place an order.</p></section>
       <section class="panel trade-market-intelligence"><div class="panel-title">Market Intelligence — CE/PE &amp; Expiry Decision Support</div><p class="status">Refreshed from the selected NSE stock quote, verified Kite NFO contracts and batched option quotes. This is decision support, not an execution approval.</p><div class="dhan-ticket-summary trade-intelligence-cards"><article><span>CMP / Day</span><strong>₹{_dhan_metric_float(market.get("cmp")):.2f}</strong><small><span class="trade-day-change {day_change_class}">{day_change_value:+.2f}%</span> · {html.escape(str(market.get("quote_at") or "Data Unavailable"))}</small></article><article><span>Trend score</span><strong>{intelligence_score:+.1f} / 10</strong><small><span class="ipo-badge {intelligence_badge}">{html.escape(intelligence_regime)}</span> {' · '.join(html.escape(str(item)) for item in intelligence.get("reasons") or [])}</small></article><article><span>CE / PE view</span><strong>{"Bullish biased" if intelligence_regime == "BULLISH" else "Bearish biased" if intelligence_regime == "BEARISH" else "Neutral / Wait"}</strong><small>{html.escape(str(intelligence.get("directional_view") or "No verified directional view."))}</small></article><article><span>Expiry preference</span><strong>{html.escape(str(intelligence.get("preferred_expiry") or "UNAVAILABLE"))}</strong><small>{html.escape(str(intelligence.get("expiry_view") or ""))}</small></article><article><span>50 / 200 DMA</span><strong>{_dhan_metric_float(market.get("dma_50")):.2f} / {_dhan_metric_float(market.get("dma_200")):.2f}</strong><small>{html.escape(str(market.get("technical_error") or market.get("source") or "Historical close calculation"))}</small></article><article class="trade-result-card"><span>Result / event risk</span><strong>{html.escape(str(result_date.get("next_result_date_display") or "Not available"))}</strong><small><span class="ipo-badge {result_badge}">{html.escape(str(result_date.get("result_date_message") or "UNKNOWN"))}</span></small></article><article><span>OHLC</span><strong>{_dhan_metric_float(ohlc.get("open")):.2f} / {_dhan_metric_float(ohlc.get("high")):.2f}</strong><small>Low {_dhan_metric_float(ohlc.get("low")):.2f} | Close {_dhan_metric_float(ohlc.get("close")):.2f}</small></article><article><span>Exposure</span><strong>{len(market.get("positions") or [])} positions</strong><small>{len(market.get("orders") or [])} recent/open orders | holdings {market.get("holding_qty") or 0}</small></article></div><div class="income-equity-order-summary">{html.escape(str(intelligence.get("directional_view") or ""))}<br>{html.escape(str(intelligence.get("expiry_view") or ""))} Verify liquidity, event risk and maximum loss in the execution review before placing any order.</div><div class="panel-title">Technical Trade Confirmation</div><div class="table-wrap"><table class="ipo-table trade-technical-table"><thead><tr><th>Check</th><th>Value</th><th>Observation</th><th>Check</th><th>Value</th><th>Observation</th></tr></thead><tbody>{technical_html}</tbody></table></div><p class="status"><strong>Opposing evidence:</strong> {html.escape(opposing_text)}</p>{tradingview_embed}<section class="trade-expiry-decision-block"><div class="panel-title">5% OTM Direction Matrix</div><p class="status">Directional suggestion combines the independently calculated trend with verified contracts in the preferred expiry. SELL choices remain blocked unless covered, cash-secured or converted to a defined-risk spread.</p><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Choice</th><th>View</th><th>Verified contract</th><th>Reason</th></tr></thead><tbody>{direction_choice_html}</tbody></table></div><div class="panel-title trade-expiry-snapshot-title">Current vs Next Expiry — ATM CE/PE Snapshot</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Month</th><th>Expiry</th><th>Contract</th><th>LTP</th><th>Bid / Ask</th><th>Spread</th><th>Volume</th><th>OI</th><th>Action</th></tr></thead><tbody>{expiry_rows}</tbody></table></div></section></section>
       <section class="panel" id="trade-manual-option-order"{" data-applied-suggestion=\"1\"" if state.trade_applied_suggestion else ""}><div class="panel-title">Manual Option Order</div>{f'<div class="trade-applied-suggestion"><div><span>Suggested contract</span><strong>{html.escape(str((state.trade_applied_suggestion or {}).get("contract") or ""))}</strong><small>Verified again against the active Kite NFO instrument master.</small></div><div><span>Direction</span><strong>{html.escape(str((state.trade_applied_suggestion or {}).get("side") or ""))}</strong><small>Draft selection only; Review Order and all risk controls remain mandatory.</small></div></div>' if state.trade_applied_suggestion else ''}<div class="compact-grid"><label><span>Verified contract</span><select name="trade_contract_symbol" required>{contract_options}</select></label><label><span>BUY / SELL</span><select name="trade_side"><option value="BUY"{" selected" if state.trade_side == "BUY" else ""}>BUY</option><option value="SELL"{" selected" if state.trade_side == "SELL" else ""}>SELL</option></select></label><label><span>Lots</span><input type="number" min="1" max="20" name="trade_lots" value="{state.trade_lots}"></label><label><span>Product</span><select name="trade_product"><option>NRML</option><option>MIS</option></select></label><label><span>LIMIT price</span><input type="number" min="0.05" step="0.05" name="trade_limit_price" value="{state.trade_limit_price or ''}" placeholder="Defaults to live LTP"></label></div><div class="actions"><button type="submit" formaction="/trade/review">Review Order</button><button type="submit" class="secondary" formaction="/trade/analyse-gpt">Analyse &amp; Validate with GPT</button>{tradingview_action}<a id="trade-open-gpt" class="button-link secondary" href="{TRADE_GPT_URL}" target="_blank" rel="noopener">Copy Prompt &amp; Open My Trading GPT</a></div><label><span>GPT analysis prompt / result</span><textarea id="trade-gpt-text" name="trade_gpt_analysis" class="conversation">{html.escape(state.trade_gpt_analysis or state.trade_gpt_prompt or TRADE_ANALYSIS_PROMPT)}</textarea></label></section>
       {stage_navigation}<section class="panel trade-execution-audit"><div class="panel-title">TRADE Execution Audit</div><div class="table-wrap"><table class="ipo-table"><thead><tr><th>Created</th><th>Mode</th><th>Order</th><th>Qty</th><th>LIMIT</th><th>Status</th><th>Broker ID</th></tr></thead><tbody>{recent_rows}</tbody></table></div></section>
@@ -33770,6 +33799,7 @@ def render_nifty_income_panel(state: PageState) -> str:
         positions,
         {
             "risk": cockpit_risk,
+            "legs": candidate_previews,
             "strategy": cockpit_strategy,
             "lot_size": int(config.get("lot_size") or 65),
             "lots": simplified_lots,
@@ -34010,7 +34040,7 @@ def render_nifty_income_panel(state: PageState) -> str:
           <div class="income-equity-metrics">
             <div><span>Active NIFTY positions</span><strong>{html.escape(str(cockpit_total_risk.get("active_nifty_positions_count") or len(positions)))}</strong></div>
             <div><span>Current MTM P&amp;L</span><strong>{html.escape(fmt_number(summary.get("pnl"), 2))}</strong></div>
-            <div><span>Current defined max risk</span><strong>{html.escape(format_buy_amount(cockpit_total_risk.get("current_defined_risk")))}</strong></div>
+            <div><span>Current defined max risk</span><strong>{html.escape(format_nifty_risk(cockpit_total_risk.get("current_defined_risk")))}</strong></div>
             <div><span>Unhedged short risk</span><strong class="score-badge {audit_badge_class('FAIL' if cockpit_total_risk.get("current_unhedged_risk_flag") else 'PASS')}">{'YES' if cockpit_total_risk.get("current_unhedged_risk_flag") else 'NO'}</strong></div>
             <div><span>Missing hedge count</span><strong>{html.escape(str(cockpit_total_risk.get("missing_hedge_count") or screen_audit.get("missing_hedge_count") or 0))}</strong></div>
             <div><span>Exit signal count</span><strong>{html.escape(str(screen_audit.get("exit_signal_count") or 0))}</strong></div>
@@ -34042,10 +34072,10 @@ def render_nifty_income_panel(state: PageState) -> str:
           </div>
           <div class="income-equity-metrics">
             <div><span>Max loss cap</span><strong>{html.escape(format_buy_amount(simplified_cap))}</strong></div>
-            <div><span>Current NIFTY max risk</span><strong>{html.escape(format_buy_amount(cockpit_total_risk.get("current_defined_risk")))}</strong></div>
+            <div><span>Current NIFTY max risk</span><strong>{html.escape(format_nifty_risk(cockpit_total_risk.get("current_defined_risk")))}</strong></div>
             <div><span>New order max loss</span><strong>{html.escape(format_buy_amount(cockpit_total_risk.get("new_order_max_loss")))}</strong></div>
-            <div><span>Total after order</span><strong>{html.escape(format_buy_amount(cockpit_total_risk.get("total_projected_max_loss")))}</strong></div>
-            <div><span>Cap remaining</span><strong>{html.escape(format_buy_amount(cockpit_total_risk.get("cap_remaining_after_order")))}</strong></div>
+            <div><span>Total after order</span><strong>{html.escape(format_nifty_risk(cockpit_total_risk.get("total_projected_max_loss")))}</strong></div>
+            <div><span>Cap remaining</span><strong>{html.escape(format_nifty_risk(cockpit_total_risk.get("cap_remaining_after_order")))}</strong></div>
             <div><span>Hard blocks</span><strong>{html.escape(hard_blocks_text)}</strong></div>
             <div><span>Warnings</span><strong>{html.escape(warnings_text)}</strong><small>Override allowed only after defined-risk acknowledgement.</small></div>
           </div>
@@ -35946,7 +35976,8 @@ def render_page(state: PageState) -> bytes:
             tab_button("pnl", "P&amp;L", pnl_tab_class),
             tab_button("income-growth", "Income Growth", income_growth_tab_class),
             tab_button("income", "INCOME", income_tab_class),
-            tab_button("nifty-income", "Nifty Income", nifty_income_tab_class)
+            tab_button("nifty-2", "Nifty Income", "") if nifty_income_enabled else "",
+            tab_button("nifty-income", "Nifty Income Legacy", nifty_income_tab_class)
             if nifty_income_enabled
             else "",
             tab_button("nifty-grow", "NIFTYGrow", nifty_grow_tab_class)
@@ -43007,6 +43038,43 @@ def render_page(state: PageState) -> bytes:
     .trade-check-card.pass {{ border-color:#86efac; background:#f0fdf4; }}
     .trade-check-card.warning {{ border-color:#fde68a; background:#fffbeb; }}
     .trade-check-card.block {{ border-color:#fecaca; background:#fff1f2; }}
+    #trade-order-ticket-modal .trade-review-card {{ width:min(1260px,96vw); max-width:1260px; text-align:left; }}
+    .spread-review-summary {{ margin:16px 0; padding:20px; border:1px solid #cbd5e1; border-radius:16px; background:#fff; color:#0f172a; text-align:left; }}
+    .spread-review-summary header {{ background:none; box-shadow:none; border:0; padding:0; color:inherit; display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }}
+    .spread-review-summary h3 {{ margin:4px 0; font-size:22px; }}
+    .spread-review-summary header p {{ margin:0; color:#64748b; }}
+    .spread-eyebrow {{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:#475569; }}
+    .spread-metrics {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }}
+    .spread-metric {{ padding:16px; border:1px solid #e2e8f0; border-radius:12px; background:#f8fafc; }}
+    .spread-metric span,.spread-metric small {{ display:block; color:#475569; font-size:12px; }}
+    .spread-metric strong {{ display:block; margin:8px 0; font-size:clamp(20px,2.2vw,30px); font-variant-numeric:tabular-nums; }}
+    .spread-metric.credit,.spread-metric.profit {{ background:#f0fdfa; border-color:#99f6e4; }}
+    .spread-metric.credit strong,.spread-metric.profit strong {{ color:#0f766e; }}
+    .spread-metric.loss {{ background:#fff7ed; border-color:#fed7aa; }}
+    .spread-metric.loss strong {{ color:#9a3412; }}
+    .spread-details {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin:18px 0; }}
+    .spread-details span,.spread-details strong {{ display:block; }}
+    .spread-details span {{ color:#64748b; font-size:12px; margin-bottom:5px; }}
+    .spread-leg-table td,.spread-leg-table th {{ text-align:right; }}
+    .spread-leg-table td:nth-child(-n+2),.spread-leg-table th:nth-child(-n+2) {{ text-align:left; }}
+    .spread-leg-table small {{ display:block; font-size:11px; color:#64748b; margin-top:5px; }}
+    .spread-leg {{ font-weight:800; }}
+    .spread-leg.buy {{ color:#0369a1; }}
+    .spread-leg.sell {{ color:#9333ea; }}
+    .spread-model-note {{ font-size:12px; line-height:1.5; color:#64748b; margin-top:14px; }}
+    .spread-blockers {{ border-left:4px solid #dc2626; background:#fef2f2; padding:14px; margin-top:14px; }}
+    .spread-blockers li {{ margin:6px 0; }}
+    .trade-review-disclosure {{ margin:12px 0; padding:12px; border:1px solid #e2e8f0; border-radius:10px; }}
+    .trade-review-disclosure summary {{ cursor:pointer; font-weight:700; color:#334155; }}
+    .trade-review-card .trade-hedge-selection label {{ margin:10px 0; }}
+    .trade-review-card .trade-hedge-selection select {{ width:100%; }}
+    .trade-review-card .modal-actions {{ position:sticky; bottom:0; z-index:2; padding:14px 0; background:#fff; border-top:1px solid #e2e8f0; }}
+    .trade-consent-title {{ margin:22px 0 10px; font-size:17px; }}
+    @media(max-width:760px) {{
+      .spread-metrics,.spread-details {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+      .spread-review-summary {{ padding:12px; }}
+      .spread-review-summary header {{ align-items:flex-start; flex-wrap:wrap; }}
+    }}
     .trade-nearby-panel {{ margin:12px 0; padding:10px; border:1px solid #bae6fd; border-radius:12px; background:#f8fbff; }}
     .trade-nearby-panel .panel-title {{ margin-bottom:2px; }}
     .trade-nearby-panel .status {{ margin:2px 0 8px; }}
@@ -43074,7 +43142,11 @@ def render_page(state: PageState) -> bytes:
     .trade-stage-chart .trade-landing-controls,.trade-stage-chart .trade-intelligence-cards,.trade-stage-chart .trade-technical-table,.trade-stage-chart #trade-manual-option-order,.trade-stage-chart .trade-execution-audit {{ display:none; }}
     .trade-stage-validate .trade-landing-controls,.trade-stage-validate .trade-market-intelligence {{ display:none; }}
     .trade-best-modal-card td small {{ display:block; margin-top:3px; white-space:normal; line-height:1.3; color:#64748b; }}
-    .trade-best-heading {{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:7px; }}
+    .trade-best-heading {{ margin-bottom:7px; }}
+    .trade-best-title-row {{ display:flex; align-items:center; justify-content:flex-start; gap:12px; margin-bottom:4px; }}
+    .trade-best-title-row .button-link {{ flex-shrink:0; margin-left:auto; }}
+    .trade-best-mode {{ display:flex; align-items:center; gap:6px; margin:0; flex-shrink:0; }}
+    .trade-best-mode select {{ width:auto; min-width:90px; padding:5px 8px; }}
     .trade-best-heading h2 {{ margin:0; font-size:20px; }}
     .trade-best-heading .status {{ margin:0; font-size:10px; }}
     .trade-best-modal-card > .income-equity-order-summary {{ margin:6px 0; padding:7px 10px; font-size:11px; line-height:1.3; text-align:left; }}
@@ -43083,6 +43155,11 @@ def render_page(state: PageState) -> bytes:
     .trade-best-filters label {{ display:flex; align-items:center; gap:6px; min-width:0; margin:0; }}
     .trade-best-filters label span {{ white-space:nowrap; font-size:10px; }}
     .trade-best-filters select {{ min-width:145px; padding:5px 8px; }}
+    .trade-best-pagination {{ display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:10px; margin-top:10px; }}
+    .trade-best-pagination label {{ display:flex; align-items:center; gap:6px; margin:0; }}
+    .trade-best-pagination select {{ width:auto; min-width:70px; padding:5px 8px; }}
+    .trade-best-pagination button {{ padding:6px 12px; }}
+    .trade-best-pagination button:disabled {{ opacity:.45; cursor:default; }}
     .trade-best-view-tabs {{ display:flex; flex-wrap:wrap; gap:5px; margin:0; }}
     .trade-best-view-tabs button {{ padding:5px 9px; background:#e2e8f0; color:#334155; font-size:10px; }}
     .trade-best-view-tabs button.active {{ background:#0f766e; color:#fff; }}
@@ -43378,6 +43455,17 @@ def render_page(state: PageState) -> bytes:
     {render_positions_panel(state, position_orders_payload, position_orders_table, position_execute_button)}
     <form id="kite-setup-panel" method="post" action="/kite-setup"{kite_setup_panel_style}>
       {env_panel}
+      <section class="panel">
+        <div class="panel-title">TRADE Environment</div>
+        <label><span>Environment flag (TRADE_ENVIRONMENT)</span>
+          <select name="trade_environment"{"" if state.local_request else " disabled"}>
+            <option value="NORMAL"{" selected" if str(load_app_settings().get("TRADE_ENVIRONMENT", os.getenv("TRADE_ENVIRONMENT", "NORMAL"))).upper() != "TEST" else ""}>NORMAL — existing PAPER / LIVE controls</option>
+            <option value="TEST"{" selected" if str(load_app_settings().get("TRADE_ENVIRONMENT", os.getenv("TRADE_ENVIRONMENT", "NORMAL"))).upper() == "TEST" else ""}>TEST — localhost simulated orders</option>
+          </select>
+        </label>
+        <p class="status">TEST applies only to localhost / 127.0.0.1 / ::1 accessed from this computer. TRADE uses current Kite data and normal checks, but forces PAPER orders. After starting a protected execution, use Reconcile → Confirm SELL → Reconcile to reach SPREAD ACTIVE. Other trading screens are unchanged.</p>
+        <p class="status">{"TEST is active for this request." if state.trade_test_mode else "TEST is not active for this request."} Save Kite Setup to apply changes.</p>
+      </section>
       {render_scheduler_control_panel()}
       <div class="actions">
         <button type="submit" formaction="/kite-setup">Save Kite Setup</button>
@@ -43602,6 +43690,7 @@ def render_page(state: PageState) -> bytes:
         visibleTabs.add(tabId);
       }}
       if (profile.NIFTY_INCOME_ENABLED) visibleTabs.add('nifty-income');
+      if (profile.NIFTY_INCOME_ENABLED) visibleTabs.add('nifty-2');
       if (profile.NIFTY_GROW_ENABLED) visibleTabs.add('nifty-grow');
       for (const checkbox of profileTabChoices) {{
         checkbox.checked = visibleTabs.has(checkbox.value);
@@ -43838,7 +43927,8 @@ def render_page(state: PageState) -> bytes:
           research: '/research',
           trade: '/trade',
           income: '/income',
-          'nifty-income': '/nifty-income',
+          'nifty-income': '/nifty-income/legacy',
+          'nifty-2': '/nifty-2',
           'nifty-grow': '/nifty-grow',
           investing: '/investing',
           equity: '/equity',
@@ -44982,16 +45072,17 @@ def render_page(state: PageState) -> bytes:
       const riskCap = data.total_risk_cap || {{}};
       const capStatus = String(riskCap.cap_status || 'FAIL');
       const formatRisk = (value) => {{
-        const numberValue = Number(value || 0);
-        if (!Number.isFinite(numberValue)) return 'UNLIMITED';
+        if (value === null || value === undefined) return 'UNKNOWN / UNCAPPED';
+        const numberValue = Number(value);
+        if (!Number.isFinite(numberValue)) return 'UNKNOWN / UNCAPPED';
         return numberValue.toFixed(0);
       }};
       if (niftyPairCapLimit) niftyPairCapLimit.textContent = formatRisk(riskCap.max_loss_cap || data.max_loss_cap || 60000);
-      if (niftyPairCurrentRisk) niftyPairCurrentRisk.textContent = formatRisk(riskCap.current_defined_risk || 0);
+      if (niftyPairCurrentRisk) niftyPairCurrentRisk.textContent = formatRisk(riskCap.current_defined_risk);
       if (niftyPairNewRisk) niftyPairNewRisk.textContent = formatRisk(riskCap.new_order_max_loss || data.max_loss || 0);
-      if (niftyPairTotalRisk) niftyPairTotalRisk.textContent = formatRisk(riskCap.total_projected_max_loss || data.max_loss || 0);
+      if (niftyPairTotalRisk) niftyPairTotalRisk.textContent = formatRisk(riskCap.total_projected_max_loss);
       if (niftyPairCapRemaining) {{
-        niftyPairCapRemaining.textContent = formatRisk(riskCap.cap_remaining_after_order || 0);
+        niftyPairCapRemaining.textContent = formatRisk(riskCap.cap_remaining_after_order);
         niftyPairCapRemaining.classList.toggle('signal-red', Number(riskCap.cap_remaining_after_order || 0) < 0);
       }}
       if (niftyPairCapStatus) {{
@@ -45106,7 +45197,7 @@ def render_page(state: PageState) -> bytes:
         const invalidCreditNote = invalidCreditSides.length
           ? ` | BLOCKED: ${{invalidCreditSides.join(' + ')}} hedge premium is higher than/equal to SELL premium. Move strike nearer to CMP, choose nearer expiry, or refresh quotes.`
           : '';
-        const capNote = ` | Risk cap ${{formatRisk(riskCap.max_loss_cap || data.max_loss_cap || 60000)}} | Current risk ${{formatRisk(riskCap.current_defined_risk || 0)}} | New max loss ${{formatRisk(riskCap.new_order_max_loss || data.max_loss || 0)}} | Total after order ${{formatRisk(riskCap.total_projected_max_loss || data.max_loss || 0)}} | Remaining ${{formatRisk(riskCap.cap_remaining_after_order || 0)}} | Cap ${{capStatus}}`;
+        const capNote = ` | Risk cap ${{formatRisk(riskCap.max_loss_cap || data.max_loss_cap || 60000)}} | Current risk ${{formatRisk(riskCap.current_defined_risk)}} | New max loss ${{formatRisk(riskCap.new_order_max_loss || data.max_loss || 0)}} | Total after order ${{formatRisk(riskCap.total_projected_max_loss)}} | Remaining ${{formatRisk(riskCap.cap_remaining_after_order)}} | Cap ${{capStatus}}`;
         niftyPairSummary.textContent = missing.length
           ? `Fresh LTP missing for ${{missing.join(', ')}}. Refresh again before GO.`
           : `${{selectedSides}} | ${{Number(data.lots || 1).toFixed(0)}} lot(s), qty ${{Number(data.quantity || 0).toFixed(0)}} per leg | ${{coverNote}} | BUY hedge near ask, SELL short near bid/CMP | Net credit ${{Number(data.max_gain || 0).toFixed(0)}} | Est. margin ${{data.max_loss_unlimited ? 'UNLIMITED' : Number(data.margin_required || data.max_loss || 0).toFixed(0)}} | Return ${{data.max_loss_unlimited ? 'N/A' : Number(data.return_on_margin_pct || 0).toFixed(2) + '%'}}${{capNote}}${{invalidCreditNote}}${{liquidityNote}}${{confidenceNote}}${{confidenceReason}}${{dynamicNote}}${{riskNote}}${{skippedNote}}${{ackNote}}${{definedRiskAckNote}}${{individualNote}}${{overrideBlockNote}}${{nakedBlocked ? ' | Acknowledge uncovered risk or enable protective covers' : ''}}`;
@@ -46281,6 +46372,8 @@ def render_page(state: PageState) -> bytes:
     const tradeCountdown = document.getElementById('trade-countdown');
     const tradeBreathText = document.getElementById('trade-breath-text');
     const tradeFinalConfirmed = document.getElementById('trade-final-confirmed');
+    const tradeHedgeSelection = document.getElementById('trade-hedge-symbol');
+    let tradeHedgeSelectionChanged = false;
     let tradeReviewTimer = null;
     tradeModalCancel && tradeModalCancel.addEventListener('click', () => {{
       if (tradeReviewTimer) {{
@@ -46292,14 +46385,31 @@ def render_page(state: PageState) -> bytes:
       if (tradeFinalConfirmed) tradeFinalConfirmed.value = '0';
     }});
     const syncTradeAcknowledgements = () => {{
-      const accepted = Boolean(tradeRiskAck && tradeRiskAck.checked && tradeRequiredAcks.every(item => item.checked));
+      const accepted = Boolean(!tradeHedgeSelectionChanged && tradeRiskAck && tradeRiskAck.checked && tradeRequiredAcks.every(item => item.checked));
       if (tradeReview) tradeReview.disabled = !accepted;
       if (!accepted && tradeSubmit) tradeSubmit.disabled = true;
       if (!accepted && tradeFinalConfirmed) tradeFinalConfirmed.value = '0';
     }};
     [tradeRiskAck, ...tradeRequiredAcks].filter(Boolean).forEach(item => item.addEventListener('change', syncTradeAcknowledgements));
+    tradeHedgeSelection && tradeHedgeSelection.addEventListener('change', () => {{
+      tradeHedgeSelectionChanged = true;
+      if (tradeReviewTimer) window.clearInterval(tradeReviewTimer);
+      tradeReviewTimer = null;
+      if (tradeRiskAck) tradeRiskAck.checked = false;
+      tradeRequiredAcks.forEach(item => {{ item.checked = false; }});
+      if (tradeCountdown) tradeCountdown.textContent = '10';
+      if (tradeBreathText) tradeBreathText.textContent = 'BUY hedge changed. Click Add BUY hedge & revalidate before accepting risk again.';
+      const summary = document.querySelector('#trade-order-ticket-modal .spread-review-summary');
+      if (summary) {{
+        const heading = summary.querySelector('.spread-eyebrow');
+        const badge = summary.querySelector('header .ipo-badge');
+        if (heading) heading.textContent = 'Selection changed — revalidate to refresh these figures';
+        if (badge) {{ badge.textContent = 'OUTDATED REVIEW'; badge.className = 'ipo-badge neutral'; }}
+      }}
+      syncTradeAcknowledgements();
+    }});
     tradeReview && tradeReview.addEventListener('click', () => {{
-      if (!tradeRiskAck || !tradeRiskAck.checked || !tradeRequiredAcks.every(item => item.checked) || tradeReviewTimer) return;
+      if (tradeHedgeSelectionChanged || !tradeRiskAck || !tradeRiskAck.checked || !tradeRequiredAcks.every(item => item.checked) || tradeReviewTimer) return;
       let remaining = 10;
       tradeReview.disabled = true;
       if (tradeCountdown) tradeCountdown.textContent = String(remaining);
@@ -46323,10 +46433,28 @@ def render_page(state: PageState) -> bytes:
       if (prompt && navigator.clipboard) navigator.clipboard.writeText(prompt).catch(() => {{}});
     }});
     const tradeBestModal = document.getElementById('trade-best-modal');
+    const tradeBestMode = document.getElementById('trade-best-mode');
+    const tradeOrderMode = document.querySelector('#trade-terminal-panel select[name="trade_mode"]');
+    if (tradeBestMode && tradeOrderMode) {{
+      tradeBestMode.addEventListener('change', () => {{
+        tradeOrderMode.value = tradeBestMode.value;
+        tradeOrderMode.dispatchEvent(new Event('change', {{ bubbles: true }}));
+      }});
+      tradeOrderMode.addEventListener('change', () => {{ tradeBestMode.value = tradeOrderMode.value; }});
+    }}
     const tradeBestClose = document.getElementById('trade-best-close');
     const tradeBestSourceFilter = document.getElementById('trade-best-source-filter');
     const tradeBestSourceCount = document.getElementById('trade-best-source-count');
     const tradeBestViewButtons = Array.from(document.querySelectorAll('[data-trade-best-view]'));
+    const tradeBestPageSize = document.getElementById('trade-best-page-size');
+    const tradeBestPageInfo = document.getElementById('trade-best-page-info');
+    const tradeBestPrev = document.getElementById('trade-best-prev');
+    const tradeBestNext = document.getElementById('trade-best-next');
+    let tradeBestPage = 1;
+    if (tradeBestPageSize) {{
+      const savedSize = window.sessionStorage.getItem('tradeBestPageSize');
+      tradeBestPageSize.value = ['10', '20', 'ALL'].includes(savedSize) ? savedSize : '10';
+    }}
     let tradeBestView = window.sessionStorage.getItem('tradeBestView') || 'ALL';
     if (tradeBestSourceFilter) {{
       const savedSource = window.sessionStorage.getItem('tradeBestSourceFilter');
@@ -46334,29 +46462,48 @@ def render_page(state: PageState) -> bytes:
     }}
     const applyTradeBestSourceFilter = () => {{
       const selected = String(tradeBestSourceFilter && tradeBestSourceFilter.value || 'ALL');
-      let visible = 0;
-      document.querySelectorAll('#trade-best-modal tbody tr[data-trade-source]').forEach(row => {{
+      const rows = Array.from(document.querySelectorAll('#trade-best-modal tbody tr[data-trade-source]'));
+      const matching = rows.filter(row => {{
         const sourceMatch = selected === 'ALL' || String(row.dataset.tradeSource || '') === selected;
         const viewMatch = tradeBestView === 'ALL' || String(row.dataset.tradeView || '') === tradeBestView;
-        const show = sourceMatch && viewMatch;
-        row.hidden = !show;
-        if (show) visible += 1;
+        return sourceMatch && viewMatch;
       }});
-      if (tradeBestSourceCount) tradeBestSourceCount.textContent = `${{visible}} stock${{visible === 1 ? '' : 's'}} shown`;
+      const sizeChoice = tradeBestPageSize ? tradeBestPageSize.value : '10';
+      const pageSize = sizeChoice === 'ALL' ? Math.max(1, matching.length) : Number(sizeChoice);
+      const pages = Math.max(1, Math.ceil(matching.length / pageSize));
+      tradeBestPage = Math.min(Math.max(1, tradeBestPage), pages);
+      const start = (tradeBestPage - 1) * pageSize;
+      rows.forEach(row => {{ row.hidden = true; }});
+      matching.slice(start, start + pageSize).forEach(row => {{ row.hidden = false; }});
+      if (tradeBestSourceCount) tradeBestSourceCount.textContent = `${{matching.length}} matching stock${{matching.length === 1 ? '' : 's'}}`;
+      if (tradeBestPageInfo) tradeBestPageInfo.textContent = matching.length
+        ? `${{start + 1}}–${{Math.min(start + pageSize, matching.length)}} of ${{matching.length}} · Page ${{tradeBestPage}} of ${{pages}}`
+        : 'No matching results';
+      if (tradeBestPrev) tradeBestPrev.disabled = tradeBestPage <= 1;
+      if (tradeBestNext) tradeBestNext.disabled = tradeBestPage >= pages;
     }};
     tradeBestSourceFilter && tradeBestSourceFilter.addEventListener('change', () => {{
+      tradeBestPage = 1;
       window.sessionStorage.setItem('tradeBestSourceFilter', tradeBestSourceFilter.value);
       applyTradeBestSourceFilter();
     }});
     tradeBestViewButtons.forEach(button => {{
       button.classList.toggle('active', button.dataset.tradeBestView === tradeBestView);
       button.addEventListener('click', () => {{
+        tradeBestPage = 1;
         tradeBestView = String(button.dataset.tradeBestView || 'ALL');
         window.sessionStorage.setItem('tradeBestView', tradeBestView);
         tradeBestViewButtons.forEach(item => item.classList.toggle('active', item === button));
         applyTradeBestSourceFilter();
       }});
     }});
+    tradeBestPageSize && tradeBestPageSize.addEventListener('change', () => {{
+      tradeBestPage = 1;
+      window.sessionStorage.setItem('tradeBestPageSize', tradeBestPageSize.value);
+      applyTradeBestSourceFilter();
+    }});
+    tradeBestPrev && tradeBestPrev.addEventListener('click', () => {{ tradeBestPage -= 1; applyTradeBestSourceFilter(); }});
+    tradeBestNext && tradeBestNext.addEventListener('click', () => {{ tradeBestPage += 1; applyTradeBestSourceFilter(); }});
     applyTradeBestSourceFilter();
     tradeBestClose && tradeBestClose.addEventListener('click', () => {{ tradeBestModal && tradeBestModal.classList.remove('visible'); }});
     document.querySelectorAll('[data-trade-best-open]').forEach(button => button.addEventListener('click', () => {{
@@ -46778,7 +46925,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.income_error = f"{friendly_external_error(exc, 'INCOME PE ranking')}\n\n{traceback.format_exc()}"
             self.send_page(state)
             return
-        if parsed_url.path == "/nifty-income":
+        if parsed_url.path in {"/nifty-2", "/nifty-income"}:
+            self.send_nifty_v2(parse_qs(parsed_url.query, keep_blank_values=True))
+            return
+        if parsed_url.path == "/nifty-income/legacy":
             if not kite_profile_nifty_income_enabled():
                 self.send_page(
                     PageState(
@@ -46970,6 +47120,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.message = f"Load today's CSV file: {DEFAULT_CSV_PATH.name}"
             self.send_page(state)
             return
+        if parsed_url.path == "/trade/execution":
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+            self.send_page(PageState(active_tab="trade", trade_stage="execution",
+                                    kite_profile=selected_kite_profile_name(first(query, "kite_profile"))))
+            return
         if parsed_url.path in {"/trade", "/trade/best", "/trade/intelligence", "/trade/chart", "/trade/validate"}:
             query = parse_qs(parsed_url.query, keep_blank_values=True)
             stage_by_path = {"/trade": "best", "/trade/best": "best", "/trade/intelligence": "intelligence", "/trade/chart": "chart", "/trade/validate": "validate"}
@@ -47128,6 +47283,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         if not self.is_authenticated():
             self.send_login()
             return
+        if request_path.startswith("/nifty-2/"):
+            self.send_nifty_v2(form, request_path)
+            return
         set_kite_env(form)
 
         state = PageState(
@@ -47247,6 +47405,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             trade_mode=first(form, "trade_mode", "PAPER").upper(),
             trade_side=first(form, "trade_side", "BUY").upper(),
             trade_contract_symbol=(first(form, "trade_alternative_contract") or first(form, "trade_contract_symbol")).upper(),
+            trade_hedge_symbol=first(form, "trade_hedge_symbol").strip().upper(),
             trade_lots=max(1, min(20, int(float(first(form, "trade_lots", "1") or 1)))),
             trade_product=first(form, "trade_product", "NRML").upper(),
             trade_limit_price=max(0.0, float(first(form, "trade_limit_price", "0") or 0)),
@@ -47470,6 +47629,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            state.local_request = is_local_request(self.headers.get("Host", ""), self.client_address[0])
+            state.trade_test_mode = test_environment_active(
+                load_app_settings().get("TRADE_ENVIRONMENT", os.getenv("TRADE_ENVIRONMENT", "NORMAL")),
+                self.headers.get("Host", ""), self.client_address[0],
+            )
+            if request_path.startswith("/trade"):
+                state.trade_mode = execution_mode(state.trade_mode, state.trade_test_mode)
             if request_path.startswith("/trade") and state.trade_draft_id:
                 load_trade_workflow_draft(state)
             if request_path == "/nfo/retry-safe-price":
@@ -47849,6 +48015,13 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 else:
                     state.message = persist_message
             elif request_path == "/kite-setup":
+                if "trade_environment" in form:
+                    if not state.local_request:
+                        raise PermissionError("The TRADE environment flag can only be changed from localhost.")
+                    environment = first(form, "trade_environment").upper()
+                    if environment not in {"NORMAL", "TEST"}:
+                        raise ValueError("Choose NORMAL or TEST.")
+                    save_app_settings({"TRADE_ENVIRONMENT": environment})
                 profile_name = selected_kite_profile_name(state.kite_profile)
                 profile_values = kite_profile_values_from_state(state)
                 saved_profile_values = save_kite_profile(profile_name, profile_values)
@@ -50333,10 +50506,18 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
             elif request_path == "/trade/review":
                 alternative_contract = first(form, "trade_alternative_contract")
+                # Draft restoration must not replace the contract explicitly
+                # submitted by this review (including hedge revalidation).
+                reviewed_contract = alternative_contract or first(form, "trade_contract_symbol")
+                if reviewed_contract:
+                    state.trade_contract_symbol = reviewed_contract.strip().upper()
                 if alternative_contract:
                     state.trade_limit_price = 0.0
+                    state.trade_hedge_symbol = ""
                 load_trade_terminal_state(state)
                 state.trade_preview, state.trade_checks = build_trade_review(state)
+                if checked(form, "trade_add_hedge"):
+                    state.trade_preview["hedge_revalidated"] = True
                 if alternative_contract:
                     state.message = (
                         f"Selected {state.trade_contract_symbol}. Live quote, POP, risk checks and overall score "
@@ -50388,6 +50569,23 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     "Advisory GPT analysis completed with the selected Kite quote, model Greeks, option-chain comparison, "
                     "availability, event context and application risk checks. Review remains mandatory before any order."
                 )
+            elif request_path in {"/trade/execution/reconcile", "/trade/execution/confirm-sell"}:
+                state.trade_stage = "execution"
+                account_id = selected_kite_profile_name(state.kite_profile)
+                execution_repo = ProtectedExecutionRepository(APP_DB_PATH)
+                execution_id = first(form, "execution_id")
+                record = execution_repo.get(account_id, execution_id)
+                broker = KiteBrokerAdapter(paper_trading=record["mode"] == "PAPER", account_id=account_id)
+                if request_path.endswith("/confirm-sell"):
+                    require_test_safe_execution(record["mode"], state.trade_test_mode)
+                    record = confirm_short(
+                        execution_repo, account_id, execution_id, broker,
+                        validator=lambda current: approve_protected_short(state, current),
+                        acknowledged=checked(form, "protected_sell_ack"),
+                    )
+                else:
+                    record = reconcile_execution(execution_repo, account_id, execution_id, broker)
+                state.message = f"Protected execution: {record['state']}. Monitoring does not place orders."
             elif request_path == "/trade/submit":
                 if first(form, "trade_final_confirmed") != "1":
                     raise PermissionError("TRADE order requires completed 10-second review and explicit final confirmation.")
@@ -50399,10 +50597,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 if not workflow_draft or str(workflow_draft.get("stage")) != "validate":
                     raise PermissionError("Complete the four-stage TRADE workflow before order submission.")
                 submitted_preview = _dhan_json_loads(first(form, "trade_preview_json"), {})
+                if state.trade_hedge_symbol != str(submitted_preview.get("selected_hedge_symbol") or ""):
+                    raise PermissionError("BUY hedge selection changed. Rebuild the review and repeat risk acceptance before submission.")
+                state.trade_hedge_symbol = str(submitted_preview.get("hedge_symbol") or state.trade_hedge_symbol)
                 state.trade_symbol = str(submitted_preview.get("symbol") or "").upper()
                 state.trade_contract_symbol = str(submitted_preview.get("tradingsymbol") or "").upper()
                 state.trade_side = str(submitted_preview.get("side") or "BUY").upper()
-                state.trade_mode = str(submitted_preview.get("mode") or "PAPER").upper()
+                state.trade_mode = execution_mode(
+                    str(submitted_preview.get("mode") or "PAPER"), state.trade_test_mode,
+                )
                 state.trade_product = str(submitted_preview.get("product") or "NRML").upper()
                 state.trade_lots = max(1, int(_dhan_metric_float(submitted_preview.get("lots"))))
                 state.trade_limit_price = _dhan_metric_float(submitted_preview.get("limit_price"))
@@ -50436,13 +50639,23 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     account_id=account_id,
                 )
                 try:
-                    if fresh_preview.get("strategy_type") == "BULL_PUT_SPREAD":
+                    if fresh_preview.get("strategy_type") in {"BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"}:
                         def final_spread_validation(current: dict[str, Any]) -> None:
-                            if _dhan_metric_float(current.get("max_loss")) <= 0:
-                                raise PermissionError("Defined maximum loss is unavailable.")
+                            loss = _dhan_metric_float(current.get("max_loss"))
+                            cap = max(1.0, _dhan_metric_float(os.getenv("TRADE_MAX_SPREAD_LOSS") or 40000))
+                            if not (0 < loss <= cap) or not current.get("eligible"):
+                                raise PermissionError("Defined maximum loss must pass the configured spread risk cap.")
                             if str(current.get("liquidity") or "BLOCK") != "PASS":
                                 raise PermissionError("Both spread legs must pass liquidity validation.")
-                        response = execute_hedge_first(fresh_preview, broker, final_validator=final_spread_validation)
+                            margin = max(_dhan_metric_float(current.get("initial_margin")),
+                                         _dhan_metric_float(current.get("final_margin")))
+                            if not math.isfinite(margin) or margin <= 0 or _dhan_metric_float(current.get("available_funds")) < margin:
+                                raise PermissionError("Verified basket margin and sufficient funds are required before hedge BUY.")
+                        response = start_execution(
+                            ProtectedExecutionRepository(APP_DB_PATH), account_id,
+                            repository.idempotency_key(account_id, fresh_preview),
+                            fresh_preview, state.trade_mode, broker, final_spread_validation,
+                        )
                         broker_order_id = str(response.get("sell_order_id") or response.get("hedge_order_id") or "")
                         repository.complete(audit_id, str(response.get("state") or "ERROR"), broker_order_id, response)
                     else:
@@ -50454,7 +50667,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     raise
                 workflow_repo = TradeWorkflowRepository(APP_DB_PATH)
                 discipline_data = dict((workflow_draft.get("data") or {}).get("discipline") or {})
-                discipline_data.update({"risk_completed": True, "executed_to_plan": True})
+                discipline_data.update({"risk_completed": True,
+                                        "executed_to_plan": fresh_preview.get("strategy_type") not in {"BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"}})
                 workflow_draft = workflow_repo.update(
                     state.trade_draft_id, account_id,
                     changes={"discipline": discipline_data, "execution_audit_id": audit_id,
@@ -50468,8 +50682,16 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 workflow_repo.save_assessment(workflow_draft, provisional, "OPEN", None)
                 state.trade_preview, state.trade_checks = None, None
-                load_trade_terminal_state(state)
+                if fresh_preview.get("strategy_type") in {"BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"}:
+                    state.trade_stage = "execution"
+                else:
+                    load_trade_terminal_state(state)
                 state.message = f"{state.trade_mode} TRADE submission state {response.get('state') or response.get('status')}: {broker_order_id}. Check broker fills; an order ID is not proof of fill."
+                if fresh_preview.get("strategy_type") in {"BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"}:
+                    self.send_response(303)
+                    self.send_header("Location", f"/trade/execution?kite_profile={quote_plus(account_id)}")
+                    self.end_headers()
+                    return
             elif request_path == "/research/load":
                 state.research_rows, state.console_log = call_with_console(
                     research_csv_symbols,
@@ -50848,12 +51070,92 @@ class KiteWebHandler(BaseHTTPRequestHandler):
 
     def send_page(self, state: PageState) -> None:
         try:
+            state.local_request = is_local_request(self.headers.get("Host", ""), self.client_address[0])
+            state.trade_test_mode = test_environment_active(
+                load_app_settings().get("TRADE_ENVIRONMENT", os.getenv("TRADE_ENVIRONMENT", "NORMAL")),
+                self.headers.get("Host", ""), self.client_address[0],
+            )
+            state.trade_mode = execution_mode(state.trade_mode, state.trade_test_mode)
             redirect_state_to_kite_setup_on_error(state)
             content = render_page(state)
         except Exception as exc:
             content = render_fallback_error_page(f"{exc}\n\n{traceback.format_exc()}")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def send_nifty_v2(self, form=None, action=None) -> None:
+        from nifty_options_engine.page import page_data, execute_action
+        from nifty_options_engine.ui import render_page as render_nifty_v2
+        from nifty_options_engine.service import load_market_context, live_snapshot_gate
+        form = form or {}
+        data, error, message = None, "", ""
+        test_mode = test_environment_active(
+            load_app_settings().get("TRADE_ENVIRONMENT", os.getenv("TRADE_ENVIRONMENT", "NORMAL")),
+            self.headers.get("Host", ""), self.client_address[0])
+        try:
+            account = selected_kite_profile_name()
+            if not kite_profile_nifty_income_enabled(account):
+                raise PermissionError("Enable Nifty Income for this profile in Kite Setup first.")
+            # Bind this request's client to saved profile credentials; never accept
+            # credentials/account identity from the execution form or mutate env.
+            from kiteconnect import KiteConnect
+            profile = load_kite_profiles()[account]
+            if not profile.get("KITE_API_KEY") or not profile.get("KITE_ACCESS_TOKEN"):
+                raise PermissionError("Connect this profile in Kite Setup before loading Nifty 2.0.")
+            kite = KiteConnect(api_key=profile["KITE_API_KEY"])
+            kite.set_access_token(profile["KITE_ACCESS_TOKEN"])
+            config = nifty_income_config()["nifty_income_v2"]
+            instruments = cached_kite_instruments(kite, "NFO")
+            if action == "/nifty-2/live-settings":
+                if first(form, "settings_ack") != "yes":
+                    raise PermissionError("Confirm the LIVE setting change explicitly.")
+                updated = {**config, "live_enabled": first(form, "live_enabled") == "yes"}
+                save_nifty_income_config({"nifty_income_v2": income_v2_config(updated)})
+                config = updated
+                action = None
+                message = "Nifty Income LIVE permission saved. Each order still requires review and confirmation."
+            def context_loader(selection):
+                context = load_market_context(kite, account, APP_DB_PATH, selection, config,
+                    app_now(), instruments,
+                    live_ack_enabled=profile.get("KITE_CONFIRM_LIVE_ORDER") == "YES")
+                if selection.get("mode") == "LIVE":
+                    # Reuse existing regime/event/confidence vetoes, refreshed at
+                    # every entry approval. The bound client supplies account risk.
+                    context["live_risk_gate"] = live_snapshot_gate(nifty_income_snapshot(force=True),
+                        lots=int(selection.get("lots") or 0), maximum_lots=config["maximum_lots_per_new_trade"],
+                        strategy_type=("IRON_CONDOR" if selection.get("include_pe") and selection.get("include_ce")
+                                       else "BULL_PUT_SPREAD" if selection.get("include_pe") else "BEAR_CALL_SPREAD"))
+                    context["now"] = app_now()
+                    context["market_open"] = context["market_open"] and (9, 15) <= (context["now"].hour, context["now"].minute) < (15, 30)
+                return context
+            if action and action != "/nifty-2/preview":
+                try:
+                    record, ticket = execute_action(action, form, account, APP_DB_PATH, config,
+                        context_loader, lambda mode: KiteBrokerAdapter(kite=kite, paper_trading=mode == "PAPER", account_id=account), test_mode)
+                    if record:
+                        selected = record["preview"]["selection"]
+                        form = {key: [str(value)] for key, value in selected.items()}
+                        form["structure"] = ["BOTH" if selected["include_pe"] and selected["include_ce"]
+                                             else "CE" if selected["include_ce"] else "PE"]
+                        message = "Saved execution state: " + record["state"] + ". Reconcile to verify fills."
+                        logger.info("NIFTY_EXECUTION_ACTION action=%s mode=%s state=%s execution=%s",
+                                    action, record["mode"], record["state"], record["id"])
+                    else:
+                        message = "Review blocked. Resolve the checks below."
+                except (PermissionError, ValueError) as exc:
+                    error = str(exc)
+            data = page_data(account, APP_DB_PATH, config, context_loader, form)
+        except PermissionError as exc:
+            error = str(exc)
+        except Exception:
+            error = "Nifty 2.0 data could not be verified. Check Kite Setup and refresh. No automatic order retry was made; reconcile any pending execution."
+        content = render_nifty_v2(data, error=error, message=message, test_mode=test_mode)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)

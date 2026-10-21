@@ -241,51 +241,28 @@ def scan_nifty_spread_alternatives(
 
 
 def validate_active_nifty_hedges(active_positions: list[dict[str, Any]] | None) -> dict[str, Any]:
-    positions = active_positions or []
-    parsed = []
-    for position in positions:
-        parsed_symbol = _parse_nifty_symbol(position.get("tradingsymbol"))
-        if not parsed_symbol:
-            continue
-        parsed.append({**position, **parsed_symbol, "quantity": _int(position.get("quantity"))})
-    shorts = [row for row in parsed if row["quantity"] < 0]
-    longs = [row for row in parsed if row["quantity"] > 0]
-    rows: list[dict[str, Any]] = []
-    critical = False
-    for short in shorts:
-        side = short["option_type"]
-        short_qty = abs(_int(short.get("quantity")))
-        expiry = short.get("expiry")
-        if side == "PE":
-            hedge_candidates = [row for row in longs if row["option_type"] == "PE" and row.get("expiry") == expiry and _float(row.get("strike")) < _float(short.get("strike"))]
-        else:
-            hedge_candidates = [row for row in longs if row["option_type"] == "CE" and row.get("expiry") == expiry and _float(row.get("strike")) > _float(short.get("strike"))]
-        hedge = max(hedge_candidates, key=lambda row: _int(row.get("quantity")), default=None)
-        if not hedge:
-            status, severity, action = "UNHEDGED_SHORT", "CRITICAL", "ADD_HEDGE_OR_EXIT"
-            critical = True
-        elif _int(hedge.get("quantity")) < short_qty:
-            status, severity, action = "PARTIAL_HEDGE", "HIGH", "ADD_QUANTITY_OR_REDUCE_SHORT"
-        else:
-            status, severity, action = "OK", "LOW", "MONITOR"
-        rows.append(
-            {
-                "short_symbol": short.get("tradingsymbol") or short.get("symbol"),
-                "hedge_symbol": hedge.get("tradingsymbol") if hedge else "",
-                "hedge_status": status,
-                "severity": severity,
-                "short_quantity": short_qty,
-                "hedge_quantity": _int(hedge.get("quantity")) if hedge else 0,
-                "quantity_match": bool(hedge and _int(hedge.get("quantity")) >= short_qty),
-                "expiry_match": bool(hedge and hedge.get("expiry") == expiry),
-                "action_required": action,
-            }
-        )
+    """Use the same quantity/ownership reconciliation as portfolio risk."""
+    from .reconciliation import reconcile_nifty_positions
+
+    result = reconcile_nifty_positions(active_positions or [])
+    rows = []
+    for short in result["shorts"]:
+        protected = short["status"] == "OPEN_SPREAD"
+        partial = short["status"] == "PARTIAL_SPREAD"
+        rows.append({
+            **short,
+            "hedge_symbol": ", ".join(row["symbol"] for row in short["allocations"]),
+            "hedge_status": "OK" if protected else "PARTIAL_HEDGE" if partial else "UNHEDGED_SHORT",
+            "severity": "LOW" if protected else "HIGH" if partial else "CRITICAL",
+            "quantity_match": protected,
+            "expiry_match": bool(short["allocations"]),
+            "action_required": "MONITOR" if protected else "ADD_HEDGE_OR_EXIT",
+        })
     return {
-        "status": "CRITICAL" if critical else "OK" if not any(row["severity"] == "HIGH" for row in rows) else "HIGH",
-        "block_new_entries": critical,
+        "status": "CRITICAL" if result["block_new_entries"] else "OK",
+        "block_new_entries": result["block_new_entries"],
         "allow_exit_orders": True,
-        "allow_hedge_repair_orders": critical,
+        "allow_hedge_repair_orders": True,
         "rows": rows,
     }
 

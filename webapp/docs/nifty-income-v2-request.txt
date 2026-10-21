@@ -1,0 +1,1361 @@
+
+Act as a principal Python software architect, senior quantitative developer, experienced NIFTY index options trader, and production trading-system engineer.
+
+PROJECT:
+Income Desk — NIFTY Income 2.0
+
+TASK:
+Refactor and enhance my existing NIFTY Income application into a complete, risk-controlled NIFTY options income, execution, position-management and performance-analytics platform.
+
+IMPORTANT:
+Do not build a standalone replacement application.
+
+First inspect my existing repository and reuse the architecture, UI components, database, broker integration, order services and trade-management features already implemented.
+
+Pay particular attention to:
+- TRADE screen
+- Nifty Income screen
+- Position screen
+- Modify / Cancel screen
+- P&L screen
+- Existing Kite/Zerodha integration
+- Existing local database
+- Existing NIFTY execution engine
+- Existing risk-management engine
+- Existing 20% profit-capture orders
+- Existing scheduled exit jobs
+- Existing hedge repair functionality
+
+My objective is consistent, repeatable NIFTY options income while protecting capital and keeping execution simple.
+
+====================================================
+1. BUSINESS OBJECTIVE
+====================================================
+
+Transform NIFTY Income into a complete lifecycle:
+
+MARKET SCAN
+    ↓
+STRATEGY SELECTION
+    ↓
+BUILD PROTECTED POSITION
+    ↓
+CALCULATE ACTUAL MAX LOSS
+    ↓
+REVIEW ORDER
+    ↓
+PLACE HEDGE FIRST
+    ↓
+PLACE SELL OPTION
+    ↓
+MONITOR POSITION
+    ↓
+PROFIT BOOK / STOP LOSS / TIME EXIT
+    ↓
+CLOSE OR MANAGE REMAINING HEDGE
+    ↓
+RECONCILE FILLS AND CHARGES
+    ↓
+UPDATE MONTHLY P&L
+    ↓
+EVALUATE NEXT OPPORTUNITY
+
+Core principle:
+
+Maximize retained net income after trading costs and losses, not simply gross premium collected.
+
+No trade should be created merely to generate activity.
+
+====================================================
+2. USER TRADING RULES
+====================================================
+
+Default configuration:
+
+nifty_income_v2:
+  enabled: true
+  timezone: "Asia/Kolkata"
+
+  max_total_nifty_defined_loss_inr: 60000
+
+  default_lots: 2
+  maximum_lots_per_new_trade: 2
+  default_hedge_width_points: 300
+
+  use_live_instrument_lot_size: true
+
+  preferred_entry_dte_min: 21
+  preferred_entry_dte_max: 35
+
+  alternate_entry_dte_min: 18
+  alternate_entry_dte_max: 24
+
+  allowed_strategies:
+    - BULL_PUT_SPREAD
+    - BEAR_CALL_SPREAD
+    - IRON_CONDOR
+
+  entry_mode: "SUGGESTION_ONLY"
+  live_enabled: false
+  manual_confirmation_required: true
+  countdown_seconds: 10
+
+  no_naked_nifty_sell: true
+  hedge_first_execution: true
+  hedge_must_be_filled_before_short_sell: true
+
+  credit_capture_target_pct: 55
+  quick_short_premium_capture_pct: 20
+
+  spread_stop_loss_credit_multiple: 1.5
+  emergency_short_premium_multiple: 2.0
+
+  force_exit_dte: 7
+
+  monthly_loss_kill_switch_enabled: true
+
+  entry_order_type: "LIMIT"
+  product: "NRML"
+
+All thresholds must be configurable through existing application settings.
+
+Never infer lot size from old screenshots.
+Always use the current NFO instrument master.
+
+Risk cap applies to the aggregate NIFTY portfolio, not independently to each new trade.
+
+====================================================
+3. FIRST INSPECT THE REPOSITORY
+====================================================
+
+Before writing code:
+
+1. Locate the existing NIFTY Income route/page.
+2. Locate the TRADE screen implementation.
+3. Identify the existing frontend framework.
+4. Identify existing Kite connection services.
+5. Locate position and order retrieval.
+6. Locate strategy selection logic.
+7. Locate broker order execution services.
+8. Locate profit-booking scheduler.
+9. Locate local database schema and migrations.
+10. Locate existing P&L reporting functions.
+11. Locate existing risk validation.
+12. Locate existing hedge-integrity checker.
+
+Do not assume Streamlit.
+
+Do not create duplicate order services or second risk engines.
+
+Create a concise implementation plan and dependency map.
+
+Prefer refactoring/reusing existing modules rather than parallel implementations.
+
+Preserve all existing stock-option, Wheel, covered-call, ETF, IPO and other trading workflows.
+
+====================================================
+4. REDESIGN NIFTY INCOME SCREEN
+====================================================
+
+Replace the current long diagnostic page with FOUR primary sections.
+
+A. NIFTY MARKET & RISK
+B. NEW NIFTY TRADE TICKET
+C. ACTIVE SPREADS & EXIT MANAGEMENT
+D. MONTHLY PERFORMANCE ANALYTICS
+
+Move:
+- detailed market regime calculations
+- full confidence score breakdown
+- scheduler details
+- extensive warnings
+- raw broker API data
+- strategy scanner diagnostics
+- execution logs
+
+into collapsible Advanced Details.
+
+Remove duplicated status, risk and decision cards.
+
+The screen should be readable within one or two desktop viewports for primary execution decisions.
+
+====================================================
+5. NIFTY MARKET & RISK BAR
+====================================================
+
+At the top display:
+
+NIFTY Spot
+India VIX
+MMI
+Market Regime
+Expected Move
+Current Open MTM
+Maximum Loss Cap
+Current Portfolio Risk
+Available Risk Budget
+Data Refresh Time
+
+Display one primary action status:
+
+READY
+PREVIEW_ONLY
+REPAIR_FIRST
+NO_TRADE
+EXIT_REQUIRED
+
+Do not display conflicting statuses from different engines.
+
+Use one authoritative decision service.
+
+Example:
+
+NIFTY 22889
+MMI 50.25 | NEUTRAL
+VIX 14.77
+Trend SIDEWAYS
+
+MAX LOSS CAP: ₹60,000
+CURRENT RISK: UNKNOWN / UNCAPPED
+NEW ORDER RISK: ₹41,106
+NEW ENTRY: BLOCKED
+REASON: EXISTING UNHEDGED SHORT
+
+Primary action:
+REPAIR HEDGE
+
+Important:
+A portfolio containing an uncovered short must never display its maximum loss as zero.
+
+====================================================
+6. FIX EXISTING POSITION RECONCILIATION
+====================================================
+
+Current application example:
+
+NIFTY26N0923200CE
+SELL
+Quantity -325
+Avg 190.40
+LTP 182.65
+
+Existing screen identifies it as UNHEDGED_SHORT but shows Current Defined Max Risk = 0.
+
+This is incorrect for portfolio risk.
+
+Create a robust position reconciliation service:
+
+reconcile_nifty_positions()
+
+Sources:
+- Kite positions
+- Kite orders
+- Kite trades/fills where available
+- Local strategy records
+- Historical imported tradebook data
+
+Match positions to strategies using:
+- account_id
+- strategy_id
+- instrument token
+- symbol
+- option type
+- strike
+- expiry
+- signed quantity
+- recorded entry/exit allocation
+- broker fill/order identifiers
+
+Do not match unrelated positions merely because they have compatible symbols.
+
+Group positions into:
+
+OPEN_SPREAD
+OPEN_IRON_CONDOR
+PARTIAL_SPREAD
+SHORT_CLOSED_HEDGE_OPEN
+HEDGE_REPAIR_REQUIRED
+UNHEDGED_SHORT
+LONG_HEDGE_ONLY
+FULLY_CLOSED
+UNMATCHED
+
+For unmatched trades, show a review workflow.
+
+For every short option:
+- Identify genuine long protective positions.
+- Verify same expiry.
+- Verify correct option type.
+- Verify strike direction.
+- Verify sufficient remaining hedge quantity.
+
+A later-expiry or earlier-expiry long option is not automatically equivalent to a fully defined-risk vertical.
+
+When hedge is missing:
+- Current defined maximum loss = UNKNOWN/UNCAPPED.
+- Do not count risk as zero.
+- Prevent opening new short-option exposure.
+- Allow repair and risk-reducing exits.
+
+====================================================
+7. CENTRAL NIFTY RISK CALCULATOR
+====================================================
+
+Create/reuse a single canonical risk service:
+
+calculate_nifty_portfolio_risk(
+    existing_positions,
+    proposed_strategy,
+    execution_prices,
+    config
+)
+
+Use this SAME service in:
+- Main dashboard
+- Order ticket
+- Live GO validation
+- Existing positions
+- Strategy analytics
+- Exit engine
+
+For Bull Put Spread:
+
+Width = Short PE Strike - Long PE Strike
+
+Max Loss =
+(Width - Net Credit Points) × Quantity
+
+For Bear Call Spread:
+
+Width = Long CE Strike - Short CE Strike
+
+Max Loss =
+(Width - Net Credit Points) × Quantity
+
+For a standard same-expiry, nonoverlapping Iron Condor:
+
+Width = MAX(PE Width, CE Width)
+
+Max Loss =
+(Width - Total Net Credit Points) × Quantity
+
+Account for closing/transaction costs separately and include conservative estimated execution costs in pretrade exposure calculations.
+
+For nonstandard structures, unequal quantities, overlapping wings or different expiries, use a payoff-scenario risk engine rather than applying the simple condor formula.
+
+Different expiry risk:
+- Do not automatically net calendar exposures.
+- Use conservative risk aggregation.
+- When loss cannot be bounded, return UNCAPPED/UNKNOWN.
+
+Aggregate existing and new strategies conservatively.
+
+For compatible same-expiry positions, calculate portfolio payoff by underlying price scenarios to avoid incorrect double counting.
+
+Use an upper bound for losses when portfolio-level expiry interactions cannot be modelled reliably.
+
+Store:
+
+current_defined_max_loss
+new_strategy_max_loss
+projected_portfolio_max_loss
+risk_cap
+risk_remaining
+uncapped_risk_present
+risk_status
+
+Hard rule:
+
+projected_portfolio_max_loss <= ₹60,000
+
+Also require:
+uncapped_risk_present = false
+
+Broker margin is a separate metric, never a substitute for defined maximum loss.
+
+====================================================
+8. NEW NIFTY TRADE TICKET
+====================================================
+
+Reuse the existing TRADE order-placement workflow.
+
+Provide selection:
+
+[ ] PE Spread
+[ ] CE Spread
+
+If both selected:
+IRON_CONDOR
+
+If only PE:
+BULL_PUT_SPREAD
+
+If only CE:
+BEAR_CALL_SPREAD
+
+Inputs:
+
+Expiry
+Lots (default 2)
+Hedge Width (default 300)
+Short PE Strike
+Short CE Strike
+Protective BUY PE Strike
+Protective BUY CE Strike
+
+Suggested strikes should come from existing MMI, regime, delta and option-chain logic.
+
+Allow manual strike editing.
+
+Always validate:
+- matching expiry
+- hedge strike direction
+- quantities
+- live instruments
+- actual credit
+- maximum risk
+
+One side selection must produce a protected TWO-option vertical, never a naked single option.
+
+====================================================
+9. REALISTIC ORDER PRICING
+====================================================
+
+Current app historically used:
+
+SELL = LTP + 20%
+BUY HEDGE = LTP - 20%
+
+These are optimistic passive target prices, not executable premium estimates.
+
+Keep optional passive target pricing for watch orders but NEVER use those hypothetical fills to approve live trades.
+
+For realistic entry preview:
+
+SELL option:
+reference executable price = best bid
+
+BUY hedge:
+reference executable price = best ask
+
+Require:
+- positive bid and ask
+- valid option contract
+- fresh quote
+- reasonable bid/ask spread
+- sufficient market depth for quantity
+- usable order book
+
+Calculate:
+
+Net Executable Credit Points
+Net Executable Credit INR
+Gross Maximum Profit
+Estimated Fees
+Net Maximum Profit
+Maximum Defined Loss
+Credit Percentage of Width
+Return on Defined Risk
+Return on Broker Margin
+
+Show hypothetical price separately.
+
+Revalidate prices immediately before live execution.
+
+If quotes missing/stale:
+PREVIEW_ONLY
+
+Do not manufacture bid/ask data from LTP.
+
+====================================================
+10. ORDER REVIEW WITH 10-SECOND COUNTDOWN
+====================================================
+
+Button:
+BUILD ORDER
+
+Then:
+REVIEW & START 10S
+
+Review modal:
+
+Strategy
+Expiry
+Selected legs
+Quantity
+BUY hedge prices
+SELL short prices
+Expected executable net credit
+Maximum profit
+Maximum loss
+Current open risk
+Total risk after trade
+Remaining ₹60K risk budget
+Broker verified margin
+Warnings
+
+GO button disabled during 10-second review.
+
+Countdown completion only enables GO.
+It does not automatically submit orders.
+
+Changing:
+- lots
+- strikes
+- expiry
+- execution prices
+- account
+- selected legs
+
+must invalidate the review and require a new countdown.
+
+When user clicks GO:
+1. Refresh positions.
+2. Refresh open orders.
+3. Refresh quotes.
+4. Recheck market hours.
+5. Recalculate maximum loss.
+6. Recheck risk cap.
+7. Recheck existing open orders.
+8. Confirm available margin.
+9. Begin controlled execution.
+
+No auto-live order during tests.
+
+====================================================
+11. HEDGE-FIRST EXECUTION
+====================================================
+
+Order execution sequence:
+
+Bull Put:
+1. BUY lower PE hedge
+2. Confirm FILLED quantity.
+3. SELL higher PE up to confirmed protected quantity.
+
+Bear Call:
+1. BUY higher CE hedge.
+2. Confirm FILLED quantity.
+3. SELL lower CE up to confirmed protected quantity.
+
+Iron Condor:
+1. BUY PE hedge.
+2. BUY CE hedge.
+3. Confirm both hedge quantities filled.
+4. SELL PE.
+5. SELL CE.
+
+Order acceptance alone is not equivalent to a filled hedge.
+
+Implement execution states:
+
+CREATED
+VALIDATED
+HEDGE_PENDING
+HEDGE_PARTIAL
+HEDGE_FILLED
+SHORT_PENDING
+SHORT_PARTIAL
+OPEN
+EXIT_PENDING
+PARTIALLY_CLOSED
+CLOSED
+ERROR
+
+Persist:
+- strategy_id
+- execution_id
+- broker order IDs
+- filled quantities
+- average fill prices
+- pending quantities
+- timestamps
+- status
+- errors
+
+Prevent duplicate placement through unique idempotency keys and refreshed broker-order reconciliation.
+
+If hedge order fails:
+Do not sell.
+
+If short order fails:
+Keep the filled hedge recorded and prompt for safe cleanup.
+
+On exit:
+Buy-to-close short first while keeping its protective hedge.
+Sell/close hedge only after matching short quantity is confirmed closed.
+
+Support partial fills and retries.
+
+====================================================
+12. POSITION GROUPING / STRATEGY LEDGER
+====================================================
+
+This is a critical new feature.
+
+Currently the app tracks individual option P&L.
+
+Change it to track COMPLETE STRATEGY P&L.
+
+Create local database tables using existing database technology:
+
+nifty_strategies
+nifty_strategy_legs
+nifty_order_events
+nifty_fills
+nifty_strategy_pnl
+nifty_risk_snapshots
+nifty_exit_events
+nifty_import_batches
+nifty_audit_events
+
+Use existing migrations/ORM conventions.
+
+Strategy-level record:
+
+strategy_id
+account_id
+strategy_type
+entry_date
+expiry_date
+entry_spot
+mmi_at_entry
+vix_at_entry
+short_pe_strike
+long_pe_strike
+short_ce_strike
+long_ce_strike
+lots
+lot_size
+net_entry_credit
+hedge_cost
+entry_fees
+exit_fees
+realised_pnl
+unrealised_pnl
+net_total_pnl
+max_defined_loss
+broker_margin
+credit_capture_pct
+risk_state
+strategy_status
+exit_reason
+exit_date
+created_at
+updated_at
+
+P&L must be built from actual fills and attributable fees.
+
+No duplicate accounting of the same trade.
+
+====================================================
+13. OCTOBER HISTORICAL P&L INTEGRATION
+====================================================
+
+My October trading report showed these visible profitable NIFTY entries:
+
+NIFTY26OCT22400PE: +₹31,980
+NIFTY26OCT23000CE: +₹27,807
+NIFTY26OCT22000PE: +₹19,201
+
+Visible subtotal = ₹78,988.
+
+This is NOT necessarily full-month net profit.
+
+There may be:
+- additional NIFTY losses
+- other NIFTY profits
+- protective hedge losses
+- brokerage
+- exchange fees
+- statutory charges
+- slippage
+- unsettled/open positions
+
+Create an historical import service:
+
+import_nifty_tradebook(file, account_id)
+
+Support appropriate Zerodha Console tradebook/P&L exports where supplied.
+
+Do not rely on Kite positions API to recover arbitrary previous months of trade history.
+
+Functions:
+
+parse_nifty_trades()
+normalize_symbols()
+resolve_instrument_expiry()
+match_strategy_legs()
+reconstruct_trade_cycles()
+allocate_fees()
+reconcile_realised_pnl()
+persist_monthly_pnl()
+
+Allow user to upload historical CSV/XLSX.
+
+Automatically:
+- detect NIFTY option trades
+- identify BUY / SELL
+- match quantities
+- identify hedge costs
+- match exits
+- calculate strategy realised P&L
+
+When grouping cannot be established:
+mark UNMATCHED.
+
+Do not invent entry or exit fills.
+
+Reconcile imported broker realised P&L with calculated trade-level P&L and flag differences.
+
+Keep stock option P&L in the existing stock modules.
+
+====================================================
+14. 20% PROFIT-CAPTURE ENGINE
+====================================================
+
+Preserve my existing short-option profit order feature:
+
+Place passive BUY-to-close at approximately 20% below the short option average sell premium.
+
+Example:
+
+Short option sold at ₹100
+Profit capture BUY target = ₹80
+
+But distinguish:
+
+PASSIVE_PROFIT_CAPTURE
+SPREAD_PROFIT_CAPTURE
+RISK_EXIT
+EMERGENCY_EXIT
+TIME_EXIT
+MANUAL_EXIT
+
+The 20%-below-average order is a profit target, NOT risk protection.
+
+If short premium increases substantially:
+- do not rely on passive profit orders as a stop.
+- evaluate risk state.
+- an emergency exit must cancel/replace conflicting passive orders safely.
+
+Require live positions and open orders before action.
+
+Never close more than the current open short quantity.
+
+====================================================
+15. MANAGE HEDGE AFTER SHORT OPTION CLOSE
+====================================================
+
+Current issue:
+
+A short option may close profitably while the protective BUY remains open.
+
+Implement:
+
+on_short_leg_closed(strategy_id)
+
+Actions:
+
+A. CLOSE_HEDGE
+B. KEEP_TAIL_HEDGE
+C. CONVERT_TO_NEW_SPREAD
+
+For regular income:
+Default = CLOSE_HEDGE after short closure is confirmed.
+
+Before closing hedge:
+- verify it is not still protecting another assigned short quantity.
+- calculate selling price and expected net proceeds.
+- place correct closing order.
+- update strategy P&L.
+
+If user selects KEEP_TAIL_HEDGE:
+- classify as separately managed long option.
+- capture its original allocated cost.
+- maintain ownership and expiry tracking.
+- do not mark whole original strategy fully closed until accounting is reconciled.
+
+Show:
+Short profit
+Hedge P&L
+Total spread profit
+Total fees
+Net profit
+
+Do not count a profitable short option as a completed winning spread if related hedge exposure remains unresolved.
+
+====================================================
+16. AUTOMATED SPREAD EXIT ENGINE
+====================================================
+
+Retain existing scheduled exit infrastructure.
+
+Default policies:
+
+A. Profit booking:
+55% of entry net credit captured on complete spread.
+
+B. Quick premium capture:
+20% short premium reduction may trigger profit booking, followed by hedge-management workflow.
+
+C. Stop-loss:
+Default spread repurchase value >=1.5x entry credit.
+
+D. Emergency:
+Short option premium >=2x its entry premium.
+Short strike touched.
+Critical position risk breached.
+Other existing emergency rules remain in place.
+
+E. Time exit:
+Close before the final 7 DTE, using existing trading-calendar logic.
+
+All automatic exits must be based on current executable closing prices where available.
+
+A stop trigger is not a guarantee of fill.
+Track execution slippage and pending/partial fills.
+
+Use frequent enough risk monitoring for the existing implementation, and keep the 15-minute scheduler as a fallback/reconciliation mechanism rather than claiming it guarantees emergency fills.
+
+No new risk may be opened by exit jobs.
+
+====================================================
+17. ACTIVE NIFTY SPREADS SCREEN
+====================================================
+
+Replace the flat positions list with a grouped spread table.
+
+Columns:
+
+Strategy ID
+Strategy Type
+Expiry
+DTE
+PE Short / Hedge
+CE Short / Hedge
+Lots
+Initial Net Credit
+Current Closing Debit
+Net P&L
+Captured %
+Max Loss
+Risk State
+Next Exit
+Action
+
+Allow expandable details for each leg.
+
+Actions:
+
+VIEW
+CLOSE SPREAD
+REPAIR HEDGE
+CLOSE ORPHAN HEDGE
+ROLL / REBUILD (preview first)
+
+Show an unhedged short prominently.
+
+Existing unhedged positions must never appear as ordinary protected spreads.
+
+Keep a separate orphan-hedge summary.
+
+====================================================
+18. MONTHLY NIFTY PERFORMANCE DASHBOARD
+====================================================
+
+This is one of the most important enhancements.
+
+Add section:
+
+NIFTY MONTHLY PERFORMANCE
+
+Month selector:
+Jan through Dec
+
+Year selector:
+Current and previous years with imported data.
+
+Summary:
+
+Realised Gross P&L
+Charges & Fees
+Realised Net P&L
+Open MTM P&L
+Total P&L
+Completed Strategies
+Winning Strategies
+Losing Strategies
+Win Rate
+Average Winner
+Average Loser
+Profit Factor
+Maximum Drawdown
+Return on Defined Risk
+Return on Margin Used
+Hedge Cost Drag
+Slippage Cost
+
+All P&L metrics must explicitly identify whether realised, unrealised, gross or net.
+
+Show charts:
+
+1. Daily realised P&L
+2. Cumulative monthly net P&L
+3. Monthly P&L trend
+4. PE vs CE spread profitability
+5. Strategy profitability
+6. Drawdown chart
+
+Charts must use existing frontend charting packages when possible.
+
+====================================================
+19. STRATEGY PERFORMANCE ANALYTICS
+====================================================
+
+Create:
+
+analyze_nifty_strategy_performance(start_date, end_date)
+
+Compare:
+
+BULL_PUT_SPREAD
+BEAR_CALL_SPREAD
+IRON_CONDOR
+
+For each strategy:
+
+Completed cycles
+Winning cycles
+Losing cycles
+Win rate
+Gross premium
+Net realised income
+Average profit
+Average loss
+Worst loss
+Profit factor
+Expectancy
+Max drawdown
+Average holding days
+Average margin
+Average max risk
+Hedge cost
+Slippage
+Capital efficiency
+
+Formula:
+
+Expectancy =
+Win Rate × Average Winner
+-
+Loss Rate × Average Absolute Loser
+
+Profit Factor =
+Gross Winning P&L / Absolute Gross Losing P&L
+
+Handle zero denominators correctly.
+
+Do not claim strategy profitability based on win rate alone.
+
+====================================================
+20. MONTHLY LOSS GUARD
+====================================================
+
+Preserve monthly NIFTY loss protection.
+
+Implement a consistent monthly P&L ledger from actual fills.
+
+Monitor:
+
+Month Realised Net P&L
+Open MTM P&L
+Conservative Month Total
+Monthly Loss Limit
+Remaining Loss Budget
+
+If monthly loss limit is reached:
+- block new entries
+- allow exits
+- allow genuine hedge repairs
+- prevent ordinary confidence/manual warnings from overriding the monthly kill switch
+
+Make monthly-loss measurement policy explicit and configurable.
+
+Do not treat margin availability as available loss budget.
+
+====================================================
+21. SCALING READINESS ENGINE
+====================================================
+
+Create:
+
+evaluate_nifty_scale_readiness()
+
+Purpose:
+Determine whether the strategy has enough evidence to consider increased deployment.
+
+DO NOT automatically increase lots.
+
+Require meaningful completed strategy sample.
+
+Suggested minimum:
+30 to 50 completed spread cycles.
+
+Consider:
+
+Positive net expectancy
+Profit factor >1.5
+Maximum drawdown
+Worst trade
+Risk-cap compliance
+Strategy performance during adverse trends
+Fill/slippage quality
+No hedge-integrity incidents
+No execution-rule violations
+
+Return:
+
+NOT_ENOUGH_DATA
+MAINTAIN_SIZE
+REVIEW_FOR_SCALE
+REDUCE_RISK
+
+Show recommendation and underlying evidence.
+
+The user’s hard ₹60,000 risk cap remains unchanged.
+
+====================================================
+22. UI SIMPLIFICATION
+====================================================
+
+Remove duplication from the default NIFTY Income screen.
+
+Keep only:
+
+TOP:
+Market Snapshot + Current Risk + Available Risk
+
+MIDDLE:
+New NIFTY Trade Ticket
+
+BELOW:
+Active NIFTY Spreads
+
+BOTTOM:
+Monthly NIFTY Performance
+
+Collapse:
+Confidence score breakdown
+MMI rules
+VIX details
+Event calendar
+Credit-quality diagnostics
+Liquidity diagnostics
+Scheduler status
+Order logs
+Audit events
+
+Do not hide critical existing-risk warnings.
+
+Use concise decision messages.
+
+Example:
+
+READY — 2-Lot PE Spread
+Expiry: [selected expiry]
+Short PE: [strike]
+BUY Hedge: [strike]
+Net Credit: [real executable credit]
+Max Loss: [calculated]
+Portfolio Risk After Order: [calculated]
+₹60K Cap: PASS
+Action: REVIEW ORDER
+
+Do not display a trade-ready state when current risk is uncapped or data is stale.
+
+====================================================
+23. SAFE EXECUTION INTEGRATION
+====================================================
+
+Use existing Kite authentication and broker session.
+
+Never hardcode credentials.
+
+Order pipeline:
+1. Validate account session.
+2. Fetch positions.
+3. Fetch open orders.
+4. Fetch fresh quotes.
+5. Reconcile existing risk.
+6. Recalculate portfolio max loss.
+7. Check margin.
+8. Obtain explicit user confirmation.
+9. Execute hedge-first orders.
+10. Confirm fills.
+11. Execute covered short orders.
+12. Persist broker IDs.
+13. Refresh positions.
+14. Update ledger.
+15. Update dashboard.
+
+Handle:
+- Kite session expiry
+- API timeouts
+- insufficient margin
+- price-band violations
+- rejected orders
+- partial fills
+- pending modifications
+- duplicate requests
+- disconnected broker
+- market closed
+
+Do not claim success from an order-submission response; report broker-confirmed execution state.
+
+====================================================
+24. DATABASE AND SCHEDULER
+====================================================
+
+Use the existing local database.
+
+Add migrations rather than destructive schema replacement.
+
+Maintain:
+- strategy history
+- order audit
+- execution fills
+- P&L history
+- risk snapshots
+- scheduler history
+- trade import batches
+
+Scheduler jobs:
+
+NIFTY_POSITION_SYNC
+NIFTY_RISK_MONITOR
+NIFTY_PROFIT_CAPTURE
+NIFTY_EXIT_MONITOR
+NIFTY_PNL_RECONCILIATION
+NIFTY_MONTHLY_LEDGER_REFRESH
+
+Ensure scheduler jobs:
+- are idempotent
+- do not create duplicate close orders
+- have market-hours checks
+- record errors
+- can be disabled safely
+- survive application restarts appropriately
+
+Show scheduler details in an Advanced expandable section.
+
+====================================================
+25. TEST REQUIREMENTS
+====================================================
+
+Create pytest coverage for:
+
+1. Two lots with width 300 and lot size 65:
+   gross width exposure = ₹39,000.
+
+2. One unhedged short:
+   risk must not show zero.
+
+3. Existing unhedged risk:
+   blocks additional live short exposure.
+
+4. Existing unhedged position:
+   hedge repair remains allowed.
+
+5. Same-expiry nonoverlapping Iron Condor:
+   max loss based on maximum side width.
+
+6. Two different expiry spreads:
+   risk is conservatively aggregated.
+
+7. Price assumptions:
+   optimistic limit credit not used for live approval.
+
+8. Missing bid/ask:
+   preview only.
+
+9. Filled hedge:
+   allows corresponding protected short quantity.
+
+10. Accepted but unfilled hedge:
+    must not authorize a short sell.
+
+11. Partial hedge fill:
+    cannot result in excess short quantity.
+
+12. Broker order retry:
+    no duplicate sell.
+
+13. 10-second review:
+    no automatic GO.
+
+14. Position selection change:
+    resets countdown.
+
+15. Existing strategy P&L:
+    includes BUY hedge cost.
+
+16. Short option 20% profit target:
+    creates correct BUY-close intent.
+
+17. Emergency exit:
+    overrides stale passive order.
+
+18. Short closed, hedge remains:
+    strategy status is not FULLY_CLOSED.
+
+19. Hedge disposal:
+    updates strategy-level net P&L.
+
+20. Imported October winning entries:
+    visible subtotal ₹78,988.
+
+21. October winning entries:
+    not assumed to represent full-month net P&L.
+
+22. Duplicate historical tradebook import:
+    must not duplicate ledger entries.
+
+23. Broker realised P&L mismatch:
+    flagged for reconciliation.
+
+24. Monthly loss cap:
+    blocks new entries.
+
+25. Monthly loss cap:
+    does not block exits or hedge repair.
+
+26. Max projected portfolio loss >₹60,000:
+    hard block.
+
+27. Missing quote:
+    live GO disabled.
+
+28. Cached market data:
+    cannot be silently treated as live.
+
+29. Incorrect/incompatible hedge expiry:
+    not classified as full defined protection.
+
+30. Existing TRADE and stock-option modules:
+    remain functional.
+
+====================================================
+26. IMPLEMENTATION PHASES
+====================================================
+
+Implement in the following order:
+
+PHASE 1:
+Repository inspection, architecture map and shared service identification.
+
+PHASE 2:
+Position reconciliation, strategy grouping and canonical risk calculator.
+
+PHASE 3:
+Simple NIFTY order ticket, quote validation and hedge-first execution.
+
+PHASE 4:
+P&L strategy ledger, historical tradebook import and reconciliation.
+
+PHASE 5:
+20% profit-capture lifecycle, hedge cleanup and automated exit management.
+
+PHASE 6:
+Monthly analytics, charts and scaling-readiness analysis.
+
+PHASE 7:
+UI simplification, tests and production readiness.
+
+After each phase:
+- run relevant tests
+- verify compatibility
+- fix failures before progressing
+
+Do not place actual broker orders while testing.
+
+====================================================
+27. FINAL ACCEPTANCE CRITERIA
+====================================================
+
+Implementation is complete only when:
+
+1. NIFTY Income is a clean, actionable trading screen.
+
+2. The user can select PE spread, CE spread or Iron Condor.
+
+3. Two lots and 300-point hedges are supported.
+
+4. ₹60,000 total NIFTY defined-loss cap is correctly enforced.
+
+5. Existing unhedged short risk is not shown as zero.
+
+6. No new naked NIFTY selling is permitted.
+
+7. Hedges must be confirmed filled before corresponding shorts are sold.
+
+8. Real executable pricing drives order approval.
+
+9. 10-second review works and requires explicit GO.
+
+10. Every strategy has a unique persistent strategy ID.
+
+11. Short premium capture and full-spread P&L are both available.
+
+12. Protective hedge costs are deducted from actual income.
+
+13. Orphan hedges are handled explicitly.
+
+14. Realised and unrealised P&L are distinguished.
+
+15. October historical NIFTY trades can be imported and reconciled.
+
+16. Monthly NIFTY analytics include winning and losing spreads.
+
+17. Monthly loss kill switch remains operational.
+
+18. Exits and hedge repairs remain available during entry blocks.
+
+19. Existing Kite integration and CSV format remain compatible.
+
+20. All tests pass and no unrelated modules are broken.
+
+====================================================
+28. REQUIRED CODEX OUTPUT
+====================================================
+
+After implementation, provide:
+
+A. List of existing files modified.
+
+B. List of new files created.
+
+C. Database migrations added.
+
+D. Core functions implemented.
+
+E. NIFTY Income UI changes.
+
+F. Historical P&L import instructions.
+
+G. Profit-capture / exit workflow details.
+
+H. Kite execution and hedge-first safety validation.
+
+I. Pytest results.
+
+J. Remaining known limitations.
+
+K. Commands to start the application locally on Windows.
+
+L. Steps to verify the application without sending a real order.
+
+Do not stop after describing the design.
+Implement the working code in the existing repository.
+
+Do not claim features are complete if they have not been implemented and tested.

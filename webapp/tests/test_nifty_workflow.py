@@ -119,7 +119,7 @@ class NiftyWorkflowTests(unittest.TestCase):
     def test_hedge_integrity_blocks_unhedged_short(self):
         result = validate_active_nifty_hedges(
             [
-                {"tradingsymbol": "NIFTY26JUL22500PE", "quantity": -65, "expiry": "2026-07-28"},
+                {"tradingsymbol": "NIFTY26JUL22500PE", "strike": 22500, "option_type": "PE", "strategy_id": "recorded-strategy", "account_id": "test", "quantity": -65, "expiry": "2026-07-28"},
             ]
         )
 
@@ -130,10 +130,10 @@ class NiftyWorkflowTests(unittest.TestCase):
     def test_hedge_integrity_allows_matching_long_hedge(self):
         result = validate_active_nifty_hedges(
             [
-                {"tradingsymbol": "NIFTY26JUL22500PE", "quantity": -65, "expiry": "2026-07-28"},
-                {"tradingsymbol": "NIFTY26JUL22000PE", "quantity": 65, "expiry": "2026-07-28"},
-                {"tradingsymbol": "NIFTY26JUL25200CE", "quantity": -65, "expiry": "2026-07-28"},
-                {"tradingsymbol": "NIFTY26JUL25700CE", "quantity": 65, "expiry": "2026-07-28"},
+                {"tradingsymbol": "NIFTY26JUL22500PE", "strike": 22500, "option_type": "PE", "strategy_id": "recorded-strategy", "account_id": "test", "quantity": -65, "expiry": "2026-07-28"},
+                {"tradingsymbol": "NIFTY26JUL22000PE", "strike": 22000, "option_type": "PE", "strategy_id": "recorded-strategy", "account_id": "test", "quantity": 65, "expiry": "2026-07-28"},
+                {"tradingsymbol": "NIFTY26JUL25200CE", "strike": 25200, "option_type": "CE", "strategy_id": "recorded-strategy", "account_id": "test", "quantity": -65, "expiry": "2026-07-28"},
+                {"tradingsymbol": "NIFTY26JUL25700CE", "strike": 25700, "option_type": "CE", "strategy_id": "recorded-strategy", "account_id": "test", "quantity": 65, "expiry": "2026-07-28"},
             ]
         )
 
@@ -144,13 +144,13 @@ class NiftyWorkflowTests(unittest.TestCase):
     def test_hedge_integrity_flags_insufficient_quantity(self):
         result = validate_active_nifty_hedges(
             [
-                {"tradingsymbol": "NIFTY26JUL25200CE", "quantity": -130, "expiry": "2026-07-28"},
-                {"tradingsymbol": "NIFTY26JUL25700CE", "quantity": 65, "expiry": "2026-07-28"},
+                {"tradingsymbol": "NIFTY26JUL25200CE", "strike": 25200, "option_type": "CE", "strategy_id": "recorded-strategy", "account_id": "test", "quantity": -130, "expiry": "2026-07-28"},
+                {"tradingsymbol": "NIFTY26JUL25700CE", "strike": 25700, "option_type": "CE", "strategy_id": "recorded-strategy", "account_id": "test", "quantity": 65, "expiry": "2026-07-28"},
             ]
         )
 
-        self.assertEqual(result["status"], "HIGH")
-        self.assertFalse(result["block_new_entries"])
+        self.assertEqual(result["status"], "CRITICAL")
+        self.assertTrue(result["block_new_entries"])
         self.assertEqual(result["rows"][0]["hedge_status"], "PARTIAL_HEDGE")
 
 

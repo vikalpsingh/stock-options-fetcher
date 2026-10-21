@@ -1,4 +1,4 @@
-"""Build verified same-expiry protective bull-put spread alternatives."""
+"""Build verified same-expiry protective put and call credit spreads."""
 
 from __future__ import annotations
 
@@ -12,25 +12,55 @@ def _num(value: Any) -> float:
         return 0.0
 
 
-def build_protective_pe_spreads(
+def protective_contracts(short_contract: dict[str, Any], contracts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Match the option type, underlying, expiry and lot, with the protective strike direction."""
+    expiry = str(short_contract.get("expiry") or "")[:10]
+    underlying = str(short_contract.get("name") or "").upper()
+    option_type = str(short_contract.get("instrument_type") or "").upper()
+    if option_type not in {"PE", "CE"}:
+        return []
+    direction = 1 if option_type == "CE" else -1
+    short_strike = _num(short_contract.get("strike"))
+    return sorted(
+        [row for row in contracts
+         if str(row.get("instrument_type") or "").upper() == option_type
+         and str(row.get("expiry") or "")[:10] == expiry
+         and (not underlying or str(row.get("name") or "").upper() == underlying)
+         and _num(row.get("lot_size")) == _num(short_contract.get("lot_size"))
+         and _num(row.get("strike")) > 0
+         and direction * (_num(row.get("strike")) - short_strike) > 0],
+        key=lambda row: abs(_num(row.get("strike")) - short_strike),
+    )
+
+
+def build_protective_spreads(
     short_contract: dict[str, Any], contracts: list[dict[str, Any]], quotes: dict[str, Any],
     quantity: int, *, max_loss_cap: float, margin_provider: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
+    selected_hedge_symbol: str = "",
 ) -> list[dict[str, Any]]:
-    """Return up to three lower-strike PE hedges, best risk efficiency first."""
+    """Review an explicit verified hedge, or suggest up to three nearby hedges."""
     short_symbol = str(short_contract.get("tradingsymbol") or "").upper()
+    option_type = str(short_contract.get("instrument_type") or "").upper()
+    if option_type not in {"PE", "CE"}:
+        return []
+    direction = "higher" if option_type == "CE" else "lower"
     expiry = str(short_contract.get("expiry") or "")[:10]
     short_strike = _num(short_contract.get("strike"))
     short_quote = quotes.get(f"NFO:{short_symbol}", {}) or {}
     short_depth = short_quote.get("depth") or {}
     short_bid = _num(((short_depth.get("buy") or [{}])[0] or {}).get("price"))
+    short_ask = _num(((short_depth.get("sell") or [{}])[0] or {}).get("price"))
     lot_size = int(_num(short_contract.get("lot_size")))
     if not short_symbol or short_strike <= 0 or short_bid <= 0 or quantity <= 0 or lot_size <= 0 or quantity % lot_size:
         return []
-    candidates = sorted(
-        [row for row in contracts if str(row.get("instrument_type") or "").upper() == "PE"
-         and str(row.get("expiry") or "")[:10] == expiry and 0 < _num(row.get("strike")) < short_strike],
-        key=lambda row: short_strike - _num(row.get("strike")),
-    )[:6]
+    candidates = protective_contracts(short_contract, contracts)
+    if selected_hedge_symbol:
+        candidates = [row for row in candidates
+                      if str(row.get("tradingsymbol") or "").upper() == selected_hedge_symbol.upper()]
+        if len(candidates) != 1:
+            raise ValueError(f"Selected BUY hedge must be a verified {direction}-strike {option_type} with the same underlying, expiry and lot size.")
+    else:
+        candidates = candidates[:6]
     alternatives: list[dict[str, Any]] = []
     for hedge in candidates:
         hedge_symbol = str(hedge.get("tradingsymbol") or "").upper()
@@ -41,7 +71,7 @@ def build_protective_pe_spreads(
         volume, oi = _num(quote.get("volume")), _num(quote.get("oi"))
         hedge_lot = int(_num(hedge.get("lot_size")))
         liquid = ask > 0 and bid > 0 and volume >= 1 and oi >= quantity and hedge_lot == lot_size
-        width = short_strike - _num(hedge.get("strike"))
+        width = (_num(hedge.get("strike")) - short_strike) if option_type == "CE" else (short_strike - _num(hedge.get("strike")))
         credit = short_bid - ask
         gross_profit = credit * quantity
         gross_loss = max(0.0, (width - credit) * quantity)
@@ -53,17 +83,40 @@ def build_protective_pe_spreads(
         initial = _num((margin.get("initial") or {}).get("total") if isinstance(margin.get("initial"), dict) else margin.get("initial"))
         final = _num((margin.get("final") or {}).get("total") if isinstance(margin.get("final"), dict) else margin.get("final"))
         eligible = liquid and credit > 0 and gross_loss > 0 and gross_loss <= max_loss_cap
+        failures = []
+        if not liquid:
+            failures.append("Hedge bid/ask, volume, open interest or lot size failed liquidity checks.")
+        if credit <= 0:
+            failures.append("The spread must receive a positive net credit.")
+        if gross_loss <= 0 or gross_loss > max_loss_cap:
+            failures.append(f"Maximum loss {gross_loss:,.2f} must be positive and within cap {max_loss_cap:,.2f}.")
         alternatives.append({
-            "strategy_type": "BULL_PUT_SPREAD", "short_symbol": short_symbol, "hedge_symbol": hedge_symbol,
+            "strategy_type": "BEAR_CALL_SPREAD" if option_type == "CE" else "BULL_PUT_SPREAD",
+            "option_type": option_type, "short_symbol": short_symbol, "hedge_symbol": hedge_symbol,
             "expiry": expiry, "short_strike": short_strike, "hedge_strike": _num(hedge.get("strike")),
             "quantity": quantity, "lot_size": lot_size, "short_limit_price": short_bid, "hedge_limit_price": ask,
+            "short_bid": short_bid, "short_ask": short_ask, "hedge_bid": bid, "hedge_ask": ask,
+            "spread_width": width, "hedge_cost": round(ask * quantity, 2),
+            "short_premium": round(short_bid * quantity, 2),
             "net_credit": round(credit * quantity, 2), "net_credit_per_share": round(credit, 2),
             "max_profit": round(gross_profit, 2), "max_loss": round(gross_loss, 2),
-            "breakeven": round(short_strike - credit, 2), "initial_margin": round(initial, 2),
+            "breakeven": round(short_strike + credit if option_type == "CE" else short_strike - credit, 2), "initial_margin": round(initial, 2),
             "final_margin": round(final, 2), "credit_margin_pct": round(gross_profit / final * 100, 2) if final > 0 else None,
             "liquidity": "PASS" if liquid else "BLOCK", "eligible": eligible,
             "status": "PASS" if eligible else "BLOCK",
-            "reason": "Verified lower-strike same-expiry hedge." if eligible else "Credit, liquidity, lot size or maximum-loss control failed.",
+            "reason": f"Verified {direction}-strike same-expiry hedge." if eligible else " ".join(failures),
             "order_payloads": payloads,
         })
     return sorted(alternatives, key=lambda row: (not row["eligible"], row["max_loss"], -(row["credit_margin_pct"] or 0)))[:3]
+
+
+def protective_pe_contracts(short_contract, contracts):
+    """Compatibility entry point for PE-only callers."""
+    return protective_contracts(short_contract, contracts) if str(short_contract.get("instrument_type")).upper() == "PE" else []
+
+
+def build_protective_pe_spreads(short_contract, contracts, quotes, quantity, **kwargs):
+    """Compatibility entry point for PE-only callers."""
+    if str(short_contract.get("instrument_type")).upper() != "PE":
+        return []
+    return build_protective_spreads(short_contract, contracts, quotes, quantity, **kwargs)
