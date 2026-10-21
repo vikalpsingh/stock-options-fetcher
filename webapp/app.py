@@ -20236,6 +20236,11 @@ def run_intraday_position_close_job(
 def position_close_scheduler_loop(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         try:
+            # Local review housekeeping only; never submits/cancels broker orders.
+            from trade_protected_execution import ProtectedExecutionRepository
+            cleared = ProtectedExecutionRepository(APP_DB_PATH).clear_previous_session_reviews()
+            if cleared:
+                logger.info("NIFTY_REVIEW_CLEANUP archived=%s", cleared)
             if not scheduler_master_state().get("enabled", True):
                 stop_event.wait(30)
                 continue
@@ -45001,6 +45006,14 @@ def render_page(state: PageState) -> bytes:
       niftyPositionActionModal.style.display = 'flex';
       refreshNiftyPositionActionDetails();
     }}
+    // Deep-link from NIFTY 2.0 opens the existing review only, never submits.
+    const requestedManagement = new URLSearchParams(window.location.search);
+    const requestedSymbol = requestedManagement.get('manage_symbol');
+    const requestedAction = requestedManagement.get('manage_action');
+    if (requestedSymbol && ['CREATE_HEDGE','ROLL_SELL','SELL_AGAINST_LONG'].includes(requestedAction)) {{
+      const selectedButton = Array.from(document.querySelectorAll('.nifty-position-action-button')).find(button => button.dataset.symbol === requestedSymbol && button.dataset.actionType === requestedAction);
+      if (selectedButton) openNiftyPositionActionModal(selectedButton);
+    }}
     for (const button of document.querySelectorAll('.nifty-position-action-button')) {{
       button.addEventListener('click', () => openNiftyPositionActionModal(button));
     }}
@@ -51130,6 +51143,14 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 form = {**form, "mode": [saved_mode(load_app_settings(), account, datetime.now(INDIA_TIME_ZONE))]}
             if not kite_profile_nifty_income_enabled(account):
                 raise PermissionError("Enable Nifty Income for this profile in Kite Setup first.")
+            from trade_protected_execution import ProtectedExecutionRepository
+            reviews = ProtectedExecutionRepository(APP_DB_PATH)
+            reviews.clear_previous_session_reviews()
+            if action == '/nifty-2/clear-reviews':
+                cleared = reviews.clear_basket_reviews(account)
+                message = f'Cleared {cleared} unsubmitted reviews. Active executions remain available.'
+                action = None
+                open_ticket = False
             if action == "/nifty-2/save-mode":
                 save_app_settings(mode_update(load_app_settings(), account, first(form, "mode"), datetime.now(INDIA_TIME_ZONE)))
                 message = "Execution mode saved for this profile until midnight IST. Order acknowledgements and risk checks still apply."
@@ -51197,7 +51218,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             error = loading_error(exc, stage)
             logger.warning("NIFTY_PAGE_LOAD_FAILED stage=%s type=%s", stage, type(exc).__name__)
-        content = render_nifty_v2(data, error=error, message=message, test_mode=test_mode, account_name=account)
+        visible_tabs = kite_profile_visible_tabs(account)
+        navigation = [(key, label) for key, label, _ in PROFILE_TAB_OPTIONS if key in visible_tabs
+            and (key not in {'nifty-income', 'nifty-2'} or kite_profile_nifty_income_enabled(account))
+            and (key != 'nifty-grow' or kite_profile_nifty_grow_enabled(account))]
+        content = render_nifty_v2(data, error=error, message=message, test_mode=test_mode,
+            account_name=account, navigation=navigation)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

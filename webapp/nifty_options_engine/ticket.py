@@ -24,6 +24,29 @@ def number(value):
         return None
 
 
+def reviewed_quote_snapshot(quote):
+    """Persist only ticket display fields, never the raw Kite SDK quote object."""
+    stamp = quote.get('timestamp')
+    try:
+        stamp = to_ist(stamp).isoformat() if stamp is not None else None
+    except (ValueError, TypeError):
+        stamp = None
+    return {'last_price': number(quote.get('last_price')),
+            'ohlc': {'close': number((quote.get('ohlc') or {}).get('close'))},
+            'timestamp': stamp}
+
+
+def ltp_limit_price(quote, instrument):
+    """Reviewed LTP rounded to the listed tick. No bid/ask fallback for orders."""
+    from decimal import Decimal, ROUND_HALF_UP
+    ltp, tick = number(quote.get('last_price')), number(instrument.get('tick_size'))
+    if ltp is None or ltp <= 0 or tick is None or tick <= 0:
+        return None
+    units = (Decimal(str(ltp))/Decimal(str(tick))).quantize(Decimal('1'),rounding=ROUND_HALF_UP)
+    value = float(units*Decimal(str(tick)))
+    return value if value>0 else None
+
+
 def depth_limit(quote, action, quantity):
     """Conservative LIMIT using quoted depth; never asserts a fill guarantee.
 
@@ -127,16 +150,22 @@ def build_ticket(selection, context, config, *, for_execution=True):
                     ask=price
                 else:
                     bid=price
+            limit_price = ltp_limit_price(context['quotes'].get('NFO:'+symbol) or {}, instrument)
+            check(f'{symbol} LTP limit', limit_price is not None,
+                  'A positive LTP and instrument-master tick size are required for the LIMIT order.')
+            if limit_price is not None and valid_book:
+                # Do not count optimistic LTP sell proceeds as executable credit.
+                ask = max(ask,limit_price) if action=='BUY' else ask
+                bid = min(bid,limit_price) if action=='SELL' else bid
             leg = dict(tradingsymbol=symbol, instrument_token=instrument["instrument_token"],
                        option_type=side, strike=float(instrument["strike"]), expiry=str(expiry),
                        quantity=qty, lot_size=lot, transaction_type=action, product="NRML",
                        bid=bid, ask=ask, oi=quote["oi"], volume=quote["volume"],
-                       reviewed_quote={key: (context["quotes"].get("NFO:" + symbol) or {}).get(key)
-                                       for key in ("last_price", "ohlc")})
+                       reviewed_quote=reviewed_quote_snapshot(context["quotes"].get("NFO:" + symbol) or {}))
             legs.append(leg)
             payloads.append(dict(variety="regular", exchange="NFO", tradingsymbol=symbol,
                                  transaction_type=action, quantity=qty, product="NRML",
-                                 order_type="LIMIT", price=price or 0, validity="DAY"))
+                                 order_type="LIMIT", price=limit_price or 0, validity="DAY"))
     legs.sort(key=lambda row: row["transaction_type"] != "BUY")
     payloads.sort(key=lambda row: row["transaction_type"] != "BUY")
     check("Matched lot sizes", bool(legs) and len({leg["lot_size"] for leg in legs}) == 1
@@ -181,10 +210,14 @@ def build_ticket(selection, context, config, *, for_execution=True):
                 check('NIFTY risk approval', False, 'Event or risk approval is unavailable or blocked. Refresh before entry.')
     margin = number(context.get("margin"))
     funds = number(context.get("funds"))
-    if for_execution:
-        check("Broker margin", margin is not None and funds is not None and 0 < margin <= funds,
-              f"Required margin {margin:,.2f}; available {funds:,.2f}; shortfall {max(0, margin-funds):,.2f}."
-              if margin is not None and funds is not None else "Broker margin could not be verified. Refresh before GO.")
+    # Explicit user policy: margin is informational for NIFTY tickets. Kite is
+    # the final authority and may reject any leg; never retry that rejection here.
+    # This does not relax payoff risk, ownership or BUY-fill-before-SELL checks.
+    margin_ok = margin is not None and funds is not None and 0 < margin <= funds
+    checks.append(dict(name='Broker margin estimate', status='PASS' if margin_ok else 'WARNING',
+        reason=(f'Estimated margin {margin:,.2f}; reported funds {funds:,.2f}. '
+                if margin is not None and funds is not None else 'Margin estimate unavailable. ')
+               + 'Informational only. Kite decides order acceptance; insufficient margin may reject the order.'))
     strategy = "IRON_CONDOR" if len(selected_sides) == 2 else "BULL_PUT_SPREAD" if selected_sides == ["PE"] else "BEAR_CALL_SPREAD"
     check("NIFTY enabled", config.get("enabled") is True, "NIFTY 2.0 must be enabled in settings.")
     check("Allowed strategy", strategy in config.get("allowed_strategies", []),
@@ -200,8 +233,8 @@ def build_ticket(selection, context, config, *, for_execution=True):
                 option_type=side, strike=instrument.get('strike'), expiry=str(instrument.get('expiry') or ''),
                 selected=selected, lots=lots if selected else 0,
                 quantity=(instrument.get('lot_size') or 0)*lots if selected else 0,
-                reviewed_quote=raw_quote, **{k:v for k,v in quote_values(raw_quote).items() if k in {'bid','ask'}}))
-    return dict(strategy_type=strategy, display_legs=display_legs, legs=legs, order_payloads=payloads, selection=selection,
+                reviewed_quote=reviewed_quote_snapshot(raw_quote), **{k:v for k,v in quote_values(raw_quote).items() if k in {'bid','ask'}}))
+    return dict(price_policy="REVIEWED_LTP_LIMIT", strategy_type=strategy, display_legs=display_legs, legs=legs, order_payloads=payloads, selection=selection,
                 mode=mode, eligible=not any(row["status"] == "BLOCK" for row in checks),
                 checks=checks, risk=risk, monthly=monthly, net_credit=credit, estimated_fees=fees,
                 net_max_profit=credit - fees,

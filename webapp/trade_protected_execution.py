@@ -47,7 +47,48 @@ class ProtectedExecutionRepository:
             rows = conn.execute(
                 "SELECT data FROM trade_protected_execution WHERE account_id=? ORDER BY rowid DESC",
                 (account,)).fetchall()
-        return [data for row in rows if (data := json.loads(row["data"])).get("kind") == "BASKET"]
+        return [data for row in rows if (data := json.loads(row["data"])).get("kind") == "BASKET" and not data.get("review_archived")]
+
+    def clear_basket_reviews(self, account=None, *, before=None):
+        """Archive unsubmitted reviews atomically; never touch orders or fills."""
+        count = 0
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            rows = conn.execute('SELECT data FROM trade_protected_execution' +
+                (' WHERE account_id=?' if account is not None else ''),
+                (account,) if account is not None else ()).fetchall()
+            for row in rows:
+                record = json.loads(row['data'])
+                if record.get('kind') != 'BASKET' or record.get('state') != 'REVIEW':
+                    continue
+                if any(leg.get('order_id') or leg.get('filled') or leg.get('status') != 'NOT_SUBMITTED'
+                       for leg in record.get('legs', [])) or record.get('exit_legs'):
+                    continue
+                if before is not None:
+                    try:
+                        stamp = datetime.fromisoformat(record['reviewed_at'])
+                        if stamp.tzinfo is None or stamp >= before:
+                            continue
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                record.update(state='CLOSED', review_archived=True,
+                    note='Unsubmitted review cleared; create a new review before GO.',
+                    version=record['version']+1, updated_at=datetime.now(timezone.utc).isoformat())
+                conn.execute('UPDATE trade_protected_execution SET version=?,data=? WHERE id=?',
+                             (record['version'],json.dumps(record),record['id']))
+                count += 1
+        return count
+
+    def clear_previous_session_reviews(self, now=None):
+        from zoneinfo import ZoneInfo
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise ValueError('Cleanup clock must be timezone aware.')
+        current = current.astimezone(ZoneInfo('Asia/Kolkata'))
+        cutoff = current.replace(hour=9,minute=0,second=0,microsecond=0)
+        if current.weekday() >= 5 or current < cutoff:
+            return 0
+        return self.clear_basket_reviews(before=cutoff)
 
     def create_basket_review(self, account, preview, mode):
         """Save authoritative review before countdown; no order is sent here."""

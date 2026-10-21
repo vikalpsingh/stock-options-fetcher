@@ -97,11 +97,12 @@ def saved_ticket_details(saved):
                ('Return on margin (estimated)', rom), ('Maximum loss incl. costs', money(saved.get('max_loss')))]
     result = '<div class="metrics">' + ''.join(f'<div class="metric"><small>{e(label)}</small><strong>{e(value)}</strong></div>' for label,value in metrics) + '</div>'
     display = saved.get('display_legs') or legs
-    result += '<table class="ticket-legs"><thead><tr><th>Selected / Leg</th><th>Contract</th><th>Lots / Qty</th><th>LTP / Day change</th><th>Bid / Ask</th></tr></thead><tbody>'
+    result += '<table class="ticket-legs"><thead><tr><th>Selected / Leg</th><th>Contract</th><th>Lots / Qty</th><th>LTP / Day change</th><th>Bid / Ask</th><th>Order LIMIT</th></tr></thead><tbody>'
     for leg in display:
         selected = leg.get('selected', True)
         quote = leg.get('reviewed_quote') or {}
-        result += f'<tr class="{"" if selected else "inactive-leg"}"><td><input type="checkbox" disabled {"checked" if selected else ""}> {e(leg["transaction_type"])} {e(leg.get("option_type"))}</td><td>{e(leg["tradingsymbol"])}<br>{e(leg.get("strike"))} · {e(leg.get("expiry"))}</td><td>{e(leg.get("lots",lots))} lots / {e(leg.get("quantity"))}</td><td>{money(number(quote.get("last_price")))}<br>{day_change_badge(quote)}</td><td>{money(leg.get("bid"))} / {money(leg.get("ask"))}</td></tr>'
+        limit = next((p.get('price') for p in saved.get('order_payloads',[]) if p['tradingsymbol']==leg['tradingsymbol'] and p['transaction_type']==leg['transaction_type']),None)
+        result += f'<tr class="{"" if selected else "inactive-leg"}"><td><input type="checkbox" disabled {"checked" if selected else ""}> {e(leg["transaction_type"])} {e(leg.get("option_type"))}</td><td>{e(leg["tradingsymbol"])}<br>{e(leg.get("strike"))} · {e(leg.get("expiry"))}</td><td>{e(leg.get("lots",lots))} lots / {e(leg.get("quantity"))}</td><td>{money(number(quote.get("last_price")))}<br>{day_change_badge(quote)}</td><td>{money(leg.get("bid"))} / {money(leg.get("ask"))}</td><td>{money(limit) if selected else "Not selected"}</td></tr>'
     result += '</tbody></table>'
     return result + '<p>Hedge coverage: BUY fills must be verified before any short SELL. POP: unavailable until a validated model is connected.</p>'
 
@@ -135,9 +136,10 @@ def execution_guidance(record):
 def active_positions_section(data):
     """One broker snapshot, one positions table, existing ticket for linked exits."""
     from datetime import date
+    from urllib.parse import urlencode
     positions = (data.get('active_positions') or {}).get('positions', [])
     context = data['context']
-    mode = data['selection']['mode']
+    mode = data.get('active_positions_mode', data['selection']['mode'])
     result = '<section id="active-positions"><h2>NIFTY Active Positions &amp; Management</h2>'
     result += '<p>'+e(mode)+' positions · Suggested matches reserve quantity but need confirmed ownership before new short exposure.</p>'
     mtms = [number(row.get('unrealised')) for row in positions]
@@ -147,7 +149,7 @@ def active_positions_section(data):
         ('Confirmed protected qty',sum(row['confirmed_hedge_qty'] for row in positions)),
         ('Unmatched short qty',sum(row['unmatched_short_qty'] for row in positions)),
         ('Available long qty',sum(row['free_long_qty'] for row in positions)),
-        ('Current defined max risk',money(data['risk']['current_defined_max_loss'])),
+        ('Current defined max risk',money(data.get('active_positions_risk',data['risk'])['current_defined_max_loss'])),
         ('Risk cap',money(data['config']['max_total_nifty_defined_loss_inr'])),
         ('Next expiry',expiries[0] if expiries else 'None')]
     result += '<div class="metrics">'+''.join(f'<div class="metric"><small>{e(k)}</small><strong>{e(v)}</strong></div>' for k,v in metrics)+'</div>'
@@ -182,7 +184,7 @@ def active_positions_section(data):
             dialogs += '<p>20% short-premium capture target: '+money(avg*.8 if avg is not None else None)+'. Existing close orders must be reconciled before submitting.</p>'
             dialogs += '<p>Suggested repair quantity: '+e(row['unmatched_short_qty'])+' at the same expiry, default 300-point protective width. Suggested matches require confirmation first.</p>'
         from .analytics import position_close_preview
-        close = position_close_preview(row, quote, context.get('orders') or [], context['now'])
+        close = position_close_preview(row, quote, context.get('broker_orders',context.get('orders')) or [], context['now'])
         dialogs += '<h4>Close preview — estimate only</h4><p>'+e(close['side'] or 'UNKNOWN')+' close · Qty '+e(close['quantity'])+' · Executable reference '+money(close['price'])+'</p>'
         dialogs += '<p>Estimated Order Cash Flow: '+money(close['cash_flow'])+' · Estimated Realised P&amp;L on Close (before fees): '+money(close['estimated_realised_gross'])+'</p>'
         if close['blockers']:
@@ -191,8 +193,17 @@ def active_positions_section(data):
         linked = [r for r in data['executions'] if r['mode']==mode and r['state'] not in {'CLOSED','REVIEW'} and any(leg['payload']['tradingsymbol']==symbol for leg in r['legs'])]
         for record in linked:
             dialogs += f'<button type="button" data-linked-execution="{e(record["id"])}">Manage Spread / Close using verified fills</button>'
+        if mode == 'LIVE':
+            dialogs += '<div class="actions">'
+            actions = [('CREATE_HEDGE','Create hedge')] if qty<0 and row['unmatched_short_qty']>0 else []
+            if qty>0 and row['free_long_qty']>0:
+                actions += [('ROLL_SELL','Roll over'),('SELL_AGAINST_LONG','Sell against free long')]
+            for action,label in actions:
+                url='/nifty-income/legacy?'+urlencode({'manage_symbol':symbol,'manage_action':action})
+                dialogs += f'<a class="desk-tab" href="{e(url)}">{e(label)} — legacy review</a>'
+            dialogs += '<a class="desk-tab" href="/positions">Close position — Position screen</a></div><p>These are actual broker positions, including when new-trade mode is PAPER. Legacy management requires its own LIVE review and confirmation.</p>'
         if not linked:
-            dialogs += '<p>No durable execution record is linked. Position import/allocation confirmation is required before this window can safely submit contract actions.</p>'
+            dialogs += '<p>No NIFTY 2.0 execution record is linked. Use the existing management screens above; no order is sent by opening them.</p>' 
         dialogs += '<p>Opening-order proceeds are cash flow, not realised profit. Closing P&amp;L uses entry cost and confirmed exit fills.</p></article>'
     result += '</tbody></table>'
     if not positions:
@@ -226,7 +237,13 @@ def nearer_liquidity_form(data):
     return result+'</details>'
 
 
-def render_page(data=None, error='', message='', review=None, test_mode=False, account_name=''):
+def desk_header(account, tabs):
+    routes = {'place':'/', 'order-management':'/orders', 'nifty-income':'/nifty-income/legacy'}
+    links = ''.join(f'<a class="desk-tab {"active" if key=="nifty-2" else ""}" href="{e(routes.get(key,"/"+key))}"'+(' aria-current="page"' if key=='nifty-2' else '')+f'>{e(label)}</a>' for key,label in tabs)
+    return ('<header class="desk-header"><div class="desk-header-inner"><div class="desk-brand"><div class="desk-mark">विकल्प</div><div><h1>Income Desk</h1><p>Wheel income, positions, ETF actions, and calm execution.</p><div class="desk-profile">Kite profile: <strong>'+e(account)+'</strong></div></div></div><div class="desk-blessing">ॐ | Jai Sri Ram | Jai Laxmi Mata</div><p class="desk-quote">&quot;Trade money for time, not time for money. You’re going to run out of time first.&quot; <strong>— Naval</strong></p></div></header><main><nav class="desk-tabs" aria-label="Income Desk tabs">'+links+'</nav>')
+
+
+def render_page(data=None, error='', message='', review=None, test_mode=False, account_name='', navigation=None):
     data = data or {}
     account = data.get('account', account_name)
     body = ''
@@ -235,14 +252,23 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
         risk, analytics = data['risk'], data['analytics']
         def card(label, value):
             return f'<div class="metric"><small>{e(label)}</small><strong>{e(value)}</strong></div>'
-        body += '<section><h2>Market &amp; risk</h2><div class="metrics">'
+        body += '<section id="market-risk"><h2>Market &amp; risk</h2><div class="metrics">'
         for label, value in [('NIFTY spot', context.get('spot')), ('India VIX', context.get('vix')),
                              ('Portfolio max loss', money(risk['current_defined_max_loss'])),
                              ('Risk remaining', money(risk['risk_remaining'])),
                              ('Loss cap', money(data['config']['max_total_nifty_defined_loss_inr'])),
                              ('Monthly guard', (context.get('monthly') or {}).get('risk_state', 'UNKNOWN'))]:
             body += card(label, value)
-        body += f'</div><p>Data refreshed {e(__import__('app_time').to_ist(context["now"]).strftime('%d %b %Y %H:%M:%S IST'))}. Mode: <b>{e(selection["mode"])}</b>.</p></section>'
+        index_quote = context.get('quotes', {}).get('NSE:NIFTY 50') or {}
+        spot = number(index_quote.get('last_price'))
+        previous = number((index_quote.get('ohlc') or {}).get('close'))
+        movement = spot-previous if spot is not None and previous is not None and previous>0 else None
+        movement_text = 'Unavailable' if movement is None else f'{movement:+,.2f} points ({movement/previous*100:+.2f}%)'
+        tone = 'pass' if movement is not None and movement>0 else 'block' if movement is not None and movement<0 else ''
+        body += f'<div class="metric"><small>NIFTY today · vs previous close</small><strong class="{tone}">{e(movement_text)}</strong></div>'
+        body += '<div class="metric"><small>Market Mood Index</small><strong id="nifty-mmi-value">Loading…</strong><span id="nifty-mmi-zone"></span><span id="nifty-mmi-signal"> | Signal: Checking…</span></div>'
+        body += f'</div><p class="snapshot-meta">Data refreshed {e(__import__('app_time').to_ist(context["now"]).strftime('%d %b %Y %H:%M:%S IST'))}. Mode: <b>{e(selection["mode"])}</b>.</p></section>'
+        body += active_positions_section(data)
         body += '<section><h2>New protected trade</h2><p>Choose contracts, refresh the preview, then save a review. Changing a ticket requires a new review.</p><form method="post" action="/nifty-2/preview"><div class="fields">'
         def select(name, label, choices, value):
             return f'<label>{e(label)}<select name="{e(name)}">' + ''.join(
@@ -292,8 +318,8 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
         for check in ticket['checks']:
             body += f'<li class="{e(check["status"].lower())}"><b>{e(check["status"])} · {e(check["name"])}</b> — {e(check["reason"])}</li>'
         body += '</ul>' + nearer_liquidity_form(data) + '<p>Portfolio checks govern new entries only. P&amp;L and position review remain available when entry risk is blocked.</p><p>POP is unavailable: no validated probability model is connected. Risk uses executable bid/ask and current master quantity.</p></section>'
-        body += active_positions_section(data)
         body += '<section id="execution"><h2>Execution window</h2><p>GO submits protective BUY legs only. Reconcile fills, then explicitly approve SELL using fresh risk checks. LIVE sends real LIMIT orders to the broker only after explicit acknowledgement and fresh approval.</p>'
+        body += '<form method="post" action="/nifty-2/clear-reviews"><button type="submit">Clear all reviews</button><p>Clears unsubmitted reviews for this profile in PAPER and LIVE. Pending orders and filled executions are preserved. Older reviews clear at 9:00 AM IST on weekdays while the app is running, or on next page load.</p></form>'
         records = data['executions']
         if not records:
             body += '<p>No saved executions. Save an eligible ticket review above.</p>'
@@ -370,8 +396,27 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
 .spread-row{display:grid;grid-template-columns:1fr 1fr;gap:18px;border:1px solid #d7e1eb;border-radius:8px;padding:16px;margin:14px 0}.spread-row h4{grid-column:1/-1;margin:0}.contract-quote{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:10px}.contract-quote small{width:100%}@media(max-width:650px){.spread-row{grid-template-columns:1fr}}dialog{width:min(1100px,92vw);max-height:88vh;overflow:auto;border:1px solid #afbfce;border-radius:12px;padding:24px}dialog::backdrop{background:#102439aa}dialog header{display:flex;align-items:center;justify-content:space-between;gap:20px}body{margin:0;background:#f3f6fa;color:#15283d;font:15px system-ui,sans-serif}main{max-width:1440px;margin:auto;padding:24px}nav{display:flex;gap:20px;padding:16px 24px;background:#142b43}nav a{color:white;text-decoration:none}nav .active{border-bottom:3px solid #57d5bd}h1{margin-bottom:8px}h2{font-size:21px}section{background:white;border:1px solid #d7e1eb;border-radius:12px;padding:22px;margin:20px 0}.metrics,.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:14px}.metric{background:#f3f7fb;padding:14px;border-radius:8px}.metric small{display:block;color:#52677b}.metric strong{display:block;font-size:22px;margin-top:8px}label{display:block;font-weight:600}input,select,button{box-sizing:border-box;padding:10px;border:1px solid #afbfce;border-radius:6px;font:inherit}label select,label input{display:block;width:100%;margin-top:6px}button{background:#163e63;color:white;cursor:pointer}button:disabled{opacity:.5;cursor:wait}.actions{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}.ack input{display:inline;width:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:12px;border-bottom:1px solid #dce4ec}article{border:1px solid #cddae5;border-radius:8px;padding:16px;margin:16px 0;overflow:auto}.block,.error{color:#9b2431}.error{padding:16px;background:#fff0f0}.pass{color:#216148}.checks{padding-left:20px;line-height:1.8}p{line-height:1.6;color:#53677b}@media(max-width:650px){main{padding:10px}section{padding:14px}table{min-width:600px}section{overflow:auto}}
 #order-ticket{width:min(810px,94vw);padding:24px 14px 0;border:0;border-radius:14px}#order-ticket header{justify-content:center;position:relative}#ticket-title{font-size:28px;margin:8px 0 24px}#close-ticket{position:absolute;right:0;top:0;background:transparent;color:#405166;border:0}#order-ticket article{border:0;padding:0;margin:0;overflow:visible}#order-ticket article>h3,#order-ticket article>h3+p{font-size:12px;color:#60718b}.ticket-mindset{background:#eff6ff;border:1px solid #8db8ff;border-radius:10px;padding:14px 18px;color:#244493;text-align:center;font-weight:750}.ticket-intro{text-align:center;font-size:14px}.risk-heading{text-align:center;font-size:15px;color:#008679}.risk-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.risk-cell{border:1px solid #b1e5e8;background:#f7fafb;border-radius:10px;padding:12px;text-align:center}.risk-cell small{font-size:12px;font-weight:800;color:#647792}.risk-cell strong{display:block;font-size:20px;color:#0c394b;margin-top:8px}.risk-fail,.risk-banner{background:#fee2e2!important;color:#a91515!important}.risk-pass{background:#d8f5e9}.risk-banner{text-align:center;padding:10px;font-weight:750;border-radius:5px}.spread-choices{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}.spread-choice{display:flex;align-items:center;gap:16px;border:1px solid #c8d5e5;background:#f1f5f9;border-radius:9px;padding:12px;text-align:center}.spread-choice>div{flex:1}.spread-choice p{margin:5px 0}.spread-choice.selected{border-color:#45d6bd;background:#ecfdf5}.coverage{background:#f0fdfa;border:1px solid #91e7da;border-radius:10px;padding:14px;margin:18px 0;color:#087b72}.ticket-footer{position:sticky;bottom:0;background:#f1f5f9;padding:14px 0;display:flex;gap:10px;justify-content:center;z-index:2;border-top:1px solid #d8e3ed}#ticket-cancel{background:#4b5563}#ticket-refresh{background:#137d89}#ticket-go{background:#a52525}#order-ticket .refresh-ticket,#order-ticket [data-countdown]{display:none}@media(max-width:550px){.risk-grid{grid-template-columns:1fr 1fr}.ticket-footer{flex-wrap:wrap}.spread-choices{grid-template-columns:1fr}}
 .inactive-leg{opacity:.55}.ticket-legs td{padding:7px;overflow-wrap:anywhere}.contract-card{border:3px solid #94a3b8;border-radius:9px;padding:14px}.contract-green{border-color:#15803d}.contract-red{border-color:#dc2626}.contract-neutral{border-color:#94a3b8}.partial{color:#92400e}.positions-table{table-layout:fixed}.positions-table td{overflow-wrap:anywhere;padding:7px}.positions-table button{padding:6px}@media(max-width:900px){.positions-table .detail{display:none}.positions-table{min-width:0;font-size:12px}}
-</style></head><body><nav><a href="/home">Income Desk</a><a href="/trade">TRADE</a><a href="/nifty-income/legacy">Legacy scan</a><a href="/nifty-income" class="active">Nifty Income</a><a href="/kite-setup">Kite Setup</a></nav><main>'''
-        + f'<h1>Nifty Income</h1><p>Protected execution &amp; strategy analytics · Profile {e(account)}'+(' · localhost TEST' if test_mode else '')+'</p>'
+
+:root{--ink:#17202a;--muted:#627084;--line:#d6e6e3;--accent:#0f766e;--panel-soft:#f8fdfc}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;background:linear-gradient(135deg,#eef7f6 0%,#f7fbff 42%,#f2fbf4 100%);color:var(--ink)}main{max-width:1440px;width:calc(100% - 32px);padding:20px 0;margin:auto}.desk-header{background:radial-gradient(circle at 16% 12%,#2dd4bf33,transparent 26%),linear-gradient(120deg,#0b1220,#123b52 48%,#0f766e);padding:7px 18px;color:white;box-shadow:0 10px 26px #0f172a29}.desk-header-inner{max-width:1440px;margin:auto;display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:14px;align-items:center}.desk-brand{display:flex;align-items:center;gap:10px}.desk-mark{display:grid;place-items:center;min-width:92px;height:38px;border-radius:12px;background:linear-gradient(135deg,#38bdf8,#14b8a6);font-size:21px;font-weight:900}.desk-header h1{margin:0 0 2px;font-size:22px}.desk-header p{margin:0;color:#d5eef3;font-size:11.5px}.desk-profile{display:inline-block;margin-top:5px;padding:4px 9px;border:1px solid #ffffff40;border-radius:20px;font-size:11px}.desk-blessing{color:#fef3c7;font-size:15px;font-weight:900;text-align:center;border-radius:999px;padding:8px 12px;background:#ffffff14;border:1px solid #fef3c72e}.desk-quote{text-align:right;padding:8px 10px;border:1px solid #bae6fd33;border-radius:12px;background:#ffffff14}.desk-tabs{display:flex;gap:8px;margin-bottom:16px;padding:10px;border:1px solid #bde8e3;border-radius:16px;background:linear-gradient(135deg,#ffffffe6,#ecfeffd6);box-shadow:0 16px 38px #0f172a14;overflow-x:auto}.desk-tabs .desk-tab{flex-shrink:0;border:1px solid #94a3b857;border-radius:12px;background:linear-gradient(135deg,#e2e8f0,#f8fafc);color:#17202a;padding:10px 14px;font-size:14px;text-decoration:none;font-weight:600}.desk-tabs .active{background:linear-gradient(135deg,#0f766e,#115e59);color:white;border-color:#0f766e}.desk-tab:hover{filter:brightness(.96)}.desk-tab:focus-visible,button:focus-visible{outline:3px solid #38bdf8;outline-offset:2px}section{border-color:var(--line);box-shadow:0 14px 34px #0f172a0d}section h2{color:#134e4a}.metric{background:var(--panel-soft);border:1px solid var(--line)}button{background:var(--accent);border-color:#0f766e}input,select{border-color:#b5ceca}p{color:var(--muted)}@media(max-width:900px){.desk-header-inner{grid-template-columns:1fr}.desk-blessing,.desk-quote{display:none}main{width:calc(100% - 20px)}.desk-tabs{gap:6px}.desk-tabs .desk-tab{padding:9px 12px}}
+
+/* Compact overview: eight metrics share a desktop row without an orphan card. */
+main{padding-top:12px}.desk-tabs{margin-bottom:10px}
+.page-title{margin:6px 0 3px;font-size:25px}.page-subtitle{margin:0 0 10px;font-size:13px}
+#market-risk,#active-positions{padding:14px 16px;margin:12px 0}
+#market-risk h2,#active-positions h2{margin:0 0 10px;font-size:19px}
+#active-positions>p{margin:0 0 10px;font-size:13px;line-height:1.4}
+#market-risk>.metrics,#active-positions>.metrics{grid-template-columns:repeat(8,minmax(0,1fr));gap:8px}
+#market-risk .metric,#active-positions>.metrics .metric{min-width:0;padding:10px;border-radius:7px}
+#market-risk .metric small,#active-positions>.metrics .metric small{font-size:11px;line-height:1.25}
+#market-risk .metric strong,#active-positions>.metrics .metric strong{font-size:18px;margin-top:5px;line-height:1.2;overflow-wrap:anywhere}
+#nifty-mmi-zone,#nifty-mmi-signal{font-size:11px;line-height:1.25}
+#market-risk .snapshot-meta{margin:8px 0 0;font-size:12px;line-height:1.4}
+#active-positions>h3{margin:12px 0 6px;font-size:16px}
+@media(max-width:1100px){#market-risk>.metrics,#active-positions>.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:600px){#market-risk,#active-positions{padding:12px}#market-risk>.metrics,#active-positions>.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.page-title{font-size:23px}}
+</style></head><body>'''
+        + desk_header(account, navigation if navigation is not None else [('home','Home'),('trade','TRADE'),('nifty-2','Nifty Income'),('kite-setup','Kite Setup')])
+        + f'<h1 class="page-title">Nifty Income</h1><p class="page-subtitle">Protected execution &amp; strategy analytics · Profile {e(account)}'+(' · localhost TEST' if test_mode else '')+'</p>'
         + (f'<div role="alert" class="error">{e(error)}</div>' if error else '')
         + (f'<p role="status">{e(message)}</p>' if message else '') + body
         + '''</main><script>
@@ -384,6 +429,20 @@ for(const button of document.querySelectorAll('[data-liquid-side]'))button.oncli
  form.elements['hedge_'+side].value=button.dataset.hedge;
  form.requestSubmit();
 };
+async function refreshNiftyMood(){
+ const value=document.getElementById('nifty-mmi-value'), zone=document.getElementById('nifty-mmi-zone'), signal=document.getElementById('nifty-mmi-signal');
+ if(!value)return;
+ try{
+  const response=await fetch('/market-mmi',{cache:'no-store'});
+  if(!response.ok)throw new Error('MMI unavailable');
+  const data=await response.json();
+  if(!data.ok || data.value==null || !Number.isFinite(Number(data.value)))throw new Error('MMI unavailable');
+  const mmi=Number(data.value);
+  value.textContent=mmi.toFixed(2);zone.textContent=data.zone||'';
+  signal.textContent=' | Signal: '+(mmi>60?'SELL CALL':mmi<40?'SELL PUT':'WAIT / NEUTRAL');
+ }catch(error){value.textContent='Unavailable';zone.textContent='';signal.textContent=' | Signal: unavailable';}
+}
+refreshNiftyMood();
 const ticketDialog=document.getElementById('order-ticket');
 let originalPosition=null, reviewTimer=null;
 const footerGo=document.getElementById('ticket-go'), footerReview=document.getElementById('ticket-review');

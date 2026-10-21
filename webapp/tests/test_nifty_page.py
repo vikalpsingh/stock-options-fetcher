@@ -69,6 +69,8 @@ def test_market_adapter_uses_read_only_kite_and_temporary_database(tmp_path, mar
     selection, context, config = market
 
     class KiteReadOnly:
+        def orders(self):
+            return []
         def positions(self):
             return {'net': []}
         def quote(self, keys):

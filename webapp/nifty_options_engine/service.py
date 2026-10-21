@@ -31,30 +31,28 @@ def load_market_context(kite, account, db_path, selection, config, now, instrume
             raise PermissionError("Kite account identity could not be verified.")
         session_fingerprint = hashlib.sha256(user_id.encode()).hexdigest()
     allocations = ledger.position_allocations(account, mode)
-    if mode == "PAPER":
+    broker_positions = []
+    for row in raw_positions:
+        symbol = str(row.get('tradingsymbol') or '')
+        if not symbol.startswith('NIFTY') or not row.get('quantity'):
+            continue
+        instrument = master.get(symbol) or {}
+        broker_positions.append({**row, 'account_id':account, 'strike':instrument.get('strike'),
+            'expiry':str(instrument.get('expiry') or '')[:10], 'option_type':instrument.get('instrument_type'),
+            'lot_size':instrument.get('lot_size'), 'instrument_token':instrument.get('instrument_token')})
+    broker_orders = [{**row, 'account_id':account} for row in kite.orders()
+                     if str(row.get('tradingsymbol') or '').startswith('NIFTY')]
+    if mode == 'PAPER':
         totals = defaultdict(int)
         for row in allocations:
-            totals[row["tradingsymbol"]] += row["quantity"]
-        positions = [{**next(row for row in allocations if row["tradingsymbol"] == symbol),
-                      "quantity": quantity, "strategy_id": ""}
-                     for symbol, quantity in totals.items() if quantity]
+            totals[row['tradingsymbol']] += row['quantity']
+        positions = [{**next(row for row in allocations if row['tradingsymbol']==symbol),
+                      'quantity':quantity,'strategy_id':''} for symbol,quantity in totals.items() if quantity]
         orders = []
     else:
-        positions = []
-        for row in raw_positions:
-            symbol = str(row.get("tradingsymbol") or "")
-            if not symbol.startswith("NIFTY") or not row.get("quantity"):
-                continue
-            instrument = master.get(symbol) or {}
-            positions.append({**row, "account_id": account, "strike": instrument.get("strike"),
-                              "expiry": str(instrument.get("expiry") or "")[:10],
-                              "option_type": instrument.get("instrument_type"),
-                              "lot_size": instrument.get("lot_size"),
-                              "instrument_token": instrument.get("instrument_token")})
-        orders = [{**row, "account_id": account} for row in kite.orders()
-                  if str(row.get("tradingsymbol") or "").startswith("NIFTY")]
+        positions, orders = broker_positions, broker_orders
     symbols = {str(selection.get(key) or "") for key in ("short_pe", "hedge_pe", "short_ce", "hedge_ce")}
-    symbols.update(row["tradingsymbol"] for row in positions)
+    symbols.update(row["tradingsymbol"] for row in positions + broker_positions)
     for pairs in nearby_spread_candidates(selection, instruments, config['default_hedge_width_points']).values():
         for pair in pairs:
             symbols.update(row['tradingsymbol'] for row in pair)
@@ -70,12 +68,20 @@ def load_market_context(kite, account, db_path, selection, config, now, instrume
     pnl.upsert_daily_records(daily, audit_event="NIFTY_V2_RISK_REFRESH")
     pnl.upsert_account_daily_summary(daily, account_id=account, trade_date=now.date(), source="ACCOUNT_DAILY")
     monthly = MonthlyRiskRepository(db_path).latest_snapshot(account, now.date())
-    equity = (kite.margins() or {}).get("equity") or {}
-    available = equity.get("available") or {}
-    funds = number(available.get("live_balance"))
-    if funds is None:
-        funds = number(available.get("cash"))
+    # Margin-service failure cannot veto order submission under the user's
+    # broker-authoritative margin policy. Do not log SDK exception messages.
+    funds = None
+    try:
+        equity = (kite.margins() or {}).get('equity') or {}
+        available = equity.get('available') or {}
+        funds = number(available.get('live_balance'))
+        if funds is None:
+            funds = number(available.get('cash'))
+    except Exception:
+        pass
     context = dict(now=now, instruments=instruments, quotes=quotes, positions=positions,
+                   broker_positions=broker_positions, broker_orders=broker_orders,
+                   broker_allocations=ledger.position_allocations(account, "LIVE"),
                    allocations=allocations, orders=orders, monthly=monthly, margin=None, funds=funds,
                    spot=spot_quote.get("last_price"), vix=(quotes.get("NSE:INDIA VIX") or {}).get("last_price"),
                    spot_timestamp=str(spot_quote.get("timestamp") or ""), market_open=market_open,
@@ -83,9 +89,12 @@ def load_market_context(kite, account, db_path, selection, config, now, instrume
     draft = build_ticket(selection, context, config)
     payloads = draft["order_payloads"]
     if payloads and all(row["price"] > 0 and row["quantity"] > 0 for row in payloads):
-        margin = kite.basket_order_margins(payloads)
-        amounts = [number((margin.get(key) or {}).get("total")) for key in ("initial", "final")]
-        context["margin"] = max(amounts) if all(value is not None and value > 0 for value in amounts) else None
+        try:
+            margin = kite.basket_order_margins(payloads)
+            amounts = [number((margin.get(key) or {}).get('total')) for key in ('initial','final')]
+            context['margin'] = max(amounts) if all(value is not None and value > 0 for value in amounts) else None
+        except Exception:
+            context['margin'] = None
     return context
 
 
@@ -149,14 +158,12 @@ def approve_entry(record, context, config):
         # A partial fill is not the cost of the entire order. The remainder
         # remains constrained by its saved LIMIT, including resumed condors.
         price = (execution["average"] * filled + payload["price"] * (quantity - filled)) / quantity
-        if payload["transaction_type"] == "BUY":
-            if execution["filled"] == 0 and payload["price"] < row["ask"]:
-                raise PermissionError("Hedge ask moved above the reviewed LIMIT. Rebuild review.")
-            row["ask"] = price
+        # Reviewed LTP limits may rest away from the current bid/ask; this is
+        # intentional. Never silently reprice a reviewed order or assume it filled.
+        if payload['transaction_type']=='BUY':
+            row['ask'] = price if filled==quantity else max(price,row['ask'])
         else:
-            if execution["filled"] == 0 and payload["price"] > row["bid"]:
-                raise PermissionError("Short bid moved below the reviewed LIMIT. Rebuild review.")
-            row["bid"] = price
+            row['bid'] = price if filled==quantity else min(price,row['bid'])
     risk = calculate_nifty_portfolio_risk(
         context["positions"], {"legs": worst}, config={**config, "estimated_execution_costs_inr": fresh["estimated_fees"]},
         strategy_allocations=context["allocations"], pending_orders=context["orders"])

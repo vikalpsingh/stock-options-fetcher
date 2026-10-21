@@ -638,3 +638,75 @@ Overall NIFTY 2.0 remains incomplete; continuation automation is still needed.
   LIVE freshness, portfolio cap and confirmed BUY-before-SELL guards unchanged.
 - Five focused depth/price/risk/PAPER fill tests passed (0.51s). No live broker
   calls, full suite, app import or runtime changes. Other backlog unchanged.
+
+## 2026-10-21 shared app appearance
+- NIFTY page adopts Income Desk branding, gradient header, profile pill, blessing,
+  quote, light teal background, panel/button styling and scrollable rounded tabs.
+- Navigation uses existing PROFILE_TAB_OPTIONS and profile visibility/feature flags,
+  with verified route mappings and active Nifty Income indicator. Responsive header
+  and keyboard focus styling included; order-ticket header remains scoped separately.
+- UI render/escaping/routes smoke check and changed UI/handler compilation passed.
+  No full tests, broker calls or runtime data changes. Browser visual check pending.
+
+## 2026-10-21 PAPER Execute JSON serialization fix
+- Four-row display ticket retained raw Kite quote objects containing datetime
+  timestamp/last_trade_time; durable review json.dumps raised encoder.py TypeError.
+- Replaced raw quotes with a display-only snapshot: numeric LTP/previous close and
+  ISO-aware IST timestamp. Unknown/missing timestamp stays null; no blanket str()
+  serialization and no mutation of source quotes or execution/pricing checks.
+- Two focused tests passed (0.44s) using SDK-like datetime objects, extra unsupported
+  raw fields and temporary databases; persisted PAPER review and day-change display
+  verified. No broker calls, runtime writes, app import or full test suite.
+
+## 2026-10-21 market overview layout
+- Moved Active Positions immediately below Market & risk; no duplicate table.
+- Added signed NIFTY day points/% versus prior close with unknown fallback.
+- MMI uses Home's /market-mmi endpoint and exact signal thresholds, actual zone
+  and value; no hardcoded 46.39. Failures show Unavailable.
+- Source compile and focused render assertions passed using isolated workspace
+  temp DB; initial OS temp path was inaccessible in sandbox. No runtime DB edits,
+  broker calls or full suite. Browser visual check pending.
+
+## 2026-10-21 compact top overview
+- Market/risk and active-position summaries now use eight desktop columns, four
+  tablet columns and two mobile columns, eliminating orphan MMI/expiry rows.
+- Reduced title, section, card and refresh-metadata spacing; retained every metric,
+  existing theme and execution behavior. Scoped styles avoid ticket card changes.
+- UI compilation/render smoke check passed. No full suite or broker calls.
+
+## 2026-10-21 actual broker positions independent of entry mode
+- Active Positions now displays actual Kite net NIFTY positions/quotes/orders and
+  LIVE ownership/risk even when new-entry mode is PAPER. PAPER execution context
+  remains separate and simulated; label makes real broker positions explicit.
+- Manage retains shared details modal and links eligible hedge/long-roll actions
+  to existing legacy review popup via symbol/action deep link (opens only, no order).
+  Close uses /positions; existing legacy close action was unimplemented. Linked
+  NIFTY durable executions retain direct guarded spread-close controls.
+- Three isolated mock/temp-DB tests passed in 1.00s, changed modules compile.
+- Limitations: unlinked closes and legacy roll/hedge review navigate to existing
+  screens; fully inline unlinked management and short-roll remain unfinished.
+  Automations remain paused; no live broker calls or runtime data changes.
+
+## 2026-10-21 reviewed LTP LIMIT execution
+- User-requested order policy: selected BUY/SELL payloads use reviewed positive LTP
+  rounded to current master tick size. Missing LTP/tick blocks; no fallback price.
+- Ticket shows exact order LIMIT. Risk still conservatively uses depth and worse
+  reviewed LIMIT; optimistic LTP does not inflate executable credit.
+- Fresh approval permits resting LTP limits (removed requirement that every limit
+  cross current book), retaining identity/quantity/risk/quote/account checks.
+  GO uses existing Kite adapter, BUY-only first, fill verification then separately
+  approved SELL. No automatic reprice, no new order API path or duplicate bypass.
+- Four focused tests passed (0.83s), mocked PAPER callbacks and temporary DB;
+  compilation passed. LIVE remains explicitly enabled/acknowledged by user, never
+  tested with real orders. LTP LIMITs can remain unfilled; reconciliation required.
+
+## 2026-10-21 user-authorized broker margin authority
+- NIFTY ticket margin/funds comparison is advisory, including fresh GO/SELL approval.
+  Missing/insufficient estimate no longer triggers Fresh checks blocked entry.
+  Funds/basket-margin API failures yield unknown estimates rather than load failure.
+- Scope limited to NIFTY ticket/service; canonical risk cap, hedge fill verification,
+  account, freshness and monthly controls unchanged. Broker can reject any leg;
+  existing durable rejection/reconciliation path remains, no automatic retry.
+- Four focused temporary-DB/mocked tests passed (0.72s), including fresh approvals
+  with insufficient/unknown funds and BUY-only duplicate protection. Source compiles.
+  No live orders, app import, runtime edits or full suite.

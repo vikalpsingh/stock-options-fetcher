@@ -17,9 +17,9 @@ def market():
     selection = dict(include_pe=True, lots='2', expiry='2026-11-24',
                      short_pe='NIFTY22300PE', hedge_pe='NIFTY22000PE', mode='PAPER')
     instruments = [dict(name='NIFTY', tradingsymbol=f'NIFTY{strike}PE', instrument_type='PE',
-                        strike=strike, expiry=selection['expiry'], lot_size=65, instrument_token=index+1)
+                        strike=strike, expiry=selection['expiry'], lot_size=65, tick_size=0.05, instrument_token=index+1)
                    for index, strike in enumerate((22000, 22300))]
-    quotes = {'NFO:' + row['tradingsymbol']: dict(timestamp=now.isoformat(),
+    quotes = {'NFO:' + row['tradingsymbol']: dict(timestamp=now.isoformat(), last_price=price+1 if price==20 else price,
               depth=dict(buy=[dict(price=price, quantity=1000)],
                          sell=[dict(price=price+1, quantity=1000)]), oi=10000, volume=10000)
               for row, price in zip(instruments, (20, 60))}
@@ -39,7 +39,7 @@ def test_ticket_executable_costs_and_master_quantity(market):
     assert [leg['quantity'] for leg in ticket['legs']] == [130, 130]
 
 
-@pytest.mark.parametrize('fault', ['stale', 'missing_ask', 'monthly', 'margin', 'live'])
+@pytest.mark.parametrize('fault', ['stale', 'missing_ask', 'monthly', 'live'])
 def test_ticket_blocks_missing_fresh_risk_evidence(market, fault):
     selection, context, config = market
     quote = context['quotes']['NFO:NIFTY22000PE']

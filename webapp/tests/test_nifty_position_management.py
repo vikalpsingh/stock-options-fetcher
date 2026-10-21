@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import datetime, timezone
+from test_nifty_ticket_service import market
 from nifty_options_engine.reconciliation import reconcile_nifty_hedge_allocations
 
 
@@ -82,4 +83,24 @@ def test_management_table_and_single_ticket():
     assert html.count('>Manage</button>')==3
     assert 'Suggested Hedge Match' in html and 'Qty -195' in html
     assert 'independent hedge disposal are blocked' in html
-    assert 'No durable execution record' in html
+    assert 'No NIFTY 2.0 execution record' in html
+
+
+def test_live_positions_display_does_not_change_paper_execution(market, tmp_path):
+    from nifty_options_engine.page import page_data
+    from nifty_options_engine.ui import active_positions_section
+    selection, context, config = market
+    context['broker_positions'] = positions()
+    context['broker_orders'] = []
+    context['broker_allocations'] = []
+    form = {key:[str(value)] for key,value in selection.items()}
+    form['structure']=['PE']
+    data=page_data('A',tmp_path/'view.db',config,lambda _:context,form)
+    assert data['selection']['mode']=='PAPER'
+    assert data['context']['positions']==[]
+    assert data['active_positions_mode']=='LIVE'
+    assert len(data['active_positions']['positions'])==3
+    html=active_positions_section(data)
+    assert 'manage_action=CREATE_HEDGE' in html
+    assert 'manage_action=ROLL_SELL' in html
+    assert 'href="/positions"' in html

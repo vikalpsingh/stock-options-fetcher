@@ -22,7 +22,7 @@ def test_preview_keeps_final_execution_gates(market):
     assert preview['eligible']
     final=build_ticket(selection,context,config)
     assert not final['eligible']
-    assert {r['name'] for r in final['checks'] if r['status']=='BLOCK'}=={'Market session','Broker margin'}
+    assert {r['name'] for r in final['checks'] if r['status']=='BLOCK'}=={'Market session'}
 
 
 def test_model_advice_not_duplicate_execution_veto(market):
