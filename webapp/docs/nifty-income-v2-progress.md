@@ -349,3 +349,151 @@ chosen trade; no manual override was introduced.
 Outstanding broader NIFTY 2.0 work: reviewed historical imports/fee attribution,
 partial/rejected recovery UI, automatic exits/profit capture, full charts/scaling
 and running-browser visual acceptance. No actual market execution was tested.
+
+## 2026-10-21 execution recovery verification and guidance
+
+Resumed existing RECOVERY_READY implementation without rebuilding it. Git showed
+only runtime settings/database edits at start; preserved these and existing code.
+- Verified terminal cancelled/rejected entries can close only their actual fills.
+  Partial short cleanup buys back filled short quantity first, then closes hedges.
+  Rejected shorts and cancelled partial BUYs allow owned orphan-hedge cleanup.
+  Pending partial orders remain blocked; no order cancellation/retry is performed.
+- Added explicit state-specific next-step guidance to execution cards, including
+  pending/partial/uncertain orders, recovery, staged exits and no-fill closure.
+- Repaired corrupted Unicode currency/separator text in the renderer and removed
+  stale LIVE preview-only dropdown wording; guarded LIVE behavior is unchanged.
+- Added four exchange-stub recovery tests and UI guidance/currency coverage.
+  29 focused tests passed in 5.82s:
+  python -m pytest tests/test_nifty_live_execution.py tests/test_nifty_basket_execution.py tests/test_nifty_page.py -q -p no:cacheprovider --basetemp=tmp/nifty-recovery-guidance-check
+- No app.py import, live broker requests, production-data edits or full test suite.
+
+Remaining: exit-order rejection/partial recovery, historical imports and actual
+fee attribution, automated exit/profit capture, full charts/scaling and browser
+visual acceptance. Overall NIFTY 2.0 acceptance is still incomplete.
+
+## 2026-10-21 milestone: explicit failed-exit recovery
+
+- Shared basket executor now totals all exit fills per owned entry symbol rather
+  than requiring every historical attempt to be COMPLETE. Over-closing blocks
+  reconciliation; pending/uncertain exits block both replacement and disposal.
+- Terminal failed short exits expose EXIT_RECOVERY_READY. A newly acknowledged
+  action revalidates broker/ledger quantities and creates a new uniquely tagged
+  order only for the remaining quantity. Prior failed orders/fills are retained.
+- Failed hedge exits can be explicitly recovered only after all short quantities
+  are verified closed. Every unsent close intent refreshes its executable price.
+- approve_exit uses residual owned quantities, retaining account identity,
+  market-hours, fresh quote, ownership and conflicting-order checks.
+- Execution window exposes the recovery action and explains remaining-quantity
+  closure. No automatic retry, modification or cancellation was introduced.
+
+Validation: 32 focused tests passed in 6.38s across test_nifty_live_execution.py,
+test_nifty_page.py and test_nifty_basket_execution.py, using temporary SQLite and
+in-memory broker stubs. New cases cover cancelled partial short exit (65 remaining
+of 130), rejected hedge exit, unique tags, retained historical attempts, duplicate
+click prevention, pending partial exit blocking and staged completion to CLOSED.
+Command: python -m pytest tests/test_nifty_live_execution.py tests/test_nifty_page.py tests/test_nifty_basket_execution.py -q -p no:cacheprovider --basetemp=tmp/nifty-exit-recovery-final
+No live broker API/order access, app.py import, runtime-data edits or full suite.
+
+Remaining broader acceptance: reviewed historical import/fee reconciliation,
+automatic profit/time/emergency exits, charts/scaling and browser visual checks.
+Uncertain orders still require reconciliation; this workflow never guesses an
+unknown submission outcome. Continue the next incomplete phase, not a rebuild.
+
+## 2026-10-21 focused request: EXECUTE popup and daily mode preference
+
+- New protected trade now has EXECUTE. It submits the current selection for the
+  existing server review, then opens a native dialog containing that exact saved
+  execution's controls. Opening it never places an order. Existing countdown,
+  acknowledgements, typed LIVE confirmation, BUY-first/fill verification and
+  renewed SELL/exit checks are unchanged. Blocked review shows reasons in dialog.
+- Saved executions also have OPEN NIFTY ORDER TICKET. Dialog moves the existing
+  form instead of cloning it, preserves one set of order controls, supports Close
+  and Escape, and reopens after execution actions. Includes saved credit, profit,
+  max loss, costs, margin, projected portfolio loss and detailed review checks.
+- Added preferences.py and Save mode for today. Explicitly saves PAPER/LIVE per
+  profile in existing app settings with an IST date. Refresh/navigation/restart
+  within that date restores the preference; a new IST date defaults to PAPER.
+  Saving mode does not grant LIVE permission or waive acknowledgements/risk gates.
+- Only two focused tests run (0.41s): dialog/control rendering and preference
+  profile isolation/IST-midnight expiry/invalid-mode handling. Changed handler
+  and UI syntax checked without importing app.py. No full test suite, application
+  startup, live broker call or runtime settings/database edits during development.
+  Command: python -m pytest tests/test_nifty_ticket_popup.py -q -p no:cacheprovider --basetemp=tmp/nifty-popup-mode-final
+- Browser visual verification not performed. Broader prior acceptance work remains.
+
+## 2026-10-21 loading-error diagnosis
+User reported generic Nifty 2.0 data-verification failure with blank profile.
+No underlying exception was retained in available logs, so cause remains unknown.
+Added safe stage/exception-class/source-location diagnostics (never exception
+message, credentials or broker response) and retained profile name on error page.
+Token/network/database failures provide specific recovery guidance. One focused
+redaction/render test passed in 0.24s; changed handler syntax checked in isolation.
+User must restart their app and refresh to expose the diagnostic for the actual
+failure. Do not claim the underlying data-loading issue is fixed yet. No live API
+calls or runtime-data edits were used to diagnose it.
+
+## 2026-10-21 fix: preferences.py timezone ValueError
+User diagnostic identified the exact loading blocker: global app_now() returns a
+naive datetime, while daily-mode preference requires timezone-aware time.
+Fixed all five clock call sites in send_nifty_v2 to datetime.now(INDIA_TIME_ZONE),
+covering mode restore/save, market context, refreshed quote checks and mode label.
+Global app_now and unrelated workflows are unchanged. Strict preference validation
+is retained, rather than guessing timezone from a naive host clock.
+Three focused popup/preference/handler-clock checks passed in 0.54s; handler parsed
+in isolation without app import. No live order, broker call or runtime-data edit.
+User must restart running app to load this code. This fixes the reported traceback;
+other account/data/risk prerequisites still apply to LIVE placement.
+
+## 2026-10-21 focused layout and ticket-detail request
+- PE SELL/protective BUY share one desktop row; CE SELL/BUY share a second row.
+  Responsive layout stacks on small screens. All four selected contracts show
+  Kite LTP, today's absolute/percentage change versus previous close and quote
+  timestamp. Missing values stay UNKNOWN. Contract selection refreshes preview;
+  manual Refresh obtains a new snapshot. No continuous streaming is claimed.
+- EXECUTE retains existing validated review -> popup flow. Popup now includes
+  legacy-style expiry, spot, lots/quantity, credit/net gain, margin, estimated
+  return on margin, costs/max loss/portfolio loss, PE/CE paired leg summaries
+  with executable prices/OI/volume, risk checks, acknowledgement and countdown.
+- Refresh ticket details creates a newly validated review/countdown; no order is
+  sent by opening or refreshing. BUY fills still gate separately confirmed SELL.
+  No naked override or invented POP was copied from the legacy UI.
+- Four focused popup/preference/detail tests passed in 0.50s; UI syntax passed.
+  No full suite, app import, live broker calls or runtime-data edits. Visual
+  browser verification not performed. Existing broader acceptance work remains.
+
+## 2026-10-21 analytics accounting milestone
+
+Inspected request/checkpoint and preserved all current changes/runtime files.
+- Added five pure actual-fill analytics tests; no broker/database/app import.
+- Fixed partial exits being labelled OPEN_SPREAD with misleading whole-spread
+  capture percentage. They now show PARTIALLY_CLOSED and no capture percentage.
+- Flat cleanup after incomplete/rejected entry now shows CLOSED_INCOMPLETE_ENTRY,
+  with close date, rather than remaining permanently classified as an open partial
+  spread. Cleanup realised P&L/fees remain included in monthly cash results, but
+  incomplete entries do not inflate completed-spread win rates/scaling samples.
+- Worst loss is now unknown when there are no losing completed spreads, instead
+  of displaying the smallest positive winner as a loss.
+- Verified hedge losses/costs and fees are included, missing charges cannot create
+  verified winners, open hedges are not completed spreads, and mixed win/loss
+  expectancy/drawdown use complete strategy results.
+- Five focused tests passed in 0.23s:
+  python -m pytest tests/test_nifty_analytics.py -q -p no:cacheprovider --basetemp=tmp/nifty-analytics-focused
+
+Remaining: historical import/actual fees reconciliation, automated exit/profit
+capture integration, full charts/scaling evidence and browser visual acceptance.
+Overall NIFTY 2.0 remains incomplete; continuation automation is still needed.
+
+## 2026-10-21 screenshot-aligned execution popup
+- Restyled popup to supplied legacy screenshot: centered title, discipline banner,
+  Risk heading, cap/new loss/total/remaining/status cards, prominent FAIL reasons,
+  PE/CE selection indicators, mandatory BUY hedge and coverage section, teal
+  panels and sticky Cancel / Refresh details / Review & Start 10s / GO footer.
+- Footer operates original forms rather than duplicating order submission paths.
+  Review starts an explicit client countdown, also waits for existing configured
+  countdown, and GO still requires server acknowledgement/risk approval. Closing
+  dialog clears its timer. Post-entry reconcile/SELL/exit controls remain available.
+- Immutable saved selection indicators remain read-only: change contracts on page
+  and create a fresh review. No unverified hedge reuse or naked override copied.
+- Blocked previews render the same risk header; UNKNOWN/UNCAPPED remains explicit.
+- Five focused popup tests passed in 0.47s; syntax checked. No full suite, browser
+  visual verification, live broker calls or runtime data edits performed.

@@ -104,3 +104,16 @@ def test_actions_require_ack_and_account_ownership(tmp_path, market):
     with pytest.raises(PermissionError, match='account'):
         execute_action('/nifty-2/start', action, 'B', path, config, lambda _:context,
                        lambda _:pytest.fail('Wrong account must not construct adapter'))
+
+
+def test_recovery_guidance_and_currency():
+    from nifty_options_engine.ui import execution_guidance, money
+    record = {'state':'RECOVERY_READY','legs':[{'filled':65,'payload':{'transaction_type':'SELL'}}]}
+    assert 'filled short quantity first' in execution_guidance(record)
+    record['legs'][0]['filled'] = 0
+    assert 'orphan hedges' in execution_guidance(record)
+    record['state'] = 'SHORT_PARTIAL'
+    assert 'Pending entry orders must finish' in execution_guidance(record)
+    record['state'] = 'CLOSED'
+    assert 'No position was opened' in execution_guidance(record)
+    assert money(100) == '\u20b9100.00'

@@ -5,7 +5,7 @@ from .ledger import NiftyStrategyRepository
 from .reconciliation import allocate_nifty_positions
 from .risk_validator import calculate_nifty_portfolio_risk
 from .ticket import build_ticket, number, quote_values
-from trade_protected_execution import ProtectedExecutionRepository
+from trade_protected_execution import ProtectedExecutionRepository, basket_remaining
 
 
 def load_market_context(kite, account, db_path, selection, config, now, instruments,
@@ -197,12 +197,15 @@ def approve_exit(record, context, close_hedges=False):
         prices[symbol] = price
         if not target:
             continue
+        remaining = basket_remaining(record, leg)
+        if remaining <= 0:
+            continue
         if record["mode"] == "LIVE":
             owned = sum(row["quantity"] for row in context.get("allocations") or []
                         if row.get("strategy_id") == record["strategy_id"]
                         and row.get("tradingsymbol") == symbol and row.get("product") == "NRML")
             direction = 1 if payload["transaction_type"] == "BUY" else -1
-            if direction * owned < leg["filled"]:
+            if direction * owned < remaining:
                 raise PermissionError("Exit exceeds this strategy's remaining allocated fills.")
         from datetime import datetime
         try:
@@ -217,7 +220,7 @@ def approve_exit(record, context, close_hedges=False):
         sign = 1 if payload["transaction_type"] == "BUY" else -1
         pending = any(row.get("tradingsymbol") == symbol and row.get("status") not in
                       {"COMPLETE", "CANCELLED", "REJECTED"} for row in context["orders"])
-        if not fresh or not price or sign * qty < leg["filled"] or pending:
+        if not fresh or not price or sign * qty < remaining or pending:
             raise PermissionError("Exit needs fresh prices, available position quantity and no conflicting open order.")
     return prices
 

@@ -155,3 +155,95 @@ def test_live_structure_must_match_existing_strategy_approval():
                   suggestion={'allowed':True,'selected_strategy':'BULL_PUT_SPREAD'})
     assert live_snapshot_gate(snapshot,strategy_type='BULL_PUT_SPREAD')['allowed']
     assert not live_snapshot_gate(snapshot,strategy_type='BEAR_CALL_SPREAD')['allowed']
+
+
+def test_cancelled_partial_short_cleanup_uses_actual_fills(live):
+    run, broker, _, _ = live
+    run('start'); broker.fill(); run('confirm-sell'); broker.fill(65)
+    broker.orders[-1]['status'] = 'CANCELLED'
+    assert run('reconcile')['state'] == 'RECOVERY_READY'
+    with pytest.raises(PermissionError): run('confirm-sell')
+    run('close-shorts')
+    assert broker.orders[-1]['transaction_type'] == 'BUY'
+    assert broker.orders[-1]['quantity'] == 65
+    broker.fill(65); broker.orders[-1]['status'] = 'COMPLETE'
+    assert run('reconcile')['state'] == 'SHORT_CLOSED_HEDGE_OPEN'
+    run('close-hedges')
+    assert broker.orders[-1]['quantity'] == 130
+    broker.fill()
+    assert run('reconcile')['state'] == 'CLOSED'
+
+
+def test_rejected_short_allows_owned_orphan_cleanup(live):
+    run, broker, _, _ = live
+    run('start'); broker.fill(); run('confirm-sell')
+    broker.orders[-1]['status'] = 'REJECTED'
+    assert run('reconcile')['state'] == 'RECOVERY_READY'
+    run('close-shorts')
+    assert broker.orders[-1]['transaction_type'] == 'SELL'
+    assert broker.orders[-1]['tradingsymbol'] == broker.orders[0]['tradingsymbol']
+    broker.fill()
+    assert run('reconcile')['state'] == 'CLOSED'
+
+
+def test_pending_partial_short_cannot_start_cleanup(live):
+    run, broker, _, _ = live
+    run('start'); broker.fill(); run('confirm-sell'); broker.fill(65)
+    assert run('reconcile')['state'] == 'SHORT_PARTIAL'
+    with pytest.raises(PermissionError): run('close-shorts')
+    assert len(broker.orders) == 2
+
+
+def test_cancelled_partial_hedge_cleanup(live):
+    run, broker, _, _ = live
+    run('start'); broker.fill(65)
+    broker.orders[-1]['status'] = 'CANCELLED'
+    assert run('reconcile')['state'] == 'RECOVERY_READY'
+    run('close-shorts')
+    assert broker.orders[-1]['quantity'] == 65
+    assert broker.orders[-1]['transaction_type'] == 'SELL'
+    broker.fill(65); broker.orders[-1]['status'] = 'COMPLETE'
+    assert run('reconcile')['state'] == 'CLOSED'
+
+
+def test_cancelled_partial_short_exit_resubmits_only_residual(live):
+    run, broker, _, _ = live
+    run('start'); broker.fill(); run('confirm-sell'); broker.fill(); run('close-shorts')
+    broker.fill(65); broker.orders[-1]['status'] = 'CANCELLED'
+    assert run('reconcile')['state'] == 'EXIT_RECOVERY_READY'
+    run('close-shorts')
+    assert broker.orders[-1]['quantity'] == 65
+    assert broker.orders[-1]['transaction_type'] == 'BUY'
+    assert len({order['tag'] for order in broker.orders}) == len(broker.orders)
+    with pytest.raises(PermissionError): run('close-shorts')
+    assert len(broker.orders) == 4
+    broker.fill(65); broker.orders[-1]['status'] = 'COMPLETE'
+    assert run('reconcile')['state'] == 'SHORT_CLOSED_HEDGE_OPEN'
+    run('close-hedges'); broker.fill()
+    result = run('reconcile')
+    assert result['state'] == 'CLOSED'
+    assert len(result['exit_legs']) == 3  # failed attempt is retained for P&L
+
+
+def test_rejected_hedge_exit_requires_new_explicit_action(live):
+    run, broker, _, _ = live
+    run('start'); broker.fill(); run('confirm-sell'); broker.fill()
+    run('close-shorts'); broker.fill(); run('close-hedges')
+    broker.orders[-1]['status'] = 'REJECTED'
+    assert run('reconcile')['state'] == 'SHORT_CLOSED_HEDGE_OPEN'
+    assert len(broker.orders) == 4
+    run('close-hedges')
+    assert len(broker.orders) == 5
+    assert broker.orders[-1]['quantity'] == 130
+    broker.fill()
+    assert run('reconcile')['state'] == 'CLOSED'
+
+
+def test_pending_partial_exit_blocks_replacement_and_hedge_disposal(live):
+    run, broker, _, _ = live
+    run('start'); broker.fill(); run('confirm-sell'); broker.fill(); run('close-shorts')
+    broker.fill(65)
+    assert run('reconcile')['state'] == 'PARTIALLY_CLOSED'
+    with pytest.raises(PermissionError): run('close-shorts')
+    with pytest.raises(PermissionError): run('close-hedges')
+    assert len(broker.orders) == 3

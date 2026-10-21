@@ -51,13 +51,14 @@ def strategy_performance(strategy, quotes=None):
             else:
                 mtm += direction * (mark - average) * remaining
                 closing_debit -= direction * mark * remaining
-        legs.append({**leg, "entered": entered, "exited": exited, "remaining": remaining,
+        legs.append({**leg, "entered": entered, "exited": exited, "remaining": remaining, "invalid": invalid,
                      "average_entry": average, "realised_gross": leg_gross})
     shorts_open = any(leg["entry_side"] == "SELL" and leg["remaining"] for leg in legs)
     longs_open = any(leg["entry_side"] == "BUY" and leg["remaining"] for leg in legs)
-    status = ("CREATED" if not any_fill else "FULLY_CLOSED" if closed else
+    flat = any_fill and all(leg["remaining"] == 0 and not leg["invalid"] for leg in legs)
+    status = ("CREATED" if not any_fill else "CLOSED_INCOMPLETE_ENTRY" if flat and partial else "FULLY_CLOSED" if closed else
               "SHORT_CLOSED_HEDGE_OPEN" if longs_open and not shorts_open and exit_dates else
-              "PARTIAL_SPREAD" if partial else "OPEN_SPREAD")
+              "PARTIAL_SPREAD" if partial else "PARTIALLY_CLOSED" if exit_dates else "OPEN_SPREAD")
     return {**strategy, "legs": legs, "status": status, "realised_gross": gross,
             "fees": known_fees if fees_known else None, "known_fees": known_fees,
             "realised_net": gross - known_fees if fees_known else None,
@@ -68,7 +69,7 @@ def strategy_performance(strategy, quotes=None):
             "captured_pct": (entry_cash - closing_debit) / entry_cash * 100
                             if entry_cash > 0 and marks_known and status == "OPEN_SPREAD" else None,
             "entry_date": min(entry_dates) if entry_dates else None,
-            "exit_date": max(exit_dates) if closed and exit_dates else None,
+            "exit_date": max(exit_dates) if flat and exit_dates else None,
             "events": events}
 
 
@@ -89,7 +90,7 @@ def analyze_nifty_strategy_performance(rows, start_date, end_date):
             "profit_factor": sum(winners) / abs(sum(losers)) if losers else None,
             "expectancy": (len(winners) * avg_win - len(losers) * avg_loss) / count if count else None,
             "maximum_drawdown": abs(max_drawdown(pnls)) if count else None,
-            "worst_loss": min(pnls) if pnls else None}
+            "worst_loss": min(losers) if losers else None}
 
 
 def monthly_analytics(strategies, month, quotes=None):

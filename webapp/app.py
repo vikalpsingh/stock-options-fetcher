@@ -51088,17 +51088,28 @@ class KiteWebHandler(BaseHTTPRequestHandler):
 
     def send_nifty_v2(self, form=None, action=None) -> None:
         from nifty_options_engine.page import page_data, execute_action
+        from nifty_options_engine.diagnostics import loading_error
+        from nifty_options_engine.preferences import saved_mode, mode_update
         from nifty_options_engine.ui import render_page as render_nifty_v2
         from nifty_options_engine.service import load_market_context, live_snapshot_gate
         form = form or {}
         data, error, message = None, "", ""
+        account, stage = "", "profile setup"
+        open_ticket = first(form, "open_ticket") == "yes"
+        popup_id = first(form, "execution_id") if open_ticket else ""
         test_mode = test_environment_active(
             load_app_settings().get("TRADE_ENVIRONMENT", os.getenv("TRADE_ENVIRONMENT", "NORMAL")),
             self.headers.get("Host", ""), self.client_address[0])
         try:
             account = selected_kite_profile_name()
+            if "mode" not in form:
+                form = {**form, "mode": [saved_mode(load_app_settings(), account, datetime.now(INDIA_TIME_ZONE))]}
             if not kite_profile_nifty_income_enabled(account):
                 raise PermissionError("Enable Nifty Income for this profile in Kite Setup first.")
+            if action == "/nifty-2/save-mode":
+                save_app_settings(mode_update(load_app_settings(), account, first(form, "mode"), datetime.now(INDIA_TIME_ZONE)))
+                message = "Execution mode saved for this profile until midnight IST. Order acknowledgements and risk checks still apply."
+                action = None
             # Bind this request's client to saved profile credentials; never accept
             # credentials/account identity from the execution form or mutate env.
             from kiteconnect import KiteConnect
@@ -51107,7 +51118,9 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 raise PermissionError("Connect this profile in Kite Setup before loading Nifty 2.0.")
             kite = KiteConnect(api_key=profile["KITE_API_KEY"])
             kite.set_access_token(profile["KITE_ACCESS_TOKEN"])
+            stage = "NIFTY configuration"
             config = nifty_income_config()["nifty_income_v2"]
+            stage = "NFO instrument master"
             instruments = cached_kite_instruments(kite, "NFO")
             if action == "/nifty-2/live-settings":
                 if first(form, "settings_ack") != "yes":
@@ -51118,17 +51131,20 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 action = None
                 message = "Nifty Income LIVE permission saved. Each order still requires review and confirmation."
             def context_loader(selection):
+                nonlocal stage
+                stage = "positions, quotes, monthly risk and margin"
                 context = load_market_context(kite, account, APP_DB_PATH, selection, config,
-                    app_now(), instruments,
+                    datetime.now(INDIA_TIME_ZONE), instruments,
                     live_ack_enabled=profile.get("KITE_CONFIRM_LIVE_ORDER") == "YES")
                 if selection.get("mode") == "LIVE":
                     # Reuse existing regime/event/confidence vetoes, refreshed at
                     # every entry approval. The bound client supplies account risk.
+                    stage = "existing NIFTY live risk evaluation"
                     context["live_risk_gate"] = live_snapshot_gate(nifty_income_snapshot(force=True),
                         lots=int(selection.get("lots") or 0), maximum_lots=config["maximum_lots_per_new_trade"],
                         strategy_type=("IRON_CONDOR" if selection.get("include_pe") and selection.get("include_ce")
                                        else "BULL_PUT_SPREAD" if selection.get("include_pe") else "BEAR_CALL_SPREAD"))
-                    context["now"] = app_now()
+                    context["now"] = datetime.now(INDIA_TIME_ZONE)
                     context["market_open"] = context["market_open"] and (9, 15) <= (context["now"].hour, context["now"].minute) < (15, 30)
                 return context
             if action and action != "/nifty-2/preview":
@@ -51136,6 +51152,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     record, ticket = execute_action(action, form, account, APP_DB_PATH, config,
                         context_loader, lambda mode: KiteBrokerAdapter(kite=kite, paper_trading=mode == "PAPER", account_id=account), test_mode)
                     if record:
+                        popup_id = record["id"] if open_ticket else ""
                         selected = record["preview"]["selection"]
                         form = {key: [str(value)] for key, value in selected.items()}
                         form["structure"] = ["BOTH" if selected["include_pe"] and selected["include_ce"]
@@ -51148,11 +51165,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 except (PermissionError, ValueError) as exc:
                     error = str(exc)
             data = page_data(account, APP_DB_PATH, config, context_loader, form)
+            data["open_ticket"] = open_ticket
+            data["open_execution"] = popup_id
+            data["saved_day_mode"] = saved_mode(load_app_settings(), account, datetime.now(INDIA_TIME_ZONE))
         except PermissionError as exc:
             error = str(exc)
-        except Exception:
-            error = "Nifty 2.0 data could not be verified. Check Kite Setup and refresh. No automatic order retry was made; reconcile any pending execution."
-        content = render_nifty_v2(data, error=error, message=message, test_mode=test_mode)
+        except Exception as exc:
+            error = loading_error(exc, stage)
+            logger.warning("NIFTY_PAGE_LOAD_FAILED stage=%s type=%s", stage, type(exc).__name__)
+        content = render_nifty_v2(data, error=error, message=message, test_mode=test_mode, account_name=account)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

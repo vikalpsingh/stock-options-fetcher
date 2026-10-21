@@ -358,6 +358,12 @@ def submit_basket_hedges(repo, account, eid, broker, validator, acknowledged=Fal
     return record
 
 
+def basket_remaining(record, entry):
+    symbol = entry["payload"]["tradingsymbol"]
+    return entry["filled"] - sum(leg["filled"] for leg in record.get("exit_legs", [])
+                                 if leg["payload"]["tradingsymbol"] == symbol)
+
+
 def reconcile_basket(repo, account, eid, broker):
     record = repo.get(account, eid)
     _check_mode(record, broker)
@@ -384,9 +390,16 @@ def reconcile_basket(repo, account, eid, broker):
         full = lambda group: bool(group) and all(leg["status"] == "COMPLETE" and leg["filled"] == leg["payload"]["quantity"] for leg in group)
         if record.get("exit_legs"):
             exits = record["exit_legs"]
-            short_exits = [leg for leg in exits if leg["payload"]["transaction_type"] == "BUY"]
-            record["state"] = ("CLOSED" if full(exits) else "SHORT_CLOSED_HEDGE_OPEN" if full(short_exits)
-                               else "PARTIALLY_CLOSED" if any(leg["filled"] for leg in exits) else "EXIT_PENDING")
+            remaining = [basket_remaining(record, leg) for leg in record["legs"]]
+            if any(qty < 0 for qty in remaining):
+                raise ValueError("Exit fills exceed owned entry quantity.")
+            pending = any(leg["status"] not in {"COMPLETE", "REJECTED", "CANCELLED", "NOT_SUBMITTED"} for leg in exits)
+            shorts_closed = all(basket_remaining(record, leg) == 0 for leg in sells)
+            record["state"] = (
+                ("PARTIALLY_CLOSED" if any(leg["filled"] for leg in exits) else "EXIT_PENDING") if pending
+                else "CLOSED" if not any(remaining)
+                else "SHORT_CLOSED_HEDGE_OPEN" if shorts_closed
+                else "EXIT_RECOVERY_READY")
         elif (any(leg["status"] in {"REJECTED", "CANCELLED"} for leg in record["legs"])
               and all(leg["status"] in {"COMPLETE", "REJECTED", "CANCELLED", "NOT_SUBMITTED"}
                       for leg in record["legs"])):
@@ -450,7 +463,7 @@ def submit_basket_exit(repo, account, eid, broker, validator, prices, acknowledg
     if not acknowledged:
         raise PermissionError("Explicit exit confirmation is required.")
     record = reconcile_basket(repo, account, eid, broker)
-    required = {"SHORT_CLOSED_HEDGE_OPEN"} if close_hedges else {"OPEN", "HEDGE_FILLED", "RECOVERY_READY"}
+    required = {"SHORT_CLOSED_HEDGE_OPEN"} if close_hedges else {"OPEN", "HEDGE_FILLED", "RECOVERY_READY", "EXIT_RECOVERY_READY"}
     if record["state"] not in required:
         raise PermissionError("Reconcile all entry/close fills before this exit stage.")
     validator(record, "EXIT_HEDGES" if close_hedges else "EXIT_SHORTS")
@@ -472,14 +485,34 @@ def submit_basket_exit(repo, account, eid, broker, validator, prices, acknowledg
     # A filled hedge with no shorts is an explicit orphan cleanup action.
     if not any(leg["filled"] for leg in record["legs"] if leg["payload"]["transaction_type"] == "SELL"):
         target_side = "SELL"
+    # A new explicit action may replace only terminal failed exits. Keep every
+    # original order/fill for accounting and submit only the remaining quantity.
+    for entry in record["legs"]:
+        original = entry["payload"]
+        closing_side = "BUY" if original["transaction_type"] == "SELL" else "SELL"
+        remaining = basket_remaining(record, entry)
+        if closing_side != target_side or remaining <= 0:
+            continue
+        attempts = [leg for leg in record["exit_legs"] if leg["payload"]["tradingsymbol"] == original["tradingsymbol"]]
+        if any(leg["status"] == "NOT_SUBMITTED" for leg in attempts):
+            continue
+        if any(leg["status"] not in {"COMPLETE", "REJECTED", "CANCELLED"} for leg in attempts):
+            raise PermissionError("An exit is still pending or uncertain; reconcile before recovery.")
+        price = float(prices.get(original["tradingsymbol"], 0))
+        if not math.isfinite(price) or price <= 0:
+            raise PermissionError("Fresh executable recovery price required.")
+        record["exit_legs"].append(dict(
+            payload={**original, "transaction_type": closing_side, "quantity": remaining, "price": price},
+            tag="NR" + eid[:15] + format(len(record["exit_legs"]), "x"),
+            order_id="", status="NOT_SUBMITTED", filled=0, average=0))
+    record = repo.save(record)
     for index, leg in enumerate(record["exit_legs"]):
         if leg["payload"]["transaction_type"] != target_side or leg["status"] != "NOT_SUBMITTED":
             continue
-        if target_side == "SELL":
-            price = float(prices.get(leg["payload"]["tradingsymbol"], 0))
-            if not math.isfinite(price) or price <= 0:
-                raise PermissionError("Fresh hedge closing bid required.")
-            leg["payload"]["price"] = price
+        price = float(prices.get(leg["payload"]["tradingsymbol"], 0))
+        if not math.isfinite(price) or price <= 0:
+            raise PermissionError("Fresh executable closing price required.")
+        leg["payload"]["price"] = price
         leg["status"] = "SUBMITTING"
         record["state"] = "EXIT_PENDING"
         record = repo.save(record)
