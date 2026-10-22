@@ -1500,7 +1500,7 @@ PROFILE_TAB_OPTIONS: tuple[tuple[str, str, str], ...] = (
     ("income-growth", "Income Growth", "Strategy"),
     ("income", "INCOME", "Strategy"),
     ("nifty-income", "Nifty Income Legacy", "Strategy"),
-    ("nifty-2", "Nifty Income", "Strategy"),
+    ("nifty-2", "NIFTY", "Strategy"),
     ("nifty-grow", "NIFTYGrow", "Strategy"),
     ("commodity", "Commodity", "Strategy"),
     ("analytics", "Analytics", "Tools"),
@@ -1531,7 +1531,7 @@ def normalize_profile_visible_tabs(value: Any) -> list[str]:
     for tab_id in raw_tabs:
         if tab_id in allowed and tab_id not in normalized:
             normalized.append(tab_id)
-    if not normalized:
+    if value is None:
         normalized = list(DEFAULT_PROFILE_VISIBLE_TABS)
     for required_tab in ALWAYS_VISIBLE_PROFILE_TABS:
         if required_tab not in normalized:
@@ -1547,11 +1547,6 @@ def kite_profile_visible_tabs(
     available_profiles = profiles if profiles is not None else load_kite_profiles()
     profile = available_profiles.get(clean_name) or blank_kite_profile(clean_name)
     visible_tabs = set(normalize_profile_visible_tabs(profile.get("VISIBLE_TABS")))
-    if kite_profile_nifty_income_enabled(clean_name, available_profiles):
-        visible_tabs.add("nifty-income")
-        visible_tabs.add("nifty-2")
-    if kite_profile_nifty_grow_enabled(clean_name, available_profiles):
-        visible_tabs.add("nifty-grow")
     return visible_tabs
 
 
@@ -1741,6 +1736,38 @@ def position_close_discount_percent_setting() -> float:
     except (TypeError, ValueError):
         return DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT
     return discount if 0 <= discount < 100 else DEFAULT_POSITION_CLOSE_DISCOUNT_PERCENT
+
+
+def position_close_sell_markup_percent_setting() -> float:
+    value = load_app_settings().get('position_close_sell_markup_percent', position_close_discount_percent_setting())
+    try:
+        markup = float(value)
+    except (TypeError, ValueError):
+        return position_close_discount_percent_setting()
+    return markup if 0 <= markup < 100 else position_close_discount_percent_setting()
+
+
+def nifty_close_percent_setting(side: str) -> float:
+    key = "nifty_close_buy_discount_percent" if side == "BUY" else "nifty_close_sell_markup_percent"
+    fallback = position_close_discount_percent_setting() if side == "BUY" else position_close_sell_markup_percent_setting()
+    try:
+        value = float(load_app_settings().get(key, fallback))
+    except (TypeError, ValueError):
+        return fallback
+    return value if 0 <= value < 100 else fallback
+
+
+def nifty_cmp_close_price(symbol: str, side: str, cmp: float, tick: float = 0.05) -> tuple[float, float] | None:
+    # Exact NIFTY index prefix; excludes BANKNIFTY, NIFTYNXT50 and other underlyings.
+    symbol = str(symbol or "").upper()
+    if not re.fullmatch(r"NIFTY[0-9].*(?:CE|PE)", symbol) or side not in {"BUY", "SELL"}:
+        return None
+    if not math.isfinite(cmp) or cmp <= 0:
+        raise ValueError("NIFTY close pricing requires a positive fresh CMP.")
+    percent = nifty_close_percent_setting(side)
+    price = (floor_to_tick(cmp * (1 - percent / 100), tick) if side == "BUY"
+             else ceil_to_tick(cmp * (1 + percent / 100), tick))
+    return price, percent
 
 
 def position_stop_option_sell_setting() -> bool:
@@ -11743,6 +11770,7 @@ def build_missing_option_close_orders(
     )
     if not 0 <= discount < 100:
         raise ValueError("Position close percentage must be between 0 and 100.")
+    sell_markup = position_close_sell_markup_percent_setting()
     positions = refresh_option_positions_with_live_ltp(
         open_option_positions(use_cache=False),
         kite,
@@ -11928,13 +11956,21 @@ def build_missing_option_close_orders(
         else:
             price_basis = max(average_price, ltp)
             limit_price = ceil_to_tick(
-                price_basis * (1 + discount / 100),
+                price_basis * (1 + sell_markup / 100),
                 0.05,
             )
             rule = (
-                f"{discount:g}% above max(LTP, average entry price); "
+                f"{sell_markup:g}% above max(LTP, average entry price); "
                 f"standard SELL close for open BUY position"
             )
+        # Normal NIFTY closes use CMP; retain existing emergency exit pricing and gates.
+        nifty_price = None
+        if close_side == "SELL" or probability_risk.probability_risk_state not in {"PANIC", "FORCE_EXIT"} or not dte_gate_allowed:
+            nifty_price = nifty_cmp_close_price(symbol, close_side, ltp)
+        if nifty_price is not None:
+            limit_price, applied_percent = nifty_price
+            price_basis = ltp
+            rule = f"NIFTY {applied_percent:g}% {'below' if close_side == 'BUY' else 'above'} fresh CMP"
         if limit_price <= 0:
             evaluation["action"] = "SKIP_INVALID_LIMIT_PRICE"
             evaluations.append(evaluation)
@@ -11967,11 +12003,11 @@ def build_missing_option_close_orders(
                 "ltp": ltp,
                 "pnl": option_position_pnl(quantity, average_price, ltp),
                 "price_basis": (
-                    "min_ltp_average_price"
+                    "CMP" if nifty_price is not None else ("min_ltp_average_price"
                     if close_side == "BUY"
-                    else "max_ltp_average_price"
+                    else "max_ltp_average_price")
                 ),
-                "discount_percent": discount,
+                "discount_percent": nifty_price[1] if nifty_price is not None else (discount if close_side == "BUY" else sell_markup),
                 "risk_note": (
                     f"AUTO CLOSE COVER: {close_side} {abs(quantity)} {symbol} at "
                     f"{limit_price:.2f}; {rule}. Average {average_price:.2f}, "
@@ -18569,6 +18605,7 @@ def kite_order_book(force_refresh: bool = False) -> list[dict[str, Any]]:
                 "tradingsymbol": symbol,
                 "transaction_type": str(order.get("transaction_type") or ""),
                 "quantity": order.get("quantity") or "",
+                "filled_quantity": order.get("filled_quantity", order.get("quantity") if status == "COMPLETE" else 0),
                 "pending_quantity": order.get("pending_quantity") or "",
                 "product": str(order.get("product") or ""),
                 "order_type": str(order.get("order_type") or ""),
@@ -18956,14 +18993,24 @@ def refresh_position_buy_order_prices(
         position_quantity = -abs(quantity) if str(updated.get("transaction_type") or "").upper() == "BUY" else quantity
         pnl = option_position_pnl(position_quantity, average_price, ltp) if average_price > 0 and quantity else float(updated.get("pnl") or 0)
         discount_percent = float(
-            getattr(args, "discount_percent", updated.get("discount_percent", 20.0)) or 20.0
+            getattr(args, "discount_percent", updated.get("discount_percent", 20.0))
         )
         tick_size = float(getattr(args, "tick_size", 0.05) or 0.05)
         is_profitable = pnl > 0 or (average_price > 0 and ltp > 0 and ltp < average_price)
         price_basis_name = "LTP" if is_profitable else "average_price"
         price_basis = ltp if is_profitable else average_price
-        if price_basis > 0:
+        if str(updated.get('transaction_type') or '').upper() == 'SELL':
+            discount_percent = position_close_sell_markup_percent_setting()
+            price_basis = max(average_price, ltp)
+            price_basis_name = 'max(LTP, average entry price)'
+            if price_basis > 0:
+                updated['price'] = ceil_to_tick(price_basis * (1 + discount_percent / 100), tick_size)
+        elif price_basis > 0:
             updated["price"] = floor_to_tick(price_basis * (1 - discount_percent / 100), tick_size)
+        nifty_price = nifty_cmp_close_price(updated.get("tradingsymbol"), str(updated.get("transaction_type") or "").upper(), ltp, tick_size)
+        if nifty_price is not None:
+            updated["price"], discount_percent = nifty_price
+            price_basis_name = "CMP"
         updated["ltp"] = ltp
         updated["pnl"] = pnl
         updated["price_basis"] = price_basis_name
@@ -19515,6 +19562,8 @@ def run_scheduled_position_close_job(
             state = PageState(
                 position_dry_run=False,
                 position_discount_percent=position_close_discount_percent_setting(),
+                position_include_long=not position_stop_option_sell_setting(),
+                position_stop_option_sell=position_stop_option_sell_setting(),
             )
             orders = build_position_buy_orders(state)
             selected = set(range(len(orders)))
@@ -20337,7 +20386,7 @@ def render_profile_tab_configuration(visible_tabs: set[str]) -> str:
         '<p class="status">Choose which strategy tabs appear for this Kite profile. '
         f"Default selected tabs are {html.escape(defaults)}.</p>"
         f"{grouped_html}"
-        '<p class="status">Home and Kite Setup remain available so a profile can always be recovered.</p>'
+        '<p class="status">Home and Kite Setup always remain available. Save the selected profile to apply changes. Nifty tabs also require their separate feature-enable switches; enabling a feature does not override hidden tabs.</p>'
         "</section>"
     )
 
@@ -20961,6 +21010,27 @@ def render_graceful_error(error: str, title: str = "Error") -> str:
     )
 
 
+def completed_order_current_pnl(order: dict[str, Any]) -> float | None:
+    """Display-only row MTM, not booked P&L or the whole position's MTM."""
+    if str(order.get("status") or "").upper() in {"CANCELLED", "CANCELED", "REJECTED"}:
+        return 0.0
+    if str(order.get("status") or "").upper() != "COMPLETE":
+        return None
+    try:
+        qty = float(order.get("filled_quantity", order.get("quantity")) or 0)
+        avg = float(order.get("position_avg_price") or 0)
+        ltp = float(order.get("ltp"))
+        position_qty = float(order.get("position_qty") or 0)
+        if not all(math.isfinite(v) for v in (qty, avg, ltp, position_qty)):
+            return None
+        if qty <= 0 or avg <= 0 or ltp < 0 or position_qty == 0:
+            return None
+        # Position direction matters: a closing BUY belongs to a short position.
+        return qty * (avg - ltp) if position_qty < 0 else qty * (ltp - avg)
+    except (TypeError, ValueError):
+        return None
+
+
 def render_order_book(state: PageState) -> str:
     orders = state.order_book
     error = state.order_book_error
@@ -21018,7 +21088,10 @@ def render_order_book(state: PageState) -> str:
             f'<span>{html.escape(str(suggestion.get("text", "")))}</span>'
             "</div>"
         )
-        position_pnl = order.get("position_pnl")
+        position_pnl = (order.get("position_pnl") if order.get("is_cancellable")
+                        else completed_order_current_pnl(order))
+        pnl_qty = (order.get("position_qty") if order.get("is_cancellable")
+                   else order.get("filled_quantity", order.get("quantity")))
         position_pnl_class = ""
         position_pnl_cell = "N/A"
         if position_pnl is not None:
@@ -21026,9 +21099,12 @@ def render_order_book(state: PageState) -> str:
             position_pnl_class = "pnl-positive" if position_pnl_value >= 0 else "pnl-negative"
             position_pnl_cell = (
                 f"<strong>{html.escape(display_cell('pnl', position_pnl_value))}</strong>"
-                f"<small>Qty {html.escape(str(order.get('position_qty') or ''))}</small>"
+                f"<small>Qty {html.escape(str(pnl_qty or 0))}</small>"
             )
         if not order.get("is_cancellable"):
+            if str(order.get("status") or "").upper() in {"CANCELLED", "CANCELED", "REJECTED"}:
+                close_pnl_cell = "0.00"
+                close_pnl_class = ""
             completed_rows.append(
                 '<tr class="completed-order-row">'
                 f"<td>{html.escape(str(order.get('tradingsymbol', '')))}</td>"
@@ -21086,7 +21162,7 @@ def render_order_book(state: PageState) -> str:
         '<th>Price</th><th>LTP</th><th>Avg Price</th><th>Current P&L</th><th>Suggestion</th><th>% Diff</th><th>Score</th><th>Close P&L</th><th>Status</th>'
         f"</tr></thead><tbody>{actionable_body}</tbody></table></div>"
         '<div class="completed-orders-section"><div class="panel-title">Completed Orders</div>'
-        '<p class="status">Read-only terminal orders. Completed, cancelled, and rejected orders cannot be modified or cancelled.</p>'
+        '<p class="status">Read-only terminal orders. Current P&amp;L uses this order’s filled Qty × (LTP − Position Avg) for long positions, or Qty × (Position Avg − LTP) for short positions. Cancelled/rejected rows show zero; missing current position data shows N/A. Close P&amp;L is booked separately.</p>'
         '<div class="table-wrap"><table class="completed-orders-table"><thead><tr>'
         '<th>Symbol</th><th>Side</th><th>Qty</th><th>Order Price</th><th>LTP</th>'
         '<th>Position Avg</th><th>Current P&L</th><th>Close P&L</th><th>Status</th>'
@@ -31204,6 +31280,10 @@ def scan_best_trade_candidates(account_id: str, watchlist: list[dict[str, Any]])
                 net_credit_yield=None,
                 mandatory_complete=bool(model_expiry_otm is not None and liquidity_status != "BLOCK" and event_clear),
             )
+            from trade_opportunity_engine import scan_max_profit
+            selected_master = next((item for item in contracts if item.get('tradingsymbol') == candidate.get('tradingsymbol')), {})
+            profit_quantity = selected_master.get('lot_size')
+            gross_max_profit = scan_max_profit(candidate.get('bid'), candidate.get('ask'), profit_quantity)
             eligible = bool(regime in {"BULLISH", "BEARISH"} and aligned and model_expiry_otm is not None and ltp > 0 and liquidity_status == "PASS" and event_clear)
             rows.append(
                 {
@@ -31234,6 +31314,9 @@ def scan_best_trade_candidates(account_id: str, watchlist: list[dict[str, Any]])
                     "model_expiry_otm_pct": model_expiry_otm,
                     "probability_model": "LOGNORMAL_RISK_NEUTRAL_CONSTANT_IV",
                     "pop": model_expiry_otm,
+                    "scan_max_profit": gross_max_profit,
+                    "scan_profit_quantity": int(profit_quantity) if gross_max_profit is not None else None,
+                    "scan_profit_basis": "ONE_LOT_SHORT_BID_BEFORE_HEDGE_AND_FEES",
                     "net_credit_yield_pct": None,
                     "premarket_score": premarket["score"],
                     "premarket_components": premarket["components"],
@@ -32041,7 +32124,7 @@ def render_trade_panel(state: PageState) -> str:
     best_scan_modal = ""
     if state.trade_best_scan_open:
         best_rows_html = "".join(
-            f'<tr data-trade-source="{trade_source_group(row.get("source"))}" data-trade-view="{"MISSED" if str(row.get("status") or "").startswith(("MISSED", "WAIT", "BLOCK")) else "LIVE" if row.get("data_mode") == "LIVE" else "PREMARKET"}">'
+            f'<tr data-trade-max-profit="{row.get("scan_max_profit") if row.get("scan_max_profit") is not None else ""}" data-trade-eligible="{"true" if row.get("eligible") else "false"}" data-trade-source="{trade_source_group(row.get("source"))}" data-trade-view="{"MISSED" if str(row.get("status") or "").startswith(("MISSED", "WAIT", "BLOCK")) else "LIVE" if row.get("data_mode") == "LIVE" else "PREMARKET"}">'
             f'<td><strong>{html.escape(str(row.get("symbol") or ""))}</strong><small>{html.escape(str(row.get("regime") or "UNKNOWN"))}</small></td><td><span class="ipo-badge neutral">{html.escape("DHAN-IT" if trade_source_group(row.get("source")) == "DHAN_IT" else trade_source_group(row.get("source")))}</span></td>'
             f'<td>{html.escape(str(row.get("option_type") or "-"))} {html.escape(str(row.get("side") or "-"))}<small>{html.escape(str(row.get("contract") or "-"))}</small></td>'
             f'<td>{f"{_dhan_metric_float(row.get("gap_pct")):+.2f}%" if row.get("gap_pct") is not None else "-"}</td>'
@@ -32053,18 +32136,19 @@ def render_trade_panel(state: PageState) -> str:
             f'<td>{_dhan_metric_float(row.get("technical_score")):.1f}<small>Pre-market {_dhan_metric_float(row.get("premarket_score") or row.get("rank_score")):.1f}</small></td>'
             f'<td>{f"{_dhan_metric_float(row.get("live_entry_score")):.1f}" if row.get("live_entry_score") is not None else "-"}<small>Combined {f"{_dhan_metric_float(row.get("combined_score")):.1f}" if row.get("combined_score") is not None else "Not executable"}</small></td>'
             f'<td>{f"{_dhan_metric_float(row.get("net_credit_yield_pct")):.2f}%" if row.get("net_credit_yield_pct") is not None else "Unresolved"}</td>'
+            f'<td>{f"₹{float(row["scan_max_profit"]):,.2f}" if row.get("scan_max_profit") is not None else "Unavailable"}<small>{str(row.get("scan_profit_quantity")) + " qty · 1 lot · before hedge/fees" if row.get("scan_profit_quantity") else "Recalculate for verified quantity/quote"}</small></td>' 
             f'<td><span class="ipo-badge {"good" if row.get("eligible") else "neutral" if index < 3 else "bad"}">{"ELIGIBLE" if row.get("eligible") else "TOP 3 · RESEARCH ONLY" if index < 3 else "BLOCKED"}</span><small>{html.escape(str(row.get("risk_note") or row.get("error") or ""))}</small></td>'
             f'<td><button type="submit" class="mini-link" form="trade-terminal-panel" formmethod="post" formaction="/trade/best/select" formnovalidate data-trade-best-open name="trade_best_symbol" value="{html.escape(str(row.get("symbol") or ""), quote=True)}"{"" if best_trade_research_access(row, index) else " disabled"}>{"Open stock" if row.get("eligible") else "Research stock"}</button></td>'
             "</tr>"
             for index, row in enumerate(best_scan_rows)
-        ) or '<tr><td colspan="14">No configured stock produced a verified candidate. Recalculate after Kite data is available.</td></tr>'
+        ) or '<tr><td colspan="15">No configured stock produced a verified candidate. Recalculate after Kite data is available.</td></tr>'
         best_scan_modal = f'''<div class="live-modal-backdrop visible" id="trade-best-modal"><div class="live-modal dhan-order-modal-card trade-best-modal-card">
-          <div class="trade-best-heading"><div class="trade-best-title-row"><h2>BEST for TRADE — Daily Market Scan{' · TEST' if state.trade_test_mode else ''}</h2><label class="trade-best-mode"><span>Mode</span><select id="trade-best-mode" aria-label="Trade execution mode"><option value="PAPER"{" selected" if state.trade_mode == "PAPER" else ""}>PAPER</option><option value="LIVE"{" selected" if state.trade_mode == "LIVE" else ""}{" disabled" if state.trade_test_mode else ""}>LIVE</option></select></label><a class="button-link secondary" href="/trade/execution?kite_profile={html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}">EXECUTION</a></div><p class="status">Saved {html.escape(str(best_scan.get("scan_date") or app_now().date()))} · generated {html.escape(str(best_scan.get("created_at") or "unknown"))} · Advisory only</p></div>
+          <div class="trade-best-heading"><div class="trade-best-title-row"><h2>BEST for TRADE — Daily Market Scan{' · TEST' if state.trade_test_mode else ''}</h2><label class="trade-best-mode"><span>Eligibility</span><select id="trade-best-eligible-filter" aria-label="Filter trade eligibility"><option value="ALL">All results</option><option value="ELIGIBLE">ELIGIBLE only</option></select></label><label class="trade-best-mode"><span>Mode</span><select id="trade-best-mode" aria-label="Trade execution mode"><option value="PAPER"{" selected" if state.trade_mode == "PAPER" else ""}>PAPER</option><option value="LIVE"{" selected" if state.trade_mode == "LIVE" else ""}{" disabled" if state.trade_test_mode else ""}>LIVE</option></select></label><a class="button-link secondary" href="/trade/execution?kite_profile={html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}">EXECUTION</a><div class="trade-best-top-actions"><button type="submit" form="trade-terminal-panel" class="danger" formaction="/trade/best/recalculate" formnovalidate>Recalculate pre-market</button><button type="submit" form="trade-terminal-panel" class="success" formaction="/trade/best/live" formnovalidate>Refresh live opportunities</button></div></div><p class="status">Saved {html.escape(str(best_scan.get("scan_date") or app_now().date()))} · generated {html.escape(str(best_scan.get("created_at") or "unknown"))} · Advisory only</p></div>
           <div class="income-equity-order-summary"><strong>Ranking:</strong> pre-market score uses fixed 30/20/15/15/20 component weights. Live score is separate; combined ranking appears only when mandatory data and capital/risk inputs are complete. Model OTM probability is a constant-IV lognormal estimate, not historical POP. The top three may continue for research even when blocked.</div>
           <div class="trade-best-toolbar"><div class="trade-best-view-tabs"><button type="button" data-trade-best-view="PREMARKET">PRE-MARKET</button><button type="button" data-trade-best-view="LIVE">LIVE OPPORTUNITIES</button><button type="button" data-trade-best-view="MISSED">MISSED / WAIT</button><button type="button" data-trade-best-view="ALL" class="active">ALL STOCKS</button></div><div class="trade-best-filters"><label><span>Stock source</span><select id="trade-best-source-filter"><option value="ALL">ALL</option><option value="DHAN">DHAN</option><option value="DHAN_IT">DHAN-IT</option><option value="MANUAL">Manual / Uploaded</option></select></label><span id="trade-best-source-count" class="status"></span></div></div>
-          <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Stock</th><th>Source</th><th>Direction</th><th>Gap %</th><th>Prev / Live</th><th>Prev Option</th><th>Live Bid/Ask</th><th>Delta / IV</th><th>OI / Volume</th><th>Technical</th><th>Live Score</th><th>Net Credit Yield</th><th>Status</th><th>Open</th></tr></thead><tbody>{best_rows_html}</tbody></table></div>
+          <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Stock</th><th>Source</th><th>Direction</th><th>Gap %</th><th>Prev / Live</th><th>Prev Option</th><th>Live Bid/Ask</th><th>Delta / IV</th><th>OI / Volume</th><th>Technical</th><th>Live Score</th><th>Net Credit Yield</th><th id="trade-best-profit-heading" aria-sort="none"><button type="button" id="trade-best-profit-sort" title="Sort gross short-leg max profit; excludes hedge costs and fees">Max profit (gross) ↕</button></th><th>Status</th><th>Open</th></tr></thead><tbody>{best_rows_html}</tbody></table></div>
           <div class="trade-best-pagination"><label>Results per page <select id="trade-best-page-size"><option value="10">10</option><option value="20">20</option><option value="ALL">All</option></select></label><span id="trade-best-page-info" class="status" aria-live="polite"></span><button type="button" class="secondary" id="trade-best-prev">Previous</button><button type="button" class="secondary" id="trade-best-next">Next</button></div>
-          <div class="modal-actions"><button type="button" class="secondary" id="trade-best-close">Close</button><button type="submit" class="danger" formaction="/trade/best/recalculate" formnovalidate>Recalculate pre-market</button><button type="submit" class="success" formaction="/trade/best/live" formnovalidate>Refresh live opportunities</button></div>
+          <div class="modal-actions"><button type="button" class="secondary" id="trade-best-close">Close</button></div>
         </div></div>'''
     if preview:
         score = float(preview.get("decision_score") or 0)
@@ -32508,6 +32592,13 @@ def render_position_close_schedule_panel() -> str:
     return (
         '<section class="panel scheduled-position-close-panel">'
         '<div class="panel-title">Scheduled Default Close Orders</div>'
+        '<div class="compact-grid">'
+        f'<label><span>BUY close: % below reference</span><input type="number" name="scheduler_buy_discount" min="0" max="99.99" step="0.01" value="{discount_percent:g}"></label>'
+        f'<label><span>SELL close: % above reference</span><input type="number" name="scheduler_sell_markup" min="0" max="99.99" step="0.01" value="{position_close_sell_markup_percent_setting():g}"></label>'
+        f'<label><span>NIFTY BUY close: % below CMP</span><input type="number" name="nifty_close_buy_discount" min="0" max="99.99" step="0.01" value="{nifty_close_percent_setting("BUY"):g}"></label>'
+        f'<label><span>NIFTY SELL close: % above CMP</span><input type="number" name="nifty_close_sell_markup" min="0" max="99.99" step="0.01" value="{nifty_close_percent_setting("SELL"):g}"></label>'
+        '</div><button type="submit" formaction="/positions/close-pricing" formnovalidate>Save close-order percentages</button>'
+        '<p class="status">Shared by both close-order jobs. NIFTY uses its separate CMP percentages for normal closes; emergency risk-exit rules take priority. Saving does not place or modify orders. STOP OPTION SELL and risk-exit rules remain active.</p>' 
         '<div class="position-summary-strip">'
         '<div class="position-summary-chip"><span>Schedule</span><strong>09:20 IST</strong></div>'
         f'<div class="position-summary-chip"><span>Profile</span><strong>{html.escape(str(schedule.get("profile") or selected_kite_profile_name()))}</strong></div>'
@@ -32531,7 +32622,7 @@ def render_position_close_schedule_panel() -> str:
         f'<p class="status">{html.escape(str(intraday.get("message") or ""))} '
         f"Short CE/PE positions: BUY at {discount_percent:g}% below the lower of "
         "fresh LTP or average entry price. "
-        f"Long CE/PE positions, including NIFTY covers: SELL at {discount_percent:g}% above "
+        f"Other long CE/PE positions: SELL at {position_close_sell_markup_percent_setting():g}% above "
         "the higher of fresh LTP or average entry price only when STOP OPTION SELL is turned off; by default SELL close orders are blocked. Existing matching close-side orders are preserved. "
         "Risk override: when a short CE/PE premium loss reaches 100%, the loss-limit path can act immediately. "
         f"Hard-stop price execution starts only when trading DTE is {intraday_hard_stop_start_dte_setting()} or fewer; "
@@ -35885,7 +35976,8 @@ def render_page(state: PageState) -> bytes:
     active_kite_profile = selected_kite_profile_name(state.kite_profile)
     active_kite_values = kite_profiles.get(active_kite_profile, blank_kite_profile(active_kite_profile))
     profile_visible_tabs = kite_profile_visible_tabs(active_kite_profile, kite_profiles)
-    if state.active_tab not in profile_visible_tabs:
+    visibility_tab = "positions" if state.active_tab == "positions-research" else state.active_tab
+    if visibility_tab not in profile_visible_tabs:
         state.active_tab = "kite-setup"
         if not state.message and not state.error:
             state.message = (
@@ -36004,7 +36096,7 @@ def render_page(state: PageState) -> bytes:
             tab_button("pnl", "P&amp;L", pnl_tab_class),
             tab_button("income-growth", "Income Growth", income_growth_tab_class),
             tab_button("income", "INCOME", income_tab_class),
-            tab_button("nifty-2", "Nifty Income", "") if nifty_income_enabled else "",
+            tab_button("nifty-2", "NIFTY", "") if nifty_income_enabled else "",
             tab_button("nifty-income", "Nifty Income Legacy", nifty_income_tab_class)
             if nifty_income_enabled
             else "",
@@ -38816,10 +38908,12 @@ def render_page(state: PageState) -> bytes:
       --tab-ink: #0369a1;
       --tab-shadow: rgba(2, 132, 199, 0.14);
     }}
-    .tab-button[data-tab="trade"] {{
-      border-color: #0f766e;
-      background: linear-gradient(135deg, #0f766e, #0369a1);
-      color: #ffffff;
+    .tab-button[data-tab="trade"],
+    .tab-button[data-tab="nifty-2"] {{
+      --tab-ink: #115e59;
+      border-color: #99dcd5;
+      background: linear-gradient(135deg, #ccfbf1, #e0f2fe);
+      color: #115e59;
     }}
     .tab-button[data-tab="income"] {{
       --tab-a: #bbf7d0;
@@ -43179,6 +43273,7 @@ def render_page(state: PageState) -> bytes:
     .trade-best-heading .status {{ margin:0; font-size:10px; }}
     .trade-best-modal-card > .income-equity-order-summary {{ margin:6px 0; padding:7px 10px; font-size:11px; line-height:1.3; text-align:left; }}
     .trade-best-toolbar {{ display:flex; align-items:end; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:7px 0; }}
+    .trade-best-top-actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
     .trade-best-filters {{ display:flex; align-items:end; gap:8px; margin:0; }}
     .trade-best-filters label {{ display:flex; align-items:center; gap:6px; min-width:0; margin:0; }}
     .trade-best-filters label span {{ white-space:nowrap; font-size:10px; }}
@@ -43710,18 +43805,16 @@ def render_page(state: PageState) -> bytes:
       if (niftyGrowEnabled) {{
         niftyGrowEnabled.checked = Boolean(profile.NIFTY_GROW_ENABLED);
       }}
-      const savedVisibleTabs = Array.isArray(profile.VISIBLE_TABS) && profile.VISIBLE_TABS.length
+      const savedVisibleTabs = Array.isArray(profile.VISIBLE_TABS)
         ? profile.VISIBLE_TABS
         : defaultProfileVisibleTabs;
       const visibleTabs = new Set(savedVisibleTabs);
       for (const tabId of alwaysProfileVisibleTabs) {{
         visibleTabs.add(tabId);
       }}
-      if (profile.NIFTY_INCOME_ENABLED) visibleTabs.add('nifty-income');
-      if (profile.NIFTY_INCOME_ENABLED) visibleTabs.add('nifty-2');
-      if (profile.NIFTY_GROW_ENABLED) visibleTabs.add('nifty-grow');
       for (const checkbox of profileTabChoices) {{
         checkbox.checked = visibleTabs.has(checkbox.value);
+        checkbox.disabled = alwaysProfileVisibleTabs.includes(checkbox.value);
       }}
       updateKiteLoginLink(profile.KITE_API_KEY);
       const ready = Boolean(
@@ -46481,12 +46574,16 @@ def render_page(state: PageState) -> bytes:
     }}
     const tradeBestClose = document.getElementById('trade-best-close');
     const tradeBestSourceFilter = document.getElementById('trade-best-source-filter');
+    const tradeBestEligibleFilter = document.getElementById('trade-best-eligible-filter');
+    if (tradeBestEligibleFilter) tradeBestEligibleFilter.value = window.sessionStorage.getItem('tradeBestEligibility') === 'ELIGIBLE' ? 'ELIGIBLE' : 'ALL';
     const tradeBestSourceCount = document.getElementById('trade-best-source-count');
     const tradeBestViewButtons = Array.from(document.querySelectorAll('[data-trade-best-view]'));
     const tradeBestPageSize = document.getElementById('trade-best-page-size');
     const tradeBestPageInfo = document.getElementById('trade-best-page-info');
     const tradeBestPrev = document.getElementById('trade-best-prev');
     const tradeBestNext = document.getElementById('trade-best-next');
+    let tradeBestProfitSort = '';
+    const tradeBestProfitButton = document.getElementById('trade-best-profit-sort');
     let tradeBestPage = 1;
     if (tradeBestPageSize) {{
       const savedSize = window.sessionStorage.getItem('tradeBestPageSize');
@@ -46503,8 +46600,18 @@ def render_page(state: PageState) -> bytes:
       const matching = rows.filter(row => {{
         const sourceMatch = selected === 'ALL' || String(row.dataset.tradeSource || '') === selected;
         const viewMatch = tradeBestView === 'ALL' || String(row.dataset.tradeView || '') === tradeBestView;
-        return sourceMatch && viewMatch;
+        const eligibleMatch = !tradeBestEligibleFilter || tradeBestEligibleFilter.value !== 'ELIGIBLE' || row.dataset.tradeEligible === 'true';
+        return sourceMatch && viewMatch && eligibleMatch;
       }});
+      if (tradeBestProfitSort) matching.sort((a,b) => {{
+        const av = a.dataset.tradeMaxProfit === '' ? null : Number(a.dataset.tradeMaxProfit);
+        const bv = b.dataset.tradeMaxProfit === '' ? null : Number(b.dataset.tradeMaxProfit);
+        if(av===null && bv===null)return 0;
+        if(av===null)return 1;if(bv===null)return -1;
+        return tradeBestProfitSort==='desc' ? bv-av : av-bv;
+      }});
+      // Reorder the actual rows as well as the pagination slice.
+      matching.forEach(row => row.parentElement.appendChild(row));
       const sizeChoice = tradeBestPageSize ? tradeBestPageSize.value : '10';
       const pageSize = sizeChoice === 'ALL' ? Math.max(1, matching.length) : Number(sizeChoice);
       const pages = Math.max(1, Math.ceil(matching.length / pageSize));
@@ -46519,6 +46626,18 @@ def render_page(state: PageState) -> bytes:
       if (tradeBestPrev) tradeBestPrev.disabled = tradeBestPage <= 1;
       if (tradeBestNext) tradeBestNext.disabled = tradeBestPage >= pages;
     }};
+    tradeBestProfitButton && tradeBestProfitButton.addEventListener('click', () => {{
+      tradeBestProfitSort = tradeBestProfitSort === 'desc' ? 'asc' : 'desc';
+      tradeBestPage = 1;
+      tradeBestProfitButton.textContent = 'Max profit (gross) ' + (tradeBestProfitSort==='desc'?'↓':'↑');
+      document.getElementById('trade-best-profit-heading').setAttribute('aria-sort',tradeBestProfitSort==='desc'?'descending':'ascending');
+      applyTradeBestSourceFilter();
+    }});
+    tradeBestEligibleFilter && tradeBestEligibleFilter.addEventListener('change', () => {{
+      tradeBestPage = 1;
+      window.sessionStorage.setItem('tradeBestEligibility', tradeBestEligibleFilter.value);
+      applyTradeBestSourceFilter();
+    }});
     tradeBestSourceFilter && tradeBestSourceFilter.addEventListener('change', () => {{
       tradeBestPage = 1;
       window.sessionStorage.setItem('tradeBestSourceFilter', tradeBestSourceFilter.value);
@@ -47390,7 +47509,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             kite_profile=selected_kite_profile_name(first(form, "kite_profile")),
             nifty_income_enabled=checked(form, "nifty_income_enabled"),
             nifty_grow_enabled=checked(form, "nifty_grow_enabled"),
-            profile_visible_tabs=normalize_profile_visible_tabs(form.get("profile_visible_tabs")),
+            profile_visible_tabs=normalize_profile_visible_tabs(form.get("profile_visible_tabs", [])),
             position_dry_run=checked(form, "position_dry_run"),
             position_discount_percent=float(
                 first(
@@ -47851,6 +47970,19 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 )
                 state.position_selected_indexes = set(range(len(state.position_orders)))
                 state.message = f"Loaded {len(state.position_orders)} close order(s) from current positions."
+            elif request_path == '/positions/close-pricing':
+                buy = float(first(form, 'scheduler_buy_discount'))
+                sell = float(first(form, 'scheduler_sell_markup'))
+                nifty_buy = float(first(form, 'nifty_close_buy_discount', str(nifty_close_percent_setting("BUY"))))
+                nifty_sell = float(first(form, 'nifty_close_sell_markup', str(nifty_close_percent_setting("SELL"))))
+                if not all(0 <= value < 100 for value in (buy, sell, nifty_buy, nifty_sell)):
+                    raise ValueError('BUY discount and SELL markup must be between 0 and 100 (exclusive).')
+                save_app_settings({'position_close_discount_percent':buy,
+                                   'position_close_sell_markup_percent':sell,
+                                   'nifty_close_buy_discount_percent':nifty_buy,
+                                   'nifty_close_sell_markup_percent':nifty_sell})
+                state.position_discount_percent = buy
+                state.message = f'Both close-order jobs now use BUY {buy:g}% below and SELL {sell:g}% above their reference prices. NIFTY: BUY {nifty_buy:g}% below CMP, SELL {nifty_sell:g}% above CMP. Existing orders unchanged.'
             elif request_path == "/positions/settings":
                 state.message = (
                     f"BUY Preview discount saved at {state.position_discount_percent:g}%. "

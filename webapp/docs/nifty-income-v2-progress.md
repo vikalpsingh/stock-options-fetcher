@@ -710,3 +710,40 @@ Overall NIFTY 2.0 remains incomplete; continuation automation is still needed.
 - Four focused temporary-DB/mocked tests passed (0.72s), including fresh approvals
   with insufficient/unknown funds and BUY-only duplicate protection. Source compiles.
   No live orders, app import, runtime edits or full suite.
+
+## 2026-10-22 Position close pricing configuration
+- Added BUY-below and SELL-above inputs and Save in Scheduled Default Close Orders.
+  BUY uses existing saved discount; SELL has separate position_close_sell_markup_percent
+  with legacy discount fallback until explicitly saved. Values validated 0 <= pct <100.
+- Daily job now includes long closes only when STOP OPTION SELL is off; shared fresh
+  repricer uses SELL markup above max(LTP,entry) and BUY discount on its existing
+  reference. Intraday missing-close builder uses separate SELL markup too. Existing
+  hard-stop BUY discount/DTE/emergency controls remain. Zero BUY discount now honored.
+- Three focused AST-extracted helper/settings checks passed, no app import/runtime
+  changes/broker calls. New UI/function compilation passed; no full suite.
+
+
+### 2026-10-22 — Completed Orders row P&L
+- Completed Orders Current P&L now uses each order filled quantity with displayed position average and LTP, signed by the current position (long LTP-minus-average; short average-minus-LTP, including closing BUY orders). Never copies aggregate contract P&L.
+- Cancelled/rejected rows display zero in both P&L columns, without changing booked accounting records. Unknown position basis remains N/A. Open orders unchanged.
+- Validation: 3 isolated helper tests passed; renderer compiled. No app import, runtime mutation, or broker calls.
+
+
+### 2026-10-22 — Profile tab selection fixes
+- Removed server/client Nifty feature-flag auto-selection that resurrected explicitly hidden tabs. Separate feature enablement remains required for Nifty navigation and execution.
+- Explicit empty selections retain only Home/Kite Setup; missing legacy configuration retains defaults. Required checkboxes are locked in the browser and restored server-side. Positions research uses its parent Position visibility.
+- Validation: 3 isolated profile visibility tests passed; app source compiled without importing it. No runtime settings changed or broker calls made.
+
+
+### 2026-10-22 — NIFTY CMP close percentages
+- Added saved NIFTY BUY-below-CMP and SELL-above-CMP controls to the existing close-pricing form. Both scheduled default pricing and intraday missing-close pricing use one shared helper, exact NIFTY index symbols only. Defaults inherit current general percentages until saved.
+- Normal closes use fresh LTP/CMP with directional tick rounding. Existing intraday emergency pricing, probability gates and STOP OPTION SELL remain in force. Saving does not modify existing orders or enable jobs.
+- Validation: 6 focused isolated tests passed and app source compiled without import. No broker API calls or runtime data edits.
+
+
+### 2026-10-22 — Protected PE/CE pair optimizer milestone
+- Added nifty_options_engine/optimizer.py: five 100-point short candidates per side, listed same-expiry 300-point hedges with explicit wider fallback, batched quote-key collection, OTM/freshness/depth screening, transparent liquidity/credit-efficiency/OTM score, and up to 25 independently risk-validated condors. All risk/cost/payoff metrics reuse build_ticket; no new execution engine.
+- service.py includes candidate symbols in existing batched quotes. page.py integrates initial/default automatic selection, explicit Refresh Preview and Auto Select Best, manual preservation, and review invalidation on contract/structure/lot changes or explicit refresh. Active/submitted executions are not cleared.
+- ui.py adds two compact scrollable comparison tables with credit, cost-adjusted max profit/loss, reward/risk, day-color quotes, selection/recommendation, rejection reasons and expandable depth. Missing executable quotes show N/A. Existing four-leg ticket, LIVE acknowledgement, countdown, and hedge-first execution retained.
+- Focused validation: 9 checks passed (optimizer + existing simulated durable hedge/fill test); after scoring/UI detail refinement, all 8 optimizer tests passed again. Four changed modules compile. Tests use synthetic data and temporary DBs; no broker calls. Existing unrelated app.py trailing whitespace reported by git diff --check, not expanded into cleanup.
+- Known limits: optional Greeks, directional regime, expected-move and event score inputs are not yet connected; explicitly flagged and receive zero (score currently max 70/100). Existing aggregate conservative execution cost estimate is reused, not a fabricated brokerage/statutory/slippage breakdown. Broker margin remains the previously authorized advisory policy and final broker acceptance; per-candidate broker margin requests are not made. Browser visual QA remains outstanding. No LIVE tests or orders.

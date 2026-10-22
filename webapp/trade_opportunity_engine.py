@@ -146,3 +146,18 @@ class TradeOpportunityRepository:
         with self.connect() as conn:
             cur = conn.execute("INSERT INTO trade_opportunity_snapshot(account_id,trade_date,created_at,mode,rows_json) VALUES(?,?,?,?,?)", (account_id, trade_date, datetime.now(IST).isoformat(timespec="seconds"), mode, json.dumps(rows, default=str)))
             return int(cur.lastrowid)
+
+
+def scan_max_profit(bid, ask, lot_size):
+    """Gross short-leg expiry profit for one current master lot, before hedge/fees.
+
+    Scan has no confirmed hedge/cover yet: this is not protected-strategy net profit
+    and must never alter eligibility or risk approval. No LTP fallback.
+    """
+    try:
+        bid, ask, quantity = float(bid), float(ask), float(lot_size)
+        if not all(math.isfinite(n) for n in (bid,ask,quantity)) or not 0 < bid <= ask or quantity <= 0 or not quantity.is_integer():
+            return None
+        return round(bid*int(quantity),2)
+    except (ValueError,TypeError):
+        return None

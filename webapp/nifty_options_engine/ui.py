@@ -237,9 +237,43 @@ def nearer_liquidity_form(data):
     return result+'</details>'
 
 
+def spread_comparison(side, rows, selection, context):
+    result = '<h3>Best '+side+' SELL + Protective BUY</h3><div class="pair-table" id="pair-table-'+e(side)+'"><table><thead><tr>'
+    headings = ('Select','Position','SELL','BUY hedge','Width','OTM %','SELL / BUY quotes','Credit pts','Credit INR','Credit % width','Net max profit','Max loss','Reward/risk','Score /100','Status')
+    result += ''.join('<th>'+e(h)+'</th>' for h in headings)+'</tr></thead><tbody>'
+    for row in rows:
+        short, hedge, ticket = row['short'], row['hedge'], row['ticket']
+        selected = short and short['tradingsymbol']==selection.get('short_'+side.lower()) and hedge and hedge['tradingsymbol']==selection.get('hedge_'+side.lower())
+        executable = ticket and not any('bid/ask' in reason or 'PREVIEW_ONLY' in reason for reason in row['reasons'])
+        qty = ticket['legs'][0]['quantity'] if ticket and ticket['legs'] else 0
+        credit = ticket['net_credit'] if executable else None
+        pts = credit/qty if credit is not None and qty else None
+        visibility = '' if selected else ' data-pair-alternative hidden'
+        result += '<tr'+visibility+' class="'+('pair-selected' if selected else '' if row['eligible'] else 'pair-blocked')+'"><td>'
+        if row['eligible']:
+            result += f'<button type="button" data-liquid-side="{side.lower()}" data-short="{e(short["tradingsymbol"])}" data-hedge="{e(hedge["tradingsymbol"])}">'+('Selected' if selected else 'Select')+'</button>'
+        result += '</td>'
+        values = [row['label'], row['strike'], hedge['strike'] if hedge else 'N/A',row.get('width','N/A'),f'{row["otm"]:.2f}' if row['otm'] is not None else 'N/A']
+        result += ''.join('<td>'+e(v)+'</td>' for v in values)
+        quotes = [context['quotes'].get('NFO:'+r['tradingsymbol'],{}) if r else {} for r in (short,hedge)]
+        result += '<td>'+''.join(contract_quote(q) for q in quotes)+'</td>'
+        values = [money(pts),money(credit),f'{pts/row["width"]*100:.2f}%' if pts is not None else 'N/A',
+                  money(ticket['net_max_profit']) if executable else 'N/A',money(ticket['max_loss']) if executable else 'N/A',
+                  f'{row["reward_risk"]:.3f}' if executable and row.get('reward_risk') is not None else 'N/A', row['score'],
+                  'RECOMMENDED' if row.get('recommended') and not selected else 'SELECTED' if selected and row['eligible'] else 'PASS' if row['eligible'] else 'BLOCKED']
+        result += ''.join('<td>'+e(v)+'</td>' for v in values)+'</tr><tr'+visibility+'><td colspan="15"><details><summary>Liquidity / checks / scoring</summary><p>'+e('; '.join(row['reasons']) or 'Mandatory checks and displayed depth passed')+'</p><p>'+e(row['confidence'])+'</p>'
+        for label, quote in zip(('SELL','BUY'), quotes):
+            result += '<p>'+e(label+' exchange timestamp: '+str(quote.get('timestamp') or 'Unavailable'))+'</p><pre>'+e(str({'depth':quote.get('depth'), 'OI':quote.get('oi'), 'volume':quote.get('volume')}))+'</pre>'
+        result += '<p>Score: execution 25 + credit efficiency 25 + OTM distance 20. Missing optional factors earn zero. Costs use the existing conservative combined estimate.</p></details></td></tr>'
+    has_selection = any(r['short'] and r['hedge'] and r['short']['tradingsymbol']==selection.get('short_'+side.lower()) and r['hedge']['tradingsymbol']==selection.get('hedge_'+side.lower()) for r in rows)
+    if not has_selection:
+        result += '<tr><td colspan="15">No selected pair in these candidates. Show more to review alternatives.</td></tr>'
+    return result+'</tbody></table></div>'+f'<button type="button" data-pair-toggle="pair-table-{e(side)}" aria-controls="pair-table-{e(side)}" aria-expanded="false">Show more · all {e(side)} options</button>'
+
+
 def desk_header(account, tabs):
     routes = {'place':'/', 'order-management':'/orders', 'nifty-income':'/nifty-income/legacy'}
-    links = ''.join(f'<a class="desk-tab {"active" if key=="nifty-2" else ""}" href="{e(routes.get(key,"/"+key))}"'+(' aria-current="page"' if key=='nifty-2' else '')+f'>{e(label)}</a>' for key,label in tabs)
+    links = ''.join(f'<a class="desk-tab {"active" if key=="nifty-2" else ""}" data-tab="{e(key)}" href="{e(routes.get(key,"/"+key))}"'+(' aria-current="page"' if key=='nifty-2' else '')+f'>{e(label)}</a>' for key,label in tabs)
     return ('<header class="desk-header"><div class="desk-header-inner"><div class="desk-brand"><div class="desk-mark">विकल्प</div><div><h1>Income Desk</h1><p>Wheel income, positions, ETF actions, and calm execution.</p><div class="desk-profile">Kite profile: <strong>'+e(account)+'</strong></div></div></div><div class="desk-blessing">ॐ | Jai Sri Ram | Jai Laxmi Mata</div><p class="desk-quote">&quot;Trade money for time, not time for money. You’re going to run out of time first.&quot; <strong>— Naval</strong></p></div></header><main><nav class="desk-tabs" aria-label="Income Desk tabs">'+links+'</nav>')
 
 
@@ -266,7 +300,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
         movement_text = 'Unavailable' if movement is None else f'{movement:+,.2f} points ({movement/previous*100:+.2f}%)'
         tone = 'pass' if movement is not None and movement>0 else 'block' if movement is not None and movement<0 else ''
         body += f'<div class="metric"><small>NIFTY today · vs previous close</small><strong class="{tone}">{e(movement_text)}</strong></div>'
-        body += '<div class="metric"><small>Market Mood Index</small><strong id="nifty-mmi-value">Loading…</strong><span id="nifty-mmi-zone"></span><span id="nifty-mmi-signal"> | Signal: Checking…</span></div>'
+        body += '</div><div class="mmi-focus" id="nifty-mmi-panel" data-mood="unknown" aria-label="Market Mood Index decision context"><div class="mmi-heading"><div><span class="mmi-eyebrow">MARKET SENTIMENT</span><h3>Market Mood Index</h3></div><span id="nifty-mmi-zone">Checking sentiment</span></div><div class="mmi-content"><div class="mmi-reading"><strong id="nifty-mmi-value" aria-live="polite">Loading…</strong><span> / 100</span></div><div class="mmi-decision"><small>Current strategy signal</small><strong id="nifty-mmi-signal" aria-live="polite">Checking…</strong><span>Sentiment context · confirm with price action and risk checks</span></div><div class="mmi-scale-wrap"><div class="mmi-scale" role="meter" aria-label="Market Mood Index from fear to greed" aria-valuemin="0" aria-valuemax="100" id="nifty-mmi-meter"><span id="nifty-mmi-marker" hidden></span></div><div class="mmi-scale-labels"><span>0 · Fear</span><span>50</span><span>Greed · 100</span></div></div></div>'
         body += f'</div><p class="snapshot-meta">Data refreshed {e(__import__('app_time').to_ist(context["now"]).strftime('%d %b %Y %H:%M:%S IST'))}. Mode: <b>{e(selection["mode"])}</b>.</p></section>'
         body += active_positions_section(data)
         body += '<section><h2>New protected trade</h2><p>Choose contracts, refresh the preview, then save a review. Changing a ticket requires a new review.</p><form method="post" action="/nifty-2/preview"><div class="fields">'
@@ -281,10 +315,18 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
             f'<label><input type="radio" name="lots" value="{n}" {"checked" if str(n)==str(selection["lots"]) else ""} required>{n}</label>'
             for n in data['config'].get('allowed_lots', [1,2,3,4]) if n <= data['config']['maximum_lots_per_new_trade']) + '</fieldset>'
         body += '</div>'
+        body += select('auto_best', 'Auto Select Best', [('yes','ON'),('no','OFF')], 'yes' if selection.get('auto_best',True) else 'no')
+        for side in ('pe','ce'):
+            body += f'<input type="hidden" name="base_{side}" value="{e(selection.get("base_"+side,""))}">'
+        for side, rows in (data.get('optimizer') or {}).get('tables',{}).items():
+            body += spread_comparison(side, rows, selection, context)
+            if not (data.get('optimizer') or {}).get('chosen',{}).get(side):
+                body += '<p class="block">'+side+(': Maximum quoted net-credit fallback selected for preview. Review all blocking checks before execution.' if (data.get('optimizer') or {}).get('fallback',{}).get(side) else ': NO_ELIGIBLE_SPREAD')+'</p>'
+        body += '<p>Last recalculated '+e(__import__('app_time').to_ist(context['now']).strftime('%H:%M:%S IST'))+'</p>'
         for kind in ('PE','CE'):
             body += f'<div class="spread-row"><h4>{kind} SELL + protective BUY</h4>'
             contracts = [row for row in data['instruments'] if row['instrument_type']==kind and str(row['expiry'])[:10]==selection['expiry']]
-            choices = []
+            choices = [('', 'Select a contract / no eligible automatic spread')]
             for row in contracts:
                 spot = float(context.get('spot') or 0)
                 otm = ((spot-float(row['strike'])) if kind=='PE' else (float(row['strike'])-spot))/spot*100 if spot else 0
@@ -299,7 +341,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
             for candidate in (data.get('liquid_alternatives') or {}).get(kind, []):
                 body += f'<button type="button" data-liquid-side="{kind.lower()}" data-short="{e(candidate["short"])}" data-hedge="{e(candidate["hedge"])}">Review liquid pair: {e(candidate["short"])} + {e(candidate["hedge"])}</button>'
             body += '</div>'
-        body += '<div class="actions"><button>Refresh preview / expiry contracts</button><button formaction="/nifty-2/review">Save order review</button><button formaction="/nifty-2/review" name="open_ticket" value="yes">EXECUTE</button><button formaction="/nifty-2/save-mode">Save mode for today</button></div></form><div class="metrics">'
+        body += '<div class="actions"><button name="optimize" value="yes">Refresh Preview</button><button name="optimize" value="force">Auto Select Best</button><button formaction="/nifty-2/review">Save order review</button><button formaction="/nifty-2/review" name="open_ticket" value="yes">EXECUTE</button><button formaction="/nifty-2/save-mode">Save mode for today</button></div></form><div class="metrics">'
         for label, value in [('Executable credit',ticket['net_credit']), ('Estimated costs',ticket['estimated_fees']), ('Net max profit',ticket['net_max_profit']), ('Max loss incl. costs',ticket['max_loss']), ('Projected portfolio loss',ticket['risk']['projected_portfolio_max_loss']), ('Broker margin',ticket['broker_margin'])]:
             body += card(label,money(value))
         body += '</div><p>Saved mode for today: <b>'+e(data.get('saved_day_mode', 'PAPER'))+'</b>. Resets to PAPER at midnight IST; LIVE permission and confirmations remain required.</p>'
@@ -397,10 +439,10 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
 #order-ticket{width:min(810px,94vw);padding:24px 14px 0;border:0;border-radius:14px}#order-ticket header{justify-content:center;position:relative}#ticket-title{font-size:28px;margin:8px 0 24px}#close-ticket{position:absolute;right:0;top:0;background:transparent;color:#405166;border:0}#order-ticket article{border:0;padding:0;margin:0;overflow:visible}#order-ticket article>h3,#order-ticket article>h3+p{font-size:12px;color:#60718b}.ticket-mindset{background:#eff6ff;border:1px solid #8db8ff;border-radius:10px;padding:14px 18px;color:#244493;text-align:center;font-weight:750}.ticket-intro{text-align:center;font-size:14px}.risk-heading{text-align:center;font-size:15px;color:#008679}.risk-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.risk-cell{border:1px solid #b1e5e8;background:#f7fafb;border-radius:10px;padding:12px;text-align:center}.risk-cell small{font-size:12px;font-weight:800;color:#647792}.risk-cell strong{display:block;font-size:20px;color:#0c394b;margin-top:8px}.risk-fail,.risk-banner{background:#fee2e2!important;color:#a91515!important}.risk-pass{background:#d8f5e9}.risk-banner{text-align:center;padding:10px;font-weight:750;border-radius:5px}.spread-choices{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}.spread-choice{display:flex;align-items:center;gap:16px;border:1px solid #c8d5e5;background:#f1f5f9;border-radius:9px;padding:12px;text-align:center}.spread-choice>div{flex:1}.spread-choice p{margin:5px 0}.spread-choice.selected{border-color:#45d6bd;background:#ecfdf5}.coverage{background:#f0fdfa;border:1px solid #91e7da;border-radius:10px;padding:14px;margin:18px 0;color:#087b72}.ticket-footer{position:sticky;bottom:0;background:#f1f5f9;padding:14px 0;display:flex;gap:10px;justify-content:center;z-index:2;border-top:1px solid #d8e3ed}#ticket-cancel{background:#4b5563}#ticket-refresh{background:#137d89}#ticket-go{background:#a52525}#order-ticket .refresh-ticket,#order-ticket [data-countdown]{display:none}@media(max-width:550px){.risk-grid{grid-template-columns:1fr 1fr}.ticket-footer{flex-wrap:wrap}.spread-choices{grid-template-columns:1fr}}
 .inactive-leg{opacity:.55}.ticket-legs td{padding:7px;overflow-wrap:anywhere}.contract-card{border:3px solid #94a3b8;border-radius:9px;padding:14px}.contract-green{border-color:#15803d}.contract-red{border-color:#dc2626}.contract-neutral{border-color:#94a3b8}.partial{color:#92400e}.positions-table{table-layout:fixed}.positions-table td{overflow-wrap:anywhere;padding:7px}.positions-table button{padding:6px}@media(max-width:900px){.positions-table .detail{display:none}.positions-table{min-width:0;font-size:12px}}
 
-:root{--ink:#17202a;--muted:#627084;--line:#d6e6e3;--accent:#0f766e;--panel-soft:#f8fdfc}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;background:linear-gradient(135deg,#eef7f6 0%,#f7fbff 42%,#f2fbf4 100%);color:var(--ink)}main{max-width:1440px;width:calc(100% - 32px);padding:20px 0;margin:auto}.desk-header{background:radial-gradient(circle at 16% 12%,#2dd4bf33,transparent 26%),linear-gradient(120deg,#0b1220,#123b52 48%,#0f766e);padding:7px 18px;color:white;box-shadow:0 10px 26px #0f172a29}.desk-header-inner{max-width:1440px;margin:auto;display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:14px;align-items:center}.desk-brand{display:flex;align-items:center;gap:10px}.desk-mark{display:grid;place-items:center;min-width:92px;height:38px;border-radius:12px;background:linear-gradient(135deg,#38bdf8,#14b8a6);font-size:21px;font-weight:900}.desk-header h1{margin:0 0 2px;font-size:22px}.desk-header p{margin:0;color:#d5eef3;font-size:11.5px}.desk-profile{display:inline-block;margin-top:5px;padding:4px 9px;border:1px solid #ffffff40;border-radius:20px;font-size:11px}.desk-blessing{color:#fef3c7;font-size:15px;font-weight:900;text-align:center;border-radius:999px;padding:8px 12px;background:#ffffff14;border:1px solid #fef3c72e}.desk-quote{text-align:right;padding:8px 10px;border:1px solid #bae6fd33;border-radius:12px;background:#ffffff14}.desk-tabs{display:flex;gap:8px;margin-bottom:16px;padding:10px;border:1px solid #bde8e3;border-radius:16px;background:linear-gradient(135deg,#ffffffe6,#ecfeffd6);box-shadow:0 16px 38px #0f172a14;overflow-x:auto}.desk-tabs .desk-tab{flex-shrink:0;border:1px solid #94a3b857;border-radius:12px;background:linear-gradient(135deg,#e2e8f0,#f8fafc);color:#17202a;padding:10px 14px;font-size:14px;text-decoration:none;font-weight:600}.desk-tabs .active{background:linear-gradient(135deg,#0f766e,#115e59);color:white;border-color:#0f766e}.desk-tab:hover{filter:brightness(.96)}.desk-tab:focus-visible,button:focus-visible{outline:3px solid #38bdf8;outline-offset:2px}section{border-color:var(--line);box-shadow:0 14px 34px #0f172a0d}section h2{color:#134e4a}.metric{background:var(--panel-soft);border:1px solid var(--line)}button{background:var(--accent);border-color:#0f766e}input,select{border-color:#b5ceca}p{color:var(--muted)}@media(max-width:900px){.desk-header-inner{grid-template-columns:1fr}.desk-blessing,.desk-quote{display:none}main{width:calc(100% - 20px)}.desk-tabs{gap:6px}.desk-tabs .desk-tab{padding:9px 12px}}
+:root{--ink:#17202a;--muted:#627084;--line:#d6e6e3;--accent:#0f766e;--panel-soft:#f8fdfc}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;background:linear-gradient(135deg,#eef7f6 0%,#f7fbff 42%,#f2fbf4 100%);color:var(--ink)}main{max-width:1440px;width:calc(100% - 32px);padding:20px 0;margin:auto}.desk-header{background:radial-gradient(circle at 16% 12%,#2dd4bf33,transparent 26%),linear-gradient(120deg,#0b1220,#123b52 48%,#0f766e);padding:7px 18px;color:white;box-shadow:0 10px 26px #0f172a29}.desk-header-inner{max-width:1440px;margin:auto;display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:14px;align-items:center}.desk-brand{display:flex;align-items:center;gap:10px}.desk-mark{display:grid;place-items:center;min-width:92px;height:38px;border-radius:12px;background:linear-gradient(135deg,#38bdf8,#14b8a6);font-size:21px;font-weight:900}.desk-header h1{margin:0 0 2px;font-size:22px}.desk-header p{margin:0;color:#d5eef3;font-size:11.5px}.desk-profile{display:inline-block;margin-top:5px;padding:4px 9px;border:1px solid #ffffff40;border-radius:20px;font-size:11px}.desk-blessing{color:#fef3c7;font-size:15px;font-weight:900;text-align:center;border-radius:999px;padding:8px 12px;background:#ffffff14;border:1px solid #fef3c72e}.desk-quote{text-align:right;padding:8px 10px;border:1px solid #bae6fd33;border-radius:12px;background:#ffffff14}.desk-tabs{display:flex;gap:8px;margin-bottom:16px;padding:10px;border:1px solid #bde8e3;border-radius:16px;background:linear-gradient(135deg,#ffffffe6,#ecfeffd6);box-shadow:0 16px 38px #0f172a14;overflow-x:auto}.desk-tabs .desk-tab{flex-shrink:0;border:1px solid #94a3b857;border-radius:12px;background:linear-gradient(135deg,#e2e8f0,#f8fafc);color:#17202a;padding:10px 14px;font-size:14px;text-decoration:none;font-weight:600}.desk-tabs .active{background:linear-gradient(135deg,#0f766e,#115e59);color:white;border-color:#0f766e}.desk-tabs .desk-tab[data-tab="trade"],.desk-tabs .desk-tab[data-tab="nifty-2"]{background:linear-gradient(135deg,#ccfbf1,#e0f2fe);color:#115e59;border-color:#99dcd5}.desk-tabs .desk-tab.active{box-shadow:inset 0 -3px 0 #115e59}.desk-tab:hover{filter:brightness(.96)}.desk-tab:focus-visible,button:focus-visible{outline:3px solid #38bdf8;outline-offset:2px}section{border-color:var(--line);box-shadow:0 14px 34px #0f172a0d}section h2{color:#134e4a}.metric{background:var(--panel-soft);border:1px solid var(--line)}button{background:var(--accent);border-color:#0f766e}input,select{border-color:#b5ceca}p{color:var(--muted)}@media(max-width:900px){.desk-header-inner{grid-template-columns:1fr}.desk-blessing,.desk-quote{display:none}main{width:calc(100% - 20px)}.desk-tabs{gap:6px}.desk-tabs .desk-tab{padding:9px 12px}}
 
 /* Compact overview: eight metrics share a desktop row without an orphan card. */
-main{padding-top:12px}.desk-tabs{margin-bottom:10px}
+.pair-table{overflow-x:auto}.pair-table td,.pair-table th{text-align:right;padding:6px;font-size:12px}.pair-selected{background:#dcfce7}.pair-blocked{color:#64748b;background:#f8fafc}main{padding-top:12px}.desk-tabs{margin-bottom:10px}
 .page-title{margin:6px 0 3px;font-size:25px}.page-subtitle{margin:0 0 10px;font-size:13px}
 #market-risk,#active-positions{padding:14px 16px;margin:12px 0}
 #market-risk h2,#active-positions h2{margin:0 0 10px;font-size:19px}
@@ -409,13 +451,23 @@ main{padding-top:12px}.desk-tabs{margin-bottom:10px}
 #market-risk .metric,#active-positions>.metrics .metric{min-width:0;padding:10px;border-radius:7px}
 #market-risk .metric small,#active-positions>.metrics .metric small{font-size:11px;line-height:1.25}
 #market-risk .metric strong,#active-positions>.metrics .metric strong{font-size:18px;margin-top:5px;line-height:1.2;overflow-wrap:anywhere}
-#nifty-mmi-zone,#nifty-mmi-signal{font-size:11px;line-height:1.25}
+#market-risk>.metrics{grid-template-columns:repeat(7,minmax(0,1fr))}
+.mmi-focus{--mood:#64748b;margin-top:10px;border:1px solid #cbd5e1;border-left:5px solid var(--mood);border-radius:10px;padding:12px 16px;background:linear-gradient(110deg,#f0fdfa,#f8fafc)}
+.mmi-focus[data-mood="fear"]{--mood:#b45309;background:linear-gradient(110deg,#fff7ed,#fffbeb)}
+.mmi-focus[data-mood="greed"]{--mood:#047857;background:linear-gradient(110deg,#ecfdf5,#f0fdfa)}
+.mmi-focus[data-mood="neutral"]{--mood:#0369a1;background:linear-gradient(110deg,#eff6ff,#f0fdfa)}
+.mmi-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}.mmi-eyebrow{font-size:10px;font-weight:800;letter-spacing:.12em;color:#475569}.mmi-heading h3{margin:2px 0 8px;font-size:18px}
+#nifty-mmi-zone{padding:5px 10px;border:1px solid var(--mood);border-radius:20px;color:var(--mood);font-size:13px;font-weight:800}
+.mmi-content{display:grid;grid-template-columns:auto 1fr minmax(200px,32%);align-items:center;gap:22px}.mmi-reading{white-space:nowrap;color:var(--mood)}#nifty-mmi-value{font-size:38px;font-weight:850;line-height:1.1}.mmi-reading>span{font-size:14px;color:#64748b}
+.mmi-decision{display:grid;gap:3px}.mmi-decision small{font-size:11px;color:#475569}#nifty-mmi-signal{font-size:20px;color:var(--mood)}.mmi-decision>span{font-size:11px;color:#475569}
+.mmi-scale{position:relative;height:10px;border-radius:8px;background:linear-gradient(90deg,#c2410c,#fbbf24 40%,#cbd5e1 50%,#6ee7b7 60%,#047857)}#nifty-mmi-marker{position:absolute;top:-5px;height:20px;width:4px;transform:translateX(-50%);background:#0f172a;border:1px solid white;border-radius:3px}.mmi-scale-labels{display:flex;justify-content:space-between;margin-top:8px;font-size:10px;color:#475569}
+@media(max-width:700px){.mmi-content{grid-template-columns:auto 1fr;gap:12px}.mmi-scale-wrap{grid-column:1/-1}#nifty-mmi-value{font-size:32px}#nifty-mmi-signal{font-size:17px}}
 #market-risk .snapshot-meta{margin:8px 0 0;font-size:12px;line-height:1.4}
 #active-positions>h3{margin:12px 0 6px;font-size:16px}
 @media(max-width:1100px){#market-risk>.metrics,#active-positions>.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media(max-width:600px){#market-risk,#active-positions{padding:12px}#market-risk>.metrics,#active-positions>.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.page-title{font-size:23px}}
 </style></head><body>'''
-        + desk_header(account, navigation if navigation is not None else [('home','Home'),('trade','TRADE'),('nifty-2','Nifty Income'),('kite-setup','Kite Setup')])
+        + desk_header(account, navigation if navigation is not None else [('home','Home'),('trade','TRADE'),('nifty-2','NIFTY'),('kite-setup','Kite Setup')])
         + f'<h1 class="page-title">Nifty Income</h1><p class="page-subtitle">Protected execution &amp; strategy analytics · Profile {e(account)}'+(' · localhost TEST' if test_mode else '')+'</p>'
         + (f'<div role="alert" class="error">{e(error)}</div>' if error else '')
         + (f'<p role="status">{e(message)}</p>' if message else '') + body
@@ -429,6 +481,13 @@ for(const button of document.querySelectorAll('[data-liquid-side]'))button.oncli
  form.elements['hedge_'+side].value=button.dataset.hedge;
  form.requestSubmit();
 };
+for(const button of document.querySelectorAll('[data-pair-toggle]'))button.onclick=()=>{
+ const expanded=button.getAttribute('aria-expanded')!=='true';
+ const table=document.getElementById(button.dataset.pairToggle);
+ table.querySelectorAll('[data-pair-alternative]').forEach(row=>row.hidden=!expanded);
+ button.setAttribute('aria-expanded',String(expanded));
+ button.textContent=expanded?'Show less · selected pair only':'Show more · all options';
+};
 async function refreshNiftyMood(){
  const value=document.getElementById('nifty-mmi-value'), zone=document.getElementById('nifty-mmi-zone'), signal=document.getElementById('nifty-mmi-signal');
  if(!value)return;
@@ -436,11 +495,14 @@ async function refreshNiftyMood(){
   const response=await fetch('/market-mmi',{cache:'no-store'});
   if(!response.ok)throw new Error('MMI unavailable');
   const data=await response.json();
-  if(!data.ok || data.value==null || !Number.isFinite(Number(data.value)))throw new Error('MMI unavailable');
+  if(!data.ok || data.value==null || !Number.isFinite(Number(data.value)) || Number(data.value)<0 || Number(data.value)>100)throw new Error('MMI unavailable');
   const mmi=Number(data.value);
   value.textContent=mmi.toFixed(2);zone.textContent=data.zone||'';
-  signal.textContent=' | Signal: '+(mmi>60?'SELL CALL':mmi<40?'SELL PUT':'WAIT / NEUTRAL');
- }catch(error){value.textContent='Unavailable';zone.textContent='';signal.textContent=' | Signal: unavailable';}
+  signal.textContent=mmi>60?'SELL CALL':mmi<40?'SELL PUT':'WAIT / NEUTRAL';
+  document.getElementById('nifty-mmi-panel').dataset.mood=mmi>60?'greed':mmi<40?'fear':'neutral';
+  const marker=document.getElementById('nifty-mmi-marker');marker.hidden=false;marker.style.left=mmi+'%';
+  const meter=document.getElementById('nifty-mmi-meter');meter.setAttribute('aria-valuenow',String(mmi));meter.setAttribute('aria-valuetext',mmi.toFixed(2)+' '+(data.zone||''));
+ }catch(error){value.textContent='Unavailable';zone.textContent='Data unavailable';signal.textContent='Signal unavailable';document.getElementById('nifty-mmi-panel').dataset.mood='unknown';document.getElementById('nifty-mmi-marker').hidden=true;document.getElementById('nifty-mmi-meter').removeAttribute('aria-valuenow');}
 }
 refreshNiftyMood();
 const ticketDialog=document.getElementById('order-ticket');

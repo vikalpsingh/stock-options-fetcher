@@ -17,7 +17,8 @@ def selection_from_form(form):
     return dict(include_pe=get('structure', 'PE') in {'PE', 'BOTH'},
                 include_ce=get('structure', 'PE') in {'CE', 'BOTH'}, lots=get('lots', '2'),
                 expiry=get('expiry'), short_pe=get('short_pe'), hedge_pe=get('hedge_pe'),
-                short_ce=get('short_ce'), hedge_ce=get('hedge_ce'), mode=get('mode', 'PAPER'))
+                short_ce=get('short_ce'), hedge_ce=get('hedge_ce'), mode=get('mode', 'PAPER'),
+                auto_best=get('auto_best', 'yes') == 'yes', base_pe=get('base_pe'), base_ce=get('base_ce'))
 
 
 def execute_action(path, form, account, db_path, config, context_loader, broker_factory, test_mode=False):
@@ -86,9 +87,10 @@ def invalidate_changed_lot_reviews(db_path, account, selection):
     for record in repo.recent_baskets(account):
         old = record['preview'].get('selection') or {}
         if (record['state'] == 'REVIEW' and record['mode'] == selection['mode']
-                and str(old.get('lots')) != str(selection['lots'])):
+                and any(str(old.get(key)) != str(selection.get(key)) for key in
+                    ('lots','expiry','short_pe','hedge_pe','short_ce','hedge_ce','include_pe','include_ce'))):
             record['state'] = 'CLOSED'
-            record['note'] = 'Lot selection changed. Create a fresh review and restart the countdown.'
+            record['note'] = 'Contract, structure or lot selection changed. Create a fresh review and restart the countdown.'
             repo.save(record)
 
 
@@ -126,7 +128,29 @@ def page_data(account, db_path, config, context_loader, form=None):
             replacement = further_otm_contract(master, kind, selection['expiry'], target)
             selection[key] = replacement['tradingsymbol'] if replacement else ''
     master = [row for row in master if is_hundred_strike(row)]
+    for side in ('pe','ce'):
+        if not any(r['tradingsymbol']==selection.get('base_'+side) and str(r['expiry'])[:10]==selection['expiry'] for r in master):
+            selection['base_'+side] = selection['short_'+side]
     context = context_loader(selection)
+    from .optimizer import optimize_spreads
+    optimizer = optimize_spreads(selection, context, config)
+    # Reviews/actions keep exact submitted strikes. Only explicit preview refresh (or initial load) auto-selects.
+    refresh_action = str((form.get('optimize') or [''])[0])
+    auto_refresh = not form.get('short_pe') or refresh_action in {'yes', 'force'}
+    if refresh_action in {'yes', 'force'}:
+        ProtectedExecutionRepository(db_path).clear_basket_reviews(account=account)
+    if (selection['auto_best'] or refresh_action == 'force') and auto_refresh:
+        for side in ('PE','CE'):
+            row = optimizer['chosen'][side]
+            if row is None:
+                from .optimizer import maximum_credit_preview
+                row = maximum_credit_preview(optimizer['tables'][side])
+                if row is not None:
+                    optimizer.setdefault('fallback', {})[side] = row
+            selection['short_'+side.lower()] = row['short']['tradingsymbol'] if row else ''
+            selection['hedge_'+side.lower()] = row['hedge']['tradingsymbol'] if row else ''
+        context = context_loader(selection)
+    invalidate_changed_lot_reviews(db_path, account, selection)
     ledger = NiftyStrategyRepository(db_path)
     ledger.ensure_schema()
     month = str((form.get('month') or [context['now'].strftime('%Y-%m')])[0])
@@ -137,7 +161,7 @@ def page_data(account, db_path, config, context_loader, form=None):
         config['max_total_nifty_defined_loss_inr'], config=config,
         strategy_allocations=context['allocations'], pending_orders=context['orders'])
     return dict(account=account, selection=selection, context=context, instruments=master, expiries=expiries,
-                ticket=ticket, lot_recommendation=sizing, config=config,
+                ticket=ticket, lot_recommendation=sizing, config=config, optimizer=optimizer,
                 liquid_alternatives=find_nearby_liquid_spreads(selection, context, config),
                 nearer_alternatives=find_nearby_liquid_spreads(selection, context, config, toward_spot=True),
                 active_positions=reconcile_nifty_hedge_allocations(context.get("broker_positions",context["positions"]),

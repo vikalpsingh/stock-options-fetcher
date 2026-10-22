@@ -56,6 +56,8 @@ def load_market_context(kite, account, db_path, selection, config, now, instrume
     for pairs in nearby_spread_candidates(selection, instruments, config['default_hedge_width_points']).values():
         for pair in pairs:
             symbols.update(row['tradingsymbol'] for row in pair)
+    from .optimizer import candidate_quote_keys
+    symbols.update(key.removeprefix("NFO:") for key in candidate_quote_keys(selection, instruments, config['default_hedge_width_points']))
     keys = ["NFO:" + symbol for symbol in symbols if symbol] + ["NSE:NIFTY 50", "NSE:INDIA VIX"]
     quotes = kite.quote(keys)
     spot_quote = quotes.get("NSE:NIFTY 50") or {}
