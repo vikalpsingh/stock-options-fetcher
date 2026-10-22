@@ -32785,20 +32785,26 @@ def render_scheduler_control_panel() -> str:
         if job_key == "intraday_position_close":
             schedule_editor = (
                 '<div class="scheduler-time-editor">'
-                f'<label><span>Start</span><input type="time" name="{job_key}_start_time" value="{html.escape(str(state.get("start_time") or INTRADAY_POSITION_CLOSE_START_TIME), quote=True)}" required></label>'
-                f'<label><span>End</span><input type="time" name="{job_key}_end_time" value="{html.escape(str(state.get("end_time") or INTRADAY_POSITION_CLOSE_END_TIME), quote=True)}" required></label>'
-                f'<label><span>Every min</span><input type="number" min="1" max="120" name="{job_key}_interval_minutes" value="{int(state.get("interval_minutes") or INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES)}" required></label>'
+                f'<label><span>Start</span><input form="scheduler-times-form" type="time" name="{job_key}_start_time" value="{html.escape(str(state.get("start_time") or INTRADAY_POSITION_CLOSE_START_TIME), quote=True)}" required></label>'
+                f'<label><span>End</span><input form="scheduler-times-form" type="time" name="{job_key}_end_time" value="{html.escape(str(state.get("end_time") or INTRADAY_POSITION_CLOSE_END_TIME), quote=True)}" required></label>'
+                f'<label><span>Every min</span><input form="scheduler-times-form" type="number" min="1" max="120" name="{job_key}_interval_minutes" value="{int(state.get("interval_minutes") or INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES)}" required></label>'
                 '</div>'
             )
         else:
             schedule_editor = (
                 '<div class="scheduler-time-editor">'
-                f'<label><span>Daily time</span><input type="time" name="{job_key}_schedule_time" value="{html.escape(str(state.get("schedule_time") or ""), quote=True)}" required></label>'
+                f'<label><span>Daily time</span><input form="scheduler-times-form" type="time" name="{job_key}_schedule_time" value="{html.escape(str(state.get("schedule_time") or ""), quote=True)}" required></label>'
                 '</div>'
             )
+        schedule_description = (
+            f"Every {int(state.get('interval_minutes') or INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES)} min, "
+            f"weekdays {state.get('start_time') or INTRADAY_POSITION_CLOSE_START_TIME}–{state.get('end_time') or INTRADAY_POSITION_CLOSE_END_TIME} IST"
+            if job_key == "intraday_position_close" else
+            f"Weekdays at {state.get('schedule_time') or 'Not configured'} IST · once daily"
+        )
         rows.append(
             "<tr>"
-            f"<td><strong>{html.escape(job['name'])}</strong><small>{html.escape(job['schedule'])}</small>{schedule_editor}</td>"
+            f"<td><strong>{html.escape(job['name'])}</strong><small>{html.escape(schedule_description)}</small>{schedule_editor}</td>"
             f"<td>{html.escape(job['purpose'])}</td>"
             f"<td>{html.escape(str(state.get('last_run_at') or 'Not run yet'))}</td>"
             f"<td>{html.escape(next_run_text)}</td>"
@@ -32822,7 +32828,7 @@ def render_scheduler_control_panel() -> str:
         '<code>app_settings.json</code> across restarts. Pausing jobs does not cancel orders already placed.</p></div>'
         '<div class="scheduler-master-actions">'
         f'<span class="score-badge {"good" if master_enabled else "avoid"}">{master_status}</span>'
-        '<button type="submit" class="success" formaction="/scheduler/save-times">Save Run Times</button>'
+        '<button type="submit" class="success" form="scheduler-times-form" formaction="/scheduler/save-times">Save Run Times</button>'
         '<button type="submit" class="danger" formaction="/scheduler/pause-all"'
         f'{" disabled" if not master_enabled else ""}>Pause All</button>'
         '<button type="submit" formaction="/scheduler/start-all"'
@@ -43594,6 +43600,7 @@ def render_page(state: PageState) -> bytes:
         <button type="submit" formaction="/kite-setup">Save Kite Setup</button>
       </div>
     </form>
+    <form id="scheduler-times-form" method="post" action="/scheduler/save-times"></form>
     <form id="gpt-panel" method="post" action="/gpt/load"{gpt_panel_style}>
       {env_hidden}
       <section class="panel gpt-hero-panel">
