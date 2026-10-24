@@ -1,5 +1,6 @@
 """Connect NIFTY tickets/ledger to the shared durable execution service."""
 from copy import deepcopy
+from observability.usage_tracker import tracked
 from app_time import to_ist, is_quote_fresh
 
 from .ledger import NiftyStrategyRepository
@@ -9,6 +10,7 @@ from .ticket import build_ticket, number, quote_values, nearby_spread_candidates
 from trade_protected_execution import ProtectedExecutionRepository, basket_remaining
 
 
+@tracked("nifty_options_engine.service:load_market_context", boundary="load_market_context")
 def load_market_context(kite, account, db_path, selection, config, now, instruments,
                         live_ack_enabled=False):
     """Read broker data using the existing session; never submits orders."""
@@ -129,6 +131,7 @@ def sync_execution_fills(db_path, record):
                 })
 
 
+@tracked("nifty_options_engine.service:approve_entry", boundary="approve_entry")
 def approve_entry(record, context, config):
     """Reprice whole final basket, using actual hedge cost after BUY fills."""
     context = deepcopy(context)
@@ -175,6 +178,7 @@ def approve_entry(record, context, config):
     return risk
 
 
+@tracked("nifty_options_engine.service:approve_exit", boundary="approve_exit")
 def approve_exit(record, context, close_hedges=False):
     """Only actual reducing quantities; never infer safety from an 'exit' label."""
     orphan_cleanup = not any(leg["filled"] for leg in record["legs"]

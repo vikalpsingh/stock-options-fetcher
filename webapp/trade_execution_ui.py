@@ -1,6 +1,7 @@
 """HTML view for durable protected executions; rendering makes no broker calls."""
 import html
 import math
+from execution_presentation import render_discipline_cards
 
 
 def render_spread_summary(preview, checks=None, *, snapshot=False):
@@ -100,17 +101,22 @@ def render_hedge_selector(preview):
     </div>'''
 
 
-def render_execution_monitor(rows, account):
+def render_execution_monitor(rows, account, quotes=None, now=None):
+    from datetime import datetime, timezone
+    from execution_pair_analytics import render_pair_pnl
+    quotes = quotes or {}
+    now = now or datetime.now(timezone.utc)
     esc = lambda value: html.escape(str(value), quote=True)
     cards = []
     for row in rows:
         preview = row["preview"]
         buy, sell = preview["order_payloads"]
-        ready = row["state"] == "HEDGE_FILLED" and row["short_status"] == "NOT_SUBMITTED"
+        ready = row.get("kind") != "TRADE_PAIR" and row["state"] == "HEDGE_FILLED" and row["short_status"] == "NOT_SUBMITTED"
         cards.append(f'''<section class="panel">
           <div class="panel-title">{esc(preview.get("symbol", ""))} · {"Bear Call Spread" if preview.get("strategy_type") == "BEAR_CALL_SPREAD" else "Bull Put Spread"} · {esc(row["mode"])}</div>
           <p><strong>{esc(row["state"])}</strong> · {esc(row["note"])} · Updated {esc(row["updated_at"])}</p>
           {render_spread_summary(preview, snapshot=True)}
+          {render_pair_pnl(row, quotes, now)}
           <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Leg</th><th>Contract</th><th>LIMIT</th><th>Filled / Qty</th><th>Status</th><th>Order ID</th></tr></thead><tbody>
           <tr><td>Hedge BUY</td><td>{esc(buy["tradingsymbol"])}</td><td>{buy["price"]:.2f}</td><td>{row["hedge_filled"]} / {buy["quantity"]}</td><td>{esc(row["hedge_status"])}</td><td>{esc(row["hedge_order_id"])}</td></tr>
           <tr><td>Short SELL</td><td>{esc(sell["tradingsymbol"])}</td><td>{sell["price"]:.2f}</td><td>{row["short_filled"]} / {sell["quantity"]}</td><td>{esc(row["short_status"])}</td><td>{esc(row["sell_order_id"])}</td></tr>
@@ -122,5 +128,13 @@ def render_execution_monitor(rows, account):
           <button type="submit">Monitor / Reconcile</button>
           <label><input type="checkbox" name="protected_sell_ack" value="1"> I accept the displayed maximum risk and authorise this SELL limit only after fresh risk checks.</label>
           <button type="submit" formaction="/trade/execution/confirm-sell" {"" if ready else "disabled"}>Confirm SELL</button>
+          </form>
+          <form method="post" action="/trade/execution/close-preview">
+          <input type="hidden" name="kite_profile" value="{esc(account)}"><input type="hidden" name="execution_id" value="{esc(row['id'])}">
+          <label>Profit target % of collected credit (advisory)<input type="number" name="pair_profit_target" min="0" max="100" value="{esc((row.get('close_review') or {}).get('target_percent',50))}"></label>
+          {('<label>LIVE confirmation<input name="close_live_ack" placeholder="PLACE LIVE ORDERS"></label>' if row['mode']=='LIVE' else '')}
+          <button type="submit">CLOSE PAIR · Preview</button>
+          <label><input type="checkbox" name="close_pair_ack" value="1"> I accept the displayed exit debit, estimated charges and any loss. Close shorts first; release hedges only after confirmed fills.</label>
+          <button type="submit" formaction="/trade/execution/close-pair" {'' if row.get('close_review') and row['state']!='CLOSED' else 'disabled'}>Confirm close stage</button>
           </form></section>''')
-    return '<section id="trade-terminal-panel"><h2>TRADE → EXECUTION</h2><a href="/trade">Back to TRADE</a><p>Monitoring never places orders. PAPER fills are simulated when reconciled. A standalone hedge remains open until managed; unknown submissions must be reconciled, never retried.</p>' + ("".join(cards) or "<p>No protected executions for this account.</p>") + "</section>"
+    return '<section id="trade-terminal-panel"><h2>TRADE → EXECUTION</h2><a href="/trade">Back to TRADE</a><p>Monitoring never places orders. PAPER fills are simulated when reconciled. A standalone hedge remains open until managed; unknown submissions must be reconciled, never retried.</p>' + render_discipline_cards() + ("".join(cards) or "<p>No protected executions for this account.</p>") + "</section>"

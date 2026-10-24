@@ -6,6 +6,7 @@ continue to come from `KITE_API_KEY` and `KITE_ACCESS_TOKEN`.
 """
 
 from __future__ import annotations
+from observability.usage_tracker import tracked
 
 import os
 from datetime import datetime
@@ -53,6 +54,7 @@ class KiteBrokerAdapter:
     def get_holdings(self) -> list[dict[str, Any]]:
         return list(self._client().holdings())
 
+    @tracked("kite_broker_adapter:KiteBrokerAdapter.get_positions", boundary="broker")
     def get_positions(self) -> dict[str, Any]:
         return dict(self._client().positions())
 
@@ -65,12 +67,14 @@ class KiteBrokerAdapter:
     def get_ltp(self, instruments: list[str] | tuple[str, ...] | str) -> dict[str, Any]:
         return dict(self._client().ltp(instruments))
 
+    @tracked("kite_broker_adapter:KiteBrokerAdapter.get_quote", boundary="broker")
     def get_quote(self, instruments: list[str] | tuple[str, ...] | str) -> dict[str, Any]:
         return dict(self._client().quote(instruments))
 
     def get_ohlc(self, instruments: list[str] | tuple[str, ...] | str) -> dict[str, Any]:
         return dict(self._client().ohlc(instruments))
 
+    @tracked("kite_broker_adapter:KiteBrokerAdapter.place_order", boundary="broker")
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         if self.paper_trading or self.dry_run:
             self._paper_order_counter += 1

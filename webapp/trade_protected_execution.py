@@ -1,6 +1,7 @@
 """Durable, manually approved protected execution. Monitoring never places orders."""
 
 from __future__ import annotations
+from observability.usage_tracker import tracked
 
 import json
 import math
@@ -203,6 +204,7 @@ def _check_mode(record, broker):
         raise PermissionError("Broker mode does not match the saved execution.")
 
 
+@tracked("trade_protected_execution:start_execution", boundary="start_execution")
 def start_execution(repo, account, request_key, preview, mode, broker, validator):
     _validate_preview(preview)
     _check_mode({"mode": mode}, broker)
@@ -297,6 +299,7 @@ def reconcile_execution(repo, account, execution_id, broker):
     return repo.save(record)
 
 
+@tracked("trade_protected_execution:confirm_short", boundary="confirm_short")
 def confirm_short(repo, account, execution_id, broker, validator: Callable[[dict], dict], acknowledged=False):
     if not acknowledged:
         raise PermissionError("Explicit renewed SELL risk acceptance is required.")
@@ -375,6 +378,7 @@ def _basket_order(record, leg, broker):
         record["note"] = "Submission outcome unknown. Reconcile; do not retry the order."
 
 
+@tracked("trade_protected_execution:submit_basket_hedges", boundary="submit_basket_hedges")
 def submit_basket_hedges(repo, account, eid, broker, validator, acknowledged=False, now=None):
     record = repo.get(account, eid)
     _check_mode(record, broker)
@@ -405,10 +409,11 @@ def basket_remaining(record, entry):
                                  if leg["payload"]["tradingsymbol"] == symbol)
 
 
+@tracked("trade_protected_execution:reconcile_basket", boundary="reconcile_basket")
 def reconcile_basket(repo, account, eid, broker):
     record = repo.get(account, eid)
     _check_mode(record, broker)
-    if record.get("kind") != "BASKET":
+    if record.get("kind") not in {"BASKET", "TRADE_PAIR"}:
         raise PermissionError("Not a basket execution.")
     if record["state"] == "REVIEW":
         return record
@@ -499,6 +504,7 @@ def confirm_basket_shorts(repo, account, eid, broker, validator, acknowledged=Fa
     return record
 
 
+@tracked("trade_protected_execution:submit_basket_exit", boundary="submit_basket_exit")
 def submit_basket_exit(repo, account, eid, broker, validator, prices, acknowledged=False, close_hedges=False):
     """Close shorts first. Separate confirmation disposes hedges only after fills."""
     if not acknowledged:

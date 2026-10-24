@@ -1,0 +1,59 @@
+"""AST-only repository mapping. Never imports the application."""
+import ast, csv, json
+from pathlib import Path
+
+EXCLUDED={'.git','.venv','venv','__pycache__','tmp','runtime','archive','node_modules'}
+
+def analyse(root):
+    modules=[]; functions=[]; imports=[]; routes=[]
+    for path in sorted(root.rglob('*.py')):
+        rel=path.relative_to(root)
+        if any(p in EXCLUDED for p in rel.parts):continue
+        try: tree=ast.parse(path.read_text(encoding='utf-8-sig'))
+        except (SyntaxError,UnicodeError):continue
+        module='.'.join(rel.with_suffix('').parts)
+        refs={n.id for n in ast.walk(tree) if isinstance(n,ast.Name)}
+        attrs={n.attr for n in ast.walk(tree) if isinstance(n,ast.Attribute)}
+        strings={n.value for n in ast.walk(tree) if isinstance(n,ast.Constant) and isinstance(n.value,str)}
+        calls={n.func.id if isinstance(n.func,ast.Name) else n.func.attr for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,(ast.Name,ast.Attribute))}
+        modules.append(dict(module=module,path=str(rel),bytes=path.stat().st_size,test_only='tests' in rel.parts,functions=0))
+        for node in ast.walk(tree):
+            if isinstance(node,(ast.Import,ast.ImportFrom)):
+                for alias in node.names:
+                    binding=alias.asname or alias.name.split('.')[0]
+                    imports.append(dict(module=module,target=(node.module or '')+'.'+alias.name if isinstance(node,ast.ImportFrom) else alias.name,possibly_unused=binding not in refs))
+        def walk(node,prefix=''):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
+                    qual=prefix+child.name
+                    critical=any(x in qual.lower() for x in ('order','risk','broker','reconcil','schedul','expiry','auth','fill','close','exit'))
+                    functions.append(dict(identifier=module+':'+qual,module=module,name=qual,line=child.lineno,
+                        kind=type(child).__name__,complexity=1+sum(isinstance(n,(ast.If,ast.For,ast.While,ast.ExceptHandler,ast.BoolOp)) for n in ast.walk(child)),
+                        classification='SAFETY CRITICAL' if critical else 'TEST ONLY' if 'tests' in rel.parts else 'DYNAMICALLY REFERENCED' if child.name in strings else 'ACTIVE / REFERENCED' if child.name in refs|attrs else 'POSSIBLY UNUSED',
+                        calls=','.join(sorted({n.func.id if isinstance(n.func,ast.Name) else n.func.attr for n in ast.walk(child) if isinstance(n,ast.Call) and isinstance(n.func,(ast.Name,ast.Attribute))}))))
+                    modules[-1]['functions']+=1
+                    walk(child,qual+'.')
+                else:walk(child,prefix)
+        walk(tree)
+        routes.extend(dict(module=module,route=x) for x in strings if x.startswith('/') and ' ' not in x and len(x)<160)
+    return dict(modules=modules,functions=functions,imports=imports,routes=routes)
+
+def write_csv(path,rows,fields=None):
+    with path.open('w',encoding='utf-8',newline='') as f:
+        writer=csv.DictWriter(f,fieldnames=fields or (list(rows[0]) if rows else ['identifier']))
+        writer.writeheader();writer.writerows(rows)
+
+def generate(root=Path('.'),out=Path('docs')):
+    out.mkdir(parents=True,exist_ok=True);data=analyse(root)
+    write_csv(out/'module_inventory.csv',data['modules'])
+    (out/'architecture_inventory.json').write_text(json.dumps(data,indent=2),encoding='utf-8')
+    ranked=sorted((m for m in data['modules'] if not m['test_only']),key=lambda m:m['bytes'],reverse=True)
+    lines=['# Code architecture','Generated with AST only; no application imports.','Static names/callers are approximate; dynamic routing, callbacks and reflection require review. No classification authorises deletion.','## Largest production modules']
+    lines += [f"- {m['path']}: {m['bytes']:,} bytes; {m['functions']} definitions" for m in ranked[:30]]
+    lines+=['## Detailed map','See architecture_inventory.json for every qualified definition, line, complexity, classification, possible calls, imports and route string. Route strings are candidates, not proof of registration.','## Boundaries','Order/broker/risk/authentication/reconciliation/expiry/scheduler functions are protected. SQLite, Kite/DHAN and dynamic imports are exposed through the import and call indexes. Never import app.py for inventory.','## Extraction priorities','Extract pure renderers and formatters first. Keep existing nifty_options_engine and broker adapters; do not create duplicate engines. Closures and app-global dependencies need explicit dependency injection before extraction.','## Duplicate review','Matching short names or call patterns are candidates only. Different financial meanings must not be merged automatically.']
+    (out/'code_architecture.md').write_text('\n'.join(lines),encoding='utf-8')
+    mapping=['# Codex module map','Generated by `python -m observability.inventory`.','Search exact function or route first with rg; read a small range. Do not import app.py or run broker jobs for inspection.','## Features','- TRADE entry: app.py build_trade_review, trade_hedged_order_builder.py, trade_protected_execution.py','- TRADE close: trade_pair_exit.py; tests/test_trade_pair_exit.py','- NIFTY: nifty_options_engine/page.py, service.py, ticket.py, ui.py','- Pair analytics: execution_pair_analytics.py','- Scheduler: app.py scheduled_job_definitions, execute_position_buy_orders','- Broker: kite_broker_adapter.py; existing DHAN modules','- Tracing: observability/usage_tracker.py; reporting: observability/report.py','- Full AST inventory: docs/architecture_inventory.json','## Safety','No live orders/tests, no runtime DB imports. Keep signatures/routes stable. No dead-code removal without approved evidence.','## Largest modules']+[f"- {m['path']}: {m['bytes']:,} bytes" for m in ranked[:20]]
+    (out/'CODEX_MODULE_MAP.md').write_text('\n'.join(mapping),encoding='utf-8')
+    return data
+
+if __name__=='__main__':generate()

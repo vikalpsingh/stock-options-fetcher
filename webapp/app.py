@@ -34,6 +34,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from observability.usage_tracker import tracked
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
 from email.utils import parsedate_to_datetime
@@ -14504,6 +14505,7 @@ def generate_research_csv_with_current_positions(
     }
 
 
+@tracked("app:run_scheduled_income_growth_gpt_job", boundary="run_scheduled_income_growth_gpt_job")
 def run_scheduled_income_growth_gpt_job(
     now: datetime | None = None,
     force: bool = False,
@@ -19237,6 +19239,15 @@ def execute_position_buy_orders(
             'Live placement refused. Set KITE_CONFIRM_LIVE_ORDER to "YES" first.'
         )
 
+    # Durable execution ownership prevents scheduler/manual close collisions.
+    ownership_repo = ProtectedExecutionRepository(APP_DB_PATH)
+    owner_account = selected_kite_profile_name()
+    owned = {p['tradingsymbol'] for record in
+             ownership_repo.recent(owner_account) + ownership_repo.recent_baskets(owner_account)
+             if record['mode']=='LIVE' and record['state'] not in {'REVIEW','CLOSED'}
+             for p in record['preview']['order_payloads']}
+    if any(str(order.get('tradingsymbol') or '') in owned for order in selected_orders):
+        raise PermissionError('A selected contract belongs to a protected execution. Use EXECUTION Close Pair to preserve hedge ownership; scheduler did not submit duplicate closes.')
     kite = kite_buy_positions.kite_client()
     results: list[dict[str, Any]] = []
     submitted_orders: list[dict[str, Any]] = []
@@ -19381,6 +19392,7 @@ def save_eod_pnl_snapshot_schedule_state(**updates: Any) -> dict[str, Any]:
     return state
 
 
+@tracked("app:run_eod_pnl_snapshot_job", boundary="run_eod_pnl_snapshot_job")
 def run_eod_pnl_snapshot_job(
     now: datetime | None = None,
     force: bool = False,
@@ -19500,6 +19512,7 @@ def run_eod_pnl_snapshot_job(
         EOD_PNL_SNAPSHOT_SCHEDULER_LOCK.release()
 
 
+@tracked("app:run_scheduled_position_close_job", boundary="run_scheduled_position_close_job")
 def run_scheduled_position_close_job(
     now: datetime | None = None,
     force: bool = False,
@@ -19989,6 +20002,7 @@ def intraday_position_close_slot(now: datetime) -> tuple[str, datetime] | None:
     return f"{now:%Y-%m-%d}:{slot_at:%H:%M}", slot_at
 
 
+@tracked("app:run_intraday_position_close_job", boundary="run_intraday_position_close_job")
 def run_intraday_position_close_job(
     now: datetime | None = None,
     force: bool = False,
@@ -21010,25 +21024,8 @@ def render_graceful_error(error: str, title: str = "Error") -> str:
     )
 
 
-def completed_order_current_pnl(order: dict[str, Any]) -> float | None:
-    """Display-only row MTM, not booked P&L or the whole position's MTM."""
-    if str(order.get("status") or "").upper() in {"CANCELLED", "CANCELED", "REJECTED"}:
-        return 0.0
-    if str(order.get("status") or "").upper() != "COMPLETE":
-        return None
-    try:
-        qty = float(order.get("filled_quantity", order.get("quantity")) or 0)
-        avg = float(order.get("position_avg_price") or 0)
-        ltp = float(order.get("ltp"))
-        position_qty = float(order.get("position_qty") or 0)
-        if not all(math.isfinite(v) for v in (qty, avg, ltp, position_qty)):
-            return None
-        if qty <= 0 or avg <= 0 or ltp < 0 or position_qty == 0:
-            return None
-        # Position direction matters: a closing BUY belongs to a short position.
-        return qty * (avg - ltp) if position_qty < 0 else qty * (ltp - avg)
-    except (TypeError, ValueError):
-        return None
+# Backward-compatible facade; implementation has no broker or database access.
+from position_order_display import completed_order_current_pnl
 
 
 def render_order_book(state: PageState) -> str:
@@ -31629,6 +31626,7 @@ def load_trade_terminal_state(state: PageState) -> None:
             state.trade_direction_result = saved_direction
 
 
+@tracked("app:build_trade_review", boundary="build_trade_review")
 def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str, str]]]:
     state.trade_mode = execution_mode(state.trade_mode, state.trade_test_mode)
     if kite_orders is None:
@@ -31730,14 +31728,19 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
         hedge_quotes = cached_kite_quote(kite, hedge_keys, ttl_seconds=0)
         max_spread_loss = max(1.0, _dhan_metric_float(os.getenv("TRADE_MAX_SPREAD_LOSS") or 40000))
         def spread_margin(order_payloads: list[dict[str, Any]]) -> dict[str, Any]:
-            if hasattr(kite, "basket_order_margins"):
-                return dict(kite.basket_order_margins(order_payloads) or {})
+            # Local estimate availability must not prevent structural hedge validation.
+            # Broker submission/RMS errors still propagate through durable execution.
+            try:
+                if hasattr(kite, "basket_order_margins"):
+                    return dict(kite.basket_order_margins(order_payloads) or {})
+            except Exception:
+                pass
             return {}
         try:
             hedge_alternatives = build_protective_spreads(
                 matching, state.trade_contracts or [], hedge_quotes, quantity,
                 max_loss_cap=max_spread_loss, margin_provider=spread_margin,
-                selected_hedge_symbol=state.trade_hedge_symbol,
+                selected_hedge_symbol=state.trade_hedge_symbol, use_ltp_limits=True,
             )
             for spread in hedge_alternatives:
                 pop_inputs = (
@@ -31809,6 +31812,7 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
         checks.append(trade_validation("Monthly loss control", "BLOCK", friendly_external_error(exc, "Monthly risk state")))
     margin_payload = build_kite_order_payload(str(matching.get("tradingsymbol") or ""), state.trade_side, quantity, limit_price, "TRADEREVIEW")
     margin_payload["product"] = state.trade_product
+    from execution_presentation import margin_estimate_status
     required_margin = 0.0
     available_funds = 0.0
     try:
@@ -31825,10 +31829,14 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
             margin_description = f"Required ₹{required_margin:,.2f}"
         funds = kite.margins("equity") or {}
         available_funds = _dhan_metric_float((funds.get("available") or {}).get("live_balance") or (funds.get("available") or {}).get("cash"))
-        enough = required_margin <= 0 or available_funds >= required_margin
-        checks.append(trade_validation("Margin and funds", "PASS" if enough else "BLOCK", f"{margin_description}; available ₹{available_funds:,.2f}."))
+        status = margin_estimate_status(required_margin, available_funds,
+            defined_risk=bool(preferred_hedge), paper=mode == "PAPER")
+        checks.append(trade_validation("Margin and funds", status,
+            f"{margin_description}; available ₹{available_funds:,.2f}. "
+            + ("Local estimate is advisory for this verified protected spread; broker RMS may reject any leg."
+               if preferred_hedge else "Broker funding and order acceptance remain required.")))
     except Exception as exc:
-        checks.append(trade_validation("Margin and funds", "WARNING" if mode == "PAPER" else "BLOCK", friendly_external_error(exc, "Kite margin validation")))
+        checks.append(trade_validation("Margin and funds", "WARNING" if preferred_hedge or mode == "PAPER" else "BLOCK", friendly_external_error(exc, "Kite margin validation")))
     checks.append(trade_validation("Earnings blackout", "WARNING", "Verified upcoming result date is unavailable in the manual terminal; confirm company events before proceeding."))
     live_enabled = profile_flag(os.getenv("TRADE_LIVE_ENABLED"), False)
     checks.append(trade_validation("Execution mode", "PASS" if mode == "PAPER" or live_enabled else "BLOCK", "PAPER simulation." if mode == "PAPER" else "LIVE execution explicitly enabled on server." if live_enabled else "LIVE is disabled. Set TRADE_LIVE_ENABLED=YES only after PAPER verification."))
@@ -32065,8 +32073,7 @@ def approve_protected_short(state: PageState, record: dict[str, Any]) -> dict[st
             except (ValueError, TypeError):
                 raise PermissionError("Verified quote timestamps within 120 seconds are required before SELL.")
     margin = max(_dhan_metric_float(fresh.get("initial_margin")), _dhan_metric_float(fresh.get("final_margin")))
-    if not math.isfinite(margin) or margin <= 0 or _dhan_metric_float(fresh.get("available_funds")) < margin:
-        raise PermissionError("Verified basket margin and sufficient available funds are required.")
+    # Local margin estimate is advisory; broker RMS and all other fresh checks remain authoritative.
     price = float(saved["order_payloads"][1]["price"])
     ltp = _dhan_metric_float(fresh.get("ltp"))
     if ltp <= 0 or abs(price - ltp) / ltp > .20:
@@ -32085,7 +32092,15 @@ def render_trade_panel(state: PageState) -> str:
     if state.active_tab == "trade" and state.trade_stage == "execution":
         account = selected_kite_profile_name(state.kite_profile)
         banner = '<div class="alert warning"><strong>TEST — localhost:</strong> current Kite data and normal risk checks; simulated orders only.</div>' if state.trade_test_mode else ""
-        return banner + render_execution_monitor(ProtectedExecutionRepository(APP_DB_PATH).recent(account), account)
+        records = ProtectedExecutionRepository(APP_DB_PATH).recent(account)
+        quotes = {}
+        try:
+            keys = sorted({'NFO:'+p['tradingsymbol'] for r in records for p in r['preview']['order_payloads']})
+            if keys:
+                quotes = KiteBrokerAdapter(account_id=account).get_quote(keys)
+        except Exception:
+            pass  # Display unavailable marks; never use saved review prices as current quotes.
+        return banner + render_execution_monitor(records, account, quotes=quotes, now=app_now())
     if state.active_tab == "trade" and state.trade_watchlist is None:
         try:
             load_trade_terminal_state(state)
@@ -32146,7 +32161,7 @@ def render_trade_panel(state: PageState) -> str:
           <div class="trade-best-heading"><div class="trade-best-title-row"><h2>BEST for TRADE — Daily Market Scan{' · TEST' if state.trade_test_mode else ''}</h2><label class="trade-best-mode"><span>Eligibility</span><select id="trade-best-eligible-filter" aria-label="Filter trade eligibility"><option value="ALL">All results</option><option value="ELIGIBLE">ELIGIBLE only</option></select></label><label class="trade-best-mode"><span>Mode</span><select id="trade-best-mode" aria-label="Trade execution mode"><option value="PAPER"{" selected" if state.trade_mode == "PAPER" else ""}>PAPER</option><option value="LIVE"{" selected" if state.trade_mode == "LIVE" else ""}{" disabled" if state.trade_test_mode else ""}>LIVE</option></select></label><a class="button-link secondary" href="/trade/execution?kite_profile={html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}">EXECUTION</a><div class="trade-best-top-actions"><button type="submit" form="trade-terminal-panel" class="danger" formaction="/trade/best/recalculate" formnovalidate>Recalculate pre-market</button><button type="submit" form="trade-terminal-panel" class="success" formaction="/trade/best/live" formnovalidate>Refresh live opportunities</button></div></div><p class="status">Saved {html.escape(str(best_scan.get("scan_date") or app_now().date()))} · generated {html.escape(str(best_scan.get("created_at") or "unknown"))} · Advisory only</p></div>
           <div class="income-equity-order-summary"><strong>Ranking:</strong> pre-market score uses fixed 30/20/15/15/20 component weights. Live score is separate; combined ranking appears only when mandatory data and capital/risk inputs are complete. Model OTM probability is a constant-IV lognormal estimate, not historical POP. The top three may continue for research even when blocked.</div>
           <div class="trade-best-toolbar"><div class="trade-best-view-tabs"><button type="button" data-trade-best-view="PREMARKET">PRE-MARKET</button><button type="button" data-trade-best-view="LIVE">LIVE OPPORTUNITIES</button><button type="button" data-trade-best-view="MISSED">MISSED / WAIT</button><button type="button" data-trade-best-view="ALL" class="active">ALL STOCKS</button></div><div class="trade-best-filters"><label><span>Stock source</span><select id="trade-best-source-filter"><option value="ALL">ALL</option><option value="DHAN">DHAN</option><option value="DHAN_IT">DHAN-IT</option><option value="MANUAL">Manual / Uploaded</option></select></label><span id="trade-best-source-count" class="status"></span></div></div>
-          <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Stock</th><th>Source</th><th>Direction</th><th>Gap %</th><th>Prev / Live</th><th>Prev Option</th><th>Live Bid/Ask</th><th>Delta / IV</th><th>OI / Volume</th><th>Technical</th><th>Live Score</th><th>Net Credit Yield</th><th id="trade-best-profit-heading" aria-sort="none"><button type="button" id="trade-best-profit-sort" title="Sort gross short-leg max profit; excludes hedge costs and fees">Max profit (gross) ↕</button></th><th>Status</th><th>Open</th></tr></thead><tbody>{best_rows_html}</tbody></table></div>
+          <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Stock</th><th>Source</th><th>Direction</th><th>Gap %</th><th>Prev / Live</th><th>Prev Option</th><th>Live Bid/Ask</th><th>Delta / IV</th><th>OI / Volume</th><th>Technical</th><th>Live Score</th><th>Net Credit Yield</th><th id="trade-best-profit-heading" aria-sort="descending"><button type="button" id="trade-best-profit-sort" title="Sort gross short-leg max profit; excludes hedge costs and fees">Max profit (gross) ↓</button></th><th>Status</th><th>Open</th></tr></thead><tbody>{best_rows_html}</tbody></table></div>
           <div class="trade-best-pagination"><label>Results per page <select id="trade-best-page-size"><option value="10">10</option><option value="20">20</option><option value="ALL">All</option></select></label><span id="trade-best-page-info" class="status" aria-live="polite"></span><button type="button" class="secondary" id="trade-best-prev">Previous</button><button type="button" class="secondary" id="trade-best-next">Next</button></div>
           <div class="modal-actions"><button type="button" class="secondary" id="trade-best-close">Close</button></div>
         </div></div>'''
@@ -43271,7 +43286,7 @@ def render_page(state: PageState) -> bytes:
     .trade-stage-validate .trade-landing-controls,.trade-stage-validate .trade-market-intelligence {{ display:none; }}
     .trade-best-modal-card td small {{ display:block; margin-top:3px; white-space:normal; line-height:1.3; color:#64748b; }}
     .trade-best-heading {{ margin-bottom:7px; }}
-    .trade-best-title-row {{ display:flex; align-items:center; justify-content:flex-start; gap:12px; margin-bottom:4px; }}
+    .trade-best-title-row {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-start; gap:12px; margin-bottom:4px; }}
     .trade-best-title-row .button-link {{ flex-shrink:0; margin-left:auto; }}
     .trade-best-mode {{ display:flex; align-items:center; gap:6px; margin:0; flex-shrink:0; }}
     .trade-best-mode select {{ width:auto; min-width:90px; padding:5px 8px; }}
@@ -43279,7 +43294,8 @@ def render_page(state: PageState) -> bytes:
     .trade-best-heading .status {{ margin:0; font-size:10px; }}
     .trade-best-modal-card > .income-equity-order-summary {{ margin:6px 0; padding:7px 10px; font-size:11px; line-height:1.3; text-align:left; }}
     .trade-best-toolbar {{ display:flex; align-items:end; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:7px 0; }}
-    .trade-best-top-actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+    .trade-best-top-actions {{ display:flex; flex:1 1 320px; min-width:0; flex-wrap:wrap; gap:8px; align-items:center; }}
+    .trade-best-top-actions button {{ flex:1 1 160px; min-width:0; word-break:normal; overflow-wrap:normal; }}
     .trade-best-filters {{ display:flex; align-items:end; gap:8px; margin:0; }}
     .trade-best-filters label {{ display:flex; align-items:center; gap:6px; min-width:0; margin:0; }}
     .trade-best-filters label span {{ white-space:nowrap; font-size:10px; }}
@@ -43343,6 +43359,37 @@ def render_page(state: PageState) -> bytes:
       .trade-direction-market {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
     }}
     @media (max-width: 560px) {{ .trade-check-grid {{ grid-template-columns:1fr; }} }}
+    /* TRADE mobile: constrain panels, not the data inside scrollable tables. */
+    @media (max-width:760px) {{
+      #trade-terminal-panel {{ min-width:0; max-width:100%; }}
+      #trade-terminal-panel .panel,#trade-terminal-panel .live-modal {{ min-width:0; box-sizing:border-box; }}
+      #trade-terminal-panel .table-wrap {{ width:100%; max-width:100%; min-width:0; overflow-x:auto; -webkit-overflow-scrolling:touch; }}
+      #trade-terminal-panel .table-wrap table {{ width:max-content; min-width:100%; }}
+      #trade-terminal-panel .trade-best-title-row {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }}
+      #trade-terminal-panel .trade-best-heading h2 {{ grid-column:1/-1; font-size:18px; line-height:1.35; overflow-wrap:anywhere; }}
+      #trade-terminal-panel .trade-best-title-row .button-link {{ margin:0; grid-column:1/-1; text-align:center; }}
+      #trade-terminal-panel .trade-best-mode {{ min-width:0; flex-direction:column; align-items:stretch; }}
+      #trade-terminal-panel .trade-best-mode select {{ width:100%; min-width:0; }}
+      #trade-terminal-panel .trade-best-top-actions {{ grid-column:1/-1; display:grid; grid-template-columns:minmax(0,1fr); width:100%; }}
+      #trade-terminal-panel .trade-best-top-actions button {{ width:100%; min-height:44px; word-break:normal; overflow-wrap:normal; }}
+      #trade-terminal-panel .trade-best-toolbar,#trade-terminal-panel .trade-best-filters {{ display:flex; flex-direction:column; width:100%; min-width:0; }}
+      #trade-terminal-panel .trade-best-filters label {{ min-width:0; flex-wrap:wrap; }}
+      #trade-terminal-panel .trade-best-filters select {{ min-width:0; width:100%; }}
+      #trade-terminal-panel .trade-best-view-tabs {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); width:100%; }}
+      #trade-terminal-panel .trade-best-pagination {{ justify-content:flex-start; }}
+      #trade-terminal-panel .trade-best-pagination label,#trade-best-page-info {{ width:100%; }}
+      #trade-terminal-panel button,#trade-terminal-panel .button-link,#trade-terminal-panel select {{ min-height:44px; white-space:normal; overflow-wrap:anywhere; }}
+      #trade-terminal-panel input,#trade-terminal-panel select,#trade-terminal-panel textarea {{ max-width:100%; box-sizing:border-box; font-size:16px; }}
+      #trade-terminal-panel .trade-expiry-controls {{ flex-direction:column; align-items:stretch; }}
+      #trade-terminal-panel .trade-expiry-controls label {{ min-width:0; }}
+      #trade-terminal-panel .trade-applied-suggestion {{ grid-template-columns:1fr; }}
+      #trade-terminal-panel .live-modal-backdrop {{ padding:8px; }}
+      #trade-terminal-panel .live-modal {{ width:100%; max-width:100%; max-height:calc(100dvh - 16px); overflow-y:auto; }}
+      #trade-terminal-panel.trade-stage-best #trade-best-modal {{ padding:0; }}
+      #trade-terminal-panel.trade-stage-best #trade-best-modal .live-modal {{ padding:12px; max-height:none; }}
+      #trade-terminal-panel .modal-actions {{ display:flex; flex-wrap:wrap; gap:8px; }}
+      #trade-terminal-panel .modal-actions > * {{ flex:1 1 140px; min-width:0; }}
+    }}
     .pnl-analytics-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
@@ -46589,7 +46636,7 @@ def render_page(state: PageState) -> bytes:
     const tradeBestPageInfo = document.getElementById('trade-best-page-info');
     const tradeBestPrev = document.getElementById('trade-best-prev');
     const tradeBestNext = document.getElementById('trade-best-next');
-    let tradeBestProfitSort = '';
+    let tradeBestProfitSort = 'desc';
     const tradeBestProfitButton = document.getElementById('trade-best-profit-sort');
     let tradeBestPage = 1;
     if (tradeBestPageSize) {{
@@ -46945,6 +46992,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
     def is_authenticated(self) -> bool:
         return valid_auth_token(self.auth_cookie_value())
 
+    @tracked("app:KiteWebHandler.do_GET", boundary="HTTP GET")
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
         if parsed_url.path == "/login":
@@ -47420,6 +47468,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 state.console_log = f"{state.console_log}\nCE scan unavailable: {friendly_external_error(exc, 'CE scan')}"
         self.send_page(state)
 
+    @tracked("app:KiteWebHandler.do_POST", boundary="HTTP POST")
     def do_POST(self) -> None:
         request_path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", "0"))
@@ -50745,6 +50794,34 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     "Advisory GPT analysis completed with the selected Kite quote, model Greeks, option-chain comparison, "
                     "availability, event context and application risk checks. Review remains mandatory before any order."
                 )
+            elif request_path in {"/trade/execution/close-preview", "/trade/execution/close-pair"}:
+                from trade_pair_exit import prepare_pair_exit, exit_prices, close_pair
+                from trade_protected_execution import reconcile_basket
+                state.trade_stage = "execution"
+                account = selected_kite_profile_name(state.kite_profile)
+                repo = ProtectedExecutionRepository(APP_DB_PATH)
+                eid = first(form, "execution_id")
+                current = repo.get(account, eid)
+                require_test_safe_execution(current['mode'], state.trade_test_mode)
+                if current['mode']=='LIVE' and first(form,'close_live_ack')!='PLACE LIVE ORDERS':
+                    raise PermissionError('Type PLACE LIVE ORDERS to review/confirm a LIVE pair close.')
+                broker = KiteBrokerAdapter(paper_trading=current['mode']=='PAPER',account_id=account)
+                current = prepare_pair_exit(repo,account,eid,broker)
+                if request_path.endswith('/close-pair'):
+                    reviewed = current.get('close_review') or {}
+                    if (not reviewed or reviewed.get('version') != current['version']-1 or
+                        (datetime.now(timezone.utc)-datetime.fromisoformat(reviewed['at'])).total_seconds()>120):
+                        raise PermissionError('Refresh CLOSE PAIR preview before confirming.')
+                    current = close_pair(repo,account,eid,broker,checked(form,'close_pair_ack'))
+                    state.message = 'Close submitted: '+current['state']+'. Reconcile fills before releasing hedges.'
+                else:
+                    prices, quotes = exit_prices(current,broker)
+                    target = float(first(form,'pair_profit_target','50'))
+                    if not math.isfinite(target) or not 0<=target<=100:
+                        raise ValueError('Profit target must be between 0 and 100%.')
+                    current['close_review'] = {'at':datetime.now(timezone.utc).isoformat(),'version':current['version']+1,'prices':prices,'target_percent':target}
+                    repo.save(current)
+                    state.message = 'Close preview ready. Review pair P&L and confirm separately; shorts close before hedges.'
             elif request_path in {"/trade/execution/reconcile", "/trade/execution/confirm-sell"}:
                 state.trade_stage = "execution"
                 account_id = selected_kite_profile_name(state.kite_profile)
@@ -50760,7 +50837,11 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         acknowledged=checked(form, "protected_sell_ack"),
                     )
                 else:
-                    record = reconcile_execution(execution_repo, account_id, execution_id, broker)
+                    if record.get('kind')=='TRADE_PAIR':
+                        from trade_protected_execution import reconcile_basket
+                        record = reconcile_basket(execution_repo, account_id, execution_id, broker)
+                    else:
+                        record = reconcile_execution(execution_repo, account_id, execution_id, broker)
                 state.message = f"Protected execution: {record['state']}. Monitoring does not place orders."
             elif request_path == "/trade/submit":
                 if first(form, "trade_final_confirmed") != "1":

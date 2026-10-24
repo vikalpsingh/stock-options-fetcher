@@ -44,3 +44,6 @@ These rules apply to all changes in this repository.
   - no broad filesystem cleanup;
   - rollback behavior for deployment changes;
   - clear user-facing risk messaging for order execution.
+
+## Focused code navigation
+Read docs/CODEX_MODULE_MAP.md first. Search exact functions/routes and inspect focused ranges; use the AST inventory without importing app.py. Run relevant isolated tests. Usage logs are evidence, never automatic deletion authority.

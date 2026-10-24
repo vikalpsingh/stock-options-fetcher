@@ -753,3 +753,27 @@ Overall NIFTY 2.0 remains incomplete; continuation automation is still needed.
 - Associated schedule time/interval inputs and Save Run Times with a dedicated sibling form, avoiding unrelated Kite Setup validation. Server-side all-fields validation remains intact. Dynamic schedule labels reflect saved values rather than hardcoded defaults.
 - Retained existing next-day IST activation, daily-job once-per-day behavior, and intraday interval limits (1–120 minutes). Saving does not start jobs or place orders.
 - Three isolated tests passed: persisted fields, runtime interval slot, invalid input all-before-write validation and dedicated form wiring. Renderer compiled. No app import or broker calls; runtime settings untouched.
+
+
+### 2026-10-23 — TRADE mobile layout
+- Added scoped <=760px styles for wrapping scan header/actions, stacked filters, two-column view tabs, touch-sized controls, constrained scrollable tables, responsive expiry/suggestion controls and viewport-bounded execution modals. Desktop rules and execution behavior unchanged.
+- Validation: Python source compiled without importing app or running jobs. No full suite or broker calls. Actual mobile browser visual verification remains outstanding.
+
+
+### 2026-10-24 — Execution enhancement, first milestone
+Request source: attachment 2c4844d3-00f4-4c13-800b-4864e04b6c27/Pasted text.txt.
+- Added execution_presentation.py with reusable four responsive discipline cards, rendered by TRADE execution and NIFTY execution UI. Soft amber/blue/teal/violet, 2x2 desktop / one column mobile.
+- TRADE local margin estimate mismatch/unavailability is WARNING only when preferred_hedge has passed existing structural/risk validation (or existing PAPER exception). Unprotected LIVE remains BLOCK. Missing/nonpositive estimates no longer falsely PASS. Basket estimate API failure no longer prevents hedge structural evaluation. No broker submission exception handling, risk cap, permissions or scheduler behavior changed.
+- Validation: tests/test_execution_presentation.py plus tests/test_trade_spread_review.py: 9 passed in 21.94s. Three presentation modules compiled. No app import, runtime settings changes or live orders.
+- Inspection: TRADE durable entry repository already creates record before BUY acknowledgment and stores actual hedge/short average fills during reconciliation. TRADE monitor lacks paired exit state; NIFTY has durable basket exit stages and allocation/pending-order checks. TRADE protected builder still defaults BUY ask / SELL bid despite manual ticket LTP default.
+- Remaining required work: unify protected LTP LIMIT defaults with conservative risk/slippage and offsets; fill-based live pair analytics on both monitors; TRADE durable close lifecycle/recovery; explicit close preview/confirmation and 50% profit target; shared scheduler/manual close reservation; safe conflict cancel/reconcile; end-to-end mocked closure/rejection/partial/idempotency tests. Do not claim full acceptance complete. Avoid retrofitting existing legacy records without careful CAS migration tests.
+
+
+### 2026-10-24 — Execution continuation and architecture phases 1–3
+- Added execution_pair_analytics.py for actual-fill gross/estimated-net open marks, realised gross P&L, remaining quantities and return on margin, using fresh depth; wired both execution monitors. Unavailable marks remain unavailable.
+- Added trade_pair_exit.py adapting reconciled terminal TRADE entry records to existing basket exits (kind TRADE_PAIR, original ID retained). Explicit preview/confirmation, 120-second HTTP review, adverse-price rejection, BUY-short-first and separate hedge disposal. Pending/uncertain orders block and direct explicit cancellation in Modify/Cancel rather than automatic cancellation. Mocked PAPER full-close/duplicate test passed.
+- Added protected ownership guard to shared position close submission; scheduler does not independently close execution-owned contracts. TRADE spread builder now opts into tick-rounded option LTP payloads with conservative bid/ask payoff risk; missing LTP/tick skips candidate. Revalidation local margin hard veto removed consistently.
+- Architecture: AST inventory + JSON dependency/call index, CSV inventory, concise module map; opt-in queued/rotating usage tracker, offline reports, usage documentation; pure completed_order_current_pnl extracted with compatible facade. Important HTTP/scheduler/execution/NIFTY/Kite boundaries instrumented. No app import or broker calls in tooling. No observed production logs or archived code.
+- Validation: 8 focused tests passed (usage tooling/failure isolation, extracted P&L helper, pair exit, discipline/margin), changed modules compile. Tests only temporary DBs and mock brokers.
+- Remaining execution acceptance gaps: comprehensive LIVE-shaped partial/rejected-close/competing scheduler tests; actual persisted broker rejection reason exposure; configurable protected-entry offset UI; NIFTY profit-target/exit-preview parity; automatic conflict cancellation intentionally not enabled (requires separately reviewed cancellation scope); browser QA. These changes are not deployed and full execution acceptance is not claimed.
+- Phase 4 awaits production usage export over adequate cycles; phase 5 requires explicit reviewed archival approval. Further app.py extraction remains incremental.

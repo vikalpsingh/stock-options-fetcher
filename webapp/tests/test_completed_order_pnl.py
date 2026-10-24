@@ -1,12 +1,7 @@
 import math
 from pathlib import Path
 
-SOURCE = Path("app.py").read_text(encoding="utf-8-sig")
-start = SOURCE.index("def completed_order_current_pnl(")
-end = SOURCE.index("\ndef render_order_book(", start)
-scope = {"Any": object, "math": math}
-exec(compile(SOURCE[start:end], "completed_order_current_pnl", "exec"), scope)
-pnl = scope["completed_order_current_pnl"]
+from position_order_display import completed_order_current_pnl as pnl
 
 
 def test_completed_row_quantity_and_position_direction():

@@ -1,4 +1,6 @@
 """Escaped server-rendered execution window. No automatic order submission."""
+from execution_presentation import render_discipline_cards
+from execution_pair_analytics import render_pair_pnl
 from html import escape
 from datetime import datetime, timezone
 from .ticket import number
@@ -360,7 +362,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
         for check in ticket['checks']:
             body += f'<li class="{e(check["status"].lower())}"><b>{e(check["status"])} · {e(check["name"])}</b> — {e(check["reason"])}</li>'
         body += '</ul>' + nearer_liquidity_form(data) + '<p>Portfolio checks govern new entries only. P&amp;L and position review remain available when entry risk is blocked.</p><p>POP is unavailable: no validated probability model is connected. Risk uses executable bid/ask and current master quantity.</p></section>'
-        body += '<section id="execution"><h2>Execution window</h2><p>GO submits protective BUY legs only. Reconcile fills, then explicitly approve SELL using fresh risk checks. LIVE sends real LIMIT orders to the broker only after explicit acknowledgement and fresh approval.</p>'
+        body += '<section id="execution"><h2>Execution window</h2>'+render_discipline_cards()+'<p>GO submits protective BUY legs only. Reconcile fills, then explicitly approve SELL using fresh risk checks. LIVE sends real LIMIT orders to the broker only after explicit acknowledgement and fresh approval.</p>'
         body += '<form method="post" action="/nifty-2/clear-reviews"><button type="submit">Clear all reviews</button><p>Clears unsubmitted reviews for this profile in PAPER and LIVE. Pending orders and filled executions are preserved. Older reviews clear at 9:00 AM IST on weekdays while the app is running, or on next page load.</p></form>'
         records = data['executions']
         if not records:
@@ -370,6 +372,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
             body += f'<p role="status"><strong>Next step:</strong> {e(execution_guidance(record))}</p>'
             body += f'<button type="button" data-open-execution="{e(record["id"])}">OPEN NIFTY ORDER TICKET</button>'
             body += f'<article id="execution-{e(record["id"])}"><h3>{e(saved.get("strategy_type"))} · {e(record["mode"])} · {e(record["state"])}</h3><p>Execution {e(record["id"])} · Strategy {e(record.get("strategy_id", "pending"))}</p>'
+            body += render_pair_pnl(record, context['quotes'], context['now'])
             body += ticket_risk_header(saved)
             body += saved_ticket_details(saved)
             if record['state']=='REVIEW':

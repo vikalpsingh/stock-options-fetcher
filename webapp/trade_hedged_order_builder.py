@@ -36,7 +36,7 @@ def protective_contracts(short_contract: dict[str, Any], contracts: list[dict[st
 def build_protective_spreads(
     short_contract: dict[str, Any], contracts: list[dict[str, Any]], quotes: dict[str, Any],
     quantity: int, *, max_loss_cap: float, margin_provider: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
-    selected_hedge_symbol: str = "",
+    selected_hedge_symbol: str = "", use_ltp_limits: bool = False,
 ) -> list[dict[str, Any]]:
     """Review an explicit verified hedge, or suggest up to three nearby hedges."""
     short_symbol = str(short_contract.get("tradingsymbol") or "").upper()
@@ -79,6 +79,20 @@ def build_protective_spreads(
             {"exchange": "NFO", "tradingsymbol": hedge_symbol, "transaction_type": "BUY", "quantity": quantity, "product": "NRML", "order_type": "LIMIT", "price": ask, "variety": "regular", "validity": "DAY"},
             {"exchange": "NFO", "tradingsymbol": short_symbol, "transaction_type": "SELL", "quantity": quantity, "product": "NRML", "order_type": "LIMIT", "price": short_bid, "variety": "regular", "validity": "DAY"},
         ]
+        if use_ltp_limits:
+            from nifty_options_engine.ticket import ltp_limit_price
+            buy_limit=ltp_limit_price(quote,hedge)
+            sell_limit=ltp_limit_price(short_quote,short_contract)
+            if buy_limit is None or sell_limit is None:
+                continue
+            # Conservative risk never counts optimistic resting-limit proceeds.
+            ask=max(ask,buy_limit)
+            short_price=min(short_bid,sell_limit)
+            credit=short_price-ask
+            gross_profit=credit*quantity
+            gross_loss=max(0.0,(width-credit)*quantity)
+            payloads[0]['price']=buy_limit
+            payloads[1]['price']=sell_limit
         margin = margin_provider(payloads) if margin_provider else {}
         initial = _num((margin.get("initial") or {}).get("total") if isinstance(margin.get("initial"), dict) else margin.get("initial"))
         final = _num((margin.get("final") or {}).get("total") if isinstance(margin.get("final"), dict) else margin.get("final"))
@@ -94,7 +108,7 @@ def build_protective_spreads(
             "strategy_type": "BEAR_CALL_SPREAD" if option_type == "CE" else "BULL_PUT_SPREAD",
             "option_type": option_type, "short_symbol": short_symbol, "hedge_symbol": hedge_symbol,
             "expiry": expiry, "short_strike": short_strike, "hedge_strike": _num(hedge.get("strike")),
-            "quantity": quantity, "lot_size": lot_size, "short_limit_price": short_bid, "hedge_limit_price": ask,
+            "quantity": quantity, "lot_size": lot_size, "short_limit_price": payloads[1]["price"], "hedge_limit_price": payloads[0]["price"],
             "short_bid": short_bid, "short_ask": short_ask, "hedge_bid": bid, "hedge_ask": ask,
             "spread_width": width, "hedge_cost": round(ask * quantity, 2),
             "short_premium": round(short_bid * quantity, 2),

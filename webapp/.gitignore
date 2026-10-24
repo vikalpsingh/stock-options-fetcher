@@ -54,3 +54,7 @@ test_*_strategy.py
 vikalp_income.db
 openai_csv_prompt.md
 ETF req
+
+# Runtime observability data
+runtime/usage_logs/
+runtime/usage_reports/
