@@ -205,14 +205,17 @@ def approve_exit(record, context, close_hedges=False):
         target = payload["transaction_type"] == ("BUY" if close_hedges or orphan_cleanup else "SELL")
         if not leg["filled"]:
             continue
-        quote = quote_values(context["quotes"].get("NFO:" + symbol) or {})
-        price = number(quote["bid" if payload["transaction_type"] == "BUY" else "ask"])
-        prices[symbol] = price
         if not target:
             continue
         remaining = basket_remaining(record, leg)
         if remaining <= 0:
             continue
+        quote = context["quotes"].get("NFO:" + symbol) or {}
+        master = next((row for row in context['instruments'] if row['tradingsymbol'] == symbol), {})
+        from pair_exit_review import executable_exit_limit
+        price = executable_exit_limit(quote, 'SELL' if payload['transaction_type']=='BUY' else 'BUY',
+                                      remaining, master.get('tick_size'), context['now'])
+        prices[symbol] = price
         if record["mode"] == "LIVE":
             owned = sum(row["quantity"] for row in context.get("allocations") or []
                         if row.get("strategy_id") == record["strategy_id"]

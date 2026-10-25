@@ -40,9 +40,9 @@ def calculate_nifty_portfolio_risk(existing_positions, proposed_strategy=None,
     Missing ownership, metadata or prices returns unknown rather than zero.
     """
     config = config or {}
-    cap = finite_number(config.get("max_total_nifty_defined_loss_inr", 60000))
+    cap = finite_number(config.get("max_total_nifty_defined_loss_inr", 100000))
     # User's hard ceiling cannot be lifted by a per-ticket override.
-    cap = min(cap, 60000.0) if cap is not None and cap > 0 else 60000.0
+    cap = cap if cap is not None and cap > 0 else 100000.0
     allocation = None
     if strategy_allocations is not None or pending_orders is not None:
         allocation = allocate_nifty_positions(
@@ -109,7 +109,7 @@ def calculate_nifty_portfolio_risk(existing_positions, proposed_strategy=None,
     }
 
 
-def strategy_risk_summary(strategy, legs, cap=60000):
+def strategy_risk_summary(strategy, legs, cap=100000):
     """Compatibility summary for existing NIFTY tickets, using canonical math.
 
     Quantities and expiry must be on actual legs. No legacy lot-size assumption,
@@ -222,7 +222,7 @@ def validate_nifty_strategy(
 
 
 def get_max_safe_lots(existing_positions, proposed_spread, allowed_lots=(1, 2, 3, 4),
-                      risk_cap=60000, *, config=None, strategy_allocations=None, pending_orders=None):
+                      risk_cap=100000, *, config=None, strategy_allocations=None, pending_orders=None):
     """Risk-only sizing advice using the canonical payoff engine; never changes selection.
 
     Broker margin, quote freshness and liquidity must still pass at review/GO.

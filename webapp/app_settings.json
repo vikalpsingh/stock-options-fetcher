@@ -725,6 +725,7 @@
     "start_time": "09:30",
     "status": "ALL_COVERED"
   },
+  "investing_v2_enabled": true,
   "kite_profiles": {
     "Aanya": {
       "KITE_ACCESS_TOKEN": "",
@@ -768,7 +769,7 @@
       ]
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "ivgt1tVZgBnYNW9RDKm49z7YjYBpBXTF",
+      "KITE_ACCESS_TOKEN": "zJkn2Z4UBVF8vVjDIf3NvqmiE3x4370f",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES",

@@ -70,10 +70,17 @@ def execute_action(path, form, account, db_path, config, context_loader, broker_
         record = reconcile_basket(repo, account, record['id'], broker)
     elif path == '/nifty-2/confirm-sell':
         record = confirm_basket_shorts(repo, account, record['id'], broker, validate, ack)
+    elif path == '/nifty-2/review-exit':
+        from pair_exit_review import save_exit_review, exit_stage
+        record=reconcile_basket(repo,account,record['id'],broker)
+        prices=validate(record,'EXIT_HEDGES' if exit_stage(record)=='HEDGES' else 'EXIT_SHORTS')
+        record=save_exit_review(repo,record,prices,get('pair_profit_target','50'))
     elif path in {'/nifty-2/close-shorts', '/nifty-2/close-hedges'}:
         record = reconcile_basket(repo, account, record['id'], broker)
         close_hedges = path.endswith('close-hedges')
         prices = validate(record, 'EXIT_HEDGES' if close_hedges else 'EXIT_SHORTS')
+        from pair_exit_review import validate_exit_review
+        validate_exit_review(record,prices)
         record = submit_basket_exit(repo, account, record['id'], broker, validate, prices, ack, close_hedges)
     else:
         raise ValueError('Unknown NIFTY execution action.')

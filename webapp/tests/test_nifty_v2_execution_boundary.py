@@ -43,7 +43,7 @@ def test_defaults_and_nonremovable_safety_requirements():
 
 
 @pytest.mark.parametrize("values", [
-    {"max_total_nifty_defined_loss_inr": 60001},
+    {"max_total_nifty_defined_loss_inr": 0},
     {"default_lots": 0.5},
     {"live_enabled": "false"},
     {"credit_capture_target_pct": 101},

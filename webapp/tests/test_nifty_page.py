@@ -40,6 +40,8 @@ def test_page_paper_lifecycle_and_analytics(tmp_path, market, monkeypatch):
                                 ('confirm-sell','SHORT_PENDING'), ('reconcile','OPEN'),
                                 ('close-shorts','EXIT_PENDING'), ('reconcile','SHORT_CLOSED_HEDGE_OPEN'),
                                 ('close-hedges','EXIT_PENDING'), ('reconcile','CLOSED')]:
+        if endpoint.startswith('close-'):
+            execute_action('/nifty-2/review-exit', action, 'A', path, config, loader, factory)
         record, _ = execute_action('/nifty-2/'+endpoint, action, 'A', path, config, loader, factory)
         assert record['state'] == expected
     assert not NiftyStrategyRepository(path).position_allocations('A','PAPER')

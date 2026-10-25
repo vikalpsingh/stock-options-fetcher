@@ -1,6 +1,7 @@
 """Escaped server-rendered execution window. No automatic order submission."""
 from execution_presentation import render_discipline_cards
 from execution_pair_analytics import render_pair_pnl
+from pair_exit_review import render_exit_review
 from html import escape
 from datetime import datetime, timezone
 from .ticket import number
@@ -285,6 +286,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
     body = ''
     if data:
         selection, ticket, context = data['selection'], data['ticket'], data['context']
+        body += '<form method="post" action="/nifty-2/loss-cap" class="fields"><label>Portfolio loss cap (₹)<input type="number" name="loss_cap" min="1" step="1" required value="'+e(data['config']['max_total_nifty_defined_loss_inr'])+'"></label><button type="submit">Save loss cap</button><small>Shared NIFTY setting · default ₹1,00,000. Saving requires fresh entry reviews. Monthly-loss and hedge checks remain active.</small></form>'
         risk, analytics = data['risk'], data['analytics']
         def card(label, value):
             return f'<div class="metric"><small>{e(label)}</small><strong>{e(value)}</strong></div>'
@@ -364,10 +366,16 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
         body += '</ul>' + nearer_liquidity_form(data) + '<p>Portfolio checks govern new entries only. P&amp;L and position review remain available when entry risk is blocked.</p><p>POP is unavailable: no validated probability model is connected. Risk uses executable bid/ask and current master quantity.</p></section>'
         body += '<section id="execution"><h2>Execution window</h2>'+render_discipline_cards()+'<p>GO submits protective BUY legs only. Reconcile fills, then explicitly approve SELL using fresh risk checks. LIVE sends real LIMIT orders to the broker only after explicit acknowledgement and fresh approval.</p>'
         body += '<form method="post" action="/nifty-2/clear-reviews"><button type="submit">Clear all reviews</button><p>Clears unsubmitted reviews for this profile in PAPER and LIVE. Pending orders and filled executions are preserved. Older reviews clear at 9:00 AM IST on weekdays while the app is running, or on next page load.</p></form>'
-        records = data['executions']
+        body += '<datalist id="pair-exit-targets"><option value="40"><option value="50"><option value="60"><option value="70"></datalist>'
+        records = sorted(data['executions'],key=lambda row:row['state']=='CLOSED')
+        body += '<h3>Active / Recovery</h3>'
+        closed_history = False
         if not records:
             body += '<p>No saved executions. Save an eligible ticket review above.</p>'
         for record in records[:30]:
+            if record['state']=='CLOSED' and not closed_history:
+                body += '<h3>Closed History</h3>'
+                closed_history = True
             saved = record['preview']
             body += f'<p role="status"><strong>Next step:</strong> {e(execution_guidance(record))}</p>'
             body += f'<button type="button" data-open-execution="{e(record["id"])}">OPEN NIFTY ORDER TICKET</button>'
@@ -404,6 +412,9 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
                     body += '<button formaction="/nifty-2/reconcile">Reconcile fills</button>'
                 if state in {'HEDGE_FILLED','SHORT_PENDING','SHORT_PARTIAL'}:
                     body += '<button formaction="/nifty-2/confirm-sell">Revalidate risk &amp; submit unsent SELL</button>'
+                if state in {'OPEN','HEDGE_FILLED','RECOVERY_READY','EXIT_RECOVERY_READY','SHORT_CLOSED_HEDGE_OPEN'}:
+                    body += '<label>Profit target % (advisory)<input name="pair_profit_target" type="number" min="0" max="100" value="50" list="pair-exit-targets"></label><button formaction="/nifty-2/review-exit">CLOSE PAIR · Review Exit</button>'
+                    body += render_exit_review(record,'','','')
                 if state in {'OPEN','HEDGE_FILLED','RECOVERY_READY','EXIT_RECOVERY_READY'}:
                     has_shorts = any(leg['filled'] for leg in record['legs'] if leg['payload']['transaction_type']=='SELL')
                     body += '<button formaction="/nifty-2/close-shorts">'+('Close shorts first' if has_shorts else 'Close orphan hedge')+'</button>'

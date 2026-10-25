@@ -135,7 +135,7 @@ def test_duplicate_fills_and_risk_blocks(setup):
     repo, broker, row = setup
     broker.fill()
     broker.fills["1"] *= 2
-    assert reconcile_execution(repo, "A", row["id"], broker)["state"] == "RECONCILIATION_REQUIRED"
+    assert reconcile_execution(repo, "A", row["id"], broker)["hedge_filled"] == 10
     broker.fills["1"] = broker.fills["1"][:1]
     def deny(_):
         raise PermissionError("Monthly loss limit")

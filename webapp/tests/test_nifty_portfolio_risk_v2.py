@@ -86,7 +86,7 @@ def test_condor_uses_maximum_wing_and_total_credit():
 
 
 def test_distinct_expiries_are_added_without_calendar_netting():
-    result = calculate_nifty_portfolio_risk(vertical() + vertical("2026-12-29", strategy="S2"))
+    result = calculate_nifty_portfolio_risk(vertical() + vertical("2026-12-29", strategy="S2"), config={"max_total_nifty_defined_loss_inr":60000})
     assert result["current_defined_max_loss"] == 62400
     assert result["risk_status"] == "BLOCK"
 
@@ -111,8 +111,9 @@ def test_bad_executable_quote_is_blocked(value):
 
 
 def test_costs_and_hard_cap_cannot_be_overridden_by_ticket():
-    result = calculate_nifty_portfolio_risk(vertical(), proposed(vertical("2026-12-29")),
-                                          config={"max_total_nifty_defined_loss_inr": 999999,
+    candidate = {**proposed(vertical("2026-12-29")), "max_total_nifty_defined_loss_inr":999999}
+    result = calculate_nifty_portfolio_risk(vertical(), candidate,
+                                          config={"max_total_nifty_defined_loss_inr": 60000,
                                                   "estimated_execution_costs_inr": 250})
     assert result["risk_cap"] == 60000
     assert result["projected_portfolio_max_loss"] == 62650
@@ -167,3 +168,13 @@ def test_app_wrappers_preserve_unknown_risk_and_repair_permission():
     additional = scope["validate_nifty_risk_cap_after_repair_or_new_spread"](
         rows, {"action_type": "SELL_AGAINST_LONG", "hedge_validity": "SAME_EXPIRY_FULL_HEDGE"})
     assert not additional["allowed"]
+
+
+def test_configurable_loss_cap_controls_same_portfolio():
+    from nifty_options_engine.config import income_v2_config
+    assert income_v2_config()['max_total_nifty_defined_loss_inr']==100000
+    rows=vertical()
+    for row in rows:row['quantity']*=3
+    assert calculate_nifty_portfolio_risk(rows,config=income_v2_config())['risk_status']=='PASS'
+    assert calculate_nifty_portfolio_risk(rows,config=income_v2_config({'max_total_nifty_defined_loss_inr':60000}))['risk_status']=='BLOCK'
+    assert calculate_nifty_portfolio_risk(rows,config=income_v2_config({'max_total_nifty_defined_loss_inr':120000}))['risk_status']=='PASS'

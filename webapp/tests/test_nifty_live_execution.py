@@ -60,6 +60,8 @@ def live(tmp_path, market):
     ProtectedExecutionRepository(path).save(record)
     action = {'execution_id':[record['id']], 'ack':['yes'], 'live_ack':['PLACE LIVE ORDERS']}
     def run(endpoint, test_mode=False):
+        if endpoint.startswith('close-'):
+            execute_action('/nifty-2/review-exit',action,'A',path,config,loader,lambda _:broker,test_mode)
         return execute_action('/nifty-2/'+endpoint,action,'A',path,config,loader,lambda _:broker,test_mode)[0]
     return run,broker,context,action
 
@@ -247,3 +249,60 @@ def test_pending_partial_exit_blocks_replacement_and_hedge_disposal(live):
     with pytest.raises(PermissionError): run('close-shorts')
     with pytest.raises(PermissionError): run('close-hedges')
     assert len(broker.orders) == 3
+
+
+def test_short_buy_rejection_keeps_hedge_and_requires_explicit_retry(live):
+    run,broker,_,_=live
+    run('start');broker.fill();run('confirm-sell');broker.fill();run('close-shorts')
+    broker.orders[-1]['status']='REJECTED'
+    assert run('reconcile')['state']=='EXIT_RECOVERY_READY'
+    with pytest.raises(PermissionError):run('close-hedges')
+    assert len(broker.orders)==3
+    run('close-shorts')
+    assert broker.orders[-1]['transaction_type']=='BUY'
+    assert broker.orders[-1]['quantity']==130
+
+
+def test_short_exit_timeout_recovers_by_tag_without_duplicate(live):
+    run,broker,_,_=live
+    run('start');broker.fill();run('confirm-sell');broker.fill()
+    original=broker.place_order
+    def accepted_but_disconnected(payload):
+        original(payload)
+        raise TimeoutError('simulated disconnect')
+    broker.place_order=accepted_but_disconnected
+    result=run('close-shorts')
+    assert result['exit_legs'][0]['status']=='SUBMISSION_UNKNOWN'
+    broker.place_order=original
+    assert run('reconcile')['state']=='EXIT_PENDING'
+    with pytest.raises(PermissionError):run('close-shorts')
+    assert len(broker.orders)==3
+    broker.fill()
+    assert run('reconcile')['state']=='SHORT_CLOSED_HEDGE_OPEN'
+
+
+def test_illiquid_hedge_does_not_block_short_risk_reduction(live):
+    run,broker,context,_=live
+    run('start');broker.fill();run('confirm-sell');broker.fill()
+    hedge=broker.orders[0]['tradingsymbol']
+    context['quotes']['NFO:'+hedge]={}
+    run('close-shorts');broker.fill()
+    assert run('reconcile')['state']=='SHORT_CLOSED_HEDGE_OPEN'
+    with pytest.raises(PermissionError):run('close-hedges')
+    assert len(broker.orders)==3
+
+
+def test_pending_scheduler_close_blocks_manual_submission(live):
+    run,broker,_,_=live
+    run('start');broker.fill();run('confirm-sell');broker.fill()
+    broker.orders.append(dict(broker.orders[-1],order_id='scheduler',transaction_type='BUY',status='OPEN',filled_quantity=0,tag='scheduler'))
+    with pytest.raises(PermissionError):run('close-shorts')
+    assert len(broker.orders)==3
+
+
+def test_repeated_close_click_does_not_duplicate_pending_order(live):
+    run,broker,_,_=live
+    run('start');broker.fill();run('confirm-sell');broker.fill()
+    run('close-shorts')
+    with pytest.raises(PermissionError):run('close-shorts')
+    assert len(broker.orders)==3

@@ -2,6 +2,7 @@
 import html
 import math
 from execution_presentation import render_discipline_cards
+from pair_exit_review import render_exit_review
 
 
 def render_spread_summary(preview, checks=None, *, snapshot=False):
@@ -20,6 +21,14 @@ def render_spread_summary(preview, checks=None, *, snapshot=False):
          if row.get("hedge_symbol") == preview.get("selected_hedge_symbol")), {}
     )
     blocks = [row for row in checks or [] if row.get("status") == "BLOCK"]
+    if spread.get('status') == 'BLOCK' and spread.get('reason'):
+        blocks.append(dict(name='Selected spread',status='BLOCK',reason=spread['reason']))
+    if not spread:
+        spread = dict(short_symbol=preview.get('tradingsymbol'),hedge_symbol=preview.get('selected_hedge_symbol'),
+                      quantity=preview.get('quantity'))
+        if spread['hedge_symbol']:
+            blocks.append(dict(name='Selected spread',status='BLOCK',reason='Spread evaluation returned no priced result. Refresh quotes and review the validation errors below.'))
+
     approved = bool(preview.get("strategy_type")) and not blocks
     title = "Saved spread review" if snapshot else "Revalidated spread" if preview.get("hedge_revalidated") else "Spread review"
     status = "REVIEW SNAPSHOT" if snapshot else "CHECKS PASSED" if approved else "REVIEW BLOCKED"
@@ -107,15 +116,20 @@ def render_execution_monitor(rows, account, quotes=None, now=None):
     quotes = quotes or {}
     now = now or datetime.now(timezone.utc)
     esc = lambda value: html.escape(str(value), quote=True)
-    cards = []
-    for row in rows:
+    cards = ["<h3>Active / Recovery</h3>"]
+    closed_history = False
+    for row in sorted(rows,key=lambda item:item["state"]=="CLOSED"):
+        if row["state"]=="CLOSED" and not closed_history:
+            cards.append("<h3>Closed History</h3>")
+            closed_history = True
         preview = row["preview"]
         buy, sell = preview["order_payloads"]
         ready = row.get("kind") != "TRADE_PAIR" and row["state"] == "HEDGE_FILLED" and row["short_status"] == "NOT_SUBMITTED"
         cards.append(f'''<section class="panel">
           <div class="panel-title">{esc(preview.get("symbol", ""))} · {"Bear Call Spread" if preview.get("strategy_type") == "BEAR_CALL_SPREAD" else "Bull Put Spread"} · {esc(row["mode"])}</div>
           <p><strong>{esc(row["state"])}</strong> · {esc(row["note"])} · Updated {esc(row["updated_at"])}</p>
-          {render_spread_summary(preview, snapshot=True)}
+          <p>Pair {esc(row['id'])} · Expiry {esc(preview.get('expiry','UNKNOWN'))} · Lots {esc(preview.get('lots','UNKNOWN'))} · {esc(row['mode'])}</p>
+          <details><summary>View Pair Details · saved review</summary>{render_spread_summary(preview, snapshot=True)}</details>
           {render_pair_pnl(row, quotes, now)}
           <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Leg</th><th>Contract</th><th>LIMIT</th><th>Filled / Qty</th><th>Status</th><th>Order ID</th></tr></thead><tbody>
           <tr><td>Hedge BUY</td><td>{esc(buy["tradingsymbol"])}</td><td>{buy["price"]:.2f}</td><td>{row["hedge_filled"]} / {buy["quantity"]}</td><td>{esc(row["hedge_status"])}</td><td>{esc(row["hedge_order_id"])}</td></tr>
@@ -125,16 +139,17 @@ def render_execution_monitor(rows, account, quotes=None, now=None):
           <form method="post" action="/trade/execution/reconcile">
           <input type="hidden" name="kite_profile" value="{esc(account)}">
           <input type="hidden" name="execution_id" value="{esc(row["id"])}">
-          <button type="submit">Monitor / Reconcile</button>
+          <button type="submit">Broker Reconciliation</button>
           <label><input type="checkbox" name="protected_sell_ack" value="1"> I accept the displayed maximum risk and authorise this SELL limit only after fresh risk checks.</label>
           <button type="submit" formaction="/trade/execution/confirm-sell" {"" if ready else "disabled"}>Confirm SELL</button>
           </form>
+          {render_exit_review(row, "/trade/execution/close-pair", "kite_profile", account) if row.get("legs") else ""}
           <form method="post" action="/trade/execution/close-preview">
           <input type="hidden" name="kite_profile" value="{esc(account)}"><input type="hidden" name="execution_id" value="{esc(row['id'])}">
-          <label>Profit target % of collected credit (advisory)<input type="number" name="pair_profit_target" min="0" max="100" value="{esc((row.get('close_review') or {}).get('target_percent',50))}"></label>
+          <label>Profit target % of collected credit (advisory)<input type="number" name="pair_profit_target" list="pair-exit-targets" min="0" max="100" value="{esc((row.get('close_review') or {}).get('target_percent',50))}"></label>
           {('<label>LIVE confirmation<input name="close_live_ack" placeholder="PLACE LIVE ORDERS"></label>' if row['mode']=='LIVE' else '')}
           <button type="submit">CLOSE PAIR · Preview</button>
           <label><input type="checkbox" name="close_pair_ack" value="1"> I accept the displayed exit debit, estimated charges and any loss. Close shorts first; release hedges only after confirmed fills.</label>
           <button type="submit" formaction="/trade/execution/close-pair" {'' if row.get('close_review') and row['state']!='CLOSED' else 'disabled'}>Confirm close stage</button>
           </form></section>''')
-    return '<section id="trade-terminal-panel"><h2>TRADE → EXECUTION</h2><a href="/trade">Back to TRADE</a><p>Monitoring never places orders. PAPER fills are simulated when reconciled. A standalone hedge remains open until managed; unknown submissions must be reconciled, never retried.</p>' + render_discipline_cards() + ("".join(cards) or "<p>No protected executions for this account.</p>") + "</section>"
+    return '<section id="trade-terminal-panel"><h2>TRADE → EXECUTION</h2><datalist id="pair-exit-targets"><option value="40"><option value="50"><option value="60"><option value="70"></datalist><a href="/trade">Back to TRADE</a><a class="button-link" href="/trade/execution?kite_profile=' + esc(account) + '">Refresh P&amp;L</a><p>Monitoring never places orders. PAPER fills are simulated when reconciled. A standalone hedge remains open until managed; unknown submissions must be reconciled, never retried.</p>' + render_discipline_cards() + ("".join(cards) or "<p>No protected executions for this account.</p>") + "</section>"

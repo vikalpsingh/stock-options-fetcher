@@ -51,7 +51,7 @@ def build_protective_spreads(
     short_bid = _num(((short_depth.get("buy") or [{}])[0] or {}).get("price"))
     short_ask = _num(((short_depth.get("sell") or [{}])[0] or {}).get("price"))
     lot_size = int(_num(short_contract.get("lot_size")))
-    if not short_symbol or short_strike <= 0 or short_bid <= 0 or quantity <= 0 or lot_size <= 0 or quantity % lot_size:
+    if not short_symbol or short_strike <= 0 or quantity <= 0 or lot_size <= 0 or quantity % lot_size:
         return []
     candidates = protective_contracts(short_contract, contracts)
     if selected_hedge_symbol:
@@ -72,6 +72,18 @@ def build_protective_spreads(
         hedge_lot = int(_num(hedge.get("lot_size")))
         liquid = ask > 0 and bid > 0 and volume >= 1 and oi >= quantity and hedge_lot == lot_size
         width = (_num(hedge.get("strike")) - short_strike) if option_type == "CE" else (short_strike - _num(hedge.get("strike")))
+        def unavailable(reason):
+            # Keep identity/observed prices in review, but never supply executable payloads.
+            return dict(strategy_type="BEAR_CALL_SPREAD" if option_type=="CE" else "BULL_PUT_SPREAD",
+                option_type=option_type,short_symbol=short_symbol,hedge_symbol=hedge_symbol,
+                expiry=expiry,short_strike=short_strike,hedge_strike=_num(hedge.get('strike')),
+                quantity=quantity,lot_size=lot_size,spread_width=width,
+                short_bid=short_bid or None,short_ask=short_ask or None,
+                hedge_bid=bid or None,hedge_ask=ask or None,
+                eligible=False,status="BLOCK",liquidity="BLOCK",reason=reason,order_payloads=[])
+        if short_bid <= 0 or ask <= 0:
+            alternatives.append(unavailable("Executable SELL bid or protective BUY ask is missing. Refresh market quotes; no executable spread can be priced."))
+            continue
         credit = short_bid - ask
         gross_profit = credit * quantity
         gross_loss = max(0.0, (width - credit) * quantity)
@@ -84,6 +96,7 @@ def build_protective_spreads(
             buy_limit=ltp_limit_price(quote,hedge)
             sell_limit=ltp_limit_price(short_quote,short_contract)
             if buy_limit is None or sell_limit is None:
+                alternatives.append(unavailable("Current LTP or instrument tick size is missing for a selected leg. Refresh quotes/instrument master before reviewing LIMIT orders."))
                 continue
             # Conservative risk never counts optimistic resting-limit proceeds.
             ask=max(ask,buy_limit)
@@ -121,7 +134,7 @@ def build_protective_spreads(
             "reason": f"Verified {direction}-strike same-expiry hedge." if eligible else " ".join(failures),
             "order_payloads": payloads,
         })
-    return sorted(alternatives, key=lambda row: (not row["eligible"], row["max_loss"], -(row["credit_margin_pct"] or 0)))[:3]
+    return sorted(alternatives, key=lambda row: (not row["eligible"], row.get("max_loss", float("inf")), -(row.get("credit_margin_pct") or 0)))[:3]
 
 
 def protective_pe_contracts(short_contract, contracts):

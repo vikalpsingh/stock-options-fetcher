@@ -6,7 +6,7 @@ from typing import Any
 NIFTY_INCOME_V2_DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "timezone": "Asia/Kolkata",
-    "max_total_nifty_defined_loss_inr": 60000,
+    "max_total_nifty_defined_loss_inr": 100000,
     "default_lots": 2,
     "maximum_lots_per_new_trade": 4,
     "allowed_lots": [1, 2, 3, 4],
@@ -56,8 +56,7 @@ def income_v2_config(overrides=None):
                 result[key] = int(value) if isinstance(default, int) else value
             except (ValueError, TypeError):
                 raise ValueError(f"Invalid NIFTY setting: {key}") from None
-    if result["max_total_nifty_defined_loss_inr"] > 60000:
-        raise ValueError("NIFTY portfolio loss cap cannot exceed ₹60,000.")
+    # User-configurable portfolio budget; finite positive whole rupees validated above.
     if (not isinstance(result["allowed_lots"], list) or not result["allowed_lots"]
             or any(type(n) is not int or n not in (1, 2, 3, 4) for n in result["allowed_lots"])
             or result["maximum_lots_per_new_trade"] > 4

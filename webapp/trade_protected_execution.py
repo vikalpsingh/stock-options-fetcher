@@ -43,6 +43,15 @@ class ProtectedExecutionRepository:
             ).fetchall()
         return [data for row in rows if (data := json.loads(row["data"])).get("kind") != "BASKET"]
 
+    def owned_symbols(self, account, mode="LIVE"):
+        """All durable owners, without the monitor's history pagination limit."""
+        with self.connect() as conn:
+            rows=conn.execute("SELECT data FROM trade_protected_execution WHERE account_id=?",(account,)).fetchall()
+        return {p['tradingsymbol'] for row in rows
+                if (record:=json.loads(row['data']))['mode']==mode
+                and record['state'] not in {'REVIEW','CLOSED'}
+                for p in record['preview']['order_payloads']}
+
     def recent_baskets(self, account):
         with self.connect() as conn:
             rows = conn.execute(
@@ -140,6 +149,7 @@ class ProtectedExecutionRepository:
                       hedge_average_price=0, hedge_status="SUBMITTING", short_status="NOT_SUBMITTED",
                       hedge_tag="TP" + execution_id[:16] + "H",
                       short_tag="TP" + execution_id[:16] + "S",
+                      created_at=datetime.now(timezone.utc).isoformat(),
                       updated_at=datetime.now(timezone.utc).isoformat(), note="")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -249,17 +259,21 @@ def _leg(record, broker, orders, side, include_trades=False):
            ("tradingsymbol", "exchange", "product", "transaction_type", "quantity", "order_type")):
         raise ValueError("Order differs from authorised leg.")
     order_id = str(order["order_id"])
-    seen, filled, cost = set(), 0, 0.0
+    seen, filled, cost = {}, 0, 0.0
     trades = broker.get_order_trades(order_id)
     for trade in trades:
         trade_id = str(trade.get("trade_id") or "")
         qty, price = trade.get("quantity", 0), float(trade.get("average_price") or trade.get("price") or 0)
-        if (not trade_id or trade_id in seen or not isinstance(qty, int) or qty <= 0
+        if (not trade_id or not isinstance(qty, int) or qty <= 0
                 or not math.isfinite(price) or price <= 0 or str(trade.get("order_id")) != order_id
                 or any(trade.get(k) != payload[k] for k in
                        ("tradingsymbol", "exchange", "product", "transaction_type"))):
             raise ValueError("Fill identity is unresolved.")
-        seen.add(trade_id)
+        identity=(qty,price,str(trade.get('order_id')))
+        if trade_id in seen:
+            if seen[trade_id]!=identity:raise ValueError('Conflicting duplicate trade ID')
+            continue
+        seen[trade_id]=identity
         filled += qty
         cost += qty * price
     status = str(order.get("status") or "").upper()
@@ -268,7 +282,8 @@ def _leg(record, broker, orders, side, include_trades=False):
     if status == "COMPLETE" and filled != payload["quantity"]:
         raise ValueError("Complete order lacks full trade confirmation.")
     result = (order_id, status, filled, cost / filled if filled else 0.0)
-    return (*result, trades) if include_trades else result
+    unique_trades={str(t['trade_id']):t for t in trades}
+    return (*result, list(unique_trades.values())) if include_trades else result
 
 
 def reconcile_execution(repo, account, execution_id, broker):
@@ -276,16 +291,24 @@ def reconcile_execution(repo, account, execution_id, broker):
     _check_mode(record, broker)
     try:
         orders = [] if record["mode"] == "PAPER" else broker.get_orders()
-        oid, status, filled, average = _leg(record, broker, orders, "hedge")
+        def verified(side):
+            prefix='hedge' if side=='hedge' else 'short'
+            if record.get(prefix+'_status')=='COMPLETE' and record.get(prefix+'_trades'):
+                return (record['hedge_order_id' if side=='hedge' else 'sell_order_id'], 'COMPLETE',
+                        record[prefix+'_filled'],record[prefix+'_average_price'],record[prefix+'_trades'])
+            result=_leg(record,broker,orders,side,include_trades=True)
+            if result[2]<record.get(prefix+'_filled',0):raise ValueError('Confirmed fills decreased')
+            return result
+        oid, status, filled, average, trades = verified("hedge")
         record.update(hedge_order_id=oid, hedge_status=status, hedge_filled=filled,
-                      hedge_average_price=average)
+                      hedge_average_price=average, hedge_trades=json.loads(json.dumps(trades,default=str)))
         short_attempted = record["short_status"] != "NOT_SUBMITTED"
         if short_attempted:
-            oid, status, filled, average = _leg(record, broker, orders, "short")
+            oid, status, filled, average, trades = verified("short")
             record.update(sell_order_id=oid, short_status=status, short_filled=filled,
-                          short_average_price=average)
+                          short_average_price=average, short_trades=json.loads(json.dumps(trades,default=str)))
             record["state"] = ("SPREAD_ACTIVE" if status == "COMPLETE" else
-                               "SHORT_" + status if status in {"REJECTED", "CANCELLED"} else "SELL_PENDING")
+                               "SHORT_" + status if status in {"REJECTED", "CANCELLED"} else "SHORT_PARTIAL" if filled else "SELL_PENDING")
         elif status == "COMPLETE":
             record["state"] = "HEDGE_FILLED"
         elif status in {"CANCELLED", "REJECTED"}:
@@ -459,6 +482,8 @@ def reconcile_basket(repo, account, eid, broker):
                                else "SHORT_PARTIAL" if any(leg["filled"] for leg in sells) else "SHORT_PENDING")
         else:
             record["state"] = "HEDGE_PARTIAL" if any(leg["filled"] for leg in buys) else "HEDGE_PENDING"
+        if record["state"] == "CLOSED":
+            record.setdefault("closed_at", datetime.now(timezone.utc).isoformat())
         record["note"] = ""
     except Exception:
         record["state"] = "RECONCILIATION_REQUIRED"
@@ -514,6 +539,13 @@ def submit_basket_exit(repo, account, eid, broker, validator, prices, acknowledg
     if record["state"] not in required:
         raise PermissionError("Reconcile all entry/close fills before this exit stage.")
     validator(record, "EXIT_HEDGES" if close_hedges else "EXIT_SHORTS")
+    # Recheck consent after reconciliation, before claiming any submission.
+    if record.get("close_review"):
+        from pair_exit_review import validate_exit_review
+        validate_exit_review(record, prices)
+    target_side = "SELL" if close_hedges else "BUY"
+    if not any(leg["filled"] for leg in record["legs"] if leg["payload"]["transaction_type"] == "SELL"):
+        target_side = "SELL"
     if not record.get("exit_legs"):
         exits = []
         for index, leg in enumerate(record["legs"]):
@@ -521,6 +553,8 @@ def submit_basket_exit(repo, account, eid, broker, validator, prices, acknowledg
                 continue
             original = leg["payload"]
             side = "BUY" if original["transaction_type"] == "SELL" else "SELL"
+            if side != target_side:
+                continue
             price = float(prices.get(original["tradingsymbol"], 0))
             if not math.isfinite(price) or price <= 0:
                 raise PermissionError("Fresh executable exit prices required for every leg.")

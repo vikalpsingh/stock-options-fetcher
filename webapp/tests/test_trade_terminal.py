@@ -196,8 +196,8 @@ def test_top_three_blocked_row_renders_research_button_without_changing_status()
         trade_best_scan={"rows": [{"symbol": "TCS", "eligible": False, "risk_note": "Liquidity blocked"}]},
     )
     rendered = app.render_trade_panel(state)
-    assert "TOP 3 · RESEARCH ONLY" in rendered
-    assert ">Research stock</button>" in rendered
+    assert ">RESEARCH</span>" in rendered
+    assert ">View</button>" in rendered
     assert "top three may continue for research even when blocked" in rendered
 
 

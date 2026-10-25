@@ -19242,10 +19242,7 @@ def execute_position_buy_orders(
     # Durable execution ownership prevents scheduler/manual close collisions.
     ownership_repo = ProtectedExecutionRepository(APP_DB_PATH)
     owner_account = selected_kite_profile_name()
-    owned = {p['tradingsymbol'] for record in
-             ownership_repo.recent(owner_account) + ownership_repo.recent_baskets(owner_account)
-             if record['mode']=='LIVE' and record['state'] not in {'REVIEW','CLOSED'}
-             for p in record['preview']['order_payloads']}
+    owned = ownership_repo.owned_symbols(owner_account)
     if any(str(order.get('tradingsymbol') or '') in owned for order in selected_orders):
         raise PermissionError('A selected contract belongs to a protected execution. Use EXECUTION Close Pair to preserve hedge ownership; scheduler did not submit duplicate closes.')
     kite = kite_buy_positions.kite_client()
@@ -29766,7 +29763,7 @@ def render_investing_panel(state: PageState) -> str:
     if state.active_tab != "investing" and state.investing_rows is None:
         return f"""
     <form id="investing-panel" method="post" action="/investing/load" style="display:none">
-      {env_hidden_fields_for_render()}
+      <input type="hidden" name="kite_profile" value="{html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}">
     </form>"""
     rows = state.investing_rows or [
         {
@@ -29805,6 +29802,8 @@ def render_investing_panel(state: PageState) -> str:
         "core_value": None,
         "core_pct": None,
     }
+
+    from investing.presentation import lakh_amount
 
     def money_cell(value: Any) -> str:
         return format_buy_amount(value) if value not in {None, ""} else "N/A"
@@ -29865,9 +29864,9 @@ def render_investing_panel(state: PageState) -> str:
             f'<td>{html.escape(fmt_number(row.get("avg_price")))}</td>'
             f'<td>{html.escape(fmt_number(row.get("cmp")))}</td>'
             f'<td class="{daily_class}">{html.escape(fmt_number(daily_change_pct))}%</td>'
-            f'<td>{html.escape(money_cell(row.get("cost_value")))}</td>'
-            f'<td>{html.escape(money_cell(row.get("market_value")))}</td>'
-            f'<td class="{pnl_class}">{html.escape(money_cell(row.get("pnl")))}<br><small>{html.escape(fmt_number(row.get("pnl_pct")))}%</small></td>'
+            f'<td data-sort-value="{html.escape(str(row.get("cost_value") if row.get("cost_value") is not None else ""), quote=True)}" title="{html.escape(money_cell(row.get("cost_value")), quote=True)}">{html.escape(lakh_amount(row.get("cost_value")))}</td>'
+            f'<td data-sort-value="{html.escape(str(row.get("market_value") if row.get("market_value") is not None else ""), quote=True)}" title="{html.escape(money_cell(row.get("market_value")), quote=True)}">{html.escape(lakh_amount(row.get("market_value")))}</td>'
+            f'<td class="{pnl_class}" data-sort-value="{html.escape(str(row.get("pnl") if row.get("pnl") is not None else ""), quote=True)}" title="{html.escape(money_cell(row.get("pnl")), quote=True)}">{html.escape(lakh_amount(row.get("pnl")))}<br><small>{html.escape(fmt_number(row.get("pnl_pct")))}%</small></td>'
             f'<td class="{high_class}">{html.escape(fmt_number(pct_to_high))}%</td>'
             f'<td class="{low_class}">{html.escape(fmt_number(pct_from_low))}%</td>'
             f'<td>{html.escape(fmt_number(row.get("portfolio_pct")))}%</td>'
@@ -29895,9 +29894,9 @@ def render_investing_panel(state: PageState) -> str:
             f'<div class="investing-summary-card"><span>Core allocation</span><strong>{html.escape(fmt_number(summary.get("core_pct")))}%</strong><small>{html.escape(crore_cell(summary.get("core_value")))} core value</small></div>',
         ]
     )
-    return f"""
+    markup = f"""
     <form id="investing-panel" method="post" action="/investing/load"{'' if state.active_tab == 'investing' else ' style="display:none"'}>
-      {env_hidden_fields_for_render()}
+      <input type="hidden" name="kite_profile" value="{html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}">
       <section class="panel investing-hero-panel">
         <div>
           <div class="panel-title">Investing Portfolio</div>
@@ -29917,14 +29916,14 @@ def render_investing_panel(state: PageState) -> str:
           <table class="investing-table" id="investing-holdings-table">
             <thead><tr>
               <th>Share</th><th>Sector</th><th>Qty</th><th>Avg</th><th>CMP</th>
-              <th><button type="button" class="sort-header" data-sort-col="5">% Change</button></th>
-              <th><button type="button" class="sort-header" data-sort-col="6">Cost</button></th>
-              <th><button type="button" class="sort-header" data-sort-col="7">Market Value</button></th>
-              <th><button type="button" class="sort-header" data-sort-col="8">P&L</button></th>
-              <th><button type="button" class="sort-header" data-sort-col="9">% to 52W High</button></th>
-              <th><button type="button" class="sort-header" data-sort-col="10">% from 52W Low</button></th>
-              <th><button type="button" class="sort-header" data-sort-col="11">Portfolio %</button></th>
-              <th>News / Sector</th>
+              <th><button type="button" class="sort-header" data-sort-col="5">Day %</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="6">Cost (L)</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="7">Value (L)</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="8">P&amp;L (L)</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="9">To 52W High</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="10">From 52W Low</button></th>
+              <th><button type="button" class="sort-header" data-sort-col="11">Wt %</button></th>
+              <th>News</th>
               <th>PE</th><th>Sector PE</th><th>OPM</th><th>MCAP</th><th>Debt</th><th>Note</th>
             </tr></thead>
             <tbody>{table_rows}</tbody>
@@ -29933,6 +29932,10 @@ def render_investing_panel(state: PageState) -> str:
       </section>
       {render_console(state.console_log)}
     </form>"""
+    from investing.advisor_handoff import render as render_advisor_handoff
+    markup = markup.replace('</form>', render_advisor_handoff(rows, APP_DB_PATH, selected_kite_profile_name(state.kite_profile)) + '</form>', 1)
+    from investing.ui import enhance
+    return enhance(markup, rows, APP_DB_PATH, selected_kite_profile_name(state.kite_profile), settings=load_app_settings())
 
 
 def render_income_growth_gpt_schedule_panel() -> str:
@@ -31538,7 +31541,7 @@ def load_trade_terminal_state(state: PageState) -> None:
         return expiry_day >= today
     instruments = [item for item in instruments if contract_not_expired(item)]
     instruments.sort(key=lambda item: (str(item.get("expiry") or ""), _dhan_metric_float(item.get("strike")), str(item.get("instrument_type") or "")))
-    state.trade_contracts = instruments[:1200]
+    state.trade_contracts = instruments
     spot_key = f"NSE:{symbol}"
     spot_quote = cached_kite_quote(kite, [spot_key], ttl_seconds=0).get(spot_key, {}) or {}
     spot_ltp = _dhan_metric_float(spot_quote.get("last_price"))
@@ -31717,6 +31720,11 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
     preferred_hedge: dict[str, Any] = {}
     if state.trade_side == "SELL" and option_type in {"PE", "CE"}:
         hedge_candidates = protective_contracts(matching, state.trade_contracts or [])
+        # A hedge from a different short/expiry must not filter out all candidates.
+        if state.trade_hedge_symbol and not any(
+            str(row['tradingsymbol']).upper() == state.trade_hedge_symbol.upper() for row in hedge_candidates
+        ):
+            state.trade_hedge_symbol = ""
         if option_type == "CE" and hedge_candidates and not state.trade_hedge_symbol:
             # Default only; this contract still passes the full spread/risk checks.
             target_strike = _dhan_metric_float(matching.get("strike")) * 1.04
@@ -31756,6 +31764,8 @@ def build_trade_review(state: PageState) -> tuple[dict[str, Any], list[dict[str,
                 ) if valid_pop_inputs and spread.get("net_credit_per_share", 0) > 0 else None
                 spread["spread_pop"] = round(100 - loss_probability, 2) if loss_probability is not None else None
             preferred_hedge = next((row for row in hedge_alternatives if row.get("eligible")), {})
+            if not state.trade_hedge_symbol and hedge_alternatives:
+                state.trade_hedge_symbol = (preferred_hedge or hedge_alternatives[0]).get('hedge_symbol', '')
             reviewed_spread = preferred_hedge or next(
                 (row for row in hedge_alternatives if row.get("hedge_symbol") == state.trade_hedge_symbol), {}
             )
@@ -32018,8 +32028,10 @@ def load_trade_workflow_draft(state: PageState) -> None:
     data = draft.get("data") or {}
     suggested = data.get("suggested_trade") or {}
     if suggested:
-        state.trade_contract_symbol = str(suggested.get("contract") or state.trade_contract_symbol).upper()
-        state.trade_side = str(suggested.get("side") or state.trade_side).upper()
+        restore_side = not state.trade_contract_symbol
+        state.trade_contract_symbol = str(state.trade_contract_symbol or suggested.get("contract") or "").strip().upper()
+        if restore_side:
+            state.trade_side = str(suggested.get("side") or state.trade_side).upper()
         state.trade_applied_suggestion = {"symbol": state.trade_symbol, "contract": state.trade_contract_symbol, "side": state.trade_side, "source": "TRADE_WIZARD"}
 
 
@@ -32151,9 +32163,9 @@ def render_trade_panel(state: PageState) -> str:
             f'<td>{_dhan_metric_float(row.get("technical_score")):.1f}<small>Pre-market {_dhan_metric_float(row.get("premarket_score") or row.get("rank_score")):.1f}</small></td>'
             f'<td>{f"{_dhan_metric_float(row.get("live_entry_score")):.1f}" if row.get("live_entry_score") is not None else "-"}<small>Combined {f"{_dhan_metric_float(row.get("combined_score")):.1f}" if row.get("combined_score") is not None else "Not executable"}</small></td>'
             f'<td>{f"{_dhan_metric_float(row.get("net_credit_yield_pct")):.2f}%" if row.get("net_credit_yield_pct") is not None else "Unresolved"}</td>'
-            f'<td>{f"₹{float(row["scan_max_profit"]):,.2f}" if row.get("scan_max_profit") is not None else "Unavailable"}<small>{str(row.get("scan_profit_quantity")) + " qty · 1 lot · before hedge/fees" if row.get("scan_profit_quantity") else "Recalculate for verified quantity/quote"}</small></td>' 
-            f'<td><span class="ipo-badge {"good" if row.get("eligible") else "neutral" if index < 3 else "bad"}">{"ELIGIBLE" if row.get("eligible") else "TOP 3 · RESEARCH ONLY" if index < 3 else "BLOCKED"}</span><small>{html.escape(str(row.get("risk_note") or row.get("error") or ""))}</small></td>'
-            f'<td><button type="submit" class="mini-link" form="trade-terminal-panel" formmethod="post" formaction="/trade/best/select" formnovalidate data-trade-best-open name="trade_best_symbol" value="{html.escape(str(row.get("symbol") or ""), quote=True)}"{"" if best_trade_research_access(row, index) else " disabled"}>{"Open stock" if row.get("eligible") else "Research stock"}</button></td>'
+            f'<td>{f"₹{float(row["scan_max_profit"]):,.2f}" if row.get("scan_max_profit") is not None else "Unavailable"}<small title="Gross short-leg premium for one lot, before hedge costs and fees. Recalculate if unavailable.">{str(row.get("scan_profit_quantity")) + " qty" if row.get("scan_profit_quantity") else "Refresh"}</small></td>'
+            f'<td><span class="ipo-badge {"good" if row.get("eligible") else "neutral" if index < 3 else "bad"}">{"ELIGIBLE" if row.get("eligible") else "RESEARCH" if index < 3 else "BLOCKED"}</span><details class="trade-scan-reason"><summary>Why</summary>{html.escape(str(row.get("risk_note") or row.get("error") or "No additional note."))}</details></td>'
+            f'<td><button type="submit" class="mini-link" form="trade-terminal-panel" formmethod="post" formaction="/trade/best/select" formnovalidate data-trade-best-open name="trade_best_symbol" value="{html.escape(str(row.get("symbol") or ""), quote=True)}"{"" if best_trade_research_access(row, index) else " disabled"}>{"Open" if row.get("eligible") else "View"}</button></td>'
             "</tr>"
             for index, row in enumerate(best_scan_rows)
         ) or '<tr><td colspan="15">No configured stock produced a verified candidate. Recalculate after Kite data is available.</td></tr>'
@@ -32161,7 +32173,7 @@ def render_trade_panel(state: PageState) -> str:
           <div class="trade-best-heading"><div class="trade-best-title-row"><h2>BEST for TRADE — Daily Market Scan{' · TEST' if state.trade_test_mode else ''}</h2><label class="trade-best-mode"><span>Eligibility</span><select id="trade-best-eligible-filter" aria-label="Filter trade eligibility"><option value="ALL">All results</option><option value="ELIGIBLE">ELIGIBLE only</option></select></label><label class="trade-best-mode"><span>Mode</span><select id="trade-best-mode" aria-label="Trade execution mode"><option value="PAPER"{" selected" if state.trade_mode == "PAPER" else ""}>PAPER</option><option value="LIVE"{" selected" if state.trade_mode == "LIVE" else ""}{" disabled" if state.trade_test_mode else ""}>LIVE</option></select></label><a class="button-link secondary" href="/trade/execution?kite_profile={html.escape(selected_kite_profile_name(state.kite_profile), quote=True)}">EXECUTION</a><div class="trade-best-top-actions"><button type="submit" form="trade-terminal-panel" class="danger" formaction="/trade/best/recalculate" formnovalidate>Recalculate pre-market</button><button type="submit" form="trade-terminal-panel" class="success" formaction="/trade/best/live" formnovalidate>Refresh live opportunities</button></div></div><p class="status">Saved {html.escape(str(best_scan.get("scan_date") or app_now().date()))} · generated {html.escape(str(best_scan.get("created_at") or "unknown"))} · Advisory only</p></div>
           <div class="income-equity-order-summary"><strong>Ranking:</strong> pre-market score uses fixed 30/20/15/15/20 component weights. Live score is separate; combined ranking appears only when mandatory data and capital/risk inputs are complete. Model OTM probability is a constant-IV lognormal estimate, not historical POP. The top three may continue for research even when blocked.</div>
           <div class="trade-best-toolbar"><div class="trade-best-view-tabs"><button type="button" data-trade-best-view="PREMARKET">PRE-MARKET</button><button type="button" data-trade-best-view="LIVE">LIVE OPPORTUNITIES</button><button type="button" data-trade-best-view="MISSED">MISSED / WAIT</button><button type="button" data-trade-best-view="ALL" class="active">ALL STOCKS</button></div><div class="trade-best-filters"><label><span>Stock source</span><select id="trade-best-source-filter"><option value="ALL">ALL</option><option value="DHAN">DHAN</option><option value="DHAN_IT">DHAN-IT</option><option value="MANUAL">Manual / Uploaded</option></select></label><span id="trade-best-source-count" class="status"></span></div></div>
-          <div class="table-wrap"><table class="ipo-table"><thead><tr><th>Stock</th><th>Source</th><th>Direction</th><th>Gap %</th><th>Prev / Live</th><th>Prev Option</th><th>Live Bid/Ask</th><th>Delta / IV</th><th>OI / Volume</th><th>Technical</th><th>Live Score</th><th>Net Credit Yield</th><th id="trade-best-profit-heading" aria-sort="descending"><button type="button" id="trade-best-profit-sort" title="Sort gross short-leg max profit; excludes hedge costs and fees">Max profit (gross) ↓</button></th><th>Status</th><th>Open</th></tr></thead><tbody>{best_rows_html}</tbody></table></div>
+          <div class="table-wrap"><table class="ipo-table trade-scan-table"><colgroup><col style="width:8%"><col style="width:6%"><col style="width:10%"><col style="width:5%"><col style="width:6%"><col style="width:5%"><col style="width:7%"><col style="width:7%"><col style="width:7%"><col style="width:6%"><col style="width:6%"><col style="width:5%"><col style="width:8%"><col style="width:8%"><col style="width:6%"></colgroup><thead><tr><th>Stock</th><th>Source</th><th>Direction</th><th>Gap %</th><th>Prev / Live</th><th>Prev Option</th><th>Live Bid/Ask</th><th>Delta / IV</th><th>OI / Volume</th><th>Technical</th><th>Live Score</th><th title="Net Credit Yield">NCY</th><th id="trade-best-profit-heading" aria-sort="descending"><button type="button" id="trade-best-profit-sort" title="Sort gross short-leg max profit; excludes hedge costs and fees">Profit ↓</button></th><th>Status</th><th>Open</th></tr></thead><tbody>{best_rows_html}</tbody></table></div>
           <div class="trade-best-pagination"><label>Results per page <select id="trade-best-page-size"><option value="10">10</option><option value="20">20</option><option value="ALL">All</option></select></label><span id="trade-best-page-info" class="status" aria-live="polite"></span><button type="button" class="secondary" id="trade-best-prev">Previous</button><button type="button" class="secondary" id="trade-best-next">Next</button></div>
           <div class="modal-actions"><button type="button" class="secondary" id="trade-best-close">Close</button></div>
         </div></div>'''
@@ -32236,7 +32248,7 @@ def render_trade_panel(state: PageState) -> str:
         f'<td>{_dhan_metric_float(row.get("ltp")):.2f}</td><td>{_dhan_metric_float(row.get("bid")):.2f} / {_dhan_metric_float(row.get("ask")):.2f}</td>'
         f'<td>{f"{float(row.get("spread_pct")):.2f}%" if row.get("spread_pct") is not None else "Unavailable"}</td>'
         f'<td>{int(_dhan_metric_float(row.get("volume")))}</td><td>{int(_dhan_metric_float(row.get("oi")))}</td>'
-        f'<td><button type="submit" class="mini-link" formaction="/trade/review" name="trade_contract_symbol" value="{html.escape(str(row.get("tradingsymbol") or ""), quote=True)}">Select &amp; Review</button></td>'
+        f'<td><button type="submit" class="mini-link" formaction="/trade/review" name="trade_alternative_contract" value="{html.escape(str(row.get("tradingsymbol") or ""), quote=True)}">Select &amp; Review</button></td>'
         "</tr>"
         for row in intelligence.get("expiry_comparison_all") or intelligence.get("expiry_comparison") or []
     ) or '<tr><td colspan="9">Verified current/next expiry quotes are unavailable.</td></tr>'
@@ -37416,9 +37428,13 @@ def render_page(state: PageState) -> bytes:
       border-color: #a7f3d0;
       background: linear-gradient(135deg, #ffffff 0%, #f8fffd 100%);
     }}
-    .investing-table {{
-      min-width: 1780px;
-    }}
+    .investing-table {{ min-width:1200px; width:100%; }}
+    #investing-holdings-table th,#investing-holdings-table td {{ padding:7px 5px; font-size:11px; }}
+    #investing-holdings-table .position-symbol-cell {{ min-width:110px; width:130px; max-width:150px; white-space:normal; overflow-wrap:anywhere; }}
+    #investing-holdings-table .position-symbol-cell span {{ font-size:10px; line-height:1.25; }}
+    #investing-holdings-table td:nth-child(7),#investing-holdings-table td:nth-child(8) {{ min-width:65px; white-space:nowrap; }}
+    #investing-holdings-table .invest-score {{ display:inline-block; border:1px solid #99d6c5; border-radius:6px; background:#ecfdf5; color:#065f46; padding:3px 5px; margin:4px 0; font-size:11px; }}
+    #investing-holdings-table .investing-news-cell {{ min-width:120px; max-width:190px; white-space:normal; }}
     .investing-table th {{
       background: linear-gradient(135deg, #0f4c5c, #0f766e);
       color: #ffffff;
@@ -43285,6 +43301,18 @@ def render_page(state: PageState) -> bytes:
     .trade-stage-chart .trade-landing-controls,.trade-stage-chart .trade-intelligence-cards,.trade-stage-chart .trade-technical-table,.trade-stage-chart #trade-manual-option-order,.trade-stage-chart .trade-execution-audit {{ display:none; }}
     .trade-stage-validate .trade-landing-controls,.trade-stage-validate .trade-market-intelligence {{ display:none; }}
     .trade-best-modal-card td small {{ display:block; margin-top:3px; white-space:normal; line-height:1.3; color:#64748b; }}
+    /* Scan-only sizing: shared IPO action cells otherwise reserve 220px. */
+    #trade-best-modal .trade-scan-table {{ width:100%; table-layout:fixed; min-width:0; }}
+    #trade-best-modal .trade-scan-table th,#trade-best-modal .trade-scan-table td {{ padding:6px 4px; font-size:11px; white-space:normal; overflow-wrap:anywhere; min-width:0; vertical-align:top; }}
+    #trade-best-modal .trade-scan-table td:last-child {{ min-width:0; }}
+    #trade-best-modal .trade-scan-table td small {{ font-size:10px; line-height:1.25; }}
+    #trade-best-modal .trade-scan-table .ipo-badge {{ padding:3px 4px; font-size:9px; white-space:normal; }}
+    #trade-best-modal .trade-scan-table button {{ min-width:0; padding:4px 5px; font-size:11px; line-height:1.3; white-space:normal; box-shadow:none; }}
+    #trade-best-modal .trade-scan-reason {{ margin-top:4px; font-size:10px; }}
+    #trade-best-modal .trade-scan-reason summary {{ cursor:pointer; color:#475569; }}
+    @media (max-width:760px) {{
+      #trade-best-modal .trade-scan-table {{ min-width:920px; }}
+    }}
     .trade-best-heading {{ margin-bottom:7px; }}
     .trade-best-title-row {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-start; gap:12px; margin-bottom:4px; }}
     .trade-best-title-row .button-link {{ flex-shrink:0; margin-left:auto; }}
@@ -43642,6 +43670,7 @@ def render_page(state: PageState) -> bytes:
         <p class="status">TEST applies only to localhost / 127.0.0.1 / ::1 accessed from this computer. TRADE uses current Kite data and normal checks, but forces PAPER orders. After starting a protected execution, use Reconcile → Confirm SELL → Reconcile to reach SPREAD ACTIVE. Other trading screens are unchanged.</p>
         <p class="status">{"TEST is active for this request." if state.trade_test_mode else "TEST is not active for this request."} Save Kite Setup to apply changes.</p>
       </section>
+      {__import__("investing.config", fromlist=["render_setup"]).render_setup(load_app_settings())}
       {render_scheduler_control_panel()}
       <div class="actions">
         <button type="submit" formaction="/kite-setup">Save Kite Setup</button>
@@ -46683,7 +46712,7 @@ def render_page(state: PageState) -> bytes:
     tradeBestProfitButton && tradeBestProfitButton.addEventListener('click', () => {{
       tradeBestProfitSort = tradeBestProfitSort === 'desc' ? 'asc' : 'desc';
       tradeBestPage = 1;
-      tradeBestProfitButton.textContent = 'Max profit (gross) ' + (tradeBestProfitSort==='desc'?'↓':'↑');
+      tradeBestProfitButton.textContent = 'Profit ' + (tradeBestProfitSort==='desc'?'↓':'↑');
       document.getElementById('trade-best-profit-heading').setAttribute('aria-sort',tradeBestProfitSort==='desc'?'descending':'ascending');
       applyTradeBestSourceFilter();
     }});
@@ -48240,6 +48269,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 else:
                     state.message = persist_message
             elif request_path == "/kite-setup":
+                from investing.config import settings_update as investing_settings_update
+                investing_settings = investing_settings_update(form)
+                if investing_settings:
+                    save_app_settings(investing_settings)
                 if "trade_environment" in form:
                     if not state.local_request:
                         raise PermissionError("The TRADE environment flag can only be changed from localhost.")
@@ -50741,6 +50774,12 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     state.trade_hedge_symbol = ""
                 load_trade_terminal_state(state)
                 state.trade_preview, state.trade_checks = build_trade_review(state)
+                if state.trade_draft_id and state.trade_preview:
+                    TradeWorkflowRepository(APP_DB_PATH).update(
+                        state.trade_draft_id, selected_kite_profile_name(state.kite_profile),
+                        changes={"suggested_trade": {"contract": state.trade_contract_symbol, "side": state.trade_side}},
+                        event="CONTRACT_REVIEWED",
+                    )
                 if checked(form, "trade_add_hedge"):
                     state.trade_preview["hedge_revalidated"] = True
                 if alternative_contract:
@@ -50808,10 +50847,6 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 broker = KiteBrokerAdapter(paper_trading=current['mode']=='PAPER',account_id=account)
                 current = prepare_pair_exit(repo,account,eid,broker)
                 if request_path.endswith('/close-pair'):
-                    reviewed = current.get('close_review') or {}
-                    if (not reviewed or reviewed.get('version') != current['version']-1 or
-                        (datetime.now(timezone.utc)-datetime.fromisoformat(reviewed['at'])).total_seconds()>120):
-                        raise PermissionError('Refresh CLOSE PAIR preview before confirming.')
                     current = close_pair(repo,account,eid,broker,checked(form,'close_pair_ack'))
                     state.message = 'Close submitted: '+current['state']+'. Reconcile fills before releasing hedges.'
                 else:
@@ -50819,8 +50854,8 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     target = float(first(form,'pair_profit_target','50'))
                     if not math.isfinite(target) or not 0<=target<=100:
                         raise ValueError('Profit target must be between 0 and 100%.')
-                    current['close_review'] = {'at':datetime.now(timezone.utc).isoformat(),'version':current['version']+1,'prices':prices,'target_percent':target}
-                    repo.save(current)
+                    from pair_exit_review import save_exit_review
+                    save_exit_review(repo,current,prices,target)
                     state.message = 'Close preview ready. Review pair P&L and confirm separately; shorts close before hedges.'
             elif request_path in {"/trade/execution/reconcile", "/trade/execution/confirm-sell"}:
                 state.trade_stage = "execution"
@@ -51101,6 +51136,16 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 live_sent = sum(1 for row in results if row.get("status") == "LIVE_SENT")
                 errors = sum(1 for row in results if row.get("status") == "ERROR")
                 state.message = f"NIFTY position action submitted. Sent {live_sent} leg(s), errors {errors}."
+            elif request_path == "/investing/advisor-response":
+                from investing.advisor_handoff import save_response
+                save_response(APP_DB_PATH, selected_kite_profile_name(state.kite_profile), first(form, "invest_advisor_response"))
+                state.investing_rows, state.investing_summary = investing_holdings_rows()
+                state.message = "GPT response saved as external commentary. No scores or orders changed."
+            elif request_path in {"/investing/import", "/investing/evaluate"}:
+                from investing.integration import handle as handle_investing_research
+                state.investing_rows, state.investing_summary = investing_holdings_rows()
+                state.message = handle_investing_research(request_path, form,
+                    selected_kite_profile_name(state.kite_profile), APP_DB_PATH, state.investing_rows, settings=load_app_settings())
             elif request_path == "/investing/load":
                 (
                     state.investing_rows,
@@ -51385,6 +51430,15 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             kite.set_access_token(profile["KITE_ACCESS_TOKEN"])
             stage = "NIFTY configuration"
             config = nifty_income_config()["nifty_income_v2"]
+            if action == "/nifty-2/loss-cap":
+                updated = income_v2_config({**config,
+                    "max_total_nifty_defined_loss_inr": first(form, "loss_cap")})
+                save_nifty_income_config({"nifty_income_v2": updated})
+                reviews.clear_basket_reviews()
+                config = updated
+                action = None
+                open_ticket = False
+                message = "NIFTY loss cap saved. Unsubmitted reviews cleared; review again using the new risk budget."
             stage = "NFO instrument master"
             instruments = cached_kite_instruments(kite, "NFO")
             if action == "/nifty-2/live-settings":
