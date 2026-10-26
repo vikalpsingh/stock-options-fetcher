@@ -9475,6 +9475,7 @@ def option_analytics_for_symbol(symbol: str) -> dict[str, Any]:
         "expiry": expiry.strftime("%d %b %Y"),
         "dte": dte,
         "spot": spot,
+        "spot_previous_close": (spot_quote.get("ohlc") or {}).get("close"),
         "option_price": option_price,
         "oi": quote_oi(option_quote),
         "rate": rate,
@@ -12152,6 +12153,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                 position,
                 {
                     "stock_cmp": data.get("spot"),
+                    "stock_previous_close": data.get("spot_previous_close"),
                     "strike": data.get("strike"),
                 },
                 available_cash,
@@ -12167,6 +12169,7 @@ def positions_research(force_refresh: bool = False) -> tuple[list[dict[str, Any]
                     "average_price": position.get("average_price"),
                     "ltp": position.get("ltp"),
                     "stock_cmp": data.get("spot"),
+                    "stock_previous_close": data.get("spot_previous_close"),
                     "pnl": pnl,
                     "deployed": deployed,
                     "return_pct": (pnl / deployed * 100) if deployed > 0 else None,
@@ -32562,7 +32565,7 @@ def render_research_panel(state: PageState) -> str:
     </form>"""
 
 
-def render_position_close_schedule_panel() -> str:
+def render_position_close_schedule_panel(section="all") -> str:
     schedule = position_close_schedule_state()
     intraday = intraday_position_close_schedule_state()
     discount_percent = position_close_discount_percent_setting()
@@ -32616,7 +32619,7 @@ def render_position_close_schedule_panel() -> str:
         if intraday_result_rows
         else ""
     )
-    return (
+    markup = (
         '<section class="panel scheduled-position-close-panel">'
         '<div class="panel-title">Scheduled Default Close Orders</div>'
         '<div class="compact-grid">'
@@ -32665,6 +32668,14 @@ def render_position_close_schedule_panel() -> str:
         "</div>"
         f"{intraday_details}</section>"
     )
+
+    marker = '<hr><div class="panel-title">Intraday Missing Close-Order Guard</div>'
+    before, _, after = markup.partition(marker)
+    if section == "intraday":
+        return '<section class="panel intraday-guard-panel"><div class="panel-title">Intraday Missing Close-Order Guard</div>' + after
+    if section == "default":
+        return before + '</section>'
+    return markup
 
 
 def render_position_risk_monitor(state: PageState) -> str:
@@ -32875,6 +32886,7 @@ def render_positions_panel(
     position_orders_table: str = "",
     position_execute_button: str = "",
 ) -> str:
+    from position_screen import movement_html as position_movement_html
     rows = state.positions_rows or []
     summary = state.positions_summary or {}
     def compact_signal(value: Any) -> str:
@@ -33020,11 +33032,11 @@ def render_positions_panel(
         (
         "<tr>"
         f'<td class="position-symbol-cell">{position_identity(row)}</td>'
-        f"<td><strong>{html.escape(fmt_number(row.get('stock_cmp')))}</strong><span>Stock CMP</span></td>"
+        f"<td><strong>{html.escape(fmt_number(row.get('stock_cmp')))}</strong>{position_movement_html(row.get('stock_cmp'), row.get('stock_previous_close'))}</td>"
         f"<td><strong>{html.escape(fmt_number(row.get('ltp')))}</strong><span>Avg {html.escape(fmt_number(row.get('average_price')))}</span></td>"
-        f'<td class="{metric_class(row.get("pnl"))}"><strong>{html.escape(display_cell("pnl", row.get("pnl", "")))}</strong><span>{html.escape(fmt_number(row.get("return_pct")))}% on margin</span></td>'
-        f'<td><strong>{html.escape(fmt_number(row.get("otm_distance")))}%</strong><span>OTM</span></td>'
-        f'<td class="{pop_strength_class(row.get("sell_pop"))}"><strong>{html.escape(fmt_number(row.get("sell_pop")))}%</strong><span>SELL POP</span></td>'
+        f'<td data-sort-value="{row.get("pnl") if row.get("pnl") is not None else ""}" class="{metric_class(row.get("pnl"))}"><strong>{html.escape(display_cell("pnl", row.get("pnl", "")))}</strong><span>{html.escape(fmt_number(row.get("return_pct")))}% on margin</span></td>'
+        f'<td data-sort-value="{row.get("otm_distance") if row.get("otm_distance") is not None else ""}"><strong>{html.escape(fmt_number(row.get("otm_distance")))}%</strong><span>OTM</span></td>'
+        f'<td data-sort-value="{row.get("sell_pop") if row.get("sell_pop") is not None else ""}" class="{pop_strength_class(row.get("sell_pop"))}"><strong>{html.escape(fmt_number(row.get("sell_pop")))}%</strong><span>SELL POP</span></td>'
         f"<td><strong>{html.escape(fmt_number(row.get('deployed')))}</strong><span>Margin"
         + (
             f" | PE cash {html.escape(fmt_number(row.get('pe_required_cash')))} "
@@ -33067,8 +33079,8 @@ def render_positions_panel(
             else ""
         )
         + "</div>"
-        '<div class="table-wrap positions-table-wrap"><table class="positions-table"><thead><tr>'
-        '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th>P&L</th><th>OTM</th><th>POP</th><th>Margin</th><th>IV</th><th>PCR</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th>'
+        '<div class="table-wrap positions-table-wrap"><table class="positions-table" id="position-active-analytics"><thead><tr>'
+        '<th>Position</th><th>Stock CMP</th><th>LTP / Avg</th><th><button type="button" class="sort-header" data-sort-col="3">P&amp;L</button></th><th><button type="button" class="sort-header" data-sort-col="4">OTM</button></th><th><button type="button" class="sort-header" data-sort-col="5">POP</button></th><th>Margin</th><th>IV</th><th>PCR</th><th>Captured</th><th>Remaining</th><th>Exit</th><th>Action</th>'
         '<th>PE Score</th><th>Trading DTE</th><th>Dist</th><th>Touch</th><th>EM</th><th>Prem x</th><th>Prob Risk</th><th>Buy</th><th>Sell</th><th>Strength</th><th>Delta</th><th>S / R</th><th>Error</th></tr></thead>'
         f"<tbody>{table_rows}</tbody></table></div></section>"
         if rows
@@ -33098,9 +33110,10 @@ def render_positions_panel(
         </div>
       </section>
       <section class="panel positions-summary-panel"><div class="position-summary-strip">{summary_cards}</div></section>
+      {render_position_close_schedule_panel("intraday")}
       {table}
       {render_position_risk_monitor(state)}
-      {render_position_close_schedule_panel()}
+      {render_position_close_schedule_panel("default")}
       {position_orders_table}
       {render_results(state.position_results)}
       <details class="panel position-buy-settings">
@@ -43991,6 +44004,7 @@ def render_page(state: PageState) -> bytes:
         sortTableByColumn(defaultSortColumn, defaultSortDir);
       }}
     }}
+    enableTableSorting(document.getElementById('position-active-analytics'));
     enableTableSorting(investingTable);
     enableTableSorting(document.getElementById('income-growth-table'));
     enableTableSorting(document.getElementById('dividend-income-table'));

@@ -2,24 +2,24 @@
   "TRADE_ENVIRONMENT": "NORMAL",
   "eod_pnl_snapshot_scheduler": {
     "enabled": true,
-    "last_attempt_at": "2026-10-22T16:00:21+05:30",
-    "last_run_at": "22 Oct 2026 16:00:21 IST",
-    "last_success_date": "2026-10-22",
-    "message": "NSE market timestamp verified at 16:00:21 IST. Saved 15 P&L row(s) for Shanti; monthly state GREEN; fresh positions allowed.",
+    "last_attempt_at": "2026-10-26T16:00:01+05:30",
+    "last_run_at": "26 Oct 2026 16:00:01 IST",
+    "last_success_date": "2026-10-26",
+    "message": "NSE market timestamp verified at 16:00:02 IST. Saved 16 P&L row(s) for Shanti; monthly state GREEN; fresh positions allowed.",
     "profile": "Shanti",
     "results": [
       {
         "account_id": "Shanti",
         "booked_mtd_pnl": 0.0,
         "daily_realized_pnl": 0.0,
-        "daily_unrealized_pnl": -23231.25,
+        "daily_unrealized_pnl": -25678.75,
         "fresh_positions_blocked": false,
         "monthly_loss_limit": 60001.0,
         "remaining_loss_budget": 60001.0,
-        "risk_mtd_pnl": -23231.25,
+        "risk_mtd_pnl": -25678.75,
         "risk_state": "GREEN",
-        "saved_rows": 15,
-        "trade_date": "2026-10-22"
+        "saved_rows": 16,
+        "trade_date": "2026-10-26"
       }
     ],
     "schedule_time": "16:00",
@@ -487,12 +487,12 @@
         "tradingsymbol": "UNITDSPR26NOV1440CE"
       }
     ],
-    "enabled": true,
+    "enabled": false,
     "end_time": "15:15",
     "interval_minutes": 15,
-    "last_run_at": "22 Oct 2026 15:15:17 IST",
-    "last_slot": "15:15",
-    "last_slot_key": "2026-10-22:15:15",
+    "last_run_at": "26 Oct 2026 13:20:21 IST",
+    "last_slot": "13:15",
+    "last_slot_key": "2026-10-26:13:15",
     "loss_limit_evaluations": [
       {
         "action": "NO_ACTION",
@@ -665,7 +665,7 @@
         "triggered": false
       }
     ],
-    "message": "All open option positions already have matching BUY/SELL close orders. Strict PE positions skipped because a close BUY order already exists: 2.",
+    "message": "Intraday Close-Order Guard stopped manually.",
     "order_count": 0,
     "paused_until": "",
     "pe_risk_evaluations": [
@@ -720,10 +720,10 @@
     ],
     "profile": "Shanti",
     "results": [],
-    "run_count_today": 20,
-    "run_date": "2026-10-22",
+    "run_count_today": 1,
+    "run_date": "2026-10-26",
     "start_time": "09:30",
-    "status": "ALL_COVERED"
+    "status": "STOPPED"
   },
   "investing_v2_enabled": true,
   "kite_profiles": {
@@ -769,7 +769,7 @@
       ]
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "zJkn2Z4UBVF8vVjDIf3NvqmiE3x4370f",
+      "KITE_ACCESS_TOKEN": "XlRtIf57jMcy60PisiFbpt7377yD41DB",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
