@@ -240,6 +240,8 @@ from income.covered_call import (
     select_monthly_expiry,
 )
 
+from position_close_safety import serialized_position_close, validate_close_submission
+
 logger = logging.getLogger(__name__)
 
 
@@ -18938,13 +18940,16 @@ def build_position_buy_orders(state: PageState) -> list[dict[str, Any]]:
     kite = kite_buy_positions.kite_client()
     positions = kite_buy_positions.current_positions(kite, args)
     positions = refresh_option_positions_with_live_ltp(positions, kite)
-    open_buy_orders = open_option_buy_orders_by_symbol(kite, True)
-    orders = [
-        order
-        for position in positions
-        if (order := kite_buy_positions.build_buy_order(position, args, kite)) is not None
-        and str(order.get("tradingsymbol") or "").upper() not in open_buy_orders
-    ]
+    from position_close_safety import bind_close_order
+    existing_closes = open_option_close_orders_by_symbol_side(kite, True)
+    orders = []
+    for position in positions:
+        order = kite_buy_positions.build_buy_order(position, args, kite)
+        if order is None:
+            continue
+        order = bind_close_order(order, position)
+        if (str(order.get("tradingsymbol") or "").upper(), order["transaction_type"]) not in existing_closes:
+            orders.append(order)
     orders = refresh_position_buy_order_prices(orders, kite, args)
     if state.position_stop_option_sell:
         stopped_symbols = [
@@ -18990,9 +18995,8 @@ def refresh_position_buy_order_prices(
         updated = dict(order)
         key = f"{updated.get('exchange') or 'NFO'}:{updated.get('tradingsymbol')}".upper()
         ltp = live_ltp.get(key)
-        if ltp is None:
-            refreshed.append(updated)
-            continue
+        if ltp is None or ltp <= 0:
+            raise ValueError("Fresh close-price reference unavailable; refresh before closing.")
         quantity = int(updated.get("quantity") or 0)
         average_price = float(updated.get("average_price") or 0)
         position_quantity = -abs(quantity) if str(updated.get("transaction_type") or "").upper() == "BUY" else quantity
@@ -19003,7 +19007,8 @@ def refresh_position_buy_order_prices(
         tick_size = float(getattr(args, "tick_size", 0.05) or 0.05)
         is_profitable = pnl > 0 or (average_price > 0 and ltp > 0 and ltp < average_price)
         price_basis_name = "LTP" if is_profitable else "average_price"
-        price_basis = ltp if is_profitable else average_price
+        price_basis = min(ltp, average_price) if average_price > 0 else 0
+        price_basis_name = "min(LTP, average entry price)"
         if str(updated.get('transaction_type') or '').upper() == 'SELL':
             discount_percent = position_close_sell_markup_percent_setting()
             price_basis = max(average_price, ltp)
@@ -19204,6 +19209,7 @@ def build_intraday_loss_limit_close_orders(
     return orders, evaluations
 
 
+@serialized_position_close
 def execute_position_buy_orders(
     orders: list[dict[str, Any]],
     selected_indexes: set[int],
@@ -19289,6 +19295,8 @@ def execute_position_buy_orders(
             if key in ORDER_FIELDS
         }
         try:
+            # Refresh signed net positions at the last boundary, never infer direction from an order.
+            validate_close_submission(order, kite.positions()["net"], kite.orders())
             if keep_existing_orders:
                 order_id = kite_buy_positions.place_order(kite, kite_order)
                 action = "placed"
@@ -19870,11 +19878,11 @@ def update_scheduled_job_control(
 
 
 def save_scheduled_job_times(values: dict[str, Any], now: datetime | None = None) -> dict[str, dict[str, Any]]:
-    """Persist validated job times, effective tomorrow, without restarting the scheduler."""
+    """Persist validated job times, effective today, without restarting the scheduler."""
     now = now.astimezone(INDIA_TIME_ZONE) if now and now.tzinfo else (
         now.replace(tzinfo=INDIA_TIME_ZONE) if now else datetime.now(INDIA_TIME_ZONE)
     )
-    effective_from = (now.date() + timedelta(days=1)).isoformat()
+    effective_from = now.date().isoformat()
     planned: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     for job_key, job in scheduled_job_definitions().items():
         if job_key == "intraday_position_close":
@@ -32630,20 +32638,20 @@ def render_position_close_schedule_panel(section="all") -> str:
         '</div><button type="submit" formaction="/positions/close-pricing" formnovalidate>Save close-order percentages</button>'
         '<p class="status">Shared by both close-order jobs. NIFTY uses its separate CMP percentages for normal closes; emergency risk-exit rules take priority. Saving does not place or modify orders. STOP OPTION SELL and risk-exit rules remain active.</p>' 
         '<div class="position-summary-strip">'
-        '<div class="position-summary-chip"><span>Schedule</span><strong>09:20 IST</strong></div>'
+        f'<div class="position-summary-chip"><span>Schedule</span><strong>{html.escape(str(schedule.get("schedule_time")))} IST</strong></div>'
         f'<div class="position-summary-chip"><span>Profile</span><strong>{html.escape(str(schedule.get("profile") or selected_kite_profile_name()))}</strong></div>'
         f'<div class="position-summary-chip {strength_class(color)}"><span>Last status</span><strong>{html.escape(status)}</strong></div>'
         f'<div class="position-summary-chip"><span>Last run</span><strong>{html.escape(str(schedule.get("last_run_at") or "Not run yet"))}</strong></div>'
         "</div>"
         f'<p class="status">{html.escape(str(schedule.get("message") or ""))} '
-        f"Default close-position BUY orders use the saved BUY Preview discount of {discount_percent:g}%; "
-        "existing open BUY close orders are skipped.</p>"
+        f"Default closes use BUY below reference by {discount_percent:g}% for shorts and SELL above reference for longs; "
+        "existing matching close orders are skipped.</p>"
         f"{details}"
         '<hr><div class="panel-title">Intraday Missing Close-Order Guard</div>'
         '<div class="position-summary-strip">'
         f'<div class="position-summary-chip"><span>Job status</span><strong>{"RUNNING" if intraday_enabled else "STOPPED"}</strong></div>'
         f'<div class="position-summary-chip"><span>Interval</span><strong>{int(intraday.get("interval_minutes") or INTRADAY_POSITION_CLOSE_INTERVAL_MINUTES) * 60}s</strong></div>'
-        '<div class="position-summary-chip"><span>Window</span><strong>09:30-15:15</strong></div>'
+        f'<div class="position-summary-chip"><span>Window</span><strong>{html.escape(str(intraday.get("start_time")))}–{html.escape(str(intraday.get("end_time")))} IST</strong></div>'
         f'<div class="position-summary-chip"><span>Runs today</span><strong>{html.escape(str(intraday.get("run_count_today") or 0))}</strong></div>'
         f'<div class="position-summary-chip {strength_class(intraday_color)}"><span>Last status</span><strong>{html.escape(intraday_status)}</strong></div>'
         f'<div class="position-summary-chip"><span>Last run</span><strong>{html.escape(str(intraday.get("last_run_at") or "Not run yet"))}</strong></div>'
@@ -32872,7 +32880,7 @@ def render_scheduler_control_panel() -> str:
         '<button type="submit" formaction="/scheduler/start-all"'
         f'{" disabled" if master_enabled else ""}>Start All</button>'
         '</div></div>'
-        f'<div class="status scheduler-master-message">{html.escape(str(master.get("message") or ""))} Saved time changes become effective tomorrow and are reloaded by the scheduler automatically.</div>'
+        f'<div class="status scheduler-master-message">{html.escape(str(master.get("message") or ""))} Saved time changes apply immediately and are reloaded by the scheduler automatically. Daily jobs already attempted today are not repeated.</div>'
         '<div class="table-wrap"><table class="scheduler-control-table"><thead><tr>'
         '<th>Name / Schedule</th><th>Purpose</th><th>Last run</th><th>Next schedule</th><th>Status</th><th>Controls</th>'
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
