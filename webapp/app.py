@@ -1639,6 +1639,8 @@ def kite_profile_nifty_income_enabled(
     clean_name = selected_kite_profile_name(profile_name)
     available_profiles = profiles if profiles is not None else load_kite_profiles()
     profile = available_profiles.get(clean_name) or blank_kite_profile(clean_name)
+    if "VISIBLE_TABS" in profile:
+        return bool(set(normalize_profile_visible_tabs(profile["VISIBLE_TABS"])) & {"nifty-2", "nifty-income", "nifty-grow"})
     return profile_flag(
         profile.get("NIFTY_INCOME_ENABLED"),
         default_nifty_income_enabled_for_profile(clean_name),
@@ -1652,6 +1654,8 @@ def kite_profile_nifty_grow_enabled(
     clean_name = selected_kite_profile_name(profile_name)
     available_profiles = profiles if profiles is not None else load_kite_profiles()
     profile = available_profiles.get(clean_name) or blank_kite_profile(clean_name)
+    if "VISIBLE_TABS" in profile:
+        return "nifty-grow" in normalize_profile_visible_tabs(profile["VISIBLE_TABS"])
     return kite_profile_nifty_income_enabled(clean_name, available_profiles) and profile_flag(
         profile.get("NIFTY_GROW_ENABLED"),
         default_nifty_grow_enabled_for_profile(clean_name),
@@ -1677,6 +1681,8 @@ def save_kite_profile(profile_name: str, values: dict[str, Any]) -> dict[str, An
         )
     if "VISIBLE_TABS" in values:
         current["VISIBLE_TABS"] = normalize_profile_visible_tabs(values.get("VISIBLE_TABS"))
+        current["NIFTY_INCOME_ENABLED"] = bool(set(current["VISIBLE_TABS"]) & {"nifty-2", "nifty-income", "nifty-grow"})
+        current["NIFTY_GROW_ENABLED"] = "nifty-grow" in current["VISIBLE_TABS"]
     if not current.get("KITE_CONFIRM_LIVE_ORDER"):
         current["KITE_CONFIRM_LIVE_ORDER"] = "YES"
     profiles[clean_name] = current
@@ -7633,6 +7639,8 @@ class PageState:
     position_orders: list[dict[str, Any]] | None = None
     position_selected_indexes: set[int] | None = None
     position_results: list[dict[str, Any]] | None = None
+    close_job_preview: list[dict[str, Any]] | None = None
+    close_job_preview_name: str = ""
     position_dry_run: bool = True
     position_discount_percent: float = field(default_factory=position_close_discount_percent_setting)
     position_exchange: str = "NFO"
@@ -19324,6 +19332,45 @@ def execute_position_buy_orders(
                 }
             )
     return submitted_orders, results
+
+
+def preview_position_close_job(job: str) -> list[dict[str, Any]]:
+    """Read-only planning: never call a runner, executor or scheduler-state saver."""
+    kite = kite_buy_positions.kite_client()
+    positions = kite.positions()["net"]
+    pending = kite.orders()
+    stop_sell = position_stop_option_sell_setting()
+    state = PageState(position_dry_run=True,
+                      position_discount_percent=position_close_discount_percent_setting(),
+                      position_include_long=not stop_sell, position_stop_option_sell=stop_sell)
+    notes = {}
+    if job == "default":
+        try:
+            candidates = build_position_buy_orders(state)
+        except ValueError as exc:
+            if not str(exc).startswith("No matching positions need a new close order"):
+                raise
+            candidates = []
+    elif job == "intraday":
+        loss, loss_eval = build_intraday_loss_limit_close_orders(
+            kite, INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT, state.position_discount_percent)
+        risk, risk_eval = build_intraday_pe_risk_exit_orders(kite)
+        basic, basic_eval = build_missing_option_close_orders_for_scheduler(
+            kite, state.position_discount_percent, stop_sell)
+        # Same precedence as the live runner: loss-limit, strict PE risk, passive close.
+        candidates, seen = [], set()
+        for order in [*loss, *risk, *basic]:
+            symbol = order.get("tradingsymbol")
+            if symbol not in seen:
+                candidates.append(order)
+                seen.add(symbol)
+        for evaluation in [*basic_eval, *risk_eval, *loss_eval]:
+            notes[evaluation.get("tradingsymbol")] = evaluation.get("skip_reason") or evaluation.get("scheduler_action") or evaluation.get("action")
+    else:
+        raise ValueError("Unknown close-order preview job.")
+    from position_close_preview import preview_rows
+    owned = ProtectedExecutionRepository(APP_DB_PATH).owned_symbols(selected_kite_profile_name())
+    return preview_rows(positions, pending, candidates, owned, stop_sell, notes)
 
 
 def position_close_schedule_state() -> dict[str, Any]:
@@ -32573,7 +32620,9 @@ def render_research_panel(state: PageState) -> str:
     </form>"""
 
 
-def render_position_close_schedule_panel(section="all") -> str:
+def render_position_close_schedule_panel(section="all", preview_state=None) -> str:
+    from position_close_preview import render_preview
+    preview = render_preview(preview_state.close_job_preview) if preview_state is not None and preview_state.close_job_preview_name == section else ""
     schedule = position_close_schedule_state()
     intraday = intraday_position_close_schedule_state()
     discount_percent = position_close_discount_percent_setting()
@@ -32630,6 +32679,8 @@ def render_position_close_schedule_panel(section="all") -> str:
     markup = (
         '<section class="panel scheduled-position-close-panel">'
         '<div class="panel-title">Scheduled Default Close Orders</div>'
+        '<button type="submit" formaction="/positions/default-close-test" formnovalidate>Test run (no orders)</button>'
+        f'{preview if section == "default" else ""}'
         '<div class="compact-grid">'
         f'<label><span>BUY close: % below reference</span><input type="number" name="scheduler_buy_discount" min="0" max="99.99" step="0.01" value="{discount_percent:g}"></label>'
         f'<label><span>SELL close: % above reference</span><input type="number" name="scheduler_sell_markup" min="0" max="99.99" step="0.01" value="{position_close_sell_markup_percent_setting():g}"></label>'
@@ -32668,6 +32719,8 @@ def render_position_close_schedule_panel(section="all") -> str:
         "hard-stop price only inside that DTE window. Before hard stop, spike closes above entry are skipped, "
         "and the passive missing-close guard can place a lower close order instead.</p>"
         '<div class="actions">'
+        f'{preview if section == "intraday" else ""}'
+        '<button type="submit" formaction="/positions/intraday-guard-test" formnovalidate>Test run (no orders)</button>'
         '<button type="submit" formaction="/positions/intraday-guard-run" class="secondary">Run Scheduler Now</button>'
         '<button type="submit" formaction="/positions/intraday-guard-start" class="secondary">Start Scheduler</button>'
         '<button type="submit" formaction="/positions/intraday-guard-stop" class="secondary">Stop Scheduler</button>'
@@ -33118,10 +33171,10 @@ def render_positions_panel(
         </div>
       </section>
       <section class="panel positions-summary-panel"><div class="position-summary-strip">{summary_cards}</div></section>
-      {render_position_close_schedule_panel("intraday")}
+      {render_position_close_schedule_panel("intraday", state)}
       {table}
       {render_position_risk_monitor(state)}
-      {render_position_close_schedule_panel("default")}
+      {render_position_close_schedule_panel("default", state)}
       {position_orders_table}
       {render_results(state.position_results)}
       <details class="panel position-buy-settings">
@@ -36105,14 +36158,8 @@ def render_page(state: PageState) -> bytes:
             ),
         }
         kite_profiles[active_kite_profile] = active_kite_values
-        nifty_income_enabled = profile_flag(
-            active_kite_values.get("NIFTY_INCOME_ENABLED"),
-            default_nifty_income_enabled_for_profile(active_kite_profile),
-        )
-        nifty_grow_enabled = nifty_income_enabled and profile_flag(
-            active_kite_values.get("NIFTY_GROW_ENABLED"),
-            default_nifty_grow_enabled_for_profile(active_kite_profile),
-        )
+        nifty_income_enabled = kite_profile_nifty_income_enabled(active_kite_profile, kite_profiles)
+        nifty_grow_enabled = kite_profile_nifty_grow_enabled(active_kite_profile, kite_profiles)
         profile_visible_tabs = kite_profile_visible_tabs(active_kite_profile, kite_profiles)
     kite_profiles_json = html.escape(json.dumps(kite_profiles), quote=True)
     default_profile_tabs_json = json.dumps(list(DEFAULT_PROFILE_VISIBLE_TABS))
@@ -36214,18 +36261,7 @@ def render_page(state: PageState) -> bytes:
             <div class="actions compact-actions">
               <button type="submit" formaction="/kite-token/save">Save Access Token</button>
             </div>
-            {render_checkbox(
-                "nifty_income_enabled",
-                "Enable Nifty Income tab",
-                nifty_income_enabled,
-                "Profile-specific permission. Recommended only for Monika; disabled profiles cannot open or run Nifty Income orders and schedulers.",
-            )}
-            {render_checkbox(
-                "nifty_grow_enabled",
-                "Enable NIFTYGrow tab",
-                nifty_grow_enabled,
-                "Optional profile-specific visibility for NIFTYGrow. It stays hidden at the tab level unless this is enabled, and it still requires Nifty Income.",
-            )}
+            <p class="status">NIFTY, Nifty Income Legacy and NIFTYGrow are controlled by Profile Tab Configuration below. Select the required tabs and save this profile.</p>
             {render_checkbox("show_credentials", "Show credential values", False, "Reveals KITE_API_SECRET, KITE_ACCESS_TOKEN, and OPENAI_API_KEY in this local browser page.")}
           </section>
           <section class="panel kite-setup-card token-card">
@@ -43928,10 +43964,10 @@ def render_page(state: PageState) -> bytes:
       );
       if (kiteProfileNoteName) kiteProfileNoteName.textContent = kiteProfileSelect.value;
       if (kiteProfileNoteStatus) {{
-        const niftyStatus = profile.NIFTY_INCOME_ENABLED
+        const niftyStatus = savedVisibleTabs.some(tab => ['nifty-2', 'nifty-income', 'nifty-grow'].includes(tab))
           ? ' Nifty Income enabled.'
           : ' Nifty Income disabled.';
-        const niftyGrowStatus = profile.NIFTY_GROW_ENABLED
+        const niftyGrowStatus = savedVisibleTabs.includes('nifty-grow')
           ? ' NIFTYGrow visible.'
           : ' NIFTYGrow hidden.';
         kiteProfileNoteStatus.textContent = (ready
@@ -48105,6 +48141,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                         else "OPTION SELL CLOSE: ENABLED. SELL close orders for long option BUY positions are allowed until you change and save this flag again."
                     )
                 )
+            elif request_path in {"/positions/default-close-test", "/positions/intraday-guard-test"}:
+                state.close_job_preview_name = "default" if request_path == "/positions/default-close-test" else "intraday"
+                state.close_job_preview = preview_position_close_job(state.close_job_preview_name)
+                state.message = "Test run complete — current-data preview only. No orders placed, modified or cancelled; scheduler state unchanged."
             elif request_path == "/positions/intraday-guard-run":
                 result = run_scheduled_job_now("intraday_position_close")
                 state.message = (
