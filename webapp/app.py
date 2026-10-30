@@ -240,7 +240,7 @@ from income.covered_call import (
     select_monthly_expiry,
 )
 
-from position_close_safety import serialized_position_close, validate_close_submission
+from position_close_safety import serialized_position_close, validate_close_submission, close_failure_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1766,16 +1766,20 @@ def nifty_close_percent_setting(side: str) -> float:
     return value if 0 <= value < 100 else fallback
 
 
-def nifty_cmp_close_price(symbol: str, side: str, cmp: float, tick: float = 0.05) -> tuple[float, float] | None:
+def nifty_cmp_close_price(symbol: str, side: str, cmp: float, average_price: float, tick: float = 0.05) -> tuple[float, float] | None:
     # Exact NIFTY index prefix; excludes BANKNIFTY, NIFTYNXT50 and other underlyings.
     symbol = str(symbol or "").upper()
     if not re.fullmatch(r"NIFTY[0-9].*(?:CE|PE)", symbol) or side not in {"BUY", "SELL"}:
         return None
     if not math.isfinite(cmp) or cmp <= 0:
         raise ValueError("NIFTY close pricing requires a positive fresh CMP.")
+    if not math.isfinite(average_price) or average_price <= 0:
+        raise ValueError("NIFTY close pricing requires a positive entry average.")
+    # Same passive profit-target reference as stock options; preserve NIFTY percentages.
+    reference = min(cmp, average_price) if side == "BUY" else max(cmp, average_price)
     percent = nifty_close_percent_setting(side)
-    price = (floor_to_tick(cmp * (1 - percent / 100), tick) if side == "BUY"
-             else ceil_to_tick(cmp * (1 + percent / 100), tick))
+    price = (floor_to_tick(reference * (1 - percent / 100), tick) if side == "BUY"
+             else ceil_to_tick(reference * (1 + percent / 100), tick))
     return price, percent
 
 
@@ -11975,14 +11979,15 @@ def build_missing_option_close_orders(
                 f"{sell_markup:g}% above max(LTP, average entry price); "
                 f"standard SELL close for open BUY position"
             )
-        # Normal NIFTY closes use CMP; retain existing emergency exit pricing and gates.
+        # Normal NIFTY closes use the same min/max entry reference as stock options; retain existing emergency exit pricing and gates.
         nifty_price = None
         if close_side == "SELL" or probability_risk.probability_risk_state not in {"PANIC", "FORCE_EXIT"} or not dte_gate_allowed:
-            nifty_price = nifty_cmp_close_price(symbol, close_side, ltp)
+            nifty_price = nifty_cmp_close_price(symbol, close_side, ltp, average_price)
         if nifty_price is not None:
             limit_price, applied_percent = nifty_price
-            price_basis = ltp
-            rule = f"NIFTY {applied_percent:g}% {'below' if close_side == 'BUY' else 'above'} fresh CMP"
+            price_basis = min(ltp, average_price) if close_side == "BUY" else max(ltp, average_price)
+            reference_label = "min(LTP, average entry price)" if close_side == "BUY" else "max(LTP, average entry price)"
+            rule = f"NIFTY {applied_percent:g}% {'below' if close_side == 'BUY' else 'above'} {reference_label}"
         if limit_price <= 0:
             evaluation["action"] = "SKIP_INVALID_LIMIT_PRICE"
             evaluations.append(evaluation)
@@ -12015,9 +12020,9 @@ def build_missing_option_close_orders(
                 "ltp": ltp,
                 "pnl": option_position_pnl(quantity, average_price, ltp),
                 "price_basis": (
-                    "CMP" if nifty_price is not None else ("min_ltp_average_price"
+                    "min_ltp_average_price"
                     if close_side == "BUY"
-                    else "max_ltp_average_price")
+                    else "max_ltp_average_price"
                 ),
                 "discount_percent": nifty_price[1] if nifty_price is not None else (discount if close_side == "BUY" else sell_markup),
                 "risk_note": (
@@ -19025,10 +19030,10 @@ def refresh_position_buy_order_prices(
                 updated['price'] = ceil_to_tick(price_basis * (1 + discount_percent / 100), tick_size)
         elif price_basis > 0:
             updated["price"] = floor_to_tick(price_basis * (1 - discount_percent / 100), tick_size)
-        nifty_price = nifty_cmp_close_price(updated.get("tradingsymbol"), str(updated.get("transaction_type") or "").upper(), ltp, tick_size)
+        nifty_price = nifty_cmp_close_price(updated.get("tradingsymbol"), str(updated.get("transaction_type") or "").upper(), ltp, average_price, tick_size)
         if nifty_price is not None:
             updated["price"], discount_percent = nifty_price
-            price_basis_name = "CMP"
+            price_basis_name = "min(LTP, average entry price)" if str(updated.get("transaction_type") or "").upper() == "BUY" else "max(LTP, average entry price)"
         updated["ltp"] = ltp
         updated["pnl"] = pnl
         updated["price_basis"] = price_basis_name
@@ -19648,6 +19653,7 @@ def run_scheduled_position_close_job(
             message = (
                 f"{market_message} Default close position orders placed: {live_count}; "
                 f"errors: {error_count}."
+                + close_failure_summary(results)
             )
             return save_position_close_schedule_state(
                 status=status,
@@ -20316,7 +20322,9 @@ def run_intraday_position_close_job(
                     f"loss/hard-stop overrides: {len(loss_limit_orders)}; "
                     f"strict PE exits: {len(risk_orders)}; "
                     f"existing close orders skipped: {risk_existing_order_skips}; "
-                    f"errors: {error_count}. {pricing_details}"
+                    f"errors: {error_count}. "
+                    + close_failure_summary(results)
+                    + f" Proposed LIMIT details (not fill confirmation): {pricing_details}"
                     + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
                     + dte_guard_message
                     + dte_passive_message
@@ -32684,10 +32692,10 @@ def render_position_close_schedule_panel(section="all", preview_state=None) -> s
         '<div class="compact-grid">'
         f'<label><span>BUY close: % below reference</span><input type="number" name="scheduler_buy_discount" min="0" max="99.99" step="0.01" value="{discount_percent:g}"></label>'
         f'<label><span>SELL close: % above reference</span><input type="number" name="scheduler_sell_markup" min="0" max="99.99" step="0.01" value="{position_close_sell_markup_percent_setting():g}"></label>'
-        f'<label><span>NIFTY BUY close: % below CMP</span><input type="number" name="nifty_close_buy_discount" min="0" max="99.99" step="0.01" value="{nifty_close_percent_setting("BUY"):g}"></label>'
-        f'<label><span>NIFTY SELL close: % above CMP</span><input type="number" name="nifty_close_sell_markup" min="0" max="99.99" step="0.01" value="{nifty_close_percent_setting("SELL"):g}"></label>'
+        f'<label><span>NIFTY BUY close: % below min(CMP, average)</span><input type="number" name="nifty_close_buy_discount" min="0" max="99.99" step="0.01" value="{nifty_close_percent_setting("BUY"):g}"></label>'
+        f'<label><span>NIFTY SELL close: % above max(CMP, average)</span><input type="number" name="nifty_close_sell_markup" min="0" max="99.99" step="0.01" value="{nifty_close_percent_setting("SELL"):g}"></label>'
         '</div><button type="submit" formaction="/positions/close-pricing" formnovalidate>Save close-order percentages</button>'
-        '<p class="status">Shared by both close-order jobs. NIFTY uses its separate CMP percentages for normal closes; emergency risk-exit rules take priority. Saving does not place or modify orders. STOP OPTION SELL and risk-exit rules remain active.</p>' 
+        '<p class="status">Shared by both close-order jobs. NIFTY uses its saved percentages with the same min/max reference as stock options for normal closes; emergency risk-exit rules take priority. Saving does not place or modify orders. STOP OPTION SELL and risk-exit rules remain active.</p>' 
         '<div class="position-summary-strip">'
         f'<div class="position-summary-chip"><span>Schedule</span><strong>{html.escape(str(schedule.get("schedule_time")))} IST</strong></div>'
         f'<div class="position-summary-chip"><span>Profile</span><strong>{html.escape(str(schedule.get("profile") or selected_kite_profile_name()))}</strong></div>'
@@ -48125,7 +48133,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                                    'nifty_close_buy_discount_percent':nifty_buy,
                                    'nifty_close_sell_markup_percent':nifty_sell})
                 state.position_discount_percent = buy
-                state.message = f'Both close-order jobs now use BUY {buy:g}% below and SELL {sell:g}% above their reference prices. NIFTY: BUY {nifty_buy:g}% below CMP, SELL {nifty_sell:g}% above CMP. Existing orders unchanged.'
+                state.message = f'Both close-order jobs now use BUY {buy:g}% below and SELL {sell:g}% above their reference prices. NIFTY: BUY {nifty_buy:g}% below min(CMP, average), SELL {nifty_sell:g}% above max(CMP, average). Existing orders unchanged.'
             elif request_path == "/positions/settings":
                 state.message = (
                     f"BUY Preview discount saved at {state.position_discount_percent:g}%. "

@@ -42,3 +42,19 @@ def validate_close_submission(order, positions, pending_orders):
     if any(key(o) == key(order) and str(o.get('status') or '').upper()
            not in {'COMPLETE', 'CANCELLED', 'REJECTED'} for o in pending_orders):
         raise ValueError('Close blocked: outstanding contract order requires reconciliation.')
+
+
+def close_failure_summary(results):
+    """Expose the recorded failure, instead of obscuring it with candidate pricing."""
+    errors = [row for row in results if row.get('status') == 'ERROR']
+    if not errors:
+        return ''
+    import re
+    def clean(value):
+        text = str(value or 'No diagnostic returned.')
+        text = re.sub(r'(?i)((?:access_token|api_key|api_secret|authorization)\s*[:=]\s*)[^\s&,;]+', r'\1[redacted]', text)
+        return text[:600]
+    return ' Submission failed: ' + '; '.join(
+        f"{row.get('tradingsymbol') or 'Contract'}: {clean(row.get('detail'))}"
+        for row in errors[:5]
+    ) + '. No automatic retry; reconcile broker orders before retrying.'
