@@ -63,7 +63,7 @@ def test_default_builder_corrects_legacy_buy_before_pricing():
 
 def test_normal_price_uses_side_and_config():
     from math import floor, ceil
-    ns = dict(Any=Any, fresh_kite_ltp_map=lambda *a:{'NFO:ABB26NOV7100CE':80},
+    ns = dict(load_app_settings=lambda:{}, Any=Any, fresh_kite_ltp_map=lambda *a:{'NFO:ABB26NOV7100CE':80},
         option_position_pnl=lambda q,a,p:q*(p-a), position_close_sell_markup_percent_setting=lambda:30,
         floor_to_tick=lambda p,t:floor(p/t)*t, ceil_to_tick=lambda p,t:ceil(p/t)*t,
         nifty_cmp_close_price=lambda *a:None)

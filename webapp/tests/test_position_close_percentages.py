@@ -19,7 +19,7 @@ def test_independent_sell_setting_and_invalid_fallback():
     assert setting()==20
 
 def test_buy_and_sell_prices_use_separate_percentages():
-    scope={'Any':object,'math':math,'nifty_cmp_close_price':lambda *a:None,'fresh_kite_ltp_map':lambda *a:{'NFO:XPE':100},
+    scope={'load_app_settings':lambda:{},'Any':object,'math':math,'nifty_cmp_close_price':lambda *a:None,'fresh_kite_ltp_map':lambda *a:{'NFO:XPE':100},
            'option_position_pnl':lambda *a:0,'floor_to_tick':lambda price,tick:round(math.floor(price/tick)*tick,2),
            'ceil_to_tick':lambda price,tick:round(math.ceil(price/tick-1e-9)*tick,2),
            'position_close_sell_markup_percent_setting':lambda:30}

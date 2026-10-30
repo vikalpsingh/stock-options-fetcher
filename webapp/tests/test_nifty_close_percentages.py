@@ -65,3 +65,20 @@ def test_default_job_reprice_uses_nifty_entry_reference():
         result=scope['refresh_position_buy_order_prices']([order],None)
         assert result[0]['price']==expected
         assert 'average entry price' in result[0]['price_basis']
+
+
+def test_cmp_only_shared_reference_both_sides_and_underlyings():
+    for enabled in [True, False]:
+        scope=functions(dict(position_close_cmp_only=enabled,nifty_close_buy_discount_percent=30,nifty_close_sell_markup_percent=30))
+        scope.update(Any=object, option_position_pnl=lambda q,a,p:q*(p-a))
+        a=SOURCE.index('def refresh_position_buy_order_prices(');b=SOURCE.index('\ndef ',a+5)
+        exec(compile(SOURCE[a:b],'<isolated>','exec'),scope)
+        for symbol in ['NIFTY26NOV23200CE','COFORGE26NOV1980CE']:
+            scope['fresh_kite_ltp_map']=lambda *args:{'NFO:'+symbol:100}
+            for side,avg in [('SELL',200),('BUY',50)]:
+                order=dict(tradingsymbol=symbol,exchange='NFO',transaction_type=side,quantity=195,average_price=avg)
+                result=scope['refresh_position_buy_order_prices']([order],None)[0]
+                percent=30 if side=='SELL' or symbol.startswith('NIFTY') else 20
+                reference=100 if enabled else avg
+                assert result['price']==round(reference*(1+percent/100 if side=='SELL' else 1-percent/100),2)
+                if enabled: assert result['price_basis']=='CMP only'
