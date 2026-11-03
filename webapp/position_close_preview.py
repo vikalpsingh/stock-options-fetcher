@@ -23,7 +23,13 @@ def preview_rows(positions, pending, candidates, owned, stop_sell, notes):
                     raise ValueError('Protected pair: use EXECUTION Close Pair.')
                 if stop_sell and side == 'SELL':
                     raise ValueError('STOP OPTION SELL is enabled.')
-                validate_close_submission(order, positions, pending)
+                from position_close_reconcile import plan_close
+                action, target, existing = plan_close(order, positions, pending)
+                if action == 'SKIP':
+                    status, reason = 'SKIPPED', 'Matching existing close preserved: ' + str(existing.get('order_id'))
+                elif action == 'MODIFY':
+                    status = 'MODIFY PROPOSED — NOT SENT'
+                    reason = 'Resize existing close ' + str(existing.get('order_id')) + '; total quantity including fills: ' + str(target['quantity'])
             except ValueError as exc:
                 status, reason = 'BLOCKED', str(exc)
         rows.append(dict(symbol=symbol, product=position.get('product'), position_qty=qty,

@@ -34,4 +34,10 @@ def test_both_paths_reference_shared_settings():
     start=SOURCE.index('def build_missing_option_close_orders(');end=SOURCE.index('\ndef ',start+5)
     assert 'position_close_sell_markup_percent_setting()' in SOURCE[start:end]
     assert '(1 + sell_markup / 100)' in SOURCE[start:end]
-    assert 'position_include_long=not position_stop_option_sell_setting()' in SOURCE
+    for runner in ('run_scheduled_position_close_job', 'run_intraday_position_close_job'):
+        start = SOURCE.index('def ' + runner + '(')
+        end = SOURCE.index('\ndef ', start + 5)
+        assert 'return run_position_close_workflow(' in SOURCE[start:end]
+    start = SOURCE.index('def run_position_close_workflow(')
+    end = SOURCE.index('\ndef ', start + 5)
+    assert 'position_stop_option_sell=position_stop_option_sell_setting()' in SOURCE[start:end]

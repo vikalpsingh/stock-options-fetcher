@@ -37,7 +37,9 @@ def render_exit_review(record, action, account_field, account):
     if not review:return ''
     rows=''.join('<tr><td>'+e(leg['payload']['tradingsymbol'])+'</td><td>'+('BUY short' if leg['payload']['transaction_type']=='SELL' else 'SELL hedge')+'</td><td>'+str(basket_remaining(record,leg))+'</td><td>'+e(str(review.get('prices',{}).get(leg['payload']['tradingsymbol'],'Next stage')))+'</td></tr>' for leg in record['legs'])
     dialog_id='exit-review-'+str(record.get('id','pair'))
-    content='<h3>Review Exit</h3><p>Target '+e(str(review.get('target_percent',50)))+'% is advisory. A loss-making risk exit is permitted. Review expires after 120 seconds.</p><table><thead><tr><th>Contract</th><th>Close action</th><th>Remaining qty</th><th>LIMIT</th></tr></thead><tbody>'+rows+'</tbody></table><p>Only the current stage is authorised. Remaining hedges require a fresh review after short fills are confirmed.</p>'
+    from underlying_market_context import context_panel
+    underlying = (record.get('preview') or {}).get('symbol') or ('NIFTY' if record.get('kind') == 'BASKET' else '')
+    content='<h3>Review Exit</h3>'+context_panel(underlying)+'<p>Target '+e(str(review.get('target_percent',50)))+'% is advisory. A loss-making risk exit is permitted. Review expires after 120 seconds.</p><table><thead><tr><th>Contract</th><th>Close action</th><th>Remaining qty</th><th>LIMIT</th></tr></thead><tbody>'+rows+'</tbody></table><p>Only the current stage is authorised. Remaining hedges require a fresh review after short fills are confirmed.</p>'
     return '<button type="button" onclick="document.getElementById(\''+e(dialog_id)+'\').showModal()">Review Exit prices</button><dialog id="'+e(dialog_id)+'" style="max-width:90vw;border:1px solid #99c9c5;border-radius:12px;padding:24px">'+content+'<button type="button" onclick="this.closest(\'dialog\').close()">Back to explicit confirmation</button></dialog>'
 
 

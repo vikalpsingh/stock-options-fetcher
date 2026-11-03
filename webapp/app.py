@@ -242,6 +242,8 @@ from income.covered_call import (
 
 from position_close_safety import serialized_position_close, validate_close_submission, close_failure_summary
 
+from underlying_market_context import CONTEXT_SCRIPT, context_panel, context_values
+
 logger = logging.getLogger(__name__)
 
 
@@ -11833,7 +11835,7 @@ def build_missing_option_close_orders(
         }
         probability_risk = build_option_probability_risk(position)
         evaluation.update(_option_probability_fields(probability_risk))
-        if existing_order:
+        if existing_order and int(existing_order.get("pending_quantity") or 0) == abs(quantity):
             evaluation.update(
                 {
                     "action": "SKIP_EXISTING_CLOSE_ORDER",
@@ -13460,6 +13462,8 @@ def screener_link_for_code(code: str) -> str:
 def yahoo_symbol_for_investing_code(code: str) -> str:
     quote_key = investing_quote_key(code)
     exchange, symbol = quote_key.split(":", 1)
+    if exchange == "NSE" and symbol == "NIFTY 50":
+        return "^NSEI"
     suffix = ".BO" if exchange == "BSE" else ".NS"
     return f"{symbol}{suffix}"
 
@@ -18964,7 +18968,8 @@ def build_position_buy_orders(state: PageState) -> list[dict[str, Any]]:
         if order is None:
             continue
         order = bind_close_order(order, position)
-        if (str(order.get("tradingsymbol") or "").upper(), order["transaction_type"]) not in existing_closes:
+        existing = existing_closes.get((str(order.get("tradingsymbol") or "").upper(), order["transaction_type"]))
+        if not existing or int(existing.get("pending_quantity") or 0) != order["quantity"]:
             orders.append(order)
     orders = refresh_position_buy_order_prices(orders, kite, args)
     if state.position_stop_option_sell:
@@ -19276,37 +19281,8 @@ def execute_position_buy_orders(
     kite = kite_buy_positions.kite_client()
     results: list[dict[str, Any]] = []
     submitted_orders: list[dict[str, Any]] = []
-    guarded_symbols = {
-        (
-            str(order.get("tradingsymbol") or "").upper(),
-            str(order.get("transaction_type") or "BUY").upper(),
-        )
-        for order in selected_orders
-        if order.get("skip_if_close_order_exists")
-    }
-    existing_close_orders = (
-        open_option_close_orders_by_symbol_side(kite, True)
-        if guarded_symbols
-        else {}
-    )
+    from position_close_reconcile import execute_close
     for order in selected_orders:
-        symbol = str(order.get("tradingsymbol") or "").upper()
-        side = str(order.get("transaction_type") or "BUY").upper()
-        existing_close = existing_close_orders.get((symbol, side))
-        if existing_close:
-            results.append(
-                {
-                    "tradingsymbol": symbol,
-                    "status": "SKIPPED_EXISTING",
-                    "order_id": existing_close.get("order_id"),
-                    "detail": (
-                        f"Existing open {side} close order preserved; "
-                        f"price {float(existing_close.get('price') or 0):.2f}, "
-                        f"pending quantity {int(float(existing_close.get('pending_quantity') or existing_close.get('quantity') or 0))}."
-                    ),
-                }
-            )
-            continue
         submitted_orders.append(order)
         kite_order = {
             key: value
@@ -19314,18 +19290,19 @@ def execute_position_buy_orders(
             if key in ORDER_FIELDS
         }
         try:
-            # Refresh signed net positions at the last boundary, never infer direction from an order.
-            validate_close_submission(order, kite.positions()["net"], kite.orders())
-            if keep_existing_orders:
-                order_id = kite_buy_positions.place_order(kite, kite_order)
-                action = "placed"
-            else:
-                order_id = kite_buy_positions.modify_or_place_order(kite, kite_order)
-                action = "placed_or_modified"
+            def reprice_close(target):
+                # Passive candidates use current CMP and saved pricing; emergency limits retain their rule.
+                if not order.get("risk_note") or str(order.get("tag") or "") == "AUTO_CLOSE":
+                    priced = refresh_position_buy_order_prices([{**order, **target}], kite)[0]
+                    target["price"] = priced["price"]
+                return target
+            result_status, order_id, action = execute_close(
+                kite, kite_order, str(APP_DB_PATH) + ".close-intents.sqlite",
+                owner_account, app_now().date().isoformat(), reprice_close)
             results.append(
                 {
                     "tradingsymbol": order["tradingsymbol"],
-                    "status": "LIVE_SENT",
+                    "status": result_status,
                     "order_id": order_id,
                     "detail": (
                         f"{action}. {order.get('risk_note')}"
@@ -19345,6 +19322,255 @@ def execute_position_buy_orders(
     return submitted_orders, results
 
 
+def plan_position_close_job(kite, state):
+    loss_limit_orders, loss_limit_evaluations = build_intraday_loss_limit_close_orders(
+        kite,
+        INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT,
+        state.position_discount_percent,
+    )
+    loss_limit_symbols = {
+        str(order.get("tradingsymbol") or "").upper()
+        for order in loss_limit_orders
+    }
+    risk_scan_error = ""
+    try:
+        risk_orders, risk_evaluations = build_intraday_pe_risk_exit_orders(kite)
+    except Exception as exc:
+        risk_orders, risk_evaluations = [], []
+        risk_scan_error = friendly_external_error(exc, "Strict SELL PE risk scan")
+    risk_symbols = {
+        str(order.get("tradingsymbol") or "").upper()
+        for order in risk_orders
+    } - loss_limit_symbols
+    risk_orders = [
+        order
+        for order in risk_orders
+        if str(order.get("tradingsymbol") or "").upper() not in loss_limit_symbols
+    ]
+    default_orders: list[dict[str, Any]] = []
+    default_orders, close_order_evaluations = build_missing_option_close_orders_for_scheduler(
+        kite,
+        state.position_discount_percent,
+        state.position_stop_option_sell,
+    )
+    default_orders = [
+        order for order in default_orders
+        if str(order.get("tradingsymbol") or "").upper()
+        not in (risk_symbols | loss_limit_symbols)
+    ]
+    return loss_limit_orders, risk_orders, default_orders, loss_limit_evaluations, risk_evaluations, close_order_evaluations, risk_scan_error
+
+
+def run_position_close_workflow(now, profile_name, save_run):
+    """Execute the same market check, risk filters and reconciliation for either schedule."""
+    try:
+        profile = load_kite_profiles().get(profile_name, blank_kite_profile())
+        apply_kite_profile_to_env(profile)
+        setup_issue = kite_setup_issue()
+        if setup_issue:
+            raise RuntimeError(setup_issue)
+        kite = kite_buy_positions.kite_client()
+        market_open, market_message = verify_scheduled_position_market_open(kite, now)
+        if not market_open:
+            return save_run(
+                status="MARKET_CLOSED",
+                message=market_message,
+                results=[],
+            )
+        state = PageState(
+            position_dry_run=False,
+            position_discount_percent=position_close_discount_percent_setting(),
+            position_keep_existing_orders=True,
+            position_stop_option_sell=position_stop_option_sell_setting(),
+        )
+        (loss_limit_orders, risk_orders, default_orders, loss_limit_evaluations,
+         risk_evaluations, close_order_evaluations, risk_scan_error) = plan_position_close_job(kite, state)
+        risk_existing_order_skips = sum(
+            1
+            for evaluation in risk_evaluations
+            if evaluation.get("scheduler_action") == "SKIP_EXISTING_CLOSE_ORDER"
+        )
+        dte_guard_skip_actions = {
+            "SKIP_INTRADAY_OVERRIDE_DTE_NOT_READY",
+            "SKIP_PROBABILITY_RISK_DTE_NOT_READY",
+            "SKIP_STRICT_PE_DTE_NOT_READY",
+        }
+        dte_guard_skips = [
+            evaluation
+            for evaluation in [
+                *loss_limit_evaluations,
+                *risk_evaluations,
+                *close_order_evaluations,
+            ]
+            if (
+                str(evaluation.get("action") or "") in dte_guard_skip_actions
+                or str(evaluation.get("scheduler_action") or "") in dte_guard_skip_actions
+            )
+        ]
+        dte_guard_message = ""
+        if dte_guard_skips:
+            skipped_symbols = ", ".join(
+                f"{evaluation.get('tradingsymbol')} "
+                f"(trading DTE {evaluation.get('dte') if evaluation.get('dte') is not None else 'unknown'})"
+                for evaluation in dte_guard_skips[:5]
+            )
+            extra_count = len(dte_guard_skips) - 5
+            dte_guard_message = (
+                f" DTE-gated risk exits skipped until trading DTE <= "
+                f"{intraday_hard_stop_start_dte_setting()}: {skipped_symbols}"
+                + (f", +{extra_count} more" if extra_count > 0 else "")
+                + "."
+            )
+        dte_passive_downgrades = [
+            evaluation
+            for evaluation in close_order_evaluations
+            if evaluation.get("dte_gate_applied")
+        ]
+        dte_passive_message = ""
+        if dte_passive_downgrades:
+            downgraded_symbols = ", ".join(
+                f"{evaluation.get('tradingsymbol')} "
+                f"(trading DTE {evaluation.get('dte') if evaluation.get('dte') is not None else 'unknown'})"
+                for evaluation in dte_passive_downgrades[:5]
+            )
+            extra_count = len(dte_passive_downgrades) - 5
+            dte_passive_message = (
+                " Aggressive risk exits downgraded to default passive close "
+                f"orders until trading DTE <= {intraday_hard_stop_start_dte_setting()}: "
+                f"{downgraded_symbols}"
+                + (f", +{extra_count} more" if extra_count > 0 else "")
+                + "."
+            )
+        passive_buy_close_count = sum(
+            1
+            for evaluation in close_order_evaluations
+            if str(evaluation.get("action") or "") == "PLACE_BUY_CLOSE"
+        )
+        passive_sell_close_count = sum(
+            1
+            for evaluation in close_order_evaluations
+            if str(evaluation.get("action") or "") == "PLACE_SELL_CLOSE"
+        )
+        passive_close_message = ""
+        if passive_buy_close_count or passive_sell_close_count:
+            passive_close_message = (
+                f" Passive close candidates: BUY {passive_buy_close_count}, "
+                f"SELL {passive_sell_close_count}."
+            )
+        submitted_orders: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
+        if loss_limit_orders:
+            loss_submitted, loss_results = execute_position_orders_for_scheduler(
+                loss_limit_orders,
+                set(range(len(loss_limit_orders))),
+                False,
+                False,
+                state.position_stop_option_sell,
+            )
+            submitted_orders.extend(loss_submitted)
+            results.extend(loss_results)
+        if risk_orders:
+            risk_submitted, risk_results = execute_position_orders_for_scheduler(
+                risk_orders,
+                set(range(len(risk_orders))),
+                False,
+                True,
+                state.position_stop_option_sell,
+            )
+            submitted_orders.extend(risk_submitted)
+            results.extend(risk_results)
+        if default_orders:
+            default_submitted, default_results = execute_position_orders_for_scheduler(
+                default_orders,
+                set(range(len(default_orders))),
+                False,
+                True,
+                state.position_stop_option_sell,
+            )
+            submitted_orders.extend(default_submitted)
+            results.extend(default_results)
+        if not submitted_orders:
+            no_order_message = (
+                "No close orders placed because open option positions are outside the intraday "
+                f"close-order trading-DTE window."
+                if dte_guard_skips
+                else "All open option positions already have matching BUY/SELL close orders."
+            )
+            return save_run(
+                status="DTE_GATED" if dte_guard_skips else "ALL_COVERED",
+                message=(
+                    no_order_message
+                    + (
+                        f" Strict PE positions skipped because a close BUY order already exists: "
+                        f"{risk_existing_order_skips}."
+                        if risk_existing_order_skips
+                        else ""
+                    )
+                    + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
+                    + dte_guard_message
+                    + dte_passive_message
+                    + passive_close_message
+                ),
+                order_count=0,
+                results=results,
+                pe_risk_evaluations=risk_evaluations,
+                loss_limit_evaluations=loss_limit_evaluations,
+                close_order_evaluations=close_order_evaluations,
+            )
+        live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
+        error_count = sum(1 for result in results if result.get("status") == "ERROR")
+        status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
+        pricing_details = "; ".join(
+            f"{order.get('tradingsymbol')}: LIMIT {float(order.get('price') or 0):.2f} "
+            f"({str(order.get('transaction_type') or 'BUY').upper()} at "
+            f"{float(order.get('discount_percent') or state.position_discount_percent):g}% "
+            f"{'below' if str(order.get('transaction_type') or 'BUY').upper() == 'BUY' else 'above'} "
+            f"{order.get('price_basis') or 'price basis'})"
+            + (f" [{order.get('risk_note')}]" if order.get("risk_note") else "")
+            for order in submitted_orders
+        )
+        return save_run(
+            status=status,
+            message=(
+                f"{market_message} Missing BUY/SELL close orders placed: {live_count}; "
+                f"loss/hard-stop overrides: {len(loss_limit_orders)}; "
+                f"strict PE exits: {len(risk_orders)}; "
+                f"existing close orders skipped: {risk_existing_order_skips}; "
+                f"errors: {error_count}. "
+                + close_failure_summary(results)
+                + f" Proposed LIMIT details (not fill confirmation): {pricing_details}"
+                + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
+                + dte_guard_message
+                + dte_passive_message
+                + passive_close_message
+            ),
+            order_count=len(submitted_orders),
+            results=results,
+            pe_risk_evaluations=risk_evaluations,
+            loss_limit_evaluations=loss_limit_evaluations,
+            close_order_evaluations=close_order_evaluations,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        status = "ALL_COVERED" if "No matching positions need a new BUY order" in message else "ERROR"
+        return save_run(
+            status=status,
+            message=(
+                "All open option positions already have matching BUY/SELL close orders."
+                if status == "ALL_COVERED"
+                else message
+            ),
+            order_count=0,
+            results=[],
+        )
+    except Exception as exc:
+        return save_run(
+            status="ERROR",
+            message=friendly_external_error(exc, "Intraday option close-order check"),
+            results=[],
+        )
+
+
 def preview_position_close_job(job: str) -> list[dict[str, Any]]:
     """Read-only planning: never call a runner, executor or scheduler-state saver."""
     kite = kite_buy_positions.kite_client()
@@ -19355,30 +19581,12 @@ def preview_position_close_job(job: str) -> list[dict[str, Any]]:
                       position_discount_percent=position_close_discount_percent_setting(),
                       position_include_long=not stop_sell, position_stop_option_sell=stop_sell)
     notes = {}
-    if job == "default":
-        try:
-            candidates = build_position_buy_orders(state)
-        except ValueError as exc:
-            if not str(exc).startswith("No matching positions need a new close order"):
-                raise
-            candidates = []
-    elif job == "intraday":
-        loss, loss_eval = build_intraday_loss_limit_close_orders(
-            kite, INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT, state.position_discount_percent)
-        risk, risk_eval = build_intraday_pe_risk_exit_orders(kite)
-        basic, basic_eval = build_missing_option_close_orders_for_scheduler(
-            kite, state.position_discount_percent, stop_sell)
-        # Same precedence as the live runner: loss-limit, strict PE risk, passive close.
-        candidates, seen = [], set()
-        for order in [*loss, *risk, *basic]:
-            symbol = order.get("tradingsymbol")
-            if symbol not in seen:
-                candidates.append(order)
-                seen.add(symbol)
-        for evaluation in [*basic_eval, *risk_eval, *loss_eval]:
-            notes[evaluation.get("tradingsymbol")] = evaluation.get("skip_reason") or evaluation.get("scheduler_action") or evaluation.get("action")
-    else:
+    if job not in {"default", "intraday"}:
         raise ValueError("Unknown close-order preview job.")
+    loss, risk, basic, loss_eval, risk_eval, basic_eval, warning = plan_position_close_job(kite, state)
+    candidates = [*loss, *risk, *basic]
+    for evaluation in [*basic_eval, *risk_eval, *loss_eval]:
+        notes[evaluation.get("tradingsymbol")] = evaluation.get("skip_reason") or evaluation.get("scheduler_action") or evaluation.get("action")
     from position_close_preview import preview_rows
     owned = ProtectedExecutionRepository(APP_DB_PATH).owned_symbols(selected_kite_profile_name())
     return preview_rows(positions, pending, candidates, owned, stop_sell, notes)
@@ -19618,65 +19826,13 @@ def run_scheduled_position_close_job(
             profile=profile_name,
             status="RUNNING",
             message=(
-                "Manual run: building default close-position BUY orders."
+                "Manual run: checking BUY/SELL close orders."
                 if force
-                else "Building default close-position BUY orders."
+                else "Checking BUY/SELL close orders."
             ),
             results=[],
         )
-        try:
-            profile = load_kite_profiles().get(profile_name, blank_kite_profile())
-            apply_kite_profile_to_env(profile)
-            setup_issue = kite_setup_issue()
-            if setup_issue:
-                raise RuntimeError(setup_issue)
-            kite = kite_buy_positions.kite_client()
-            market_open, market_message = verify_scheduled_position_market_open(kite, now)
-            if not market_open:
-                return save_position_close_schedule_state(
-                    status="MARKET_CLOSED",
-                    message=market_message,
-                    results=[],
-                )
-            state = PageState(
-                position_dry_run=False,
-                position_discount_percent=position_close_discount_percent_setting(),
-                position_include_long=not position_stop_option_sell_setting(),
-                position_stop_option_sell=position_stop_option_sell_setting(),
-            )
-            orders = build_position_buy_orders(state)
-            selected = set(range(len(orders)))
-            submitted_orders, results = execute_position_orders_for_scheduler(
-                orders,
-                selected,
-                False,
-                False,
-                position_stop_option_sell_setting(),
-            )
-            live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
-            error_count = sum(1 for result in results if result.get("status") == "ERROR")
-            status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
-            message = (
-                f"{market_message} Default close position orders placed: {live_count}; "
-                f"errors: {error_count}."
-                + close_failure_summary(results)
-            )
-            return save_position_close_schedule_state(
-                status=status,
-                message=message,
-                order_count=len(submitted_orders),
-                results=results,
-            )
-        except ValueError as exc:
-            message = str(exc)
-            status = "NO_ORDERS" if "No matching positions need a new BUY order" in message else "ERROR"
-            return save_position_close_schedule_state(status=status, message=message, results=[])
-        except Exception as exc:
-            return save_position_close_schedule_state(
-                status="ERROR",
-                message=friendly_external_error(exc, "Scheduled close BUY"),
-                results=[],
-            )
+        return run_position_close_workflow(now, profile_name, save_position_close_schedule_state)
     finally:
         POSITION_CLOSE_SCHEDULER_LOCK.release()
 
@@ -19751,7 +19907,7 @@ def scheduled_job_definitions() -> dict[str, dict[str, Any]]:
     return {
         "position_close_open": {
             "name": "Default Close Orders",
-            "purpose": "Place default close-position BUY orders once at market open.",
+            "purpose": "Check BUY/SELL close orders once at the configured daily time.",
             "schedule": "Weekdays at 09:20 IST",
             "load": position_close_schedule_state,
             "save": save_position_close_schedule_state,
@@ -20122,245 +20278,7 @@ def run_intraday_position_close_job(
             ),
             results=[],
         )
-        try:
-            profile = load_kite_profiles().get(profile_name, blank_kite_profile())
-            apply_kite_profile_to_env(profile)
-            setup_issue = kite_setup_issue()
-            if setup_issue:
-                raise RuntimeError(setup_issue)
-            kite = kite_buy_positions.kite_client()
-            market_open, market_message = verify_scheduled_position_market_open(kite, now)
-            if not market_open:
-                return save_intraday_position_close_schedule_state(
-                    status="MARKET_CLOSED",
-                    message=market_message,
-                    results=[],
-                )
-            state = PageState(
-                position_dry_run=False,
-                position_discount_percent=position_close_discount_percent_setting(),
-                position_keep_existing_orders=True,
-                position_stop_option_sell=position_stop_option_sell_setting(),
-            )
-            loss_limit_orders, loss_limit_evaluations = build_intraday_loss_limit_close_orders(
-                kite,
-                INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT,
-                state.position_discount_percent,
-            )
-            loss_limit_symbols = {
-                str(order.get("tradingsymbol") or "").upper()
-                for order in loss_limit_orders
-            }
-            risk_scan_error = ""
-            try:
-                risk_orders, risk_evaluations = build_intraday_pe_risk_exit_orders(kite)
-            except Exception as exc:
-                risk_orders, risk_evaluations = [], []
-                risk_scan_error = friendly_external_error(exc, "Strict SELL PE risk scan")
-            risk_existing_order_skips = sum(
-                1
-                for evaluation in risk_evaluations
-                if evaluation.get("scheduler_action") == "SKIP_EXISTING_CLOSE_ORDER"
-            )
-            risk_symbols = {
-                str(order.get("tradingsymbol") or "").upper()
-                for order in risk_orders
-            } - loss_limit_symbols
-            risk_orders = [
-                order
-                for order in risk_orders
-                if str(order.get("tradingsymbol") or "").upper() not in loss_limit_symbols
-            ]
-            default_orders: list[dict[str, Any]] = []
-            default_orders, close_order_evaluations = build_missing_option_close_orders_for_scheduler(
-                kite,
-                state.position_discount_percent,
-                state.position_stop_option_sell,
-            )
-            default_orders = [
-                order for order in default_orders
-                if str(order.get("tradingsymbol") or "").upper()
-                not in (risk_symbols | loss_limit_symbols)
-            ]
-            dte_guard_skip_actions = {
-                "SKIP_INTRADAY_OVERRIDE_DTE_NOT_READY",
-                "SKIP_PROBABILITY_RISK_DTE_NOT_READY",
-                "SKIP_STRICT_PE_DTE_NOT_READY",
-            }
-            dte_guard_skips = [
-                evaluation
-                for evaluation in [
-                    *loss_limit_evaluations,
-                    *risk_evaluations,
-                    *close_order_evaluations,
-                ]
-                if (
-                    str(evaluation.get("action") or "") in dte_guard_skip_actions
-                    or str(evaluation.get("scheduler_action") or "") in dte_guard_skip_actions
-                )
-            ]
-            dte_guard_message = ""
-            if dte_guard_skips:
-                skipped_symbols = ", ".join(
-                    f"{evaluation.get('tradingsymbol')} "
-                    f"(trading DTE {evaluation.get('dte') if evaluation.get('dte') is not None else 'unknown'})"
-                    for evaluation in dte_guard_skips[:5]
-                )
-                extra_count = len(dte_guard_skips) - 5
-                dte_guard_message = (
-                    f" DTE-gated risk exits skipped until trading DTE <= "
-                    f"{intraday_hard_stop_start_dte_setting()}: {skipped_symbols}"
-                    + (f", +{extra_count} more" if extra_count > 0 else "")
-                    + "."
-                )
-            dte_passive_downgrades = [
-                evaluation
-                for evaluation in close_order_evaluations
-                if evaluation.get("dte_gate_applied")
-            ]
-            dte_passive_message = ""
-            if dte_passive_downgrades:
-                downgraded_symbols = ", ".join(
-                    f"{evaluation.get('tradingsymbol')} "
-                    f"(trading DTE {evaluation.get('dte') if evaluation.get('dte') is not None else 'unknown'})"
-                    for evaluation in dte_passive_downgrades[:5]
-                )
-                extra_count = len(dte_passive_downgrades) - 5
-                dte_passive_message = (
-                    " Aggressive risk exits downgraded to default passive close "
-                    f"orders until trading DTE <= {intraday_hard_stop_start_dte_setting()}: "
-                    f"{downgraded_symbols}"
-                    + (f", +{extra_count} more" if extra_count > 0 else "")
-                    + "."
-                )
-            passive_buy_close_count = sum(
-                1
-                for evaluation in close_order_evaluations
-                if str(evaluation.get("action") or "") == "PLACE_BUY_CLOSE"
-            )
-            passive_sell_close_count = sum(
-                1
-                for evaluation in close_order_evaluations
-                if str(evaluation.get("action") or "") == "PLACE_SELL_CLOSE"
-            )
-            passive_close_message = ""
-            if passive_buy_close_count or passive_sell_close_count:
-                passive_close_message = (
-                    f" Passive close candidates: BUY {passive_buy_close_count}, "
-                    f"SELL {passive_sell_close_count}."
-                )
-            submitted_orders: list[dict[str, Any]] = []
-            results: list[dict[str, Any]] = []
-            if loss_limit_orders:
-                loss_submitted, loss_results = execute_position_orders_for_scheduler(
-                    loss_limit_orders,
-                    set(range(len(loss_limit_orders))),
-                    False,
-                    False,
-                    state.position_stop_option_sell,
-                )
-                submitted_orders.extend(loss_submitted)
-                results.extend(loss_results)
-            if risk_orders:
-                risk_submitted, risk_results = execute_position_orders_for_scheduler(
-                    risk_orders,
-                    set(range(len(risk_orders))),
-                    False,
-                    True,
-                    state.position_stop_option_sell,
-                )
-                submitted_orders.extend(risk_submitted)
-                results.extend(risk_results)
-            if default_orders:
-                default_submitted, default_results = execute_position_orders_for_scheduler(
-                    default_orders,
-                    set(range(len(default_orders))),
-                    False,
-                    True,
-                    state.position_stop_option_sell,
-                )
-                submitted_orders.extend(default_submitted)
-                results.extend(default_results)
-            if not submitted_orders:
-                no_order_message = (
-                    "No close orders placed because open option positions are outside the intraday "
-                    f"close-order trading-DTE window."
-                    if dte_guard_skips
-                    else "All open option positions already have matching BUY/SELL close orders."
-                )
-                return save_intraday_position_close_schedule_state(
-                    status="DTE_GATED" if dte_guard_skips else "ALL_COVERED",
-                    message=(
-                        no_order_message
-                        + (
-                            f" Strict PE positions skipped because a close BUY order already exists: "
-                            f"{risk_existing_order_skips}."
-                            if risk_existing_order_skips
-                            else ""
-                        )
-                        + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
-                        + dte_guard_message
-                        + dte_passive_message
-                        + passive_close_message
-                    ),
-                    order_count=0,
-                    results=results,
-                    pe_risk_evaluations=risk_evaluations,
-                    loss_limit_evaluations=loss_limit_evaluations,
-                    close_order_evaluations=close_order_evaluations,
-                )
-            live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
-            error_count = sum(1 for result in results if result.get("status") == "ERROR")
-            status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
-            pricing_details = "; ".join(
-                f"{order.get('tradingsymbol')}: LIMIT {float(order.get('price') or 0):.2f} "
-                f"({str(order.get('transaction_type') or 'BUY').upper()} at "
-                f"{float(order.get('discount_percent') or state.position_discount_percent):g}% "
-                f"{'below' if str(order.get('transaction_type') or 'BUY').upper() == 'BUY' else 'above'} "
-                f"{order.get('price_basis') or 'price basis'})"
-                + (f" [{order.get('risk_note')}]" if order.get("risk_note") else "")
-                for order in submitted_orders
-            )
-            return save_intraday_position_close_schedule_state(
-                status=status,
-                message=(
-                    f"{market_message} Missing BUY/SELL close orders placed: {live_count}; "
-                    f"loss/hard-stop overrides: {len(loss_limit_orders)}; "
-                    f"strict PE exits: {len(risk_orders)}; "
-                    f"existing close orders skipped: {risk_existing_order_skips}; "
-                    f"errors: {error_count}. "
-                    + close_failure_summary(results)
-                    + f" Proposed LIMIT details (not fill confirmation): {pricing_details}"
-                    + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
-                    + dte_guard_message
-                    + dte_passive_message
-                    + passive_close_message
-                ),
-                order_count=len(submitted_orders),
-                results=results,
-                pe_risk_evaluations=risk_evaluations,
-                loss_limit_evaluations=loss_limit_evaluations,
-                close_order_evaluations=close_order_evaluations,
-            )
-        except ValueError as exc:
-            message = str(exc)
-            status = "ALL_COVERED" if "No matching positions need a new BUY order" in message else "ERROR"
-            return save_intraday_position_close_schedule_state(
-                status=status,
-                message=(
-                    "All open option positions already have matching BUY/SELL close orders."
-                    if status == "ALL_COVERED"
-                    else message
-                ),
-                order_count=0,
-                results=[],
-            )
-        except Exception as exc:
-            return save_intraday_position_close_schedule_state(
-                status="ERROR",
-                message=friendly_external_error(exc, "Intraday option close-order check"),
-                results=[],
-            )
+        return run_position_close_workflow(now, profile_name, save_intraday_position_close_schedule_state)
     finally:
         INTRADAY_POSITION_CLOSE_SCHEDULER_LOCK.release()
 
@@ -23838,6 +23756,7 @@ def render_dhan_repair_modal(state: PageState) -> str:
     return f"""
       <div class="live-modal-backdrop visible" id="dhan-repair-modal"><div class="live-modal dhan-order-modal-card">
         <h2>DHAN Repair Order - {html.escape(str(preview.get('symbol') or ''))}</h2>
+          {context_panel(preview.get("symbol"))}
         <p class="status">This repairs an existing incomplete {html.escape(option_type)} setup. It places only the missing leg after acknowledgement.</p>
         <input type="hidden" name="dhan_repair_preview_json" value="{preview_json}">
         <input type="hidden" name="dhan_repair" value="{html.escape(str(preview.get('symbol') or '') + '|' + option_type + '|' + repair_action, quote=True)}">
@@ -23927,7 +23846,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
         sheet = income_growth_by_symbol.get(symbol) or {}
         pct_value: float | None = None
         for key in ("pct_to_52_high", "drawdown_from_52w_high_pct", "week_52"):
-            raw = row.get(key, sheet.get(key))
+            raw = row.get(key) if row.get(key) not in (None, "") else sheet.get(key)
             try:
                 pct_value = float(raw)
                 break
@@ -23956,7 +23875,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
         sheet = income_growth_by_symbol.get(symbol) or {}
         pct_value: float | None = None
         for key in ("pct_from_52_low", "distance_from_52w_low_pct", "from_52w_low_pct"):
-            raw = row.get(key, sheet.get(key))
+            raw = row.get(key) if row.get(key) not in (None, "") else sheet.get(key)
             try:
                 pct_value = float(raw)
                 break
@@ -24003,6 +23922,10 @@ def render_kite_spreads_panel(state: PageState) -> str:
         event_risk = bool(int(row.get("event_risk_flag") or 0))
         gap_label, gap_detail, gap_class = dhan_52w_gap(row)
         low_gap_label, low_gap_detail, low_gap_class = dhan_52w_low_gap(row)
+        low_context_attrs = (
+            f' data-market-context="{symbol_value}" data-low-only data-cmp="{html.escape(str(row.get("cmp") or ""), quote=True)}"'
+            if low_gap_class == "dhan-52w-unknown" else ""
+        )
         try:
             row_day_change = float(row.get("day_change_pct") or 0)
         except (TypeError, ValueError):
@@ -24058,7 +23981,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
             f"<button type=\"submit\" class=\"dhan-action-btn dhan-action-muted\" formaction=\"/kite-spreads/deactivate\" name=\"dhan_watchlist_id\" value=\"{html.escape(str(row.get('id') or ''), quote=True)}\"{remove_disabled}{remove_title}>Hide</button>"
             "</td>"
             f"<td class=\"dhan-52w-cell {gap_class}\"><strong>{html.escape(gap_label)}</strong><small>{html.escape(gap_detail)}</small></td>"
-            f"<td class=\"dhan-52w-cell {low_gap_class}\"><strong>{html.escape(low_gap_label)}</strong><small>{html.escape(low_gap_detail)}</small></td>"
+            f"<td class=\"dhan-52w-cell {low_gap_class}\"{low_context_attrs}><strong>{html.escape(low_gap_label)}</strong><small>{html.escape(low_gap_detail)}</small></td>"
             f"<td class=\"dhan-fno-parent-cell\"><strong>#{html.escape(text_value(fno_detail.get('rank')))}</strong><small><span class=\"ipo-badge good\">{html.escape(fno_strategy_badge)} SELL</span></small></td>"
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('spot_price_sheet'))}<small>Kite {money(fno_detail.get('cmp_kite'))}</small></td>"
             f"<td class=\"dhan-fno-parent-cell\">{money(fno_detail.get('sheet_strike'))}<small>{money(fno_detail.get('sheet_premium'))} prem | {money(fno_detail.get('sheet_total_premium'))} total</small></td>"
@@ -24520,6 +24443,7 @@ def render_kite_spreads_panel(state: PageState) -> str:
               <div>
                 <div class="leg-kicker">DHAN paired execution ticket</div>
                 <h2>{html.escape(text_value(selected.get('symbol')))} - {html.escape(strategy_label)}</h2>
+          {context_panel(selected.get("symbol"))}
                 <p class="status">Hedge BUY is placed first. BUY and SELL LIMIT prices use Strategy Controls and are rounded to Zerodha ₹0.05 tick.</p>
               </div>
               <span class="ipo-badge {risk_badge}">{html.escape(ticket_decision_label)}</span>
@@ -25640,6 +25564,7 @@ def render_dhan_it_repair_modal(state: PageState) -> str:
     return f"""
       <div class="live-modal-backdrop visible" id="dhan-it-repair-modal"><div class="live-modal dhan-order-modal-card">
         <h2>DHAN-IT Repair Order - {html.escape(str(preview.get('symbol') or ''))}</h2>
+          {context_panel(preview.get("symbol"))}
         <p class="status">This repairs an existing incomplete CE setup. It does not apply new-spread blockers because the current open option is riskier without the missing leg.</p>
         <input type="hidden" name="dhan_it_repair_preview_json" value="{preview_json}">
         <input type="hidden" name="dhan_it_repair" value="{html.escape(str(preview.get('symbol') or '') + '|' + repair_action, quote=True)}">
@@ -26946,6 +26871,7 @@ def render_sector_income_panel(state: PageState) -> str:
         selected_preview = f"""
         <div class="live-modal-backdrop visible" id="dhan-it-order-modal"><div class="live-modal dhan-order-modal-card">
           <h2>SECTOR-Income Order Ticket - {html.escape(text_value(selected.get('symbol')))}</h2>
+          {context_panel(selected.get("symbol"))}
           <p class="status">Defined-risk sector CE spread. BUY hedge is submitted first; SELL leg is placed by the monitor only after hedge fill.</p>
           <input type="hidden" name="sector_income_selected_index" value="{selected_idx}">
           <input type="hidden" name="dhan_it_selected_index" value="{selected_idx}">
@@ -27489,6 +27415,7 @@ def render_ai52_call_spread_panel(state: PageState) -> str:
         selected_html = f"""
         <div class="live-modal-backdrop visible" id="ai52-order-modal"><div class="live-modal dhan-order-modal-card">
           <h2>52W AI Order Ticket - {html.escape(str(selected.get('symbol') or '-'))}</h2>
+          {context_panel(selected.get("symbol"))}
           <p class="status">Defined-risk CE credit spread. BUY +20% OTM hedge first, then SELL +5% OTM CE through the shared Pair Order Monitor.</p>
           <div class="dhan-it-execution-leg-grid">
             <article class="dhan-it-execution-leg"><span>Live CMP / Expiry</span><strong>{money(selected.get('cmp') or selected.get('spot'))} / {html.escape(str(selected.get('expiry') or '-'))}</strong><small>DTE {html.escape(str(selected.get('dte') or '-'))} | Lots {html.escape(str(selected.get('selected_lots') or 1))} | Qty {html.escape(str(selected.get('quantity') or 0))}</small></article>
@@ -28036,6 +27963,7 @@ def render_dhan_it_panel(state: PageState) -> str:
         selected_preview = f"""
         <div class="live-modal-backdrop visible" id="dhan-it-order-modal"><div class="live-modal dhan-order-modal-card">
           <h2>DHAN-IT Order Ticket - {html.escape(text_value(selected.get('symbol')))}</h2>
+          {context_panel(selected.get("symbol"))}
           <p class="status">Paired CE spread order. BUY hedge is submitted first; SELL parked LIMIT uses Strategy Controls and is repriced after hedge fill.</p>
           <input type="hidden" name="dhan_it_selected_index" value="{selected_idx}">
           <input type="hidden" name="dhan_it_trade_mode" value="{html.escape(submit_mode, quote=True)}">
@@ -32275,6 +32203,7 @@ def render_trade_panel(state: PageState) -> str:
         ) if preview.get("side") == "SELL" and preview.get("option_type") in {"PE", "CE"} else ""
         modal = f'''<div class="live-modal-backdrop visible" id="trade-order-ticket-modal"><div class="live-modal dhan-order-modal-card trade-review-card">
           <h2>TRADE Order Review — {html.escape(str(preview.get("tradingsymbol") or ""))}{' · TEST (simulated orders)' if state.trade_test_mode else ''}</h2>
+          {context_panel(preview.get("symbol") or underlying_for_symbol(preview.get("tradingsymbol") or ""))}
           <p class="status">Advisory analysis never submits an order. This ticket uses the exact user-selected Kite contract.</p>
           <input type="hidden" name="trade_preview_json" value="{preview_json}"><input type="hidden" name="trade_checks_json" value="{checks_json}">
           {hedge_section}
@@ -35428,6 +35357,7 @@ def render_nifty_income_panel(state: PageState) -> str:
       <div class="live-modal-backdrop" id="nifty-pair-order-modal">
         <div class="live-modal income-pe-order-modal-card nifty-pair-order-modal-card">
           <h2>NIFTY Order Ticket</h2>
+          {context_panel("NIFTY")}
           <p class="status">Simple defined-risk execution: choose PE spread, CE spread, or both. SELL strikes are kept near the configured credit zone; BUY hedges go first, then SELL shorts after the 10-second review.</p>
           <input type="hidden" name="nifty_pair_confirmed" id="nifty-pair-confirmed" value="0">
           <input type="hidden" name="nifty_pair_pe_otm" id="nifty-pair-pe-otm" value="{html.escape(default_pe_otm, quote=True)}">
@@ -47031,7 +46961,7 @@ def render_page(state: PageState) -> bytes:
       }}
     }}
   </script>
-</body>
+{CONTEXT_SCRIPT}</body>
 </html>"""
     return html_doc.encode("utf-8")
 
@@ -47113,6 +47043,24 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             return
         if not self.is_authenticated():
             self.send_login()
+            return
+        if parsed_url.path == "/api/underlying-context":
+            symbol = first(parse_qs(parsed_url.query), "symbol").strip().upper()
+            if not re.fullmatch(r"[A-Z0-9&.-]{1,30}|NIFTY 50", symbol):
+                self.send_json({})
+                return
+            code = "NSE:" + ("NIFTY 50" if symbol == "NIFTY" else symbol)
+            try:
+                spot = cached_kite_quote(kite_orders.kite_client(), [code]).get(code) or {}
+            except Exception:
+                spot = {}
+            values = context_values(spot, {})
+            if not values["low"] or not values["high"]:
+                try:
+                    values = context_values(spot, investing_52_week_levels(code) or {})
+                except Exception:
+                    pass
+            self.send_json(values)
             return
         if is_app_page_request(parsed_url.path) and claim_daily_kite_login_prompt():
             self.send_page(

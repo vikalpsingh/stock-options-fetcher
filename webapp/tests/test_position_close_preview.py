@@ -11,7 +11,7 @@ def test_preview_long_short_and_pending():
     assert preview_rows(positions,[],[order],set(),False,{})[0]['status'] == 'BLOCKED'
     order['transaction_type'] = 'SELL'
     assert preview_rows(positions,[],[order],set(),False,{})[0]['side'] == 'SELL'
-    assert preview_rows(positions,[dict(order,status='OPEN')],[order],set(),False,{})[0]['status'] == 'BLOCKED'
+    assert preview_rows(positions,[dict(order,status='OPEN',order_id='existing')],[order],set(),False,{})[0]['status'] == 'SKIPPED'
     assert preview_rows(positions,[],[order],{order['tradingsymbol']},False,{})[0]['status'] == 'BLOCKED'
     assert preview_rows(positions,[],[order],set(),True,{})[0]['status'] == 'BLOCKED'
 
@@ -28,7 +28,7 @@ def test_planners_are_read_only_and_keep_intraday_priority():
     from typing import Any
     source = Path('app.py').read_text(encoding='utf-8-sig')
     tree = ast.parse(source)
-    node = next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name == 'preview_position_close_job')
+    nodes = [n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in {'preview_position_close_job', 'plan_position_close_job'}]
     pos = dict(exchange='NFO',tradingsymbol='ABC26NOV100CE',product='NRML',quantity=-50)
     order = dict(pos,quantity=50,transaction_type='BUY',price=6)
     class ReadOnlyBroker:
@@ -46,9 +46,22 @@ def test_planners_are_read_only_and_keep_intraday_priority():
               INTRADAY_LOSS_LIMIT_TRIGGER_PERCENT=100,APP_DB_PATH='unused',
               ProtectedExecutionRepository=lambda path:SimpleNamespace(owned_symbols=lambda account:set()),
               selected_kite_profile_name=lambda:'test')
-    exec(compile(ast.Module(body=[node],type_ignores=[]),'<isolated>','exec'),ns)
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),'<isolated>','exec'),ns)
     for job in ['default','intraday']:
         result = ns['preview_position_close_job'](job)
         assert len(result)==1
         assert result[0]['price']==6
         assert result[0]['status']=='PROPOSED — NOT SENT'
+
+    # A long position must reach the same saved SELL-close switch in both planners.
+    pos['quantity'] = 50
+    order['transaction_type'] = 'SELL'
+    ns['build_intraday_loss_limit_close_orders'] = lambda *args: ([], [])
+    ns['build_intraday_pe_risk_exit_orders'] = lambda *args: ([], [])
+    ns['build_missing_option_close_orders_for_scheduler'] = lambda kite, discount, stop: ([] if stop else [order], [])
+    for stop in (True, False):
+        ns['position_stop_option_sell_setting'] = lambda: stop
+        for job in ('default', 'intraday'):
+            row = ns['preview_position_close_job'](job)[0]
+            assert row['status'] == ('SKIPPED' if stop else 'PROPOSED — NOT SENT')
+            assert row['side'] == 'SELL'
