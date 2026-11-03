@@ -19276,13 +19276,15 @@ def execute_position_buy_orders(
     ownership_repo = ProtectedExecutionRepository(APP_DB_PATH)
     owner_account = selected_kite_profile_name()
     owned = ownership_repo.owned_symbols(owner_account)
-    if any(str(order.get('tradingsymbol') or '') in owned for order in selected_orders):
-        raise PermissionError('A selected contract belongs to a protected execution. Use EXECUTION Close Pair to preserve hedge ownership; scheduler did not submit duplicate closes.')
     kite = kite_buy_positions.kite_client()
     results: list[dict[str, Any]] = []
     submitted_orders: list[dict[str, Any]] = []
     from position_close_reconcile import execute_close
     for order in selected_orders:
+        if order.get("tradingsymbol") in owned:
+            results.append({"tradingsymbol": order["tradingsymbol"], "status": "BLOCKED_OWNED",
+                            "detail": "Protected execution owns this contract. Use EXECUTION Close Pair."})
+            continue
         submitted_orders.append(order)
         kite_order = {
             key: value
@@ -19489,6 +19491,10 @@ def run_position_close_workflow(now, profile_name, save_run):
             )
             submitted_orders.extend(default_submitted)
             results.extend(default_results)
+        owned_count = sum(result.get("status") == "BLOCKED_OWNED" for result in results)
+        if owned_count and not submitted_orders:
+            return save_run(status="BLOCKED", message="Protected execution owns the proposed closes. Use EXECUTION Close Pair.",
+                            order_count=0, results=results, close_order_evaluations=close_order_evaluations)
         if not submitted_orders:
             no_order_message = (
                 "No close orders placed because open option positions are outside the intraday "
@@ -19519,7 +19525,7 @@ def run_position_close_workflow(now, profile_name, save_run):
             )
         live_count = sum(1 for result in results if result.get("status") == "LIVE_SENT")
         error_count = sum(1 for result in results if result.get("status") == "ERROR")
-        status = "PLACED" if live_count and not error_count else "PARTIAL" if live_count else "ERROR"
+        status = "PLACED" if live_count and not (error_count or owned_count) else "PARTIAL" if live_count else "ERROR"
         pricing_details = "; ".join(
             f"{order.get('tradingsymbol')}: LIMIT {float(order.get('price') or 0):.2f} "
             f"({str(order.get('transaction_type') or 'BUY').upper()} at "
@@ -19536,7 +19542,7 @@ def run_position_close_workflow(now, profile_name, save_run):
                 f"loss/hard-stop overrides: {len(loss_limit_orders)}; "
                 f"strict PE exits: {len(risk_orders)}; "
                 f"existing close orders skipped: {risk_existing_order_skips}; "
-                f"errors: {error_count}. "
+                f"protected contracts skipped: {owned_count}; errors: {error_count}. "
                 + close_failure_summary(results)
                 + f" Proposed LIMIT details (not fill confirmation): {pricing_details}"
                 + (f" Strict PE scan warning: {risk_scan_error}" if risk_scan_error else "")
@@ -47642,7 +47648,7 @@ class KiteWebHandler(BaseHTTPRequestHandler):
             position_live_confirmed=first(form, "position_live_confirmed") == "1",
             position_stop_option_sell=(
                 checked(form, "position_stop_option_sell")
-                if "position_stop_option_sell_present" in form
+                if request_path == "/positions/save-option-sell-flag" and "position_stop_option_sell_present" in form
                 else position_stop_option_sell_setting()
             ),
             gpt_url=first(form, "gpt_url", DEFAULT_GPT_SHARE_URL),
@@ -47865,7 +47871,6 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                 save_app_settings(
                     {
                         "position_close_discount_percent": state.position_discount_percent,
-                        "position_stop_option_sell": state.position_stop_option_sell,
                     }
                 )
             else:
@@ -48099,6 +48104,10 @@ class KiteWebHandler(BaseHTTPRequestHandler):
                     "Scheduled Default Close Orders and Intraday Missing Close-Order Guard will use these values."
                 )
             elif request_path == "/positions/save-option-sell-flag":
+                if "position_stop_option_sell_present" not in form:
+                    raise ValueError("Refresh the Position page and save the SELL close flag again.")
+                save_app_settings({"position_stop_option_sell": state.position_stop_option_sell})
+                state.position_stop_option_sell = position_stop_option_sell_setting()
                 state.message = (
                     "Position server cache saved: "
                     + (
