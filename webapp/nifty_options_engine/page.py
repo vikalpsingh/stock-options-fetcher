@@ -14,11 +14,15 @@ from trade_environment import require_test_safe_execution
 
 def selection_from_form(form):
     get = lambda key, default='': str((form.get(key) or [default])[0])
-    return dict(include_pe=get('structure', 'PE') in {'PE', 'BOTH'},
-                include_ce=get('structure', 'PE') in {'CE', 'BOTH'}, lots=get('lots', '2'),
+    quick_pair = get('quick_pair')
+    if quick_pair and quick_pair not in {'PE','CE'}:
+        raise ValueError('Quick pair must be PE or CE.')
+    structure = quick_pair or get('structure', 'PE')
+    return dict(skip_strategy_validation=get('skip_strategy_validation') == 'yes', quick_pair=quick_pair, include_pe=structure in {'PE', 'BOTH'},
+                include_ce=structure in {'CE', 'BOTH'}, lots=get('lots', '2'),
                 expiry=get('expiry'), short_pe=get('short_pe'), hedge_pe=get('hedge_pe'),
                 short_ce=get('short_ce'), hedge_ce=get('hedge_ce'), mode=get('mode', 'PAPER'),
-                auto_best=get('auto_best', 'yes') == 'yes', base_pe=get('base_pe'), base_ce=get('base_ce'))
+                auto_best=not quick_pair and get('auto_best', 'yes') == 'yes', base_pe=get('base_pe'), base_ce=get('base_ce'))
 
 
 def execute_action(path, form, account, db_path, config, context_loader, broker_factory, test_mode=False):
@@ -95,7 +99,7 @@ def invalidate_changed_lot_reviews(db_path, account, selection):
         old = record['preview'].get('selection') or {}
         if (record['state'] == 'REVIEW' and record['mode'] == selection['mode']
                 and any(str(old.get(key)) != str(selection.get(key)) for key in
-                    ('lots','expiry','short_pe','hedge_pe','short_ce','hedge_ce','include_pe','include_ce'))):
+                    ('lots','expiry','short_pe','hedge_pe','short_ce','hedge_ce','include_pe','include_ce','quick_pair','skip_strategy_validation'))):
             record['state'] = 'CLOSED'
             record['note'] = 'Contract, structure or lot selection changed. Create a fresh review and restart the countdown.'
             repo.save(record)

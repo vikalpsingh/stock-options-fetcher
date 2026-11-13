@@ -2,24 +2,24 @@
   "TRADE_ENVIRONMENT": "NORMAL",
   "eod_pnl_snapshot_scheduler": {
     "enabled": true,
-    "last_attempt_at": "2026-10-26T16:00:01+05:30",
-    "last_run_at": "26 Oct 2026 16:00:01 IST",
-    "last_success_date": "2026-10-26",
-    "message": "NSE market timestamp verified at 16:00:02 IST. Saved 16 P&L row(s) for Shanti; monthly state GREEN; fresh positions allowed.",
+    "last_attempt_at": "2026-11-13T16:00:26+05:30",
+    "last_run_at": "13 Nov 2026 16:00:26 IST",
+    "last_success_date": "2026-11-13",
+    "message": "NSE market timestamp verified at 16:00:26 IST. Saved 10 P&L row(s) for Shanti; monthly state GREEN; fresh positions allowed.",
     "profile": "Shanti",
     "results": [
       {
         "account_id": "Shanti",
         "booked_mtd_pnl": 0.0,
         "daily_realized_pnl": 0.0,
-        "daily_unrealized_pnl": -25678.75,
+        "daily_unrealized_pnl": -253312.5,
         "fresh_positions_blocked": false,
         "monthly_loss_limit": 60001.0,
         "remaining_loss_budget": 60001.0,
-        "risk_mtd_pnl": -25678.75,
+        "risk_mtd_pnl": -253312.5,
         "risk_state": "GREEN",
-        "saved_rows": 16,
-        "trade_date": "2026-10-26"
+        "saved_rows": 10,
+        "trade_date": "2026-11-13"
       }
     ],
     "schedule_time": "16:00",
@@ -44,16 +44,16 @@
     "WAAREEENER"
   ],
   "income_growth_gpt_scheduler": {
-    "csv_path": "C:\\Coding\\NSE\\stock-options-fetcher\\21Oct2026.csv",
+    "csv_path": "C:\\Coding\\NSE\\stock-options-fetcher\\13Nov2026.csv",
     "enabled": true,
-    "last_attempt_date": "2026-10-21",
-    "last_run_at": "21 Oct 2026 09:30:06 IST",
-    "message": "NSE market timestamp verified at 09:30:07 IST. Saved CSV text to 21Oct2026.csv with fresh Kite prices for 2 option contract(s). Ready for Research and Trading preview.",
-    "order_count": 2,
-    "output_preview": "symbol,exchange,transaction_type,lots,price_markup_percent,product,order_type,price,validity,tag\nUNITDSPR26NOV1460CE,NFO,SELL,1,0,NRML,LIMIT,13.0,DAY,COVERED_CALL\nPFC26NOV360CE,NFO,SELL,1,0,NRML,LIMIT,2.9,DAY,COVERED_CALL",
+    "last_attempt_date": "2026-11-13",
+    "last_run_at": "13 Nov 2026 09:30:11 IST",
+    "message": "NSE market timestamp verified at 09:30:12 IST. Saved CSV text to 13Nov2026.csv with fresh Kite prices for 1 option contract(s). Ready for Research and Trading preview.",
+    "order_count": 1,
+    "output_preview": "symbol,exchange,transaction_type,lots,price_markup_percent,product,order_type,price,validity,tag\nPFC26DEC365CE,NFO,SELL,1,0,NRML,LIMIT,6.1,DAY,COVERED_CALL",
     "paused_until": "",
-    "profile": "Monika",
-    "response_id": "resp_077ea443915bb9a8006ad838e61a5487d1b172528147c886b5",
+    "profile": "Shanti",
+    "response_id": "resp_0f6ab5fc34bd1389006af68b5e6b0487d2a8d06902c2dc99b1",
     "schedule_time": "09:30",
     "status": "SAVED"
   },
@@ -769,7 +769,7 @@
       ]
     },
     "Shanti": {
-      "KITE_ACCESS_TOKEN": "dXQC4Cl70Ny3CiRksN43y3nnKWdXZZpc",
+      "KITE_ACCESS_TOKEN": "E6PhDwEznJmjGQUJ1gwd11yjcg6CUpgo",
       "KITE_API_KEY": "vr6yz47r650vum8p",
       "KITE_API_SECRET": "vgbk58nvcdmtjc68mbrwoebkbldmm4oj",
       "KITE_CONFIRM_LIVE_ORDER": "YES",
@@ -1695,12 +1695,12 @@
   "position_close_discount_percent": 40.0,
   "position_close_scheduler": {
     "enabled": true,
-    "last_attempt_date": "2026-10-21",
-    "last_run_at": "21 Oct 2026 09:20:13 IST",
-    "message": "Scheduled close BUY authentication failed: open Kite Setup, confirm the active profile, and regenerate today's access token.",
+    "last_attempt_date": "2026-11-13",
+    "last_run_at": "13 Nov 2026 09:29:09 IST",
+    "message": "Intraday option close-order check authentication failed: open Kite Setup, confirm the active profile, and regenerate today's access token.",
     "order_count": 4,
     "paused_until": "",
-    "profile": "Monika",
+    "profile": "Shanti",
     "results": [],
     "schedule_time": "09:20",
     "status": "ERROR"

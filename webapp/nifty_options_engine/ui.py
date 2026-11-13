@@ -1,5 +1,6 @@
 """Escaped server-rendered execution window. No automatic order submission."""
 from underlying_market_context import CONTEXT_SCRIPT, context_panel
+from .directional_ui import render_directional_panel, DTV_STYLE, DTV_SCRIPT
 from execution_presentation import render_discipline_cards
 from execution_pair_analytics import render_pair_pnl
 from pair_exit_review import render_exit_review
@@ -10,6 +11,21 @@ from .ticket import number
 
 def e(value):
     return escape(str(value if value is not None else ''), quote=True)
+
+
+def skip_strategy_control(selected):
+    checked = ' checked' if selected.get('skip_strategy_validation') is True else ''
+    return ('<label class="ack"><input type="checkbox" name="skip_strategy_validation" value="yes"'+checked+'> Skip strategy validations (directional advice only)</label>'
+            '<small>Account, contract, quote, capital/monthly loss limits and confirmed hedge-fill checks remain mandatory. Changing this choice requires a new 10-second review.</small>')
+
+
+def quick_pair_review_form(selected):
+    result = '<form method="post" action="/nifty-2/review"><input type="hidden" name="open_ticket" value="yes">'
+    for key,value in selected.items():
+        if key not in {'quick_pair','skip_strategy_validation','include_ce','include_pe','auto_best'}:
+            result += f'<input type="hidden" name="{e(key)}" value="{e(value)}">'
+    result += '<input type="hidden" name="auto_best" value="no">'+skip_strategy_control(selected)
+    return result + '<div class="actions"><button name="quick_pair" value="PE">Review PE pair at CMP</button><button name="quick_pair" value="CE">Review CE pair at CMP</button></div></form>'
 
 
 def money(value):
@@ -93,7 +109,8 @@ def saved_ticket_details(saved):
     legs = saved.get('legs') or []
     qty = legs[0].get('quantity') if legs else None
     lots = (saved.get('selection') or {}).get('lots')
-    metrics = [('Expiry', saved.get('expiry')), ('NIFTY spot', saved.get('spot')),
+    metrics = [('Expiry', saved.get('expiry')), ('DTE (calendar days)', saved.get('dte')),
+               ('Spread POP', 'Unavailable — no validated model'), ('NIFTY spot', saved.get('spot')),
                ('Lots / quantity', f'{lots} / {qty}'), ('Net credit', money(saved.get('net_credit'))),
                ('Net maximum gain', money(profit)), ('Estimated margin', money(margin)),
                ('Estimated costs', money(saved.get('estimated_fees'))),
@@ -287,26 +304,47 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
     body = ''
     if data:
         selection, ticket, context = data['selection'], data['ticket'], data['context']
+        body += '<form method="post" action="/nifty-2/preview" class="actions" aria-label="Refresh NIFTY market data">'
+        refresh_fields = {key: value for key, value in selection.items() if key not in {'include_pe','include_ce','auto_best'}}
+        refresh_fields.update(structure='BOTH' if selection.get('include_pe') and selection.get('include_ce') else 'CE' if selection.get('include_ce') else 'PE', auto_best='no', refresh_market='yes')
+        for key, value in refresh_fields.items():
+            body += f'<input type="hidden" name="{e(key)}" value="{e(value)}">'
+        body += '<button type="submit">Refresh market data</button><small>Reload quotes, positions and trend history. Selected contracts are preserved; no orders are submitted.</small></form>'
+
         body += '<form method="post" action="/nifty-2/loss-cap" class="fields"><label>Portfolio loss cap (₹)<input type="number" name="loss_cap" min="1" step="1" required value="'+e(data['config']['max_total_nifty_defined_loss_inr'])+'"></label><button type="submit">Save loss cap</button><small>Shared NIFTY setting · default ₹1,00,000. Saving requires fresh entry reviews. Monthly-loss and hedge checks remain active.</small></form>'
         risk, analytics = data['risk'], data['analytics']
+        from .readiness import monthly_view, entry_readiness
+        monthly_display = monthly_view(context.get('monthly'))
         def card(label, value):
             return f'<div class="metric"><small>{e(label)}</small><strong>{e(value)}</strong></div>'
         body += '<section id="market-risk"><h2>Market &amp; risk</h2><div class="metrics">'
         for label, value in [('NIFTY spot', context.get('spot')), ('India VIX', context.get('vix')),
                              ('Portfolio max loss', money(risk['current_defined_max_loss'])),
-                             ('Risk remaining', money(risk['risk_remaining'])),
+                             ('Available new-trade risk capacity', money(risk['risk_remaining'])),
+                             ('Execution cost reserve', money(risk.get('estimated_execution_costs'))),
                              ('Loss cap', money(data['config']['max_total_nifty_defined_loss_inr'])),
-                             ('Monthly guard', (context.get('monthly') or {}).get('risk_state', 'UNKNOWN'))]:
+                             ('Monthly guard', monthly_display['display_state'])]:
             body += card(label, value)
         index_quote = context.get('quotes', {}).get('NSE:NIFTY 50') or {}
         spot = number(index_quote.get('last_price'))
         previous = number((index_quote.get('ohlc') or {}).get('close'))
         movement = spot-previous if spot is not None and previous is not None and previous>0 else None
-        movement_text = 'Unavailable' if movement is None else f'{movement:+,.2f} points ({movement/previous*100:+.2f}%)'
+        session = context.get('market_session') or {}
+        if session and not session.get('regular_session_open'):
+            movement = None
+        movement_text = ('N/A · '+session.get('reason', 'Data unavailable')) if movement is None else f'{movement:+,.2f} points ({movement/previous*100:+.2f}%)'
         tone = 'pass' if movement is not None and movement>0 else 'block' if movement is not None and movement<0 else ''
         body += f'<div class="metric"><small>NIFTY today · vs previous close</small><strong class="{tone}">{e(movement_text)}</strong></div>'
-        body += '</div><div class="mmi-focus" id="nifty-mmi-panel" data-mood="unknown" aria-label="Market Mood Index decision context"><div class="mmi-heading"><div><span class="mmi-eyebrow">MARKET SENTIMENT</span><h3>Market Mood Index</h3></div><span id="nifty-mmi-zone">Checking sentiment</span></div><div class="mmi-content"><div class="mmi-reading"><strong id="nifty-mmi-value" aria-live="polite">Loading…</strong><span> / 100</span></div><div class="mmi-decision"><small>Current strategy signal</small><strong id="nifty-mmi-signal" aria-live="polite">Checking…</strong><span>Sentiment context · confirm with price action and risk checks</span></div><div class="mmi-scale-wrap"><div class="mmi-scale" role="meter" aria-label="Market Mood Index from fear to greed" aria-valuemin="0" aria-valuemax="100" id="nifty-mmi-meter"><span id="nifty-mmi-marker" hidden></span></div><div class="mmi-scale-labels"><span>0 · Fear</span><span>50</span><span>Greed · 100</span></div></div></div>'
-        body += '</div><div class="nifty-discipline">' + render_discipline_cards() + '</div>'
+        readiness, readiness_reason = entry_readiness(context, ['CE','PE'])
+        body += card('Trade readiness', readiness)
+        body += card('Monthly booked P&L', money(monthly_display.get('booked_pnl')))
+        body += card('Monthly loss budget used', money(monthly_display.get('loss_used')))
+        body += card('Remaining monthly allowance', money(monthly_display.get('remaining_display')))
+        body += '<details><summary>Risk and data details</summary><p>'+e(readiness_reason)+'</p><p>Open-position risk capacity includes the execution cost reserve; it is separate from the account monthly booked-loss budget. Unrealised position P&L: '+e(money(monthly_display.get('unrealised_pnl')))+' (not a verified month-opening change).</p><p>Spot timestamp: '+e(context.get('spot_timestamp') or 'Unavailable')+'</p></details>'
+        body += card('Exchange session', session.get('status', 'UNKNOWN')+' · '+session.get('reason', ''))
+        body += card('Last completed / next session', str(session.get('last_trading_date') or 'Unknown')+' / '+str(session.get('next_trading_date') or 'Unknown'))
+        body += '</div><div class="nifty-sentiment-grid"><div class="mmi-focus" id="nifty-mmi-panel" data-mood="unknown" aria-label="Market Mood Index decision context"><div class="mmi-heading"><div><span class="mmi-eyebrow">MARKET SENTIMENT</span><h3>Market Mood Index</h3></div><span id="nifty-mmi-zone">Checking sentiment</span></div><div class="mmi-content"><div class="mmi-reading"><strong id="nifty-mmi-value" aria-live="polite">Loading…</strong><span> / 100</span></div><div class="mmi-decision"><small>Current strategy signal</small><strong id="nifty-mmi-signal" aria-live="polite">Checking…</strong><span>Sentiment context · confirm with price action and risk checks</span></div><div class="mmi-scale-wrap"><div class="mmi-scale" role="meter" aria-label="Market Mood Index from fear to greed" aria-valuemin="0" aria-valuemax="100" id="nifty-mmi-meter"><span id="nifty-mmi-marker" hidden></span></div><div class="mmi-scale-labels"><span>0 · Fear</span><span>50</span><span>Greed · 100</span></div></div></div>'
+        body += '</div>' + render_directional_panel(context.get('dtv'), data['config']) + '</div><div class="nifty-discipline">' + render_discipline_cards() + '</div>'
         body += f'<p class="snapshot-meta">Data refreshed {e(__import__('app_time').to_ist(context["now"]).strftime('%d %b %Y %H:%M:%S IST'))}. Mode: <b>{e(selection["mode"])}</b>.</p></section>'
         body += active_positions_section(data)
         body += '<section><h2>New protected trade</h2><p>Choose contracts, refresh the preview, then save a review. Changing a ticket requires a new review.</p><form method="post" action="/nifty-2/preview"><div class="fields">'
@@ -329,6 +367,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
             if not (data.get('optimizer') or {}).get('chosen',{}).get(side):
                 body += '<p class="block">'+side+(': Maximum quoted net-credit fallback selected for preview. Review all blocking checks before execution.' if (data.get('optimizer') or {}).get('fallback',{}).get(side) else ': NO_ELIGIBLE_SPREAD')+'</p>'
         body += '<p>Last recalculated '+e(__import__('app_time').to_ist(context['now']).strftime('%H:%M:%S IST'))+'</p>'
+        body += skip_strategy_control(selection)
         for kind in ('PE','CE'):
             body += f'<div class="spread-row"><h4>{kind} SELL + protective BUY</h4>'
             contracts = [row for row in data['instruments'] if row['instrument_type']==kind and str(row['expiry'])[:10]==selection['expiry']]
@@ -344,6 +383,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
                 border = contract_border_class(action, quote)
                 body += f'<div class="contract-card {border}">' + select(prefix+kind.lower(), label+' '+kind, choices, symbol)
                 body += contract_quote(quote) + '</div>'
+            body += f'<div class="actions" style="grid-column:1/-1"><button type="submit" formaction="/nifty-2/review" name="quick_pair" value="{kind}">Review {kind} pair at CMP</button><small>Both selected legs · selected lots · LIMIT at reviewed LTP. Review risk, wait 10 seconds, then confirm.</small></div>'
             for candidate in (data.get('liquid_alternatives') or {}).get(kind, []):
                 body += f'<button type="button" data-liquid-side="{kind.lower()}" data-short="{e(candidate["short"])}" data-hedge="{e(candidate["hedge"])}">Review liquid pair: {e(candidate["short"])} + {e(candidate["hedge"])}</button>'
             body += '</div>'
@@ -384,15 +424,18 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
                 body += f'<details class="spread-record"><summary>Put spread · {e(record["mode"])} · {e(record["state"])} · {e(record["id"][:8])} — view execution</summary>'
             body += f'<p role="status"><strong>Next step:</strong> {e(execution_guidance(record))}</p>'
             body += f'<button type="button" data-open-execution="{e(record["id"])}">OPEN NIFTY ORDER TICKET</button>'
-            body += f'<article id="execution-{e(record["id"])}"><h3>{e(saved.get("strategy_type"))} · {e(record["mode"])} · {e(record["state"])}</h3><p>Execution {e(record["id"])} · Strategy {e(record.get("strategy_id", "pending"))}</p>'
+            body += f'<article id="execution-{e(record["id"])}" data-quick-pair="{e(saved.get("selection",{}).get("quick_pair",""))}"><h3>{e(saved.get("strategy_type"))} · {e(record["mode"])} · {e(record["state"])}</h3><p>Execution {e(record["id"])} · Strategy {e(record.get("strategy_id", "pending"))}</p>'
             body += render_pair_pnl(record, context['quotes'], context['now'])
             body += ticket_risk_header(saved)
             body += saved_ticket_details(saved)
             if record['state']=='REVIEW':
                 reviewed_selection = saved.get('selection') or {}
+                body += quick_pair_review_form(reviewed_selection)
                 reviewed_structure = 'BOTH' if reviewed_selection.get('include_pe') and reviewed_selection.get('include_ce') else 'CE' if reviewed_selection.get('include_ce') else 'PE'
                 body += '<form method="post" action="/nifty-2/review"><input type="hidden" name="open_ticket" value="yes">'
                 for key,value in {**reviewed_selection,'structure':reviewed_structure}.items():
+                    if key == 'skip_strategy_validation':
+                        value = 'yes' if value is True else 'no'
                     body += f'<input type="hidden" name="{e(key)}" value="{e(value)}">'
                 body += '<button class="refresh-ticket">Refresh details</button></form>'
 
@@ -453,6 +496,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
             '<li>'+e(check['name'])+': '+e(check['reason'])+'</li>'
             for check in (data.get('ticket') or {}).get('checks', []) if check['status']=='BLOCK') + '</ul>'
     if data.get('open_ticket') and not target:
+        blocked += quick_pair_review_form(data.get('selection') or {})
         blocked += nearer_liquidity_form(data)
     body += f'<dialog id="order-ticket" aria-labelledby="ticket-title" data-auto="{str(bool(data.get("open_ticket"))).lower()}" data-execution="{e(target)}"><header><h2 id="ticket-title">NIFTY Order Ticket</h2><button type="button" id="close-ticket" aria-label="Close ticket">×</button></header>{context_panel("NIFTY")}{popup_error}{blocked}<div id="ticket-content"></div><footer class="ticket-footer"><button type="button" id="ticket-cancel">Cancel</button><button type="button" id="ticket-refresh">Refresh details</button><button type="button" id="ticket-review">Review &amp; Start 10s</button><button type="button" id="ticket-go" disabled>GO</button></footer></dialog>'
     return ('''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Nifty 2.0 · Income Desk</title><style>
@@ -460,7 +504,7 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
 #order-ticket{width:min(810px,94vw);padding:24px 14px 0;border:0;border-radius:14px}#order-ticket header{justify-content:center;position:relative}#ticket-title{font-size:28px;margin:8px 0 24px}#close-ticket{position:absolute;right:0;top:0;background:transparent;color:#405166;border:0}#order-ticket article{border:0;padding:0;margin:0;overflow:visible}#order-ticket article>h3,#order-ticket article>h3+p{font-size:12px;color:#60718b}.ticket-mindset{background:#eff6ff;border:1px solid #8db8ff;border-radius:10px;padding:14px 18px;color:#244493;text-align:center;font-weight:750}.ticket-intro{text-align:center;font-size:14px}.risk-heading{text-align:center;font-size:15px;color:#008679}.risk-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.risk-cell{border:1px solid #b1e5e8;background:#f7fafb;border-radius:10px;padding:12px;text-align:center}.risk-cell small{font-size:12px;font-weight:800;color:#647792}.risk-cell strong{display:block;font-size:20px;color:#0c394b;margin-top:8px}.risk-fail,.risk-banner{background:#fee2e2!important;color:#a91515!important}.risk-pass{background:#d8f5e9}.risk-banner{text-align:center;padding:10px;font-weight:750;border-radius:5px}.spread-choices{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}.spread-choice{display:flex;align-items:center;gap:16px;border:1px solid #c8d5e5;background:#f1f5f9;border-radius:9px;padding:12px;text-align:center}.spread-choice>div{flex:1}.spread-choice p{margin:5px 0}.spread-choice.selected{border-color:#45d6bd;background:#ecfdf5}.coverage{background:#f0fdfa;border:1px solid #91e7da;border-radius:10px;padding:14px;margin:18px 0;color:#087b72}.ticket-footer{position:sticky;bottom:0;background:#f1f5f9;padding:14px 0;display:flex;gap:10px;justify-content:center;z-index:2;border-top:1px solid #d8e3ed}#ticket-cancel{background:#4b5563}#ticket-refresh{background:#137d89}#ticket-go{background:#a52525}#order-ticket .refresh-ticket,#order-ticket [data-countdown]{display:none}@media(max-width:550px){.risk-grid{grid-template-columns:1fr 1fr}.ticket-footer{flex-wrap:wrap}.spread-choices{grid-template-columns:1fr}}
 .inactive-leg{opacity:.55}.ticket-legs td{padding:7px;overflow-wrap:anywhere}.contract-card{border:3px solid #94a3b8;border-radius:9px;padding:14px}.contract-green{border-color:#15803d}.contract-red{border-color:#dc2626}.contract-neutral{border-color:#94a3b8}.partial{color:#92400e}.positions-table{table-layout:fixed}.positions-table td{overflow-wrap:anywhere;padding:7px}.positions-table button{padding:6px}@media(max-width:900px){.positions-table .detail{display:none}.positions-table{min-width:0;font-size:12px}}
 
-:root{--ink:#17202a;--muted:#627084;--line:#d6e6e3;--accent:#0f766e;--panel-soft:#f8fdfc}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;background:linear-gradient(135deg,#eef7f6 0%,#f7fbff 42%,#f2fbf4 100%);color:var(--ink)}main{max-width:1440px;width:calc(100% - 32px);padding:20px 0;margin:auto}.desk-header{background:radial-gradient(circle at 16% 12%,#2dd4bf33,transparent 26%),linear-gradient(120deg,#0b1220,#123b52 48%,#0f766e);padding:7px 18px;color:white;box-shadow:0 10px 26px #0f172a29}.desk-header-inner{max-width:1440px;margin:auto;display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:14px;align-items:center}.desk-brand{display:flex;align-items:center;gap:10px}.desk-mark{display:grid;place-items:center;min-width:92px;height:38px;border-radius:12px;background:linear-gradient(135deg,#38bdf8,#14b8a6);font-size:21px;font-weight:900}.desk-header h1{margin:0 0 2px;font-size:22px}.desk-header p{margin:0;color:#d5eef3;font-size:11.5px}.desk-profile{display:inline-block;margin-top:5px;padding:4px 9px;border:1px solid #ffffff40;border-radius:20px;font-size:11px}.desk-blessing{color:#fef3c7;font-size:15px;font-weight:900;text-align:center;border-radius:999px;padding:8px 12px;background:#ffffff14;border:1px solid #fef3c72e}.desk-quote{text-align:right;padding:8px 10px;border:1px solid #bae6fd33;border-radius:12px;background:#ffffff14}.desk-tabs{display:flex;gap:8px;margin-bottom:16px;padding:10px;border:1px solid #bde8e3;border-radius:16px;background:linear-gradient(135deg,#ffffffe6,#ecfeffd6);box-shadow:0 16px 38px #0f172a14;overflow-x:auto}.desk-tabs .desk-tab{flex-shrink:0;border:1px solid #94a3b857;border-radius:12px;background:linear-gradient(135deg,#e2e8f0,#f8fafc);color:#17202a;padding:10px 14px;font-size:14px;text-decoration:none;font-weight:600}.desk-tabs .active{background:linear-gradient(135deg,#0f766e,#115e59);color:white;border-color:#0f766e}.desk-tabs .desk-tab[data-tab="trade"],.desk-tabs .desk-tab[data-tab="nifty-2"]{background:linear-gradient(135deg,#ccfbf1,#e0f2fe);color:#115e59;border-color:#99dcd5}.desk-tabs .desk-tab.active{box-shadow:inset 0 -3px 0 #115e59}.desk-tab:hover{filter:brightness(.96)}.desk-tab:focus-visible,button:focus-visible{outline:3px solid #38bdf8;outline-offset:2px}section{border-color:var(--line);box-shadow:0 14px 34px #0f172a0d}section h2{color:#134e4a}.metric{background:var(--panel-soft);border:1px solid var(--line)}button{background:var(--accent);border-color:#0f766e}input,select{border-color:#b5ceca}p{color:var(--muted)}@media(max-width:900px){.desk-header-inner{grid-template-columns:1fr}.desk-blessing,.desk-quote{display:none}main{width:calc(100% - 20px)}.desk-tabs{gap:6px}.desk-tabs .desk-tab{padding:9px 12px}}
+:root{--ink:#17202a;--muted:#627084;--line:#d6e6e3;--accent:#0f766e;--panel-soft:#f8fdfc}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;background:linear-gradient(135deg,#eef7f6 0%,#f7fbff 42%,#f2fbf4 100%);color:var(--ink)}main{max-width:1440px;width:calc(100% - 32px);padding:20px 0;margin:auto}.desk-header{background:radial-gradient(circle at 16% 12%,#2dd4bf33,transparent 26%),linear-gradient(120deg,#0b1220,#123b52 48%,#0f766e);padding:7px 18px;color:white;box-shadow:0 10px 26px #0f172a29}.desk-header-inner{max-width:1440px;margin:auto;display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:14px;align-items:center}.desk-brand{display:flex;align-items:center;gap:10px}.desk-mark{display:grid;place-items:center;min-width:92px;height:38px;border-radius:12px;background:linear-gradient(135deg,#38bdf8,#14b8a6);font-size:21px;font-weight:900}.desk-header h1{margin:0 0 2px;font-size:22px}.desk-header p{margin:0;color:#d5eef3;font-size:11.5px}.desk-profile{display:inline-block;margin-top:5px;padding:4px 9px;border:1px solid #ffffff40;border-radius:20px;font-size:11px}.desk-blessing{color:#fef3c7;font-size:15px;font-weight:900;text-align:center;border-radius:999px;padding:8px 12px;background:#ffffff14;border:1px solid #fef3c72e}.desk-quote{text-align:right;padding:8px 10px;border:1px solid #bae6fd33;border-radius:12px;background:#ffffff14}.desk-tabs{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:6px;margin-bottom:10px;padding:7px;border:1px solid #bde8e3;border-radius:16px;background:linear-gradient(135deg,#ffffffe6,#ecfeffd6);align-items:stretch}.desk-tabs .desk-tab{display:flex;align-items:center;justify-content:center;min-width:0;min-height:38px;border:1px solid #94a3b857;border-radius:12px;background:linear-gradient(135deg,#e0f2fe,#ecfeff);color:#0f3b65;padding:7px 5px;font-size:12px;line-height:1.3;text-align:center;text-decoration:none;font-weight:800;white-space:normal;overflow-wrap:anywhere}.desk-tabs .desk-tab.active{background:linear-gradient(135deg,#0f4c5c,#0f766e);color:#fff;border-color:#083f49;box-shadow:inset 0 -3px 0 #a7f3d0;font-weight:900}@media(max-width:1100px){.desk-tabs{grid-template-columns:repeat(5,minmax(0,1fr))}}@media(max-width:650px){.desk-tabs{grid-template-columns:repeat(3,minmax(0,1fr))}}.desk-tab:hover{filter:brightness(.96)}.desk-tab:focus-visible,button:focus-visible{outline:3px solid #38bdf8;outline-offset:2px}section{border-color:var(--line);box-shadow:0 14px 34px #0f172a0d}section h2{color:#134e4a}.metric{background:var(--panel-soft);border:1px solid var(--line)}button{background:var(--accent);border-color:#0f766e}input,select{border-color:#b5ceca}p{color:var(--muted)}@media(max-width:900px){.desk-header-inner{grid-template-columns:1fr}.desk-blessing,.desk-quote{display:none}main{width:calc(100% - 20px)}.desk-tabs{gap:6px}.desk-tabs .desk-tab{padding:7px 5px}}
 
 /* Compact overview: eight metrics share a desktop row without an orphan card. */
 .pair-table{overflow-x:auto}.pair-table td,.pair-table th{text-align:right;padding:6px;font-size:12px}.pair-selected{background:#dcfce7}.pair-blocked{color:#64748b;background:#f8fafc}main{padding-top:12px}.desk-tabs{margin-bottom:10px}
@@ -473,16 +517,14 @@ def render_page(data=None, error='', message='', review=None, test_mode=False, a
 #market-risk .metric small,#active-positions>.metrics .metric small{font-size:11px;line-height:1.25}
 #market-risk .metric strong,#active-positions>.metrics .metric strong{font-size:18px;margin-top:5px;line-height:1.2;overflow-wrap:anywhere}
 #market-risk>.metrics{grid-template-columns:repeat(7,minmax(0,1fr))}
-.mmi-focus{--mood:#64748b;margin-top:10px;border:1px solid #cbd5e1;border-left:5px solid var(--mood);border-radius:10px;padding:12px 16px;background:linear-gradient(110deg,#f0fdfa,#f8fafc)}
-.mmi-focus[data-mood="fear"]{--mood:#b45309;background:linear-gradient(110deg,#fff7ed,#fffbeb)}
-.mmi-focus[data-mood="greed"]{--mood:#047857;background:linear-gradient(110deg,#ecfdf5,#f0fdfa)}
-.mmi-focus[data-mood="neutral"]{--mood:#0369a1;background:linear-gradient(110deg,#eff6ff,#f0fdfa)}
-.mmi-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}.mmi-eyebrow{font-size:10px;font-weight:800;letter-spacing:.12em;color:#475569}.mmi-heading h3{margin:2px 0 8px;font-size:18px}
-#nifty-mmi-zone{padding:5px 10px;border:1px solid var(--mood);border-radius:20px;color:var(--mood);font-size:13px;font-weight:800}
-.mmi-content{display:grid;grid-template-columns:auto 1fr minmax(200px,32%);align-items:center;gap:22px}.mmi-reading{white-space:nowrap;color:var(--mood)}#nifty-mmi-value{font-size:38px;font-weight:850;line-height:1.1}.mmi-reading>span{font-size:14px;color:#64748b}
-.mmi-decision{display:grid;gap:3px}.mmi-decision small{font-size:11px;color:#475569}#nifty-mmi-signal{font-size:20px;color:var(--mood)}.mmi-decision>span{font-size:11px;color:#475569}
-.mmi-scale{position:relative;height:10px;border-radius:8px;background:linear-gradient(90deg,#c2410c,#fbbf24 40%,#cbd5e1 50%,#6ee7b7 60%,#047857)}#nifty-mmi-marker{position:absolute;top:-5px;height:20px;width:4px;transform:translateX(-50%);background:#0f172a;border:1px solid white;border-radius:3px}.mmi-scale-labels{display:flex;justify-content:space-between;margin-top:8px;font-size:10px;color:#475569}
-@media(max-width:700px){.mmi-content{grid-template-columns:auto 1fr;gap:12px}.mmi-scale-wrap{grid-column:1/-1}#nifty-mmi-value{font-size:32px}#nifty-mmi-signal{font-size:17px}}
+.mmi-focus{--mood:#64748b;margin-top:10px;border:1px solid #c9dee5;border-top:3px solid #0d9488;border-radius:12px;padding:14px;background:#f8fcfd;color:#20384a}
+.mmi-focus[data-mood="fear"]{--mood:#926415}.mmi-focus[data-mood="greed"]{--mood:#24735b}.mmi-focus[data-mood="neutral"]{--mood:#356781}
+.mmi-heading{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.mmi-eyebrow{font-size:10px;font-weight:700;letter-spacing:.08em;color:#527084}.mmi-heading h3{margin:5px 0 8px;font-size:17px;color:#134e4a}
+#nifty-mmi-zone{padding:3px 7px;border:1px solid #d6e4e8;border-radius:6px;background:#fff;color:var(--mood);font-size:11px;font-weight:600}
+.mmi-content{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:10px 14px}.mmi-reading{white-space:nowrap;color:#243e51}#nifty-mmi-value{font-size:24px;font-weight:700;line-height:1.2}.mmi-reading>span{font-size:11px;color:#607789}
+.mmi-decision{display:grid;gap:3px}.mmi-decision small{font-size:11px;color:#607789}#nifty-mmi-signal{font-size:14px;font-weight:600;color:var(--mood)}.mmi-decision>span{font-size:11px;line-height:1.4;color:#607789}
+.mmi-scale-wrap{grid-column:1/-1}.mmi-scale{position:relative;height:6px;border-radius:6px;background:linear-gradient(90deg,#d5a486,#edcf86 40%,#dde5e9 50%,#b2d9c7 60%,#6baf98)}#nifty-mmi-marker{position:absolute;top:-3px;height:12px;width:3px;transform:translateX(-50%);background:#425a6b;border:1px solid white;border-radius:3px}.mmi-scale-labels{display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:#607789}
+@media(max-width:480px){.mmi-content{gap:8px 12px}#nifty-mmi-value{font-size:22px}#nifty-mmi-signal{font-size:14px}}
 #market-risk .snapshot-meta{margin:8px 0 0;font-size:12px;line-height:1.4}
 #active-positions>h3{margin:12px 0 6px;font-size:16px}
 @media(max-width:1100px){#market-risk>.metrics,#active-positions>.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}}
@@ -520,6 +562,7 @@ async function refreshNiftyMood(){
   const mmi=Number(data.value);
   value.textContent=mmi.toFixed(2);zone.textContent=data.zone||'';
   signal.textContent=mmi>60?'SELL CALL':mmi<40?'SELL PUT':'WAIT / NEUTRAL';
+  document.dispatchEvent(new CustomEvent('nifty-mmi-updated',{detail:signal.textContent}));
   document.getElementById('nifty-mmi-panel').dataset.mood=mmi>60?'greed':mmi<40?'fear':'neutral';
   const marker=document.getElementById('nifty-mmi-marker');marker.hidden=false;marker.style.left=mmi+'%';
   const meter=document.getElementById('nifty-mmi-meter');meter.setAttribute('aria-valuenow',String(mmi));meter.setAttribute('aria-valuetext',mmi.toFixed(2)+' '+(data.zone||''));
@@ -529,20 +572,32 @@ refreshNiftyMood();
 const ticketDialog=document.getElementById('order-ticket');
 let originalPosition=null, reviewTimer=null;
 const footerGo=document.getElementById('ticket-go'), footerReview=document.getElementById('ticket-review');
+ticketDialog.addEventListener('change',event=>{
+ if(event.target.name!=='skip_strategy_validation')return;
+ const article=event.target.closest('article');if(!article)return;
+ article.dataset.reviewChanged='yes';footerGo.disabled=true;footerReview.disabled=true;
+ footerReview.textContent='Submit pair for a new review';
+});
+ticketDialog.addEventListener('click',event=>{
+ const button=event.target.closest('[data-countdown]');
+ if(button?.closest('article')?.dataset.reviewChanged==='yes'){event.preventDefault();event.stopImmediatePropagation();}
+},true);
+
 document.getElementById('ticket-cancel').onclick=()=>ticketDialog.close();
 document.getElementById('ticket-refresh').onclick=()=>document.querySelector('#ticket-content .refresh-ticket')?.click();
 footerReview.onclick=()=>{clearInterval(reviewTimer);let left=10;footerGo.disabled=true;footerReview.disabled=true;footerReview.textContent='Review '+left+'s';reviewTimer=setInterval(()=>{left--;footerReview.textContent='Review '+left+'s';if(left<=0){left=0;const waiting=Boolean(document.querySelector('#ticket-content [data-countdown]')?.disabled ?? true);footerReview.textContent=waiting?'Waiting for review timer':'Review complete';if(!waiting){clearInterval(reviewTimer);footerGo.disabled=false;}}},1000);};
-footerGo.onclick=()=>document.querySelector('#ticket-content [data-countdown]')?.click();
+footerGo.onclick=()=>{if(window.confirm('Confirm this reviewed pair order in the displayed PAPER/LIVE mode? BUY hedge is submitted first; SELL requires confirmed hedge fills.'))document.querySelector('#ticket-content [data-countdown]')?.click();};
 function openTicket(id){
   const article=document.getElementById('execution-'+id);
   document.getElementById('ticket-title').textContent=article?.dataset.positionManagement?'Manage NIFTY Position':'NIFTY Order Ticket';
   if(article){article.hidden=false;originalPosition=document.createComment('execution-position');article.before(originalPosition);document.getElementById('ticket-content').append(article);}
   footerGo.disabled=true;footerReview.disabled=!document.querySelector('#ticket-content [data-countdown]');footerReview.textContent='Review & Start 10s';document.getElementById('ticket-refresh').disabled=!document.querySelector('#ticket-content .refresh-ticket');
   ticketDialog.showModal();
+  if(article?.dataset.quickPair && !footerReview.disabled)footerReview.click();
 }
 document.getElementById('close-ticket').addEventListener('click',()=>ticketDialog.close());
 ticketDialog.addEventListener('close',()=>{clearInterval(reviewTimer);if(originalPosition){const article=document.querySelector('#ticket-content article');if(article){originalPosition.replaceWith(article);if(article.dataset.positionManagement)article.hidden=true;}originalPosition=null;}});
 for(const button of document.querySelectorAll('[data-open-execution]'))button.addEventListener('click',()=>openTicket(button.dataset.openExecution));
 for(const button of document.querySelectorAll('[data-linked-execution]'))button.onclick=()=>{ticketDialog.addEventListener('close',()=>openTicket(button.dataset.linkedExecution),{once:true});ticketDialog.close();};
 if(ticketDialog.dataset.auto==='true')openTicket(ticketDialog.dataset.execution);
-for(const button of document.querySelectorAll('[data-countdown]')){let left=Number(button.dataset.countdown);const update=()=>{button.disabled=left>0;button.textContent=left>0?'Review risk · '+left+'s':'GO · submit BUY hedges';left-=1;};update();const timer=setInterval(()=>{update();if(left<0)clearInterval(timer);},1000);}</script>'''+CONTEXT_SCRIPT+'</body></html>').encode('utf-8')
+for(const button of document.querySelectorAll('[data-countdown]')){let left=Number(button.dataset.countdown);const update=()=>{button.disabled=left>0;button.textContent=left>0?'Review risk · '+left+'s':'GO · submit BUY hedges';left-=1;};update();const timer=setInterval(()=>{update();if(left<0)clearInterval(timer);},1000);}</script>'''+DTV_STYLE+DTV_SCRIPT+CONTEXT_SCRIPT+'</body></html>').encode('utf-8')

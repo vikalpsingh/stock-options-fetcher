@@ -41,6 +41,7 @@ def test_page_paper_lifecycle_and_analytics(tmp_path, market, monkeypatch):
                                 ('close-shorts','EXIT_PENDING'), ('reconcile','SHORT_CLOSED_HEDGE_OPEN'),
                                 ('close-hedges','EXIT_PENDING'), ('reconcile','CLOSED')]:
         if endpoint.startswith('close-'):
+            context['dtv'].update(pe_status='BLOCK', ce_status='BLOCK')
             execute_action('/nifty-2/review-exit', action, 'A', path, config, loader, factory)
         record, _ = execute_action('/nifty-2/'+endpoint, action, 'A', path, config, loader, factory)
         assert record['state'] == expected
@@ -121,3 +122,26 @@ def test_recovery_guidance_and_currency():
     record['state'] = 'CLOSED'
     assert 'No position was opened' in execution_guidance(record)
     assert money(100) == '\u20b9100.00'
+
+
+def test_top_market_refresh_preserves_selection_without_execution(tmp_path,market):
+    selection,context,config=market
+    form={k:[str(v)] for k,v in selection.items()}
+    form.update(structure=['PE'],auto_best=['no'])
+    data=page_data('A',tmp_path/'refresh.db',config,lambda _:deepcopy(context),form)
+    html=render_page(data).decode('utf-8')
+    assert html.index('Refresh market data')<html.index('id="market-risk"')
+    from html.parser import HTMLParser
+    class Forms(HTMLParser):
+        def __init__(self):super().__init__();self.fields={};self.active=False
+        def handle_starttag(self,tag,attrs):
+            attrs=dict(attrs)
+            if tag=='form':self.active=attrs.get('aria-label')=='Refresh NIFTY market data'
+            if self.active and tag=='input':self.fields[attrs.get('name')]=attrs.get('value')
+        def handle_endtag(self,tag):
+            if tag=='form':self.active=False
+    parser=Forms();parser.feed(html)
+    assert parser.fields['refresh_market']=='yes'
+    assert parser.fields['short_pe']==selection['short_pe']
+    assert parser.fields['lots']==selection['lots']
+    assert 'ack' not in parser.fields and 'execution_id' not in parser.fields

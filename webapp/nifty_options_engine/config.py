@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from typing import Any
+from .directional_trend import DTV_CONFIG, settings as dtv_settings
 
 
 NIFTY_INCOME_V2_DEFAULTS: dict[str, Any] = {
+    "directional_trend_veto": DTV_CONFIG,
     "enabled": True,
     "timezone": "Asia/Kolkata",
     "max_total_nifty_defined_loss_inr": 100000,
@@ -84,6 +86,7 @@ def income_v2_config(overrides=None):
             raise ValueError(f"NIFTY setting {key} must be true or false.")
     result["countdown_seconds"] = max(10, result["countdown_seconds"])
     result["entry_order_type"], result["product"] = "LIMIT", "NRML"
+    result["directional_trend_veto"] = dtv_settings(result)
     return result
 
 

@@ -12,7 +12,7 @@ from trade_protected_execution import ProtectedExecutionRepository, basket_remai
 
 @tracked("nifty_options_engine.service:load_market_context", boundary="load_market_context")
 def load_market_context(kite, account, db_path, selection, config, now, instruments,
-                        live_ack_enabled=False):
+                        live_ack_enabled=False, cache=None, mmi=None):
     """Read broker data using the existing session; never submits orders."""
     from collections import defaultdict
     from datetime import datetime
@@ -63,9 +63,9 @@ def load_market_context(kite, account, db_path, selection, config, now, instrume
     keys = ["NFO:" + symbol for symbol in symbols if symbol] + ["NSE:NIFTY 50", "NSE:INDIA VIX"]
     quotes = kite.quote(keys)
     spot_quote = quotes.get("NSE:NIFTY 50") or {}
-    market_open = False
-    market_open = (now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) < (15, 30)
-                   and is_quote_fresh(spot_quote, 120, now))
+    from .market_session import get_nse_market_session
+    market_session = get_nse_market_session(now)
+    market_open = market_session['regular_session_open']
     # Reuse the existing monthly ledger and its actual-position P&L snapshot.
     pnl = PnlRepository(db_path)
     daily = snapshot_from_kite_positions(raw_positions, account_id=account, trade_date=now.date())
@@ -88,8 +88,10 @@ def load_market_context(kite, account, db_path, selection, config, now, instrume
                    broker_allocations=ledger.position_allocations(account, "LIVE"),
                    allocations=allocations, orders=orders, monthly=monthly, margin=None, funds=funds,
                    spot=spot_quote.get("last_price"), vix=(quotes.get("NSE:INDIA VIX") or {}).get("last_price"),
-                   spot_timestamp=str(spot_quote.get("timestamp") or ""), market_open=market_open,
+                   spot_timestamp=str(spot_quote.get("timestamp") or ""), market_open=market_open, market_session=market_session,
                    live_ack_enabled=live_ack_enabled, session_fingerprint=session_fingerprint)
+    from .directional_market import load_directional_context
+    context["dtv"] = load_directional_context(kite, account, now, instruments, spot_quote, config, cache, mmi, market_session=market_session)
     draft = build_ticket(selection, context, config)
     payloads = draft["order_payloads"]
     if payloads and all(row["price"] > 0 and row["quantity"] > 0 for row in payloads):
@@ -112,6 +114,12 @@ def persist_review(db_path, account, ticket):
     strategy = ledger.create_strategy(account, record["id"], ticket["strategy_type"],
                                       ticket["legs"], ticket["mode"])
     record["strategy_id"] = strategy
+    # Persist group/pair membership before any broker submission. Capital remains
+    # unverified until complete fills and a separately verified capital snapshot.
+    from smart_closer_repository import SmartCloserRepository
+    closer = SmartCloserRepository(db_path)
+    closer.ensure_schema()
+    closer.register(account, strategy, ticket["mode"])
     return repo.save(record)
 
 

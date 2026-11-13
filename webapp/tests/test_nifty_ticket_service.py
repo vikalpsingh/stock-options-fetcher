@@ -26,6 +26,9 @@ def market():
     context = dict(now=now, instruments=instruments, quotes=quotes, positions=[], allocations=[],
                    orders=[], monthly=dict(risk_state='GREEN', hard_locked=False), margin=50000,
                    funds=100000, spot=23000, market_open=True, live_ack_enabled=False)
+    # Explicit mocked directional evidence keeps baseline execution tests independent of Kite history.
+    context['dtv'] = dict(ce_status='ALLOW', pe_status='ALLOW', calculated_at=now.isoformat(),
+                          valid_until=(now+timedelta(minutes=2)).isoformat(), reasons={'CE':'Fixture', 'PE':'Fixture'})
     return selection, context, income_v2_config()
 
 
@@ -106,3 +109,39 @@ def test_entry_rechecks_monthly_lock_after_review(tmp_path, market):
     context['monthly']['hard_locked'] = True
     with pytest.raises(PermissionError, match='Monthly loss guard'):
         approve_entry(record, context, config)
+
+
+def test_quick_pair_advice_override_keeps_capital_and_monthly_checks(market):
+    selection,context,config=market
+    context['dtv']['pe_status']='BLOCK'
+    assert not build_ticket(selection,context,config)['eligible']
+    selection['quick_pair']='PE'
+    assert not build_ticket(selection,context,config)['eligible']
+    selection['skip_strategy_validation']=True
+    ticket=build_ticket(selection,context,config)
+    assert ticket['eligible']
+    assert all(p['tradingsymbol'].endswith('PE') for p in ticket['order_payloads'])
+    assert any(c['name']=='Directional Trend Veto PE' and c['status']=='WARNING' for c in ticket['checks'])
+    context['monthly']['hard_locked']=True
+    assert not build_ticket(selection,context,config)['eligible']
+
+
+def test_quick_pair_selects_exact_side_and_lots():
+    from nifty_options_engine.page import selection_from_form
+    selected=selection_from_form({'structure':['BOTH'],'quick_pair':['CE'],'lots':['3'],'auto_best':['yes']})
+    assert selected['include_ce'] and not selected['include_pe']
+    assert selected['lots']=='3' and not selected['auto_best']
+    with pytest.raises(ValueError):selection_from_form({'quick_pair':['BOTH']})
+
+
+def test_skip_strategy_choice_is_explicit_and_scoped(market):
+    from nifty_options_engine.page import selection_from_form
+    selection,context,config=market
+    context['dtv']['pe_status']='BLOCK'
+    selection['skip_strategy_validation']=True
+    assert not build_ticket(selection,context,config)['eligible']  # ordinary flow cannot bypass
+    assert not selection_from_form({'skip_strategy_validation':['true']})['skip_strategy_validation']
+    assert selection_from_form({'skip_strategy_validation':['yes']})['skip_strategy_validation']
+    from nifty_options_engine.ui import quick_pair_review_form
+    html=quick_pair_review_form(selection)
+    assert 'value="PE"' in html and 'value="CE"' in html and 'directional advice only' in html

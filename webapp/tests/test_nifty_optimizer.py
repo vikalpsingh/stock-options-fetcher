@@ -13,6 +13,7 @@ def test_five_strikes_and_normalization():
 @pytest.mark.parametrize('lots',[1,2,3,4])
 def test_actual_lots_credit_and_cap(market,lots):
     selection,ctx,cfg=market
+    cfg['max_total_nifty_defined_loss_inr']=60000  # Explicit budget for this cap regression.
     selection['lots']=str(lots)
     result=optimize_spreads(selection,ctx,cfg)
     base=next(r for r in result['tables']['PE'] if r['label']=='BASE')
@@ -72,6 +73,7 @@ def test_page_refresh_manual_selection_and_review_reset(market,tmp_path):
 def test_maximum_credit_fallback_keeps_risk_blocks(market):
     from nifty_options_engine.optimizer import maximum_credit_preview
     selection,ctx,cfg=market
+    cfg['max_total_nifty_defined_loss_inr']=60000
     selection['lots']='4'
     result=optimize_spreads(selection,ctx,cfg)
     assert result['chosen']['PE'] is None

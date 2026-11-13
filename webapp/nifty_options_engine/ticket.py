@@ -93,6 +93,9 @@ def build_ticket(selection, context, config, *, for_execution=True):
     master = {str(row["tradingsymbol"]): row for row in context["instruments"]
               if row.get("name") == "NIFTY" and row.get("instrument_type") in {"PE", "CE"}}
     selected_sides = [side for side in ("PE", "CE") if selection.get("include_" + side.lower())]
+    from .directional_trend import entry_checks
+    directional_checks = entry_checks(selection, context, config)
+    checks.extend(directional_checks)
     check("Protected structure", bool(selected_sides), "Select PE, CE, or both for a protected iron condor.")
     try:
         lots = int(selection.get("lots", 2))
@@ -157,7 +160,8 @@ def build_ticket(selection, context, config, *, for_execution=True):
                 # Do not count optimistic LTP sell proceeds as executable credit.
                 ask = max(ask,limit_price) if action=='BUY' else ask
                 bid = min(bid,limit_price) if action=='SELL' else bid
-            leg = dict(tradingsymbol=symbol, instrument_token=instrument["instrument_token"],
+            leg = dict(tradingsymbol=symbol, name=instrument["name"], exchange="NFO",
+                       tick_size=instrument.get("tick_size"), instrument_token=instrument["instrument_token"],
                        option_type=side, strike=float(instrument["strike"]), expiry=str(expiry),
                        quantity=qty, lot_size=lot, transaction_type=action, product="NRML",
                        bid=bid, ask=ask, oi=quote["oi"], volume=quote["volume"],
@@ -218,10 +222,42 @@ def build_ticket(selection, context, config, *, for_execution=True):
         reason=(f'Estimated margin {margin:,.2f}; reported funds {funds:,.2f}. '
                 if margin is not None and funds is not None else 'Margin estimate unavailable. ')
                + 'Informational only. Kite decides order acceptance; insufficient margin may reject the order.'))
+    for directional in directional_checks:
+        if directional['status'] != 'CAUTION':
+            continue
+        side = directional['name'].split()[-1]
+        controlled = risk['risk_status'] == 'PASS'
+        for leg in legs:
+            if leg.get('option_type') != side:
+                continue
+            raw = context['quotes'].get('NFO:'+leg['tradingsymbol']) or {}
+            values = quote_values(raw)
+            bid, ask = values['bid'], values['ask']
+            controlled = controlled and bool(bid and ask and ask >= bid and
+                (ask-bid)/bid*100 <= config['max_bid_ask_spread_pct'] and
+                depth_limit(raw, leg['transaction_type'], leg['quantity'])['shortfall'] == 0 and
+                is_quote_fresh(raw, config['max_quote_age_seconds'], now))
+        check('DTV caution controls '+side, controlled,
+              'CAUTION requires bounded payoff, fresh prices, full depth and the configured spread limit.')
     strategy = "IRON_CONDOR" if len(selected_sides) == 2 else "BULL_PUT_SPREAD" if selected_sides == ["PE"] else "BEAR_CALL_SPREAD"
     check("NIFTY enabled", config.get("enabled") is True, "NIFTY 2.0 must be enabled in settings.")
     check("Allowed strategy", strategy in config.get("allowed_strategies", []),
           "The selected strategy must be enabled in settings.")
+    # Explicit quick-pair override: directional strategy advice is informational.
+    # Contract/quote/account/monthly/capital/ownership checks remain mandatory.
+    # Never apply this override to ordinary previews or automatic selection.
+    quick_pair = selection.get('quick_pair')
+    if selection.get('skip_strategy_validation') is True and quick_pair in {'PE','CE'} and selected_sides == [quick_pair]:
+        for row in checks:
+            if row['name'].startswith('Directional Trend Veto ') or row['name'].startswith('DTV caution controls '):
+                row['status'] = 'WARNING'
+                row['reason'] = 'Explicit manual pair override — ' + row['reason']
+    # Final NIFTY dashboard gate is not an advisory/quick-pair override.
+    # Exit and hedge-repair services use their own risk-reducing authorization.
+    if context.get('market_session') is not None:
+        from .readiness import entry_readiness
+        readiness, reason = entry_readiness(context, selected_sides)
+        check('Final trade readiness', readiness == 'READY FOR PREVIEW', reason)
     display_legs = []
     for side in ('PE', 'CE'):
         for action, field in (('BUY', 'hedge_'), ('SELL', 'short_')):
